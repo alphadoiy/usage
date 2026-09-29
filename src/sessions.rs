@@ -14,6 +14,8 @@ use serde_json::Value;
 const CODEX_QUERY: &str = "SELECT id, cwd, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), id) AS title, recency_at_ms FROM threads WHERE archived=0 AND cwd<>'' AND COALESCE(thread_source,'user')='user' AND source<>'exec' ORDER BY recency_at_ms DESC;";
 const CODEX_METADATA_SCAN_LINES: usize = 8;
 const CODEX_TITLE_SCAN_LINES: usize = 256;
+const GROK_TITLE_SCAN_LINES: usize = 256;
+const TITLE_MAX_CHARS: usize = 120;
 const GHOSTTY_SCRIPT: &str = r#"
 on run argv
     set projectDir to item 1 of argv
@@ -91,6 +93,9 @@ impl AgentKind {
     }
     fn command(self) -> &'static str {
         self.command
+    }
+    pub fn resume_command(self, id: &str) -> String {
+        format!("{} {id}", self.command)
     }
     fn home_env(self) -> &'static str {
         self.home_env
@@ -271,6 +276,46 @@ fn is_local_record(session: &SessionRecord) -> bool {
     uuid::Uuid::parse_str(&session.id).is_ok() && session.cwd.is_absolute() && session.cwd.is_dir()
 }
 
+fn display_title(raw: &str) -> Option<String> {
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = one_line.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let mut chars = title.chars();
+    let short: String = chars.by_ref().take(TITLE_MAX_CHARS).collect();
+    Some(if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
+    })
+}
+
+fn tagged_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let start = format!("<{tag}>");
+    let end = format!("</{tag}>");
+    text.split_once(&start)?
+        .1
+        .split_once(&end)
+        .map(|(value, _)| value.trim())
+}
+
+fn user_prompt(text: &str) -> Option<String> {
+    let text = text.trim();
+    if let Some(command) = tagged_text(text, "command-name") {
+        let args = tagged_text(text, "command-args").unwrap_or("");
+        return display_title(&format!("{command} {args}"));
+    }
+    if text.starts_with('<')
+        || text.starts_with("[Request interrupted")
+        || text.starts_with("Caveat:")
+        || text.starts_with("# AGENTS.md")
+    {
+        return None;
+    }
+    display_title(text)
+}
+
 fn load_codex_index(home: &Path) -> Result<Vec<SessionRecord>, String> {
     let database = fs::read_dir(home)
         .map_err(|e| e.to_string())?
@@ -304,11 +349,17 @@ fn load_codex_index(home: &Path) -> Result<Vec<SessionRecord>, String> {
         serde_json::from_slice(&output.stdout).map_err(|e| format!("索引格式不兼容：{e}"))?;
     Ok(rows
         .into_iter()
-        .map(|r| SessionRecord {
-            id: r.id,
-            cwd: r.cwd,
-            title: r.title,
-            recency_at_ms: r.recency_at_ms,
+        .map(|r| {
+            let title = (r.title != r.id)
+                .then(|| user_prompt(&r.title))
+                .flatten()
+                .unwrap_or_else(|| "未命名会话".into());
+            SessionRecord {
+                id: r.id,
+                cwd: r.cwd,
+                title,
+                recency_at_ms: r.recency_at_ms,
+            }
         })
         .collect())
 }
@@ -326,8 +377,9 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
                     row.get("id").and_then(Value::as_str),
                     row.get("thread_name").and_then(Value::as_str),
                 )
+                && let Some(title) = user_prompt(title)
             {
-                titles.insert(id.to_string(), title.to_string());
+                titles.insert(id.to_string(), title);
             }
         }
     }
@@ -410,6 +462,14 @@ fn codex_rollout_metadata(path: &Path, titles: &HashMap<String, String>) -> Opti
             .take(CODEX_TITLE_SCAN_LINES)
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .find_map(|row| {
+                if row.get("type").and_then(Value::as_str) == Some("event_msg")
+                    && row.pointer("/payload/type").and_then(Value::as_str) == Some("user_message")
+                {
+                    return row
+                        .pointer("/payload/message")
+                        .and_then(Value::as_str)
+                        .and_then(user_prompt);
+                }
                 if row.get("type").and_then(Value::as_str) != Some("response_item")
                     || row.pointer("/payload/role").and_then(Value::as_str) != Some("user")
                 {
@@ -418,14 +478,14 @@ fn codex_rollout_metadata(path: &Path, titles: &HashMap<String, String>) -> Opti
                 row.pointer("/payload/content")
                     .and_then(Value::as_array)?
                     .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .map(str::trim)
-                    .find(|text| {
-                        !text.is_empty()
-                            && !text.starts_with("<environment_context>")
-                            && !text.starts_with("<system_reminder>")
+                    .filter(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "text")
+                        )
                     })
-                    .map(|text| text.chars().take(120).collect())
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .find_map(user_prompt)
             })
             .unwrap_or_else(|| "未命名会话".into())
     });
@@ -474,6 +534,7 @@ fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
 
 fn claude_metadata(path: &Path) -> Option<(PathBuf, String)> {
     let mut cwd = None;
+    let mut named = None;
     for line in BufReader::new(File::open(path).ok()?)
         .lines()
         .map_while(Result::ok)
@@ -484,32 +545,49 @@ fn claude_metadata(path: &Path) -> Option<(PathBuf, String)> {
         if cwd.is_none() {
             cwd = row.get("cwd").and_then(Value::as_str).map(PathBuf::from);
         }
+        if row.get("type").and_then(Value::as_str) == Some("ai-title") {
+            named = row
+                .get("aiTitle")
+                .and_then(Value::as_str)
+                .and_then(display_title);
+        } else if row.get("type").and_then(Value::as_str) == Some("summary") && named.is_none() {
+            named = row
+                .get("summary")
+                .and_then(Value::as_str)
+                .and_then(display_title);
+        }
         if row.get("type").and_then(Value::as_str) != Some("user")
             || row.get("isSidechain").and_then(Value::as_bool) == Some(true)
+            || row.get("isMeta").and_then(Value::as_bool) == Some(true)
         {
             continue;
         }
         let Some(content) = row.pointer("/message/content") else {
             continue;
         };
-        let title = match content {
-            Value::String(text) => text.as_str(),
+        let text = match content {
+            Value::String(text) => text.clone(),
             Value::Array(items) => {
-                let Some(text) = items
+                if items
                     .iter()
-                    .find_map(|item| item.get("text").and_then(Value::as_str))
-                else {
+                    .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+                {
                     continue;
-                };
-                text
+                }
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             }
             _ => continue,
         };
-        if !title.trim().is_empty() {
-            return Some((cwd?, title.into()));
+        if let Some(title) = user_prompt(&text) {
+            return Some((cwd?, title));
         }
     }
-    None
+    Some((cwd?, named?))
 }
 
 fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
@@ -523,11 +601,10 @@ fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
         if !project.path().is_dir() {
             continue;
         }
+        let subagent_ids = grok_subagent_ids(&project.path());
         for entry in fs::read_dir(project.path()).map_err(|e| e.to_string())? {
-            let summary_path = entry
-                .map_err(|e| e.to_string())?
-                .path()
-                .join("summary.json");
+            let session_dir = entry.map_err(|e| e.to_string())?.path();
+            let summary_path = session_dir.join("summary.json");
             let Ok(contents) = fs::read(&summary_path) else {
                 continue;
             };
@@ -537,14 +614,42 @@ fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
             let Some(id) = summary.pointer("/info/id").and_then(Value::as_str) else {
                 continue;
             };
+            if subagent_ids.contains(id)
+                || summary
+                    .get("session_kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.starts_with("subagent"))
+            {
+                continue;
+            }
             let Some(cwd) = summary.pointer("/info/cwd").and_then(Value::as_str) else {
                 continue;
             };
-            let title = ["generated_title", "session_summary"]
-                .iter()
-                .filter_map(|key| summary.get(*key).and_then(Value::as_str))
-                .find(|title| !title.trim().is_empty())
-                .unwrap_or("未命名会话");
+            let forked = summary
+                .get("parent_session_id")
+                .and_then(Value::as_str)
+                .is_some_and(|parent| !parent.is_empty());
+            let fork_created_at = summary
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(crate::timeutil::parse_time)
+                .map(|created| created.timestamp());
+            let prompt_title = if forked && fork_created_at.is_none() {
+                None
+            } else {
+                grok_prompt_title(
+                    &session_dir.join("updates.jsonl"),
+                    if forked { fork_created_at } else { None },
+                )
+            };
+            let title = prompt_title
+                .or_else(|| {
+                    ["generated_title", "session_summary"]
+                        .iter()
+                        .filter_map(|key| summary.get(*key).and_then(Value::as_str))
+                        .find_map(display_title)
+                })
+                .unwrap_or_else(|| "未命名会话".into());
             let recency_at_ms = ["last_active_at", "updated_at"]
                 .iter()
                 .filter_map(|key| summary.get(*key).and_then(Value::as_str))
@@ -556,12 +661,74 @@ fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
             sessions.push(SessionRecord {
                 id: id.into(),
                 cwd: PathBuf::from(cwd),
-                title: title.into(),
+                title,
                 recency_at_ms,
             });
         }
     }
     Ok(sessions)
+}
+
+fn grok_subagent_ids(project_dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(sessions) = fs::read_dir(project_dir) else {
+        return ids;
+    };
+    for session in sessions.flatten() {
+        let Ok(markers) = fs::read_dir(session.path().join("subagents")) else {
+            continue;
+        };
+        for marker in markers.flatten() {
+            if let Some(id) = marker.path().file_stem().and_then(|name| name.to_str()) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn grok_prompt_title(path: &Path, since_secs: Option<i64>) -> Option<String> {
+    let mut prompt = String::new();
+    let lines = BufReader::new(File::open(path).ok()?).lines();
+    for line in lines.map_while(Result::ok).take(GROK_TITLE_SCAN_LINES) {
+        if !line.contains("user_message_chunk") {
+            if !prompt.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(since) = since_secs {
+            let Some(timestamp) = row.get("timestamp").and_then(Value::as_i64) else {
+                continue;
+            };
+            let seconds = if timestamp > 1_000_000_000_000 {
+                timestamp / 1000
+            } else {
+                timestamp
+            };
+            if seconds < since {
+                continue;
+            }
+        }
+        if row
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("user_message_chunk")
+            && row
+                .pointer("/params/update/content/type")
+                .and_then(Value::as_str)
+                == Some("text")
+            && let Some(chunk) = row
+                .pointer("/params/update/content/text")
+                .and_then(Value::as_str)
+        {
+            prompt.push_str(chunk);
+        }
+    }
+    user_prompt(&prompt)
 }
 
 fn modified_ms(path: &Path) -> i64 {
@@ -686,6 +853,122 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn claude_title_skips_metadata_tool_results_and_uses_prompt() {
+        let root =
+            std::env::temp_dir().join(format!("usage-claude-title-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","cwd":"/tmp","isMeta":true,"message":{"content":"Caveat: generated context"}}),
+            serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":[{"type":"tool_result","content":"tool output"}]}}),
+            serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":"<environment_context>injected</environment_context>"}}),
+            serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":[{"type":"text","text":"Fix the"},{"type":"text","text":"browser\nlayout"}]}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            claude_metadata(&path),
+            Some((PathBuf::from("/tmp"), "Fix the browser layout".into()))
+        );
+        fs::write(&path, [
+            serde_json::json!({"type":"user","cwd":"/tmp","message":{"content":"<command-name>/review</command-name><command-args>42</command-args>"}}).to_string(),
+        ].join("\n")).unwrap();
+        assert_eq!(claude_metadata(&path).unwrap().1, "/review 42");
+        fs::write(
+            &path,
+            [
+                serde_json::json!({"type":"user","cwd":"/tmp","isMeta":true,"message":{"content":"generated"}}),
+                serde_json::json!({"type":"ai-title","aiTitle":"Named   session"}),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(claude_metadata(&path).unwrap().1, "Named session");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grok_skips_subagents_but_keeps_forks_and_prefers_first_prompt() {
+        let root =
+            std::env::temp_dir().join(format!("usage-grok-subagents-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("project");
+        let base = root.join("grok/sessions/project");
+        fs::create_dir_all(&cwd).unwrap();
+        let main = "123e4567-e89b-12d3-a456-426614174010";
+        let sub = "123e4567-e89b-12d3-a456-426614174011";
+        let fork = "123e4567-e89b-12d3-a456-426614174012";
+        let marked = "123e4567-e89b-12d3-a456-426614174013";
+        for (id, kind, parent, generated) in [
+            (main, "main", "", "Generated title"),
+            (sub, "subagent:explore", main, "Subagent title"),
+            (fork, "main", main, "Fork title"),
+            (marked, "main", main, "Marked subagent"),
+        ] {
+            fs::create_dir_all(base.join(id)).unwrap();
+            fs::write(
+                base.join(id).join("summary.json"),
+                serde_json::json!({
+                    "info":{"id":id,"cwd":cwd},
+                    "session_kind":kind,
+                    "parent_session_id":parent,
+                    "generated_title":generated,
+                    "created_at":"2026-09-27T08:00:00Z",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(base.join(main).join("subagents")).unwrap();
+        fs::write(
+            base.join(main)
+                .join("subagents")
+                .join(format!("{marked}.json")),
+            "{}",
+        )
+        .unwrap();
+        fs::write(base.join(main).join("updates.jsonl"), [
+            serde_json::json!({"params":{"update":{"sessionUpdate":"hook_execution"}}}),
+            serde_json::json!({"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Port the "}}}}),
+            serde_json::json!({"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"parser"}}}}),
+            serde_json::json!({"params":{"update":{"sessionUpdate":"agent_message_chunk"}}}),
+        ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        fs::write(
+            base.join(fork).join("updates.jsonl"),
+            [
+                serde_json::json!({"timestamp":1790495000,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Copied source prompt"}}}}),
+                serde_json::json!({"timestamp":1790496010,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"New direction"}}}}),
+                serde_json::json!({"timestamp":1790496020,"params":{"update":{"sessionUpdate":"agent_message_chunk"}}}),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let records = load_grok(&root.join("grok")).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records.iter().find(|s| s.id == main).unwrap().title,
+            "Port the parser"
+        );
+        assert_eq!(
+            records.iter().find(|s| s.id == fork).unwrap().title,
+            "New direction"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn loads_codex_index_and_skips_subagents() {
@@ -776,6 +1059,7 @@ mod tests {
             [
                 serde_json::json!({"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/tmp","thread_source":"user"}}),
                 serde_json::json!({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<environment_context>system data</environment_context>"}]}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"# AGENTS.md project instructions"}}),
                 serde_json::json!({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"Build the browser"}]}}),
             ]
             .iter()
@@ -786,6 +1070,24 @@ mod tests {
         .unwrap();
         let session = codex_rollout_metadata(&path, &HashMap::new()).unwrap();
         assert_eq!(session.title, "Build the browser");
+        fs::write(
+            &path,
+            [
+                serde_json::json!({"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/tmp","thread_source":"user"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Review\n the layout"}}),
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_rollout_metadata(&path, &HashMap::new())
+                .unwrap()
+                .title,
+            "Review the layout"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

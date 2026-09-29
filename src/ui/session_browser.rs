@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
+use unicode_width::UnicodeWidthChar;
 
 use crate::sessions::{AgentKind, Session};
 
@@ -248,8 +249,13 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let [search_area, lists_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+    let preview_height = if area.height >= 12 { 4 } else { 0 };
+    let [search_area, lists_area, preview_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(preview_height),
+    ])
+    .areas(area);
     let cursor = if browser.searching { "▏" } else { "" };
     let search = if browser.query.is_empty() && !browser.searching {
         " / 搜索项目、标题、工具或会话 ID".to_string()
@@ -271,6 +277,64 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     };
     render_projects(project_area, buf, browser);
     render_sessions(session_area, buf, browser);
+    if preview_height > 0 {
+        render_preview(preview_area, buf, browser);
+    }
+}
+
+fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
+    let Some(session) = browser.selected_session() else {
+        return;
+    };
+    let block = Block::bordered()
+        .title(format!(
+            " 恢复预览 · {} · Ghostty 右侧分屏 ",
+            session.provider.name()
+        ))
+        .border_style(DIM);
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let width = usize::from(inner.width);
+    let lines = vec![
+        Line::from(preview_text(
+            &format!("目录  {}", session.cwd.display()),
+            width,
+        )),
+        Line::from(preview_text(
+            &format!("运行  {}", session.provider.resume_command(&session.id)),
+            width,
+        )),
+    ];
+    Paragraph::new(lines)
+        .style(Style::new().fg(DIM))
+        .render(inner, buf);
+}
+
+fn preview_text(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let value = clean(value);
+    if value
+        .chars()
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum::<usize>()
+        <= width
+    {
+        return value;
+    }
+    let mut short = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let char_width = ch.width().unwrap_or(0);
+        if used + char_width + 1 > width {
+            break;
+        }
+        short.push(ch);
+        used += char_width;
+    }
+    short.push('…');
+    short
 }
 
 fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
@@ -503,7 +567,44 @@ mod tests {
             assert!(text.contains("Claude Code"), "{text}");
             assert!(text.contains("Codex"), "{text}");
             assert!(text.contains("Grok"), "{text}");
+            let compact = text.replace(' ', "");
+            assert!(compact.contains("恢复预览"), "{text}");
+            assert!(compact.contains("Ghostty右侧分屏"), "{text}");
+            assert!(compact.contains("目录"), "{text}");
+            assert!(compact.contains("运行"), "{text}");
         }
+    }
+
+    #[test]
+    fn preview_tracks_selected_session_and_truncates_to_width() {
+        let mut browser = SessionBrowser::new(vec![
+            session(AgentKind::CLAUDE, "First", "/tmp/a project", 10),
+            session(AgentKind::CODEX, "Second", "/tmp/a project", 20),
+        ]);
+        browser.focus_sessions();
+        browser.move_by(1);
+        let area = Rect::new(0, 0, 44, 20);
+        let mut buffer = Buffer::empty(area);
+        render(area, &mut buffer, &browser);
+        let rows = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("Codex·Ghostty右侧分屏"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.replace(' ', "").contains("codexresume"))
+        );
+        assert!(
+            unicode_width::UnicodeWidthStr::width(preview_text("目录  /tmp/中文项目", 12).as_str())
+                <= 12
+        );
     }
 
     #[test]
