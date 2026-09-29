@@ -6,6 +6,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
+use unicode_width::UnicodeWidthStr;
 
 use crate::labels::fmt_percent;
 use crate::theme;
@@ -36,7 +37,14 @@ pub fn preferred_height(view: &CardView, width: u16) -> u16 {
         }
         _ => 1,
     };
-    2 + inner + notes
+    2 + inner + notes + reset_note_gap(view)
+}
+
+fn reset_note_gap(view: &CardView) -> u16 {
+    u16::from(
+        (!view.bars.is_empty() || !view.rings.is_empty())
+            && view.lines.iter().any(|line| line.starts_with("主动重置 ")),
+    )
 }
 
 pub fn render_card(area: Rect, buf: &mut Buffer, provider_id: &str, title: &str, view: &CardView) {
@@ -97,12 +105,13 @@ fn render_body(area: Rect, buf: &mut Buffer, provider_id: &str, view: &CardView)
         render_notes(notes_area, buf, provider_id, &view.lines);
         return;
     }
+    let gap = reset_note_gap(view).min(area.height.saturating_sub(note_height));
     let meter_area = Rect {
-        height: area.height.saturating_sub(note_height),
+        height: area.height.saturating_sub(note_height + gap),
         ..area
     };
     let notes_area = Rect {
-        y: area.y + meter_area.height,
+        y: area.y + meter_area.height + gap,
         height: note_height,
         ..area
     };
@@ -143,12 +152,35 @@ enum MeterKind {
     Dots,
 }
 
+#[derive(Clone, Copy)]
+struct MeterColumns {
+    label: u16,
+    detail: u16,
+}
+
 fn render_rows(area: Rect, buf: &mut Buffer, provider_id: &str, bars: &[BarSpec], kind: MeterKind) {
     if bars.is_empty() || area.height == 0 {
         return;
     }
     let stacked = area.width < 34;
     let stride = if stacked { 3 } else { 2 };
+    let label_width = bars
+        .iter()
+        .map(|bar| UnicodeWidthStr::width(bar.label.as_str()) as u16)
+        .max()
+        .unwrap_or(0)
+        .clamp(6, if area.width >= 50 { 10 } else { 8 });
+    let detail_width = bars
+        .iter()
+        .filter(|bar| !bar.detail.is_empty())
+        .map(|bar| UnicodeWidthStr::width(format!("⟳ {}", bar.detail).as_str()) as u16)
+        .max()
+        .unwrap_or(0)
+        .min(if area.width >= 50 { 12 } else { 9 });
+    let columns = MeterColumns {
+        label: label_width,
+        detail: detail_width,
+    };
     for (index, spec) in bars.iter().enumerate() {
         let y = area.y.saturating_add((index as u16).saturating_mul(stride));
         if y >= area.bottom() {
@@ -179,6 +211,7 @@ fn render_rows(area: Rect, buf: &mut Buffer, provider_id: &str, bars: &[BarSpec]
                 accent(provider_id),
                 meter_color(provider_id, spec.percent),
                 kind,
+                columns,
             );
         }
     }
@@ -216,11 +249,11 @@ fn render_stacked_meter(
         let meter = Rect {
             y: area.y + 1,
             height: 1,
-            width: area.width.min(if matches!(kind, MeterKind::Dots) {
-                20
+            width: if matches!(kind, MeterKind::Dots) {
+                area.width.min(20)
             } else {
-                24
-            }),
+                area.width
+            },
             ..area
         };
         match kind {
@@ -245,25 +278,36 @@ fn render_meter_row(
     label_color: Color,
     color: Color,
     kind: MeterKind,
+    columns: MeterColumns,
 ) {
     // Give wide glyphs and the reset icon their own cells. The dots view uses
     // one empty cell between circles because some fonts draw ● past its cell.
-    let (label_width, meter_width, gap) = match (kind, area.width) {
-        (MeterKind::Braille, 50..) => (10, 12, 3),
-        (MeterKind::Braille, 34..) => (8, 8, 2),
-        (MeterKind::Braille, _) => (6, 4, 1),
-        (MeterKind::Dots, 50..) => (10, 16, 2),
-        (MeterKind::Dots, 34..) => (8, 12, 1),
-        (MeterKind::Dots, _) => (6, 8, 1),
+    let (label_width, meter_width, gap, detail_width) = match (kind, area.width) {
+        (MeterKind::Braille, 50..) => (
+            columns.label,
+            Constraint::Fill(1),
+            3,
+            Constraint::Length(columns.detail),
+        ),
+        (MeterKind::Braille, 34..) => (
+            columns.label,
+            Constraint::Fill(1),
+            2,
+            Constraint::Length(columns.detail),
+        ),
+        (MeterKind::Braille, _) => (6, Constraint::Length(4), 1, Constraint::Fill(1)),
+        (MeterKind::Dots, 50..) => (10, Constraint::Length(16), 2, Constraint::Fill(1)),
+        (MeterKind::Dots, 34..) => (8, Constraint::Length(12), 1, Constraint::Fill(1)),
+        (MeterKind::Dots, _) => (6, Constraint::Length(8), 1, Constraint::Fill(1)),
     };
     let [label, _gap1, meter, _gap2, percent, _gap3, detail] = Layout::horizontal([
         Constraint::Length(label_width),
         Constraint::Length(gap),
-        Constraint::Length(meter_width),
+        meter_width,
         Constraint::Length(gap),
         Constraint::Length(5),
         Constraint::Length(gap),
-        Constraint::Fill(1),
+        detail_width,
     ])
     .areas(area);
     Paragraph::new(spec.label.as_str())
@@ -437,6 +481,13 @@ fn badge_color(provider_id: &str, kind: BadgeKind) -> Color {
 }
 
 fn note_color(provider_id: &str, line: &str) -> Color {
+    if line.starts_with("主动重置 ") {
+        return if line.contains("重置 0 次") {
+            DIM
+        } else {
+            accent(provider_id)
+        };
+    }
     if provider_id == "grok" {
         return if line.starts_with("超额") || line.starts_with("没有返回") {
             DIM
@@ -547,15 +598,85 @@ mod tests {
             "Braille bar should draw filled dots\n{text}"
         );
         assert_eq!(area.height, 3);
-        assert_eq!(buffer[(15, 1)].fg, accent("codex"));
-        assert_eq!(buffer[(21, 1)].fg, TRACK);
-        assert_eq!(buffer[(15, 1)].bg, CARD_BG);
-        assert_eq!(buffer[(30, 1)].symbol(), "5");
-        assert_eq!(buffer[(38, 1)].symbol(), "⟳");
-        assert_eq!(buffer[(39, 1)].symbol(), " ");
+        let meter_cells = (0..area.width)
+            .filter(|&x| buffer[(x, 1)].symbol() == "⣿")
+            .collect::<Vec<_>>();
+        assert!(meter_cells.len() >= 30, "bar is still too short\n{text}");
+        let first = meter_cells[0];
+        let last = *meter_cells.last().unwrap();
+        assert_eq!(buffer[(first, 1)].fg, accent("codex"));
+        assert_eq!(buffer[(first + meter_cells.len() as u16 / 2, 1)].fg, TRACK);
+        assert_eq!(buffer[(first, 1)].bg, CARD_BG);
+        let percent_x = (last + 1..area.width)
+            .find(|&x| buffer[(x, 1)].symbol() == "5")
+            .unwrap();
+        let reset_x = (percent_x + 1..area.width)
+            .find(|&x| buffer[(x, 1)].symbol() == "⟳")
+            .unwrap();
+        assert!(percent_x >= last + 3);
+        assert!(reset_x >= percent_x + 6);
         assert!(text.contains("⟳ 2h0m"), "{text}");
         assert!(!text.contains('█'), "block gauge should be absent\n{text}");
         assert!(text.contains("50%"), "{text}");
+    }
+
+    #[test]
+    fn reset_note_has_space_after_braille_bars() {
+        let view = CardView {
+            badge: "12:00:00".into(),
+            badge_kind: BadgeKind::Ok,
+            kind: ViewKind::Bar,
+            rings: Vec::new(),
+            bars: vec![
+                BarSpec {
+                    label: "5小时".into(),
+                    percent: 50.0,
+                    detail: "2h0m".into(),
+                },
+                BarSpec {
+                    label: "7天".into(),
+                    percent: 23.0,
+                    detail: "4d0h".into(),
+                },
+            ],
+            lines: vec!["主动重置 2 次 · x".into()],
+        };
+        let area = Rect::new(0, 0, 70, preferred_height(&view, 70));
+        assert_eq!(area.height, 7);
+        let mut buffer = Buffer::empty(area);
+        render_card(area, &mut buffer, "codex", "Codex", &view);
+        assert_eq!(buffer[(12, 3)].symbol(), "⣿");
+        assert!((2..area.width - 2).all(|x| buffer[(x, 4)].symbol() == " "));
+        assert_eq!(buffer[(2, 5)].symbol(), "主");
+        let text = buffer_text(&buffer);
+        assert!(compact(&text).contains("主动重置2次·x"), "{text}");
+    }
+
+    #[test]
+    fn braille_bar_expands_with_available_card_width() {
+        let view = CardView {
+            badge: "12:00:00".into(),
+            badge_kind: BadgeKind::Ok,
+            kind: ViewKind::Bar,
+            rings: Vec::new(),
+            bars: vec![BarSpec {
+                label: "5小时".into(),
+                percent: 50.0,
+                detail: "4h35m".into(),
+            }],
+            lines: Vec::new(),
+        };
+        let lengths = [50, 70].map(|width| {
+            let area = Rect::new(0, 0, width, preferred_height(&view, width));
+            let mut buffer = Buffer::empty(area);
+            render_card(area, &mut buffer, "codex", "Codex", &view);
+            (0..width)
+                .filter(|&x| buffer[(x, 1)].symbol() == "⣿")
+                .count()
+        });
+        assert!(lengths[0] >= 18, "50-column card: {} cells", lengths[0]);
+        assert!(lengths[1] >= 35, "70-column card: {} cells", lengths[1]);
+        assert!(lengths[1] > lengths[0]);
     }
 
     #[test]

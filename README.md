@@ -8,14 +8,14 @@
 - `Canvas` 上的 `Circle` 和 `Line`：用量圆环
 - 圆点状态栏：参考 [nilbuild/claude-statusline](https://github.com/nilbuild/claude-statusline) 的短圆点条，圆点之间留空格，额度窗口之间留一行；Claude、Codex、Grok 都可使用
 
-终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。窄卡片会把额度信息和进度条分成两行，避免截断。
+终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。Braille 进度条会随卡片宽度延伸；窄卡片会把额度信息和进度条分成两行，避免截断。
 
 查询方式对齐 cc-switch 的官方订阅额度：只读取本机已有登录凭据，不负责登录，也不把令牌写回磁盘。
 
 | 工具 | 凭据 | 接口 |
 | --- | --- | --- |
 | Claude Code | Keychain `Claude Code-credentials`，否则 `~/.claude/.credentials.json` | `GET https://api.anthropic.com/api/oauth/usage` |
-| Codex | Keychain `Codex Auth`，否则 `~/.codex/auth.json`（仅 ChatGPT 登录） | `GET https://chatgpt.com/backend-api/wham/usage` |
+| Codex | Keychain `Codex Auth`，否则 `~/.codex/auth.json`（仅 ChatGPT 登录） | `GET https://chatgpt.com/backend-api/wham/usage`；主动重置走 `rate-limit-reset-credits` 接口 |
 | Grok | `~/.grok/auth.json`，优先 SuperGrok OIDC 条目 | `POST https://grok.com/.../GetGrokCreditsConfig` |
 
 ## 安装
@@ -60,6 +60,7 @@ TUI 按键：
 | `2` | 圆环（Canvas） |
 | `3` | 圆点状态栏 |
 | `s` | 把当前样式写进配置 |
+| `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
 | `j` / `k` | 滚动 |
 | `q` | 退出 |
 
@@ -77,6 +78,8 @@ grok = ""
 ```
 
 令牌过期时，界面会提示重新登录对应的 CLI。网络抖动或查询超时时保留上一份成功结果。TUI 空闲时按秒更新倒计时，查询结果和按键变化会立即重画。TUI 和一次性查询对单个工具最多等待 20 秒；Keychain 读取最多等待 10 秒。独立状态栏对单个工具最多等待 4 秒。
+
+Codex 的用量响应若提供主动重置次数，卡片会显示剩余次数。按 `x` 后会向 Codex 查询最新次数和最近到期时间；确认框显示当前账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。Claude Code 和 Grok 没有主动重置入口。
 
 ## 状态栏
 
@@ -106,6 +109,8 @@ grok = ""
 ```rust
 factory.register("gemini", |ctx| Box::new(GeminiProvider::new(ctx)))?;
 ```
+
+工具若支持主动重置，可另外实现 `UsageReset`，并让其 `UsageProvider::reset()` 返回该能力；默认提供方不提供重置。
 
 新增一种画法：向 `StyleRegistry` 登记一个函数。它把快照中的额度窗口编排为一种视图；内置的进度条使用 Braille 点阵，圆环使用 `Canvas`。
 

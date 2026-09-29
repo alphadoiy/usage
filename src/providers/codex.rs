@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use super::{ProviderContext, UsageProvider};
+use super::{ProviderContext, ProviderError, ResetPreview, UsageProvider, UsageReset};
 use crate::credentials::{CODEX_KEYCHAIN_SERVICE, parse_codex_credentials};
 use crate::http::{TransportError, body_excerpt, is_transient_status};
 use crate::model::{
@@ -15,6 +15,9 @@ use crate::model::{
 };
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const RESET_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
 pub struct CodexProvider {
     ctx: Arc<ProviderContext>,
@@ -37,6 +40,10 @@ impl UsageProvider for CodexProvider {
 
     fn display_name(&self) -> &'static str {
         Self::NAME
+    }
+
+    fn reset(&self) -> Option<&dyn UsageReset> {
+        Some(self)
     }
 
     async fn query(&self) -> UsageSnapshot {
@@ -88,6 +95,222 @@ impl UsageProvider for CodexProvider {
     }
 }
 
+#[async_trait]
+impl UsageReset for CodexProvider {
+    async fn preview_reset(&self) -> Result<ResetPreview, ProviderError> {
+        let (token, account_id) = self.reset_credentials().await?;
+        fetch_reset_preview(&self.ctx, &token, &account_id).await
+    }
+
+    async fn consume_reset(&self) -> Result<(), ProviderError> {
+        let (token, account_id) = self.reset_credentials().await?;
+        let preview = fetch_reset_preview(&self.ctx, &token, &account_id).await?;
+        if preview.available == 0 {
+            return Err(ProviderError("没有可用的主动重置次数".into()));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "redeem_request_id": uuid::Uuid::new_v4().to_string(),
+        }))
+        .map_err(|error| ProviderError(format!("无法构建重置请求: {error}")))?;
+        let response = self
+            .ctx
+            .http
+            .request(
+                "POST",
+                RESET_CONSUME_URL,
+                &reset_headers(&token, &account_id, true),
+                Some(body),
+            )
+            .await
+            .map_err(|TransportError(error)| {
+                ProviderError(format!(
+                    "重置请求结果未知: {error}。请先刷新额度确认，勿直接重试"
+                ))
+            })?;
+        if is_transient_status(response.status) {
+            return Err(ProviderError(format!(
+                "重置请求结果未知 (HTTP {})。请先刷新额度确认，勿直接重试",
+                response.status
+            )));
+        }
+        check_reset_response(&response, "重置")?;
+        Ok(())
+    }
+}
+
+impl CodexProvider {
+    async fn reset_credentials(&self) -> Result<(String, String), ProviderError> {
+        let ctx = Arc::clone(&self.ctx);
+        let now = (ctx.now)();
+        let (token, account_id, status, message) =
+            tokio::task::spawn_blocking(move || read_credentials(&ctx, now))
+                .await
+                .map_err(|error| ProviderError(format!("凭据读取中断: {error}")))?;
+        if !matches!(status, CredentialStatus::Valid | CredentialStatus::Expired) {
+            return Err(ProviderError(
+                message.unwrap_or_else(|| "请先登录 Codex".into()),
+            ));
+        }
+        let token = token.ok_or_else(|| ProviderError("Codex 访问令牌为空".into()))?;
+        let account_id = account_id.ok_or_else(|| {
+            ProviderError("Codex 凭据缺少 account_id，无法确认要重置的账号".into())
+        })?;
+        Ok((token, account_id))
+    }
+}
+
+fn reset_headers(token: &str, account_id: &str, post: bool) -> Vec<(&'static str, String)> {
+    let os = match std::env::consts::OS {
+        "macos" => "Mac OS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        other => other,
+    };
+    let mut headers = vec![
+        ("Authorization", format!("Bearer {token}")),
+        (
+            "User-Agent",
+            format!(
+                "Codex Desktop/{} ({os}; {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::ARCH
+            ),
+        ),
+        ("originator", "Codex Desktop".into()),
+        ("ChatGPT-Account-Id", account_id.to_string()),
+        ("Accept", "application/json".into()),
+    ];
+    if post {
+        headers.push(("Content-Type", "application/json".into()));
+    }
+    headers
+}
+
+async fn fetch_reset_preview(
+    ctx: &ProviderContext,
+    token: &str,
+    account_id: &str,
+) -> Result<ResetPreview, ProviderError> {
+    let response = ctx
+        .http
+        .request(
+            "GET",
+            RESET_CREDITS_URL,
+            &reset_headers(token, account_id, false),
+            None,
+        )
+        .await
+        .map_err(|TransportError(error)| ProviderError(format!("查询主动重置次数失败: {error}")))?;
+    check_reset_response(&response, "查询主动重置次数")?;
+    let payload: Value = serde_json::from_slice(&response.body)
+        .map_err(|error| ProviderError(format!("重置次数响应无法解析: {error}")))?;
+    let mut preview = parse_reset_preview(&payload, (ctx.now)())?;
+    preview.account_label = Some(
+        account_id
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(48)
+            .collect(),
+    );
+    Ok(preview)
+}
+
+fn check_reset_response(
+    response: &crate::http::HttpResponse,
+    action: &str,
+) -> Result<(), ProviderError> {
+    match response.status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(ProviderError("Codex 登录已过期，请重新登录".into())),
+        status => Err(ProviderError(format!(
+            "{action}失败 (HTTP {status}): {}",
+            body_excerpt(&response.body)
+        ))),
+    }
+}
+
+pub fn parse_reset_preview(
+    payload: &Value,
+    now: DateTime<Utc>,
+) -> Result<ResetPreview, ProviderError> {
+    let data = payload.get("data").unwrap_or(payload);
+    let credits = payload
+        .get("credits")
+        .or_else(|| data.get("credits"))
+        .and_then(Value::as_array);
+    let available = payload
+        .get("available_count")
+        .or_else(|| payload.get("availableCount"))
+        .or_else(|| data.get("available_count"))
+        .or_else(|| data.get("availableCount"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| {
+            credits.map(|items| {
+                items
+                    .iter()
+                    .filter(|item| available_credit(item, now).is_some())
+                    .count() as u32
+            })
+        })
+        .ok_or_else(|| ProviderError("重置次数响应缺少可用次数".into()))?;
+    let next_expires_at = credits
+        .into_iter()
+        .flatten()
+        .filter_map(|item| available_credit(item, now))
+        .flatten()
+        .min();
+    Ok(ResetPreview {
+        available,
+        next_expires_at,
+        account_label: None,
+    })
+}
+
+fn available_credit(value: &Value, now: DateTime<Utc>) -> Option<Option<DateTime<Utc>>> {
+    let record = value.as_object()?;
+    let status = record
+        .get("status")
+        .or_else(|| record.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("available")
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(
+        status.as_str(),
+        "redeemed" | "used" | "consumed" | "expired"
+    ) {
+        return None;
+    }
+    let expires_at = ["expires_at", "expire_at", "expiresAt"]
+        .iter()
+        .find_map(|key| record.get(*key).and_then(reset_timestamp));
+    if expires_at.is_some_and(|moment| moment <= now) {
+        return None;
+    }
+    Some(expires_at)
+}
+
+fn reset_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    match value {
+        Value::Number(number) => {
+            let stamp = number.as_i64()?;
+            if stamp > 1_000_000_000_000 {
+                DateTime::from_timestamp_millis(stamp)
+            } else {
+                DateTime::from_timestamp(stamp, 0)
+            }
+        }
+        Value::String(text) => {
+            if let Ok(stamp) = text.parse::<i64>() {
+                return reset_timestamp(&Value::from(stamp));
+            }
+            crate::timeutil::parse_time(text)
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_codex_usage(body: &Value, now: DateTime<Utc>) -> UsageSnapshot {
     let Some(root) = body.as_object() else {
         return snapshot_error(
@@ -106,7 +329,13 @@ pub fn parse_codex_usage(body: &Value, now: DateTime<Utc>) -> UsageSnapshot {
             }
         }
     }
-    snapshot_ok(CodexProvider::ID, CodexProvider::NAME, tiers, None, now)
+    let mut snapshot = snapshot_ok(CodexProvider::ID, CodexProvider::NAME, tiers, None, now);
+    snapshot.reset_credits_available = root
+        .get("rate_limit_reset_credits")
+        .and_then(|value| value.get("available_count"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    snapshot
 }
 
 pub fn window_seconds_to_tier_name(seconds: i64) -> String {
@@ -246,6 +475,7 @@ mod tests {
 
     use super::*;
     use crate::credentials::parse_codex_credentials;
+    use crate::http::{FakeHttp, HttpResponse};
     use crate::model::CredentialStatus;
 
     fn now() -> DateTime<Utc> {
@@ -286,6 +516,160 @@ mod tests {
             .map(|tier| (tier.name.as_str(), tier.utilization))
             .collect();
         assert_eq!(tiers, vec![("five_hour", 41.5), ("seven_day", 12.0)]);
+    }
+
+    #[test]
+    fn usage_includes_reset_credit_count() {
+        let snapshot = parse_codex_usage(
+            &json!({
+                "rate_limit": {"primary_window": {"used_percent": 42, "limit_window_seconds": 18000}},
+                "rate_limit_reset_credits": {"available_count": 2}
+            }),
+            now(),
+        );
+        assert_eq!(snapshot.reset_credits_available, Some(2));
+        assert_eq!(snapshot.to_json()["resetCreditsAvailable"], 2);
+        let card = crate::view::build_view(&snapshot, "bar", now(), None).unwrap();
+        assert!(card.lines.iter().any(|line| line.contains("主动重置 2 次")));
+    }
+
+    #[test]
+    fn reset_preview_filters_expired_and_used_records() {
+        let preview = parse_reset_preview(
+            &json!({
+                "data": {"credits": [
+                    {"id": "available", "status": "available", "expires_at": "2099-06-25T08:30:00Z"},
+                    {"id": "expired", "expires_at": "2020-01-01T00:00:00Z"},
+                    {"id": "used", "status": "redeemed", "expires_at": "2099-07-01T00:00:00Z"}
+                ]}
+            }),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(preview.available, 1);
+        assert_eq!(
+            preview.next_expires_at,
+            Some(Utc.with_ymd_and_hms(2099, 6, 25, 8, 30, 0).unwrap())
+        );
+        assert!(parse_reset_preview(&json!({}), now()).is_err());
+    }
+
+    fn reset_test_provider(http: Arc<FakeHttp>) -> CodexProvider {
+        let credentials = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {"access_token": "test-token", "account_id": "account-123"}
+        })
+        .to_string();
+        CodexProvider::new(Arc::new(ProviderContext {
+            claude_dir: "/nonexistent/usage-test-claude".into(),
+            codex_dir: "/nonexistent/usage-test-codex".into(),
+            grok_dir: "/nonexistent/usage-test-grok".into(),
+            http,
+            keychain: Arc::new(move |_, _| Some(credentials.clone())),
+            now: Arc::new(now),
+        }))
+    }
+
+    fn response(status: u16, body: Value) -> HttpResponse {
+        HttpResponse {
+            status,
+            headers: Default::default(),
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_requires_available_credit_before_post() {
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            RESET_CREDITS_URL,
+            Ok(response(200, json!({"available_count": 0}))),
+        );
+        let provider = reset_test_provider(Arc::clone(&http));
+        assert!(provider.reset().is_some());
+        let error = provider.consume_reset().await.unwrap_err();
+        assert!(error.to_string().contains("没有可用"));
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "GET");
+    }
+
+    #[tokio::test]
+    async fn reset_refuses_credentials_without_account_id() {
+        let http = Arc::new(FakeHttp::new());
+        let provider = CodexProvider::new(Arc::new(ProviderContext {
+            claude_dir: "/nonexistent/usage-test-claude".into(),
+            codex_dir: "/nonexistent/usage-test-codex".into(),
+            grok_dir: "/nonexistent/usage-test-grok".into(),
+            http: Arc::clone(&http) as Arc<dyn crate::http::HttpClient>,
+            keychain: Arc::new(|_, _| {
+                Some(
+                    json!({"auth_mode": "chatgpt", "tokens": {"access_token": "test-token"}})
+                        .to_string(),
+                )
+            }),
+            now: Arc::new(now),
+        }));
+        let error = provider.consume_reset().await.unwrap_err();
+        assert!(error.to_string().contains("account_id"));
+        assert!(http.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reset_sends_one_confirmed_consume_request() {
+        let http = Arc::new(FakeHttp::new());
+        http.route(RESET_CONSUME_URL, Ok(response(200, json!({}))));
+        http.route(
+            RESET_CREDITS_URL,
+            Ok(response(200, json!({"available_count": 2}))),
+        );
+        let provider = reset_test_provider(Arc::clone(&http));
+        let preview = provider.preview_reset().await.unwrap();
+        assert_eq!(preview.available, 2);
+        provider.consume_reset().await.unwrap();
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.method.as_str())
+                .collect::<Vec<_>>(),
+            ["GET", "GET", "POST"]
+        );
+        assert_eq!(calls[2].url, RESET_CONSUME_URL);
+        assert!(
+            calls[2]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "ChatGPT-Account-Id" && value == "account-123")
+        );
+        assert!(
+            calls[2]
+                .headers
+                .iter()
+                .any(|(name, value)| name == "originator" && value == "Codex Desktop")
+        );
+        let body: Value = serde_json::from_slice(calls[2].body.as_ref().unwrap()).unwrap();
+        let request_id = body["redeem_request_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(request_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_consume_does_not_retry_automatically() {
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            RESET_CONSUME_URL,
+            Err(TransportError("connection closed".into())),
+        );
+        http.route(
+            RESET_CREDITS_URL,
+            Ok(response(200, json!({"available_count": 1}))),
+        );
+        let provider = reset_test_provider(Arc::clone(&http));
+        let error = provider.consume_reset().await.unwrap_err();
+        assert!(error.to_string().contains("结果未知"));
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| call.method == "POST").count(), 1);
     }
 
     #[test]

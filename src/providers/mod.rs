@@ -30,6 +30,23 @@ pub trait UsageProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
     async fn query(&self) -> UsageSnapshot;
+
+    fn reset(&self) -> Option<&dyn UsageReset> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetPreview {
+    pub available: u32,
+    pub next_expires_at: Option<DateTime<Utc>>,
+    pub account_label: Option<String>,
+}
+
+#[async_trait]
+pub trait UsageReset: Send + Sync {
+    async fn preview_reset(&self) -> Result<ResetPreview, ProviderError>;
+    async fn consume_reset(&self) -> Result<(), ProviderError>;
 }
 
 pub async fn query_with_timeout(provider: &dyn UsageProvider, timeout: Duration) -> UsageSnapshot {
@@ -276,6 +293,10 @@ mod tests {
     fn builtin_order_and_unknown_provider() {
         let factory = builtin_factory();
         assert_eq!(factory.registry.ids(), ["claude", "codex", "grok"]);
+        for id in ["claude", "codex", "grok"] {
+            let provider = factory.create(id, empty_ctx()).unwrap();
+            assert_eq!(provider.reset().is_some(), id == "codex");
+        }
         let Err(error) = factory.create_many(&["claude".into(), "missing".into()], empty_ctx())
         else {
             panic!("expected unknown provider");

@@ -17,3 +17,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 toml = "0.8"
 toml_edit = "0.22"
 unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }

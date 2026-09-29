@@ -237,6 +237,12 @@ fn lines(snapshot: &UsageSnapshot, warning: Option<&str>) -> Vec<String> {
         lines.push(format!("网络波动，仍显示上次结果。{warning}"));
     }
     if snapshot.success {
+        if let Some(available) = snapshot.reset_credits_available {
+            lines.push(format!(
+                "主动重置 {available} 次{}",
+                if available > 0 { " · x" } else { "" }
+            ));
+        }
         if let Some(extra) = extra_line(snapshot.extra_usage.as_ref()) {
             lines.push(extra);
         } else if snapshot.tiers.is_empty() {
