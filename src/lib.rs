@@ -8,6 +8,7 @@ pub mod labels;
 pub mod model;
 pub mod plain;
 pub mod providers;
+pub mod sessions;
 pub mod statusline;
 pub mod theme;
 pub mod timeutil;

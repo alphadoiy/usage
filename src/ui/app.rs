@@ -15,11 +15,13 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 use tokio::runtime::Handle;
 
-use crate::config::{AppConfig, ConfigError, write_style};
+use crate::config::{AppConfig, ConfigError, home_dir, write_style};
 use crate::model::UsageSnapshot;
 use crate::providers::{
     ProviderError, QUERY_TIMEOUT, ResetPreview, UsageProvider, query_with_timeout,
 };
+use crate::sessions;
+use crate::ui::session_browser::{self, Focus, SessionBrowser};
 use crate::ui::widgets::{accent, preferred_height, render_card, render_loading};
 use crate::view::{CardView, builtin_styles};
 
@@ -41,6 +43,14 @@ enum AppEvent {
     ResetConsumed {
         generation: u64,
         result: Result<(), ProviderError>,
+    },
+    SessionLaunched {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    SessionsLoaded {
+        generation: u64,
+        catalog: sessions::SessionCatalog,
     },
 }
 
@@ -90,8 +100,25 @@ pub fn run(
     config: AppConfig,
     config_path: std::path::PathBuf,
 ) -> io::Result<()> {
+    let app = Dashboard::new(providers, config, config_path);
+    run_dashboard(handle, app)
+}
+
+/// Runs the TUI with additional or replacement local session sources.
+pub fn run_with_sessions(
+    handle: Handle,
+    providers: Vec<Arc<dyn UsageProvider>>,
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+    registry: sessions::SessionRegistry,
+    homes: sessions::SessionHomes,
+) -> io::Result<()> {
+    let app = Dashboard::new_with_sessions(providers, config, config_path, registry, homes);
+    run_dashboard(handle, app)
+}
+
+fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     let mut terminal = ratatui::try_init().map_err(io::Error::other)?;
-    let mut app = Dashboard::new(providers, config, config_path);
     let mut redraw = RedrawSchedule::new();
     app.refresh(&handle);
     let result = loop {
@@ -121,6 +148,11 @@ pub fn run(
                         redraw.invalidate();
                         continue;
                     }
+                    if app.browser.is_some() {
+                        app.handle_browser_key(key.code, &handle);
+                        redraw.invalidate();
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Char('r') => app.refresh(&handle),
@@ -129,6 +161,7 @@ pub fn run(
                         KeyCode::Char('3') => app.set_style("statusline"),
                         KeyCode::Char('s') => app.save_style(),
                         KeyCode::Char('x') => app.open_reset(&handle),
+                        KeyCode::Char('p') => app.open_browser(&handle),
                         KeyCode::Char('j') | KeyCode::Down => {
                             app.scroll_by(1, terminal.size().map(|size| size.width).unwrap_or(80))
                         }
@@ -167,6 +200,11 @@ struct Dashboard {
     notice: Option<String>,
     reset: Option<ResetFlow>,
     reset_generation: u64,
+    session_homes: sessions::SessionHomes,
+    session_registry: sessions::SessionRegistry,
+    browser: Option<SessionBrowser>,
+    browser_generation: u64,
+    browser_loading: bool,
 }
 
 struct CardSlot {
@@ -182,6 +220,45 @@ impl Dashboard {
         providers: Vec<Arc<dyn UsageProvider>>,
         config: AppConfig,
         config_path: std::path::PathBuf,
+    ) -> Self {
+        let home = home_dir();
+        let session_homes = sessions::SessionHomes::new()
+            .with(
+                "claude",
+                config
+                    .claude_dir
+                    .clone()
+                    .unwrap_or_else(|| home.join(".claude")),
+            )
+            .with(
+                "codex",
+                config
+                    .codex_dir
+                    .clone()
+                    .unwrap_or_else(|| home.join(".codex")),
+            )
+            .with(
+                "grok",
+                config
+                    .grok_dir
+                    .clone()
+                    .unwrap_or_else(|| home.join(".grok")),
+            );
+        Self::new_with_sessions(
+            providers,
+            config,
+            config_path,
+            sessions::builtin_registry(),
+            session_homes,
+        )
+    }
+
+    fn new_with_sessions(
+        providers: Vec<Arc<dyn UsageProvider>>,
+        config: AppConfig,
+        config_path: std::path::PathBuf,
+        session_registry: sessions::SessionRegistry,
+        session_homes: sessions::SessionHomes,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cards = providers
@@ -211,6 +288,144 @@ impl Dashboard {
             notice: None,
             reset: None,
             reset_generation: 0,
+            session_homes,
+            session_registry,
+            browser: None,
+            browser_generation: 0,
+            browser_loading: false,
+        }
+    }
+
+    fn open_browser(&mut self, handle: &Handle) {
+        self.browser = Some(SessionBrowser::new(Vec::new()));
+        self.start_browser_load(handle);
+    }
+
+    fn start_browser_load(&mut self, handle: &Handle) {
+        if self.browser_loading {
+            return;
+        }
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        let generation = self.browser_generation;
+        let homes = self.session_homes.clone();
+        let registry = self.session_registry.clone();
+        let tx = self.tx.clone();
+        self.browser_loading = true;
+        self.notice = None;
+        handle.spawn_blocking(move || {
+            let catalog = registry.load_all(&homes);
+            let _ = tx.send(AppEvent::SessionsLoaded {
+                generation,
+                catalog,
+            });
+        });
+    }
+
+    fn handle_browser_key(&mut self, key: KeyCode, handle: &Handle) {
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.launching)
+        {
+            return;
+        }
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.searching)
+        {
+            if let Some(browser) = &mut self.browser {
+                match key {
+                    KeyCode::Esc | KeyCode::Enter => browser.searching = false,
+                    KeyCode::Backspace => browser.backspace(),
+                    KeyCode::Char(ch) => browser.type_char(ch),
+                    _ => {}
+                }
+            }
+            return;
+        }
+        match key {
+            KeyCode::Esc
+                if self
+                    .browser
+                    .as_ref()
+                    .is_some_and(|b| b.focus() == Focus::Sessions) =>
+            {
+                if let Some(browser) = &mut self.browser {
+                    browser.focus_projects();
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.browser = None;
+                self.browser_generation = self.browser_generation.wrapping_add(1);
+                self.browser_loading = false;
+                self.notice = None;
+            }
+            KeyCode::Char('r') => self.start_browser_load(handle),
+            KeyCode::Tab => {
+                if let Some(browser) = &mut self.browser {
+                    browser.toggle_focus();
+                }
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                if let Some(browser) = &mut self.browser {
+                    browser.focus_projects();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(browser) = &mut self.browser {
+                    browser.focus_sessions();
+                }
+            }
+            KeyCode::Char('/') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.searching = true;
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.clear_search();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(browser) = &mut self.browser {
+                    browser.backspace();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.move_by(-1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.move_by(1);
+                }
+            }
+            KeyCode::Enter => {
+                if self.browser_loading {
+                    return;
+                }
+                let Some(browser) = &mut self.browser else {
+                    return;
+                };
+                if browser.focus() == Focus::Projects {
+                    browser.focus_sessions();
+                    return;
+                }
+                let Some(session) = browser.selected_session().cloned() else {
+                    return;
+                };
+                browser.launching = true;
+                self.notice = Some("正在 Ghostty 右侧打开会话…".into());
+                let tx = self.tx.clone();
+                let generation = self.browser_generation;
+                handle.spawn_blocking(move || {
+                    let result = sessions::resume_in_ghostty(&session);
+                    let _ = tx.send(AppEvent::SessionLaunched { generation, result });
+                });
+            }
+            _ => {}
         }
     }
 
@@ -333,7 +548,11 @@ impl Dashboard {
     }
 
     fn maybe_auto_refresh(&mut self, handle: &Handle) -> bool {
-        if self.refresh_seconds == 0 || self.pending > 0 || self.reset.is_some() {
+        if self.refresh_seconds == 0
+            || self.pending > 0
+            || self.reset.is_some()
+            || self.browser.is_some()
+        {
             return false;
         }
         if self.last_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds) {
@@ -387,6 +606,57 @@ impl Dashboard {
                                 reset_consumed = true;
                             }
                             Err(error) => self.notice = Some(format!("主动重置失败: {error}")),
+                        }
+                    }
+                    continue;
+                }
+                AppEvent::SessionLaunched { generation, result } => {
+                    if generation == self.browser_generation && self.browser.is_some() {
+                        changed = true;
+                        match result {
+                            Ok(()) => {
+                                self.browser = None;
+                                self.notice = Some("已在 Ghostty 右侧恢复会话".into());
+                            }
+                            Err(error) => {
+                                if let Some(browser) = &mut self.browser {
+                                    browser.launching = false;
+                                }
+                                self.notice = Some(error);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                AppEvent::SessionsLoaded {
+                    generation,
+                    catalog,
+                } => {
+                    if generation == self.browser_generation && self.browser.is_some() {
+                        changed = true;
+                        self.browser_loading = false;
+                        let message = if catalog.warnings.is_empty() {
+                            "未找到可恢复的本机会话".to_string()
+                        } else {
+                            catalog.warnings.join(" · ")
+                        };
+                        if catalog.sessions.is_empty()
+                            && self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
+                        {
+                            self.browser = None;
+                            self.notice = Some(message);
+                        } else {
+                            if let Some(browser) = &mut self.browser {
+                                browser.refresh(catalog.sessions);
+                            }
+                            self.notice =
+                                if self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
+                                    || !catalog.warnings.is_empty()
+                                {
+                                    Some(message)
+                                } else {
+                                    None
+                                };
                         }
                     }
                     continue;
@@ -449,27 +719,68 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let status = app.notice.clone().unwrap_or_else(|| app.status.clone());
-    Paragraph::new(Line::from(vec![" 用量 ".bold(), status.dim()]))
+    let status = if app.browser_loading {
+        "正在读取本机会话…".to_string()
+    } else {
+        app.notice.clone().unwrap_or_else(|| {
+            app.browser.as_ref().map_or_else(
+                || app.status.clone(),
+                |browser| {
+                    format!(
+                        "{} 个项目 · 显示 {}/{} 个会话",
+                        browser.project_count(),
+                        browser.visible_count(),
+                        browser.sessions.len()
+                    )
+                },
+            )
+        })
+    };
+    let header_title = if app.browser.is_some() {
+        " 会话 "
+    } else {
+        " 用量 "
+    };
+    Paragraph::new(Line::from(vec![header_title.bold(), status.dim()]))
         .style(
             Style::new()
                 .bg(Color::Rgb(22, 22, 24))
                 .fg(Color::Rgb(242, 242, 247)),
         )
         .render(header, frame.buffer_mut());
-    draw_cards(frame, body, app);
-    let footer_text = match app.reset.as_ref().map(|flow| &flow.stage) {
-        Some(ResetStage::Loading) => " 正在查询重置次数…   n/Esc 取消",
-        Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次   n/Esc 取消",
-        Some(ResetStage::Consuming) => " 正在提交主动重置，请等待结果…",
-        None if app
-            .providers
-            .iter()
-            .any(|provider| provider.reset().is_some()) =>
-        {
-            " q 退出  r 刷新  1 点阵  2 圆环  3 圆点  x 重置  s 保存  j/k 滚动"
+    if let Some(browser) = &app.browser {
+        if app.browser_loading && browser.sessions.is_empty() {
+            Paragraph::new(" 正在扫描 Claude Code、Codex 和 Grok 的本机会话…")
+                .style(Style::new().fg(Color::Rgb(142, 142, 147)))
+                .render(body, frame.buffer_mut());
+        } else {
+            session_browser::render(body, frame.buffer_mut(), browser);
         }
-        None => " q 退出   r 刷新   1 Braille 条   2 圆环   3 圆点状态栏   s 保存   j/k 滚动",
+    } else {
+        draw_cards(frame, body, app);
+    }
+    let footer_text = if let Some(browser) = &app.browser {
+        if app.browser_loading {
+            " 正在读取本机会话… Esc 返回"
+        } else if browser.launching {
+            " 正在 Ghostty 右侧打开会话… 请等待"
+        } else {
+            " ↑/↓ 选择  Tab/←/→ 切换列表  Enter 进入/打开  / 搜索  c 清除  r 更新  Esc 返回"
+        }
+    } else {
+        match app.reset.as_ref().map(|flow| &flow.stage) {
+            Some(ResetStage::Loading) => " 正在查询重置次数…   n/Esc 取消",
+            Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次   n/Esc 取消",
+            Some(ResetStage::Consuming) => " 正在提交主动重置，请等待结果…",
+            None if app
+                .providers
+                .iter()
+                .any(|provider| provider.reset().is_some()) =>
+            {
+                " q 退出  r 刷新  1 点阵  2 圆环  3 圆点  p 会话  x 重置  s 保存  j/k 滚动"
+            }
+            None => " q 退出   r 刷新   1 点阵   2 圆环   3 圆点   p 会话   s 保存   j/k 滚动",
+        }
     };
     Paragraph::new(footer_text)
         .style(
@@ -633,6 +944,7 @@ mod tests {
     use super::*;
     use crate::model::{QuotaTier, snapshot_not_found, snapshot_ok};
     use crate::providers::UsageReset;
+    use crate::sessions::{AgentKind, Session};
 
     struct ResetTestProvider {
         available: u32,
@@ -751,6 +1063,142 @@ mod tests {
             },
         ];
         app
+    }
+
+    #[tokio::test]
+    async fn browser_navigates_projects_and_searches_without_launching() {
+        let mut app = dashboard();
+        app.browser = Some(SessionBrowser::new(vec![
+            Session {
+                provider: AgentKind::CLAUDE,
+                id: "123e4567-e89b-12d3-a456-426614174000".into(),
+                cwd: "/tmp/project".into(),
+                title: "Claude task".into(),
+                recency_at_ms: 0,
+                home: "/tmp/claude".into(),
+            },
+            Session {
+                provider: AgentKind::CODEX,
+                id: "123e4567-e89b-12d3-a456-426614174001".into(),
+                cwd: "/tmp/other".into(),
+                title: "Codex task".into(),
+                recency_at_ms: 0,
+                home: "/tmp/codex".into(),
+            },
+        ]));
+        let handle = Handle::current();
+        assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Projects);
+        app.handle_browser_key(KeyCode::Enter, &handle);
+        assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Sessions);
+        app.handle_browser_key(KeyCode::Char('/'), &handle);
+        app.handle_browser_key(KeyCode::Char('t'), &handle);
+        assert_eq!(app.browser.as_ref().unwrap().visible_count(), 2);
+        app.handle_browser_key(KeyCode::Esc, &handle);
+        assert!(!app.browser.as_ref().unwrap().searching);
+        app.handle_browser_key(KeyCode::Esc, &handle);
+        assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Projects);
+        app.handle_browser_key(KeyCode::Esc, &handle);
+        assert!(app.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_load_runs_in_background_and_reports_empty_result() {
+        let mut app = dashboard();
+        let missing = std::env::temp_dir().join(format!("usage-missing-{}", uuid::Uuid::new_v4()));
+        app.session_homes = sessions::SessionHomes::new()
+            .with("claude", missing.join("claude"))
+            .with("codex", missing.join("codex"))
+            .with("grok", missing.join("grok"));
+        let handle = Handle::current();
+        app.open_browser(&handle);
+        assert!(app.browser_loading);
+        assert!(app.browser.is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.browser_loading {
+                app.drain_events();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.browser.is_none());
+        assert_eq!(app.notice.as_deref(), Some("未找到可恢复的本机会话"));
+    }
+
+    #[tokio::test]
+    async fn closing_browser_discards_pending_catalog() {
+        let mut app = dashboard();
+        let missing = std::env::temp_dir().join(format!("usage-missing-{}", uuid::Uuid::new_v4()));
+        app.session_homes = sessions::SessionHomes::new()
+            .with("claude", missing.join("claude"))
+            .with("codex", missing.join("codex"))
+            .with("grok", missing.join("grok"));
+        let handle = Handle::current();
+        app.open_browser(&handle);
+        app.handle_browser_key(KeyCode::Esc, &handle);
+        assert!(!app.browser_loading);
+        assert!(app.browser.is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        app.drain_events();
+        assert!(app.browser.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    fn custom_sessions(home: &std::path::Path) -> Result<Vec<sessions::SessionRecord>, String> {
+        Ok(vec![sessions::SessionRecord {
+            id: "123e4567-e89b-12d3-a456-426614174004".into(),
+            cwd: home.join("project"),
+            title: "Custom task".into(),
+            recency_at_ms: 42,
+        }])
+    }
+
+    #[tokio::test]
+    async fn dashboard_uses_injected_session_registry() {
+        let root = std::env::temp_dir().join(format!("usage-dashboard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        let kind = AgentKind::new(
+            "custom",
+            "Custom Agent",
+            Some((180, 120, 210)),
+            "custom resume",
+            "CUSTOM_HOME",
+            3,
+        );
+        let mut registry = sessions::SessionRegistry::new();
+        registry
+            .register(sessions::SessionSource {
+                kind,
+                load: custom_sessions,
+            })
+            .unwrap();
+        let mut app = Dashboard::new_with_sessions(
+            Vec::new(),
+            AppConfig::default(),
+            root.join("config.toml"),
+            registry,
+            sessions::SessionHomes::new().with("custom", &root),
+        );
+        let handle = Handle::current();
+        app.open_browser(&handle);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.browser_loading {
+                app.drain_events();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .selected_session()
+                .unwrap()
+                .provider,
+            kind
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn row_text(buffer: &Buffer, y: u16) -> String {
