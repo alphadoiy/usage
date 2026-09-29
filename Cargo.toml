@@ -1,0 +1,19 @@
+[package]
+name = "usage"
+version = "0.1.0"
+edition = "2024"
+description = "在终端里查看 Claude Code、Codex 和 Grok 的官方用量"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["charset", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+toml_edit = "0.22"
+unicode-width = "0.2"
