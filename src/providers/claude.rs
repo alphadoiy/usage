@@ -4,14 +4,15 @@
 //! 再回退 ~/.claude/.credentials.json。
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{ProviderContext, UsageProvider};
-use crate::credentials::{CLAUDE_KEYCHAIN_SERVICE, parse_claude_credentials};
+use crate::credentials::{CLAUDE_KEYCHAIN_SERVICE, clean_email, parse_claude_credentials};
 use crate::http::{TransportError, body_excerpt, is_transient_status};
 use crate::labels::KNOWN_CLAUDE_TIERS;
 use crate::model::{
@@ -21,9 +22,11 @@ use crate::model::{
 use crate::timeutil::parse_time;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 pub struct ClaudeProvider {
     ctx: Arc<ProviderContext>,
+    profile_cache: Mutex<Option<(String, String)>>,
 }
 
 impl ClaudeProvider {
@@ -31,7 +34,10 @@ impl ClaudeProvider {
     pub const NAME: &'static str = "Claude Code";
 
     pub fn new(ctx: Arc<ProviderContext>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            profile_cache: Mutex::new(None),
+        }
     }
 }
 
@@ -77,7 +83,30 @@ impl UsageProvider for ClaudeProvider {
                         now,
                     );
                 };
-                let result = query_usage(&self.ctx, &token, now).await;
+                let cached_email = self.profile_cache.lock().ok().and_then(|cache| {
+                    cache.as_ref().and_then(|(cached_token, email)| {
+                        (cached_token == &token).then(|| email.clone())
+                    })
+                });
+                let (mut result, email) =
+                    tokio::join!(query_usage(&self.ctx, &token, now), async {
+                        if let Some(email) = cached_email {
+                            return Some(email);
+                        }
+                        let email = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            query_profile(&self.ctx, &token),
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some(email) = &email
+                            && let Ok(mut cache) = self.profile_cache.lock()
+                        {
+                            *cache = Some((token.clone(), email.clone()));
+                        }
+                        email
+                    });
                 if status == CredentialStatus::Expired && !result.success {
                     snapshot_error(
                         Self::ID,
@@ -88,11 +117,37 @@ impl UsageProvider for ClaudeProvider {
                         now,
                     )
                 } else {
+                    result.account_email = email;
                     result
                 }
             }
         }
     }
+}
+
+async fn query_profile(ctx: &ProviderContext, token: &str) -> Option<String> {
+    let response = ctx
+        .http
+        .request(
+            "GET",
+            PROFILE_URL,
+            &[
+                ("Authorization", format!("Bearer {token}")),
+                ("anthropic-beta", "oauth-2025-04-20".into()),
+                ("Accept", "application/json".into()),
+            ],
+            None,
+        )
+        .await
+        .ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+    let payload: Value = serde_json::from_slice(&response.body).ok()?;
+    payload
+        .pointer("/account/email")
+        .and_then(Value::as_str)
+        .and_then(clean_email)
 }
 
 pub fn parse_claude_quota(body: &Value, now: DateTime<Utc>) -> UsageSnapshot {
@@ -453,6 +508,56 @@ mod tests {
                 .unwrap()
                 .1,
             "Bearer from-keychain"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_email_is_cached_for_the_same_token() {
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            USAGE_URL,
+            Ok(HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: json!({"five_hour": {"utilization": 10}})
+                    .to_string()
+                    .into_bytes(),
+            }),
+        );
+        http.route(
+            PROFILE_URL,
+            Ok(HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: json!({"account": {"email": "claude@example.com"}})
+                    .to_string()
+                    .into_bytes(),
+            }),
+        );
+        let ctx = Arc::new(ProviderContext {
+            claude_dir: std::env::temp_dir(),
+            codex_dir: std::env::temp_dir(),
+            grok_dir: std::env::temp_dir(),
+            http: http.clone(),
+            keychain: Arc::new(|_, _| {
+                Some(json!({"claudeAiOauth": {"accessToken": "token"}}).to_string())
+            }),
+            now: Arc::new(now),
+        });
+        let provider = ClaudeProvider::new(ctx);
+        for _ in 0..2 {
+            let snapshot = provider.query().await;
+            assert!(snapshot.success);
+            assert_eq!(
+                snapshot.account_email.as_deref(),
+                Some("claude@example.com")
+            );
+            assert_eq!(snapshot.to_json()["accountEmail"], "claude@example.com");
+        }
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|call| call.url == PROFILE_URL).count(),
+            1
         );
     }
 

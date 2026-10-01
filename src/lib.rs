@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod credentials;
+pub mod history;
 pub mod http;
 pub mod labels;
 pub mod model;

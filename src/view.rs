@@ -38,6 +38,7 @@ pub struct BarSpec {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CardView {
+    pub account_email: Option<String>,
     pub badge: String,
     pub badge_kind: BadgeKind,
     pub kind: ViewKind,
@@ -201,6 +202,7 @@ fn card(
 ) -> CardView {
     let (badge, badge_kind) = badge(snapshot);
     CardView {
+        account_email: snapshot.account_email.clone(),
         badge,
         badge_kind,
         kind,

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{Datelike, Local, Utc};
 use clap::{Parser, Subcommand};
 use tokio::runtime::Handle;
 use tokio::task::JoinSet;
@@ -49,6 +49,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// TUI 贡献看板：年度热力图、每日明细和月度趋势
+    #[command(visible_alias = "dashboard")]
+    History {
+        /// 年份，默认今年
+        #[arg(long, value_parser = clap::value_parser!(i32).range(1970..=9999))]
+        year: Option<i32>,
+        /// 显示月度汇总
+        #[arg(long)]
+        monthly: bool,
+        /// 输出文本明细后退出
+        #[arg(long, conflicts_with = "json")]
+        once: bool,
+        /// 输出按日、按月聚合的 JSON 后退出
+        #[arg(long)]
+        json: bool,
+    },
     /// 输出适合 Claude Code 等 agent 的轻量状态栏，读取可选的 stdin JSON
     Statusline {
         /// 用量缓存秒数；0 表示每次查询
@@ -84,6 +100,68 @@ pub async fn run() -> i32 {
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
+        Some(Command::History {
+            year,
+            monthly,
+            once,
+            json,
+        }) => {
+            let path = cli.config.clone().unwrap_or_else(default_config_path);
+            let config = load_config(&path, cli.config.is_some())?;
+            let config = with_overrides(config, None, cli.providers.as_deref(), None)?;
+            let year = year.unwrap_or_else(|| Local::now().year());
+            if once || json || cli.once || cli.json {
+                let sources = config.providers.clone();
+                let history = tokio::task::spawn_blocking(move || {
+                    crate::history::HistoryCache::default().load(&config)
+                })
+                .await
+                .map_err(|e| CliError(format!("历史读取失败: {e}")))?;
+                let report = history.report(year, &sources);
+                if json || cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report)
+                            .map_err(|e| CliError(e.to_string()))?
+                    );
+                } else {
+                    println!(
+                        "{year} · {} · {} · {} Tokens",
+                        report.providers.join(" + "),
+                        report.timezone,
+                        report.totals.total()
+                    );
+                    println!("日期          总 Token       输入       输出       缓存   调用/记录");
+                    let rows = if monthly {
+                        report.monthly
+                    } else {
+                        report.daily
+                    };
+                    for (date, tokens) in rows {
+                        println!(
+                            "{date:<10} {:>12} {:>10} {:>10} {:>10} {:>10}",
+                            tokens.total(),
+                            tokens.input,
+                            tokens.output,
+                            tokens.cached,
+                            tokens.calls
+                        );
+                    }
+                    for warning in report.warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+            } else {
+                let handle = Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    crate::ui::run_history(handle, config, path, year, monthly)
+                })
+                .await
+                .map_err(|e| CliError(format!("界面任务失败: {e}")))?
+                .map_err(|e| CliError(e.to_string()))?;
+            }
+            Ok(0)
+        }
         Some(Command::Statusline {
             cache_seconds,
             no_color,
@@ -294,6 +372,32 @@ mod tests {
 
     use super::*;
     use crate::model::snapshot_not_found;
+
+    #[test]
+    fn parses_tui_dashboard_alias_and_history_exports() {
+        let cli = Cli::try_parse_from([
+            "usage",
+            "dashboard",
+            "--year",
+            "2026",
+            "--monthly",
+            "--providers",
+            "codex,grok",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::History {
+                year: Some(2026),
+                monthly: true,
+                once: false,
+                json: false
+            })
+        ));
+        assert_eq!(cli.providers.as_deref(), Some("codex,grok"));
+        assert!(Cli::try_parse_from(["usage", "history", "--year", "0"]).is_err());
+        assert!(Cli::try_parse_from(["usage", "history", "--once", "--json"]).is_err());
+    }
 
     struct WaitingProvider {
         id: &'static str,

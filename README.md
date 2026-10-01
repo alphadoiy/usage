@@ -18,9 +18,28 @@
 | Codex | Keychain `Codex Auth`，否则 `~/.codex/auth.json`（仅 ChatGPT 登录） | `GET https://chatgpt.com/backend-api/wham/usage`；主动重置走 `rate-limit-reset-credits` 接口 |
 | Grok | `~/.grok/auth.json`，优先 SuperGrok OIDC 条目 | `POST https://grok.com/.../GetGrokCreditsConfig` |
 
+用量卡片会在额度旁显示当前账户的邮箱（如果能够确定）：Claude Code 使用同一 OAuth 令牌查询账户资料，Codex 从当前 ChatGPT 登录的 ID Token 读取，Grok 从选中的登录条目或其令牌读取。邮箱缺失或资料查询失败时不显示；邮箱不会写入配置文件或状态栏缓存。
+
 ## 安装
 
 需要 Rust 1.88 或更新版本。
+
+只在本机使用时，可交给 Homebrew 管理。打包脚本用当前源码构建 macOS 二进制，生成 Formula 并放入本机 `alphadoiy/local` tap；无需 GitHub 仓库或发布版本。具体步骤和产物说明见[本机 Homebrew 安装与更新](docs/homebrew-local.md)。
+
+```bash
+./scripts/package-brew-local.sh
+brew install alphadoiy/local/usage-local
+usage
+```
+
+修改源码后重新打包并安装；移除时用 `brew uninstall usage-local`。Formula 的名称是 `usage-local`，安装的命令仍是 `usage`。本地源码变化不会被 `brew upgrade` 自动发现。
+
+```bash
+./scripts/package-brew-local.sh
+brew reinstall alphadoiy/local/usage-local
+```
+
+也可以直接通过 Cargo 安装：
 
 ```bash
 cargo build --release
@@ -44,6 +63,9 @@ usage statusline --providers claude  # 给 Claude Code 等 agent 输出轻量状
 usage --style ring    # 本次只用圆环
 usage --style statusline  # 本次使用圆点状态栏视图
 usage --providers claude,codex
+usage history         # TUI 贡献看板（也可用 usage dashboard）
+usage history --providers codex,claude --monthly
+usage history --year 2026 --json  # 导出日/月 Token 汇总
 usage providers       # 列出已注册的工具
 usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
@@ -61,6 +83,7 @@ TUI 按键：
 | `3` | 圆点状态栏 |
 | `s` | 把当前样式写进配置 |
 | `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
+| `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
 | `j` / `k` | 滚动 |
 | `q` | 退出 |
@@ -85,6 +108,42 @@ Codex 的用量响应若提供主动重置次数，卡片会显示剩余次数�
 在 Ghostty 中按 `p` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter`，会在当前终端右侧新建 split，进入项目目录并恢复会话。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。此功能要求 macOS Ghostty 1.3+ 和对应工具的 CLI；Codex 优先读取本机 SQLite 索引，无法打开时改读本机会话日志。首次使用时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
+
+## TUI 贡献看板
+
+主面板按 `h`，或运行 `usage history` / `usage dashboard`，进入终端内的历史用量看板。布局按“年度概览 → 贡献图 → 选中日期与近期用量”排列：来源筛选放在顶部，年度摘要显示 Token、活跃日和缓存读取占比。
+
+贡献图参考 [hindsight](https://github.com/chaosprint/hindsight) 的前景色小方块样式，列间留空，星期只标周一/周三/周五。蓝色阶按当前年份、当前来源的活跃用量划分，使峰值很高时较小用量也容易区分；零用量显示灰色方块，未来日期留空。选中日期显示 `▣`，下方集中展示输入、输出、缓存和来源分布。窄终端只显示选中日期附近的周；宽终端将选中日期明细与近期列表并排。
+
+近期列表最多显示 7 条，跳过未选中的零用量日期，不随终端高度铺满。按 `PgUp` / `PgDn` 跳到前一个/后一个活跃日，可快速浏览稀疏历史；普通方向键仍能选中无用量的过去日期。
+
+按 `m` 切换月度视图：显示选中月份的输入、输出、缓存及来源合计，与 12 个月的彩色堆叠趋势条；不再重复堆叠月度表格。蓝色为 Codex、暖色为 Claude、灰白色为 Grok。较矮终端优先显示月度趋势，较高终端同时保留热力图。
+
+| 键 | 作用 |
+| --- | --- |
+| `0` / `1` / `2` / `3` | 全部 / Codex / Claude / Grok（在本次 `--providers` 范围内） |
+| `Tab` | 轮换来源筛选 |
+| `m` | 每日 / 月度视图 |
+| `↑` / `↓` 或 `k` / `j` | 每日视图选择日期，月度视图选择月份 |
+| `←` / `→` | 前一周 / 后一周 |
+| `PgUp` / `PgDn` | 前一个 / 后一个活跃日 |
+| `[` / `]` | 上一年 / 下一年 |
+| `t` | 回到今天 |
+| `r` | 重新读取日志 |
+| `Esc` / `q` | 返回主面板；独立打开时退出 |
+
+```bash
+usage history --year 2026
+usage dashboard --monthly --providers codex,claude,grok
+usage history --providers grok --monthly --once
+usage history --json
+```
+
+历史数据参考 cockpit-tools 的会话日志统计方式，读取配置中的本地目录：Codex 的 `sessions/` 和 `archived_sessions/`、Claude 的 `projects/`（包括子代理日志）、Grok 的 `sessions/**/updates.jsonl`。读取在后台进行；按 `r` 刷新时复用未变化文件的内存缓存，变化的文件重新统计。
+
+Codex 优先读取 `last_token_usage`，缺失时使用累计值的增量，去掉重复额度快照和分叉会话重放前缀；Claude 按消息 ID 合并流式记录；Grok 按 prompt ID 去重，只统计 `turn_completed` 的汇总。日期按本地时区归属。总 Token 为输入加输出，缓存已经包含在输入内，不会重复相加；Claude 的输入包含缓存读取和缓存写入，Codex/Grok 的缓存读取是输入的子集。Grok 的调用数来自 `modelCalls`，Codex/Claude 则为有效用量记录数，三者不能视为严格一致的 HTTP 请求次数。
+
+此看板统计本机仍保留的日志，已删除或未记录的历史无法还原；它与主面板的官方滚动额度百分比是不同的数据。`--json` 输出全年日/月汇总（包括零用量日期）和读取警告，不包含对话内容、登录凭据或项目路径。
 
 ## 状态栏
 

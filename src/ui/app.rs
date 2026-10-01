@@ -21,6 +21,7 @@ use crate::providers::{
     ProviderError, QUERY_TIMEOUT, ResetPreview, UsageProvider, query_with_timeout,
 };
 use crate::sessions;
+use crate::ui::history::{self, HistoryPanel};
 use crate::ui::session_browser::{self, Focus, SessionBrowser};
 use crate::ui::widgets::{accent, preferred_height, render_card, render_loading};
 use crate::view::{CardView, builtin_styles};
@@ -35,6 +36,10 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    HistoryLoaded {
+        history: crate::history::History,
+        cache: crate::history::HistoryCache,
+    },
     Quota(Box<RefreshEvent>),
     ResetPreview {
         generation: u64,
@@ -117,6 +122,23 @@ pub fn run_with_sessions(
     run_dashboard(handle, app)
 }
 
+pub fn run_history(
+    handle: Handle,
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+    year: i32,
+    monthly: bool,
+) -> io::Result<()> {
+    let mut app = Dashboard::new(Vec::new(), config, config_path);
+    app.history = Some(HistoryPanel::new(
+        app.history_config.providers.clone(),
+        year,
+        monthly,
+    ));
+    app.start_history_load(&handle);
+    run_dashboard(handle, app)
+}
+
 fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     let mut terminal = ratatui::try_init().map_err(io::Error::other)?;
     let mut redraw = RedrawSchedule::new();
@@ -148,6 +170,24 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
+                    if app.history.is_some() {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                if app.providers.is_empty() {
+                                    break Ok(());
+                                }
+                                app.history = None;
+                            }
+                            KeyCode::Char('r') => app.start_history_load(&handle),
+                            code => {
+                                if let Some(panel) = &mut app.history {
+                                    panel.key(code);
+                                }
+                            }
+                        }
+                        redraw.invalidate();
+                        continue;
+                    }
                     if app.browser.is_some() {
                         app.handle_browser_key(key.code, &handle);
                         redraw.invalidate();
@@ -162,6 +202,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         KeyCode::Char('s') => app.save_style(),
                         KeyCode::Char('x') => app.open_reset(&handle),
                         KeyCode::Char('p') => app.open_browser(&handle),
+                        KeyCode::Char('h') => app.open_history(&handle),
                         KeyCode::Char('j') | KeyCode::Down => {
                             app.scroll_by(1, terminal.size().map(|size| size.width).unwrap_or(80))
                         }
@@ -185,6 +226,10 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
 }
 
 struct Dashboard {
+    history: Option<HistoryPanel>,
+    history_config: AppConfig,
+    history_cache: Option<crate::history::HistoryCache>,
+    history_loading: bool,
     providers: Vec<Arc<dyn UsageProvider>>,
     cards: Vec<CardSlot>,
     style_name: String,
@@ -273,6 +318,10 @@ impl Dashboard {
             .collect();
         let styles = builtin_styles();
         Self {
+            history: None,
+            history_config: config.clone(),
+            history_cache: Some(crate::history::HistoryCache::default()),
+            history_loading: false,
             providers,
             cards,
             status: format!("百分比是已用额度 · {}", styles.label(&config.style)),
@@ -294,6 +343,33 @@ impl Dashboard {
             browser_generation: 0,
             browser_loading: false,
         }
+    }
+
+    fn open_history(&mut self, handle: &Handle) {
+        use chrono::Datelike;
+        self.history = Some(HistoryPanel::new(
+            self.history_config.providers.clone(),
+            chrono::Local::now().year(),
+            false,
+        ));
+        self.start_history_load(handle);
+    }
+
+    fn start_history_load(&mut self, handle: &Handle) {
+        if self.history_loading {
+            return;
+        }
+        self.history_loading = true;
+        if let Some(panel) = &mut self.history {
+            panel.loading = true;
+        }
+        let config = self.history_config.clone();
+        let mut cache = self.history_cache.take().unwrap_or_default();
+        let tx = self.tx.clone();
+        handle.spawn_blocking(move || {
+            let history = cache.load(&config);
+            let _ = tx.send(AppEvent::HistoryLoaded { history, cache });
+        });
     }
 
     fn open_browser(&mut self, handle: &Handle) {
@@ -567,6 +643,16 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::HistoryLoaded { history, cache } => {
+                    self.history_loading = false;
+                    self.history_cache = Some(cache);
+                    if let Some(panel) = &mut self.history {
+                        panel.history = history;
+                        panel.loading = false;
+                    }
+                    changed = true;
+                    continue;
+                }
                 AppEvent::Quota(event) => event,
                 AppEvent::ResetPreview { generation, result } => {
                     if self
@@ -719,7 +805,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let status = if app.browser_loading {
+    let status = if app.history.is_some() {
+        "本地 Token · 本地时区".to_string()
+    } else if app.browser_loading {
         "正在读取本机会话…".to_string()
     } else {
         app.notice.clone().unwrap_or_else(|| {
@@ -736,7 +824,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
             )
         })
     };
-    let header_title = if app.browser.is_some() {
+    let header_title = if app.history.is_some() {
+        " 贡献看板 "
+    } else if app.browser.is_some() {
         " 会话 "
     } else {
         " 用量 "
@@ -748,7 +838,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
                 .fg(Color::Rgb(242, 242, 247)),
         )
         .render(header, frame.buffer_mut());
-    if let Some(browser) = &app.browser {
+    if let Some(panel) = &app.history {
+        history::render(body, frame.buffer_mut(), panel);
+    } else if let Some(browser) = &app.browser {
         if app.browser_loading && browser.sessions.is_empty() {
             Paragraph::new(" 正在扫描 Claude Code、Codex 和 Grok 的本机会话…")
                 .style(Style::new().fg(Color::Rgb(142, 142, 147)))
@@ -759,7 +851,13 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
     } else {
         draw_cards(frame, body, app);
     }
-    let footer_text = if let Some(browser) = &app.browser {
+    let footer_text = if app.history.is_some() {
+        if frame.area().width >= 105 {
+            " ↑/↓ 日期  ←/→ 周  PgUp/PgDn 活跃日  m 日/月  Tab 来源  [/] 年  t 今天  r 更新  Esc 返回"
+        } else {
+            " ↑/↓ 选择  ←/→ 周  m 日/月  Tab 来源  [/] 年  r 更新  Esc 返回"
+        }
+    } else if let Some(browser) = &app.browser {
         if app.browser_loading {
             " 正在读取本机会话… Esc 返回"
         } else if browser.launching {
@@ -777,9 +875,11 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
                 .iter()
                 .any(|provider| provider.reset().is_some()) =>
             {
-                " q 退出  r 刷新  1 点阵  2 圆环  3 圆点  p 会话  x 重置  s 保存  j/k 滚动"
+                " q 退出  r 刷新  1 点阵  2 圆环  3 圆点  h 历史  p 会话  x 重置  s 保存  j/k 滚动"
             }
-            None => " q 退出   r 刷新   1 点阵   2 圆环   3 圆点   p 会话   s 保存   j/k 滚动",
+            None => {
+                " q 退出   r 刷新   1 点阵   2 圆环   3 圆点   h 历史   p 会话   s 保存   j/k 滚动"
+            }
         }
     };
     Paragraph::new(footer_text)

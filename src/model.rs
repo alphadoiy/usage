@@ -34,6 +34,9 @@ pub struct ExtraUsage {
 pub struct UsageSnapshot {
     pub tool: String,
     pub display_name: String,
+    /// 只用于当前查询结果；状态栏缓存序列化时不落盘。
+    #[serde(skip)]
+    pub account_email: Option<String>,
     pub credential_status: CredentialStatus,
     pub success: bool,
     pub tiers: Vec<QuotaTier>,
@@ -52,6 +55,7 @@ impl UsageSnapshot {
         json!({
             "id": self.tool,
             "displayName": self.display_name,
+            "accountEmail": self.account_email,
             "credentialStatus": serde_json::to_value(self.credential_status).unwrap_or(Value::Null),
             "success": self.success,
             "transient": self.transient,
@@ -83,6 +87,7 @@ pub fn snapshot_not_found(
     UsageSnapshot {
         tool: tool.to_string(),
         display_name: display_name.to_string(),
+        account_email: None,
         credential_status: CredentialStatus::NotFound,
         credential_message: message,
         success: false,
@@ -106,6 +111,7 @@ pub fn snapshot_error(
     UsageSnapshot {
         tool: tool.to_string(),
         display_name: display_name.to_string(),
+        account_email: None,
         credential_status: status,
         credential_message: Some(message.clone()),
         success: false,
@@ -126,6 +132,7 @@ pub fn snapshot_transient(
     UsageSnapshot {
         tool: tool.to_string(),
         display_name: display_name.to_string(),
+        account_email: None,
         credential_status: CredentialStatus::Valid,
         success: false,
         tiers: Vec::new(),
@@ -148,6 +155,7 @@ pub fn snapshot_ok(
     UsageSnapshot {
         tool: tool.to_string(),
         display_name: display_name.to_string(),
+        account_email: None,
         credential_status: CredentialStatus::Valid,
         success: true,
         tiers,
@@ -162,4 +170,18 @@ pub fn snapshot_ok(
 
 fn iso(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_is_in_json_output_but_not_cached_snapshot() {
+        let mut snapshot = snapshot_ok("codex", "Codex", Vec::new(), None, Utc::now());
+        snapshot.account_email = Some("user@example.com".into());
+        assert_eq!(snapshot.to_json()["accountEmail"], "user@example.com");
+        let cached = serde_json::to_value(&snapshot).unwrap();
+        assert!(cached.get("account_email").is_none());
+    }
 }

@@ -3,6 +3,7 @@
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -17,6 +18,72 @@ const CODEX_STALE_SECONDS: i64 = 8 * 24 * 3600;
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type CredentialRead = (Option<String>, CredentialStatus, Option<String>);
+
+pub fn clean_email(value: &str) -> Option<String> {
+    let email = value.trim();
+    if email.len() > 254
+        || email.contains(char::is_whitespace)
+        || email.contains(char::is_control)
+        || email.matches('@').count() != 1
+        || email.starts_with('@')
+        || email.ends_with('@')
+    {
+        return None;
+    }
+    Some(email.to_string())
+}
+
+fn email_from_jwt(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() || payload.len() > 8192 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("email")?.as_str().and_then(clean_email)
+}
+
+pub fn codex_email_from_credentials(content: &str) -> Option<String> {
+    let root: Value = serde_json::from_str(content).ok()?;
+    if root.get("auth_mode")?.as_str()? != "chatgpt" {
+        return None;
+    }
+    let tokens = root.get("tokens")?;
+    tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(email_from_jwt)
+        .or_else(|| {
+            tokens
+                .get("access_token")
+                .and_then(Value::as_str)
+                .and_then(email_from_jwt)
+        })
+}
+
+pub fn grok_email_from_auth(content: &str) -> Option<String> {
+    let root: Value = serde_json::from_str(content).ok()?;
+    let entry = select_grok_entry(root.as_object()?)?;
+    entry
+        .get("email")
+        .and_then(Value::as_str)
+        .and_then(clean_email)
+        .or_else(|| {
+            entry
+                .get("id_token")
+                .and_then(Value::as_str)
+                .and_then(email_from_jwt)
+        })
+        .or_else(|| {
+            entry
+                .get("key")
+                .and_then(Value::as_str)
+                .and_then(email_from_jwt)
+        })
+}
 
 pub fn read_macos_keychain(service: &str, account: Option<&str>) -> Option<String> {
     if !cfg!(target_os = "macos") {
@@ -274,6 +341,52 @@ fn codex_refresh_is_stale(last_refresh: &str, now: DateTime<Utc>) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn jwt(email: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(json!({ "email": email }).to_string());
+        format!("header.{payload}.signature")
+    }
+
+    #[test]
+    fn codex_email_comes_from_current_chatgpt_token() {
+        let content = json!({
+            "auth_mode": "chatgpt",
+            "tokens": { "id_token": jwt(" user@example.com "), "access_token": jwt("other@example.com") }
+        })
+        .to_string();
+        assert_eq!(
+            codex_email_from_credentials(&content).as_deref(),
+            Some("user@example.com")
+        );
+        let api_key = content.replace("chatgpt", "apikey");
+        assert_eq!(codex_email_from_credentials(&api_key), None);
+        assert_eq!(codex_email_from_credentials("{}"), None);
+    }
+
+    #[test]
+    fn grok_email_uses_the_selected_auth_entry() {
+        let content = json!({
+            "https://accounts.x.ai/sign-in": { "key": jwt("legacy@example.com") },
+            "https://auth.x.ai::client": {
+                "key": "opaque-token",
+                "id_token": jwt("oidc@example.com")
+            }
+        })
+        .to_string();
+        assert_eq!(
+            grok_email_from_auth(&content).as_deref(),
+            Some("oidc@example.com")
+        );
+        assert_eq!(grok_email_from_auth("{}"), None);
+    }
+
+    #[test]
+    fn invalid_email_is_not_shown() {
+        assert_eq!(clean_email("not-an-email"), None);
+        assert_eq!(clean_email("a@b.com\nsecret"), None);
+        assert_eq!(email_from_jwt("opaque-token"), None);
+    }
 
     #[test]
     fn child_output_and_timeout_are_bounded() {

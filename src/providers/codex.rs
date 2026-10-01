@@ -7,7 +7,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use super::{ProviderContext, ProviderError, ResetPreview, UsageProvider, UsageReset};
-use crate::credentials::{CODEX_KEYCHAIN_SERVICE, parse_codex_credentials};
+use crate::credentials::{
+    CODEX_KEYCHAIN_SERVICE, codex_email_from_credentials, parse_codex_credentials,
+};
 use crate::http::{TransportError, body_excerpt, is_transient_status};
 use crate::model::{
     CredentialStatus, QuotaTier, UsageSnapshot, snapshot_error, snapshot_not_found, snapshot_ok,
@@ -49,17 +51,18 @@ impl UsageProvider for CodexProvider {
     async fn query(&self) -> UsageSnapshot {
         let now = (self.ctx.now)();
         let ctx = Arc::clone(&self.ctx);
-        let (token, account_id, status, message) = match tokio::task::spawn_blocking(move || {
-            read_credentials(&ctx, now)
-        })
-        .await
-        {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                return snapshot_transient(Self::ID, Self::NAME, format!("凭据读取中断: {error}"));
-            }
-        };
-        match status {
+        let (token, account_id, status, message, email) =
+            match tokio::task::spawn_blocking(move || read_credentials(&ctx, now)).await {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    return snapshot_transient(
+                        Self::ID,
+                        Self::NAME,
+                        format!("凭据读取中断: {error}"),
+                    );
+                }
+            };
+        let mut result = match status {
             CredentialStatus::NotFound => snapshot_not_found(Self::ID, Self::NAME, message),
             CredentialStatus::ParseError => snapshot_error(
                 Self::ID,
@@ -91,7 +94,9 @@ impl UsageProvider for CodexProvider {
                     result
                 }
             }
-        }
+        };
+        result.account_email = email;
+        result
     }
 }
 
@@ -142,7 +147,7 @@ impl CodexProvider {
     async fn reset_credentials(&self) -> Result<(String, String), ProviderError> {
         let ctx = Arc::clone(&self.ctx);
         let now = (ctx.now)();
-        let (token, account_id, status, message) =
+        let (token, account_id, status, message, _) =
             tokio::task::spawn_blocking(move || read_credentials(&ctx, now))
                 .await
                 .map_err(|error| ProviderError(format!("凭据读取中断: {error}")))?;
@@ -362,23 +367,42 @@ fn read_credentials(
     Option<String>,
     CredentialStatus,
     Option<String>,
+    Option<String>,
 ) {
     if let Some(raw) = (ctx.keychain)(CODEX_KEYCHAIN_SERVICE, None) {
-        return parse_codex_credentials(&raw, now);
+        return parsed_credentials(&raw, now);
     }
     let path = ctx.codex_dir.join("auth.json");
     if !path.exists() {
-        return (None, None, CredentialStatus::NotFound, None);
+        return (None, None, CredentialStatus::NotFound, None, None);
     }
     match std::fs::read_to_string(&path) {
-        Ok(content) => parse_codex_credentials(&content, now),
+        Ok(content) => parsed_credentials(&content, now),
         Err(error) => (
             None,
             None,
             CredentialStatus::ParseError,
             Some(format!("无法读取 Codex 凭据: {error}")),
+            None,
         ),
     }
+}
+
+fn parsed_credentials(
+    content: &str,
+    now: DateTime<Utc>,
+) -> (
+    Option<String>,
+    Option<String>,
+    CredentialStatus,
+    Option<String>,
+    Option<String>,
+) {
+    let (token, account_id, status, message) = parse_codex_credentials(content, now);
+    let email = token
+        .as_ref()
+        .and_then(|_| codex_email_from_credentials(content));
+    (token, account_id, status, message, email)
 }
 
 async fn query_usage(

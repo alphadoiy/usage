@@ -10,7 +10,7 @@ use super::grok_proto::{
     is_transient_grpc_status, parse_billing_payload, percent_decode, tier_name_for_reset,
 };
 use super::{ProviderContext, UsageProvider};
-use crate::credentials::parse_grok_auth;
+use crate::credentials::{grok_email_from_auth, parse_grok_auth};
 use crate::http::{TransportError, body_excerpt, is_transient_status};
 use crate::model::{
     CredentialStatus, QuotaTier, UsageSnapshot, snapshot_error, snapshot_not_found, snapshot_ok,
@@ -47,7 +47,7 @@ impl UsageProvider for GrokProvider {
     async fn query(&self) -> UsageSnapshot {
         let now = (self.ctx.now)();
         let ctx = Arc::clone(&self.ctx);
-        let (token, status, message) = match tokio::task::spawn_blocking(move || {
+        let (token, status, message, email) = match tokio::task::spawn_blocking(move || {
             read_credentials(&ctx, now)
         })
         .await
@@ -57,7 +57,7 @@ impl UsageProvider for GrokProvider {
                 return snapshot_transient(Self::ID, Self::NAME, format!("凭据读取中断: {error}"));
             }
         };
-        match status {
+        let mut result = match status {
             CredentialStatus::NotFound => snapshot_not_found(Self::ID, Self::NAME, message),
             CredentialStatus::ParseError => snapshot_error(
                 Self::ID,
@@ -90,7 +90,9 @@ impl UsageProvider for GrokProvider {
                     result
                 }
             }
-        }
+        };
+        result.account_email = email;
+        result
     }
 }
 
@@ -137,17 +139,27 @@ pub fn grpc_failure(status: i64, message: &str, now: DateTime<Utc>) -> UsageSnap
 fn read_credentials(
     ctx: &ProviderContext,
     now: DateTime<Utc>,
-) -> crate::credentials::CredentialRead {
+) -> (
+    Option<String>,
+    CredentialStatus,
+    Option<String>,
+    Option<String>,
+) {
     let path = ctx.grok_dir.join("auth.json");
     if !path.exists() {
-        return (None, CredentialStatus::NotFound, None);
+        return (None, CredentialStatus::NotFound, None, None);
     }
     match std::fs::read_to_string(&path) {
-        Ok(content) => parse_grok_auth(&content, now),
+        Ok(content) => {
+            let (token, status, message) = parse_grok_auth(&content, now);
+            let email = token.as_ref().and_then(|_| grok_email_from_auth(&content));
+            (token, status, message, email)
+        }
         Err(error) => (
             None,
             CredentialStatus::ParseError,
             Some(format!("无法读取 Grok 凭据: {error}")),
+            None,
         ),
     }
 }

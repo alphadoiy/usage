@@ -12,6 +12,7 @@ pub fn render_dashboard(snapshots: &[UsageSnapshot], style: &str, now: DateTime<
         .iter()
         .map(|snapshot| {
             let view = build_view(snapshot, style, now, None).unwrap_or_else(|_| CardView {
+                account_email: snapshot.account_email.clone(),
                 badge: "查询失败".into(),
                 badge_kind: crate::view::BadgeKind::Error,
                 kind: ViewKind::Bar,
@@ -27,6 +28,9 @@ pub fn render_dashboard(snapshots: &[UsageSnapshot], style: &str, now: DateTime<
 
 fn render_card(title: &str, view: &CardView) -> String {
     let mut lines = vec![format!("{title}  {}", view.badge)];
+    if let Some(email) = &view.account_email {
+        lines.push(format!("邮箱  {email}"));
+    }
     if view.kind == ViewKind::Ring && !view.rings.is_empty() {
         let captions: Vec<String> = view
             .rings
@@ -105,7 +109,7 @@ mod tests {
     #[test]
     fn once_output_uses_compact_statusline_style() {
         let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
-        let snapshot = snapshot_ok(
+        let mut snapshot = snapshot_ok(
             "codex",
             "Codex",
             vec![QuotaTier {
@@ -116,7 +120,9 @@ mod tests {
             None,
             now,
         );
+        snapshot.account_email = Some("user@example.com".into());
         let output = render_dashboard(&[snapshot], "statusline", now);
+        assert!(output.contains("邮箱  user@example.com"), "{output}");
         assert!(output.contains("●") && output.contains("○"), "{output}");
         assert!(output.contains("⟳ 2h0m"), "{output}");
         assert!(!output.contains('⣿'), "{output}");

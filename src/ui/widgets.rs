@@ -37,7 +37,7 @@ pub fn preferred_height(view: &CardView, width: u16) -> u16 {
         }
         _ => 1,
     };
-    2 + inner + notes + reset_note_gap(view)
+    2 + inner + notes + reset_note_gap(view) + u16::from(view.account_email.is_some())
 }
 
 fn reset_note_gap(view: &CardView) -> u16 {
@@ -93,7 +93,16 @@ fn inset_horizontal(area: Rect) -> Rect {
     }
 }
 
-fn render_body(area: Rect, buf: &mut Buffer, provider_id: &str, view: &CardView) {
+fn render_body(mut area: Rect, buf: &mut Buffer, provider_id: &str, view: &CardView) {
+    if let Some(email) = &view.account_email
+        && area.height > 0
+    {
+        Paragraph::new(format!("邮箱  {email}"))
+            .style(Style::new().fg(DIM))
+            .render(Rect { height: 1, ..area }, buf);
+        area.y += 1;
+        area.height -= 1;
+    }
     let note_rows = view.lines.len() as u16;
     let note_height = note_rows.min(area.height);
     if view.bars.is_empty() && view.rings.is_empty() {
@@ -577,6 +586,7 @@ mod tests {
     #[test]
     fn bar_style_uses_braille_only() {
         let view = CardView {
+            account_email: None,
             badge: "12:00:00".into(),
             badge_kind: BadgeKind::Ok,
             kind: ViewKind::Bar,
@@ -621,8 +631,36 @@ mod tests {
     }
 
     #[test]
+    fn account_email_has_its_own_row_above_usage() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+        let mut snapshot = snapshot_ok(
+            "codex",
+            "Codex",
+            vec![QuotaTier {
+                name: "five_hour".into(),
+                utilization: 50.0,
+                resets_at: None,
+            }],
+            None,
+            now,
+        );
+        snapshot.account_email = Some("user@example.com".into());
+        let view = crate::view::build_view(&snapshot, "bar", now, None).unwrap();
+        for (width, meter_row) in [(45, 2), (28, 3)] {
+            let area = Rect::new(0, 0, width, preferred_height(&view, width));
+            let mut buffer = Buffer::empty(area);
+            render_card(area, &mut buffer, "codex", "Codex", &view);
+            let text = buffer_text(&buffer);
+            let rows = text.lines().collect::<Vec<_>>();
+            assert!(rows[1].contains("user@example.com"), "{text}");
+            assert!(rows[meter_row].contains('⣿'), "{text}");
+        }
+    }
+
+    #[test]
     fn reset_note_has_space_after_braille_bars() {
         let view = CardView {
+            account_email: None,
             badge: "12:00:00".into(),
             badge_kind: BadgeKind::Ok,
             kind: ViewKind::Bar,
@@ -655,6 +693,7 @@ mod tests {
     #[test]
     fn braille_bar_expands_with_available_card_width() {
         let view = CardView {
+            account_email: None,
             badge: "12:00:00".into(),
             badge_kind: BadgeKind::Ok,
             kind: ViewKind::Bar,
@@ -698,6 +737,7 @@ mod tests {
     #[test]
     fn two_braille_bars_fit_narrow_card() {
         let view = CardView {
+            account_email: None,
             badge: "12:00:00".into(),
             badge_kind: BadgeKind::Ok,
             kind: ViewKind::Bar,
