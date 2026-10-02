@@ -5,4 +5,4 @@ mod history;
 mod session_browser;
 mod widgets;
 
-pub use app::{run, run_history, run_with_sessions};
+pub use app::{run, run_history, run_history_with_query, run_with_sessions};

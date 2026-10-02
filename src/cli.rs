@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{Datelike, Local, Utc};
+use chrono::{Datelike, Duration, Local, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use tokio::runtime::Handle;
 use tokio::task::JoinSet;
@@ -35,7 +35,7 @@ struct Cli {
     #[arg(long, global = true)]
     providers: Option<String>,
     /// 自动刷新秒数，0 表示不自动刷新
-    #[arg(long)]
+    #[arg(long, global = true)]
     refresh: Option<u64>,
     /// 查询一次，用文本打印后退出
     #[arg(long)]
@@ -55,6 +55,24 @@ enum Command {
         /// 年份，默认今年
         #[arg(long, value_parser = clap::value_parser!(i32).range(1970..=9999))]
         year: Option<i32>,
+        /// 时间范围（本地日历日期）；不指定则按年份查询
+        #[arg(long, value_parser = ["today", "7d", "30d", "month"], conflicts_with_all = ["year", "from", "to"])]
+        range: Option<String>,
+        /// 起始日期 YYYY-MM-DD（含当天）
+        #[arg(long)]
+        from: Option<NaiveDate>,
+        /// 结束日期 YYYY-MM-DD（含当天）
+        #[arg(long)]
+        to: Option<NaiveDate>,
+        /// 项目路径包含的文字
+        #[arg(long)]
+        project: Option<String>,
+        /// 模型名称包含的文字
+        #[arg(long)]
+        model: Option<String>,
+        /// 导出当前筛选范围的 CSV
+        #[arg(long, conflicts_with_all = ["json", "once"])]
+        csv: bool,
         /// 显示月度汇总
         #[arg(long)]
         monthly: bool,
@@ -102,23 +120,54 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
         Some(Command::History {
             year,
+            range,
+            from,
+            to,
+            project,
+            model,
+            csv,
             monthly,
             once,
             json,
         }) => {
             let path = cli.config.clone().unwrap_or_else(default_config_path);
             let config = load_config(&path, cli.config.is_some())?;
-            let config = with_overrides(config, None, cli.providers.as_deref(), None)?;
+            let config = with_overrides(config, None, cli.providers.as_deref(), cli.refresh)?;
+            let query = history_query(range.as_deref(), from, to, project, model, year)?;
             let year = year.unwrap_or_else(|| Local::now().year());
-            if once || json || cli.once || cli.json {
+            if once || json || csv || cli.once || cli.json {
                 let sources = config.providers.clone();
                 let history = tokio::task::spawn_blocking(move || {
                     crate::history::HistoryCache::default().load(&config)
                 })
                 .await
                 .map_err(|e| CliError(format!("历史读取失败: {e}")))?;
-                let report = history.report(year, &sources);
-                if json || cli.json {
+                let report = history.report_query(year, &sources, &query);
+                if csv {
+                    if cli.json {
+                        return Err(CliError("--csv 不能与 --json 同时使用".into()));
+                    }
+                    println!(
+                        "date,total_tokens,input_tokens,output_tokens,cached_read_tokens,calls"
+                    );
+                    for (date, t) in if monthly {
+                        &report.monthly
+                    } else {
+                        &report.daily
+                    } {
+                        println!(
+                            "{date},{},{},{},{},{}",
+                            t.total(),
+                            t.input,
+                            t.output,
+                            t.cached,
+                            t.calls
+                        );
+                    }
+                    for warning in &report.warnings {
+                        eprintln!("{warning}");
+                    }
+                } else if json || cli.json {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&report)
@@ -154,7 +203,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
             } else {
                 let handle = Handle::current();
                 tokio::task::spawn_blocking(move || {
-                    crate::ui::run_history(handle, config, path, year, monthly)
+                    crate::ui::run_history_with_query(handle, config, path, year, monthly, query)
                 })
                 .await
                 .map_err(|e| CliError(format!("界面任务失败: {e}")))?
@@ -185,6 +234,46 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         }
         None => query(cli).await,
     }
+}
+
+fn history_query(
+    range: Option<&str>,
+    from: Option<NaiveDate>,
+    to: Option<NaiveDate>,
+    project: Option<String>,
+    model: Option<String>,
+    year: Option<i32>,
+) -> Result<crate::history::HistoryQuery, CliError> {
+    let today = Local::now().date_naive();
+    let (from, to) = match range {
+        Some("today") => (Some(today), Some(today)),
+        Some("7d") => (Some(today - Duration::days(6)), Some(today)),
+        Some("30d") => (Some(today - Duration::days(29)), Some(today)),
+        Some("month") => (today.with_day(1), Some(today)),
+        _ if from.is_some() || to.is_some() => (
+            Some(from.unwrap_or_else(|| {
+                NaiveDate::from_ymd_opt(year.unwrap_or_else(|| to.unwrap_or(today).year()), 1, 1)
+                    .unwrap()
+            })),
+            Some(to.unwrap_or(today)),
+        ),
+        _ => (None, None),
+    };
+    if from.zip(to).is_some_and(|(from, to)| from > to) {
+        return Err(CliError("起始日期不能晚于结束日期".into()));
+    }
+    if from
+        .zip(to)
+        .is_some_and(|(from, to)| (to - from).num_days() > 36600)
+    {
+        return Err(CliError("一次最多查询 100 年历史".into()));
+    }
+    Ok(crate::history::HistoryQuery {
+        from,
+        to,
+        project,
+        model,
+    })
 }
 
 async fn print_statusline(
@@ -391,7 +480,8 @@ mod tests {
                 year: Some(2026),
                 monthly: true,
                 once: false,
-                json: false
+                json: false,
+                ..
             })
         ));
         assert_eq!(cli.providers.as_deref(), Some("codex,grok"));
@@ -399,6 +489,42 @@ mod tests {
         assert!(Cli::try_parse_from(["usage", "history", "--once", "--json"]).is_err());
     }
 
+    #[test]
+    fn history_ranges_are_inclusive_and_invalid_dates_fail() {
+        let q = history_query(Some("7d"), None, None, None, None, None).unwrap();
+        assert_eq!((q.to.unwrap() - q.from.unwrap()).num_days(), 6);
+        assert!(
+            history_query(
+                None,
+                NaiveDate::from_ymd_opt(2026, 10, 2),
+                NaiveDate::from_ymd_opt(2026, 10, 1),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["usage", "history", "--from", "2026-02-30"]).is_err());
+        assert!(
+            Cli::try_parse_from(["usage", "history", "--range", "7d", "--year", "2026"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["usage", "history", "--csv", "--json"]).is_err());
+        let cli = Cli::try_parse_from([
+            "usage",
+            "history",
+            "--range",
+            "month",
+            "--project",
+            "usage",
+            "--model",
+            "gpt",
+            "--refresh",
+            "0",
+            "--csv",
+        ])
+        .unwrap();
+        assert_eq!(cli.refresh, Some(0));
+    }
     struct WaitingProvider {
         id: &'static str,
         barrier: Arc<Barrier>,

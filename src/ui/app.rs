@@ -36,6 +36,7 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    HistoryCached(crate::history::History),
     HistoryLoaded {
         history: crate::history::History,
         cache: crate::history::HistoryCache,
@@ -129,12 +130,33 @@ pub fn run_history(
     year: i32,
     monthly: bool,
 ) -> io::Result<()> {
+    run_history_with_query(
+        handle,
+        config,
+        config_path,
+        year,
+        monthly,
+        crate::history::HistoryQuery::default(),
+    )
+}
+
+pub fn run_history_with_query(
+    handle: Handle,
+    config: AppConfig,
+    config_path: std::path::PathBuf,
+    year: i32,
+    monthly: bool,
+    query: crate::history::HistoryQuery,
+) -> io::Result<()> {
     let mut app = Dashboard::new(Vec::new(), config, config_path);
     app.history = Some(HistoryPanel::new(
         app.history_config.providers.clone(),
         year,
         monthly,
     ));
+    if let Some(panel) = &mut app.history {
+        panel.set_query(query);
+    }
     app.start_history_load(&handle);
     run_dashboard(handle, app)
 }
@@ -146,10 +168,16 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     let result = loop {
         let (received, reset_consumed) = app.drain_events();
         if reset_consumed {
+            app.quota_refresh_due = app.pending > 0;
             app.refresh(&handle);
             app.notice = Some("已消耗 1 次，正在刷新额度".into());
         }
-        let refresh_started = app.maybe_auto_refresh(&handle);
+        let deferred_refresh = app.quota_refresh_due && app.pending == 0;
+        if deferred_refresh {
+            app.quota_refresh_due = false;
+            app.refresh(&handle);
+        }
+        let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
         if received || reset_consumed || refresh_started {
             redraw.invalidate();
         }
@@ -170,15 +198,42 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
+                    if matches!(key.code, KeyCode::F(1..=3))
+                        && app.reset.is_none()
+                        && !app.browser.as_ref().is_some_and(|b| b.launching)
+                    {
+                        match key.code {
+                            KeyCode::F(1) if !app.providers.is_empty() => {
+                                app.close_history();
+                                app.close_browser(false);
+                            }
+                            KeyCode::F(2) => app.open_history(&handle),
+                            KeyCode::F(3) => {
+                                app.browser_filter = None;
+                                app.open_browser(&handle);
+                            }
+                            _ => {}
+                        }
+                        redraw.invalidate();
+                        continue;
+                    }
                     if app.history.is_some() {
+                        if let Some(panel) = &mut app.history
+                            && panel.is_editing()
+                        {
+                            panel.key(key.code);
+                            redraw.invalidate();
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 if app.providers.is_empty() {
                                     break Ok(());
                                 }
-                                app.history = None;
+                                app.close_history();
                             }
                             KeyCode::Char('r') => app.start_history_load(&handle),
+                            KeyCode::Enter => app.open_history_sessions(&handle),
                             code => {
                                 if let Some(panel) = &mut app.history {
                                     panel.key(code);
@@ -201,7 +256,10 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         KeyCode::Char('3') => app.set_style("statusline"),
                         KeyCode::Char('s') => app.save_style(),
                         KeyCode::Char('x') => app.open_reset(&handle),
-                        KeyCode::Char('p') => app.open_browser(&handle),
+                        KeyCode::Char('p') => {
+                            app.browser_filter = None;
+                            app.open_browser(&handle);
+                        }
                         KeyCode::Char('h') => app.open_history(&handle),
                         KeyCode::Char('j') | KeyCode::Down => {
                             app.scroll_by(1, terminal.size().map(|size| size.width).unwrap_or(80))
@@ -227,9 +285,16 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
 
 struct Dashboard {
     history: Option<HistoryPanel>,
+    saved_history: Option<HistoryPanel>,
+    saved_browser: Option<SessionBrowser>,
+    loaded_history: crate::history::History,
+    browser_filter: Option<(Vec<String>, crate::history::HistoryQuery)>,
+    history_return: bool,
+    last_history_refresh: std::time::Instant,
     history_config: AppConfig,
     history_cache: Option<crate::history::HistoryCache>,
     history_loading: bool,
+    quota_refresh_due: bool,
     providers: Vec<Arc<dyn UsageProvider>>,
     cards: Vec<CardSlot>,
     style_name: String,
@@ -319,9 +384,16 @@ impl Dashboard {
         let styles = builtin_styles();
         Self {
             history: None,
+            saved_history: None,
+            saved_browser: None,
+            loaded_history: crate::history::History::default(),
+            browser_filter: None,
+            history_return: false,
+            last_history_refresh: std::time::Instant::now(),
             history_config: config.clone(),
             history_cache: Some(crate::history::HistoryCache::default()),
             history_loading: false,
+            quota_refresh_due: false,
             providers,
             cards,
             status: format!("百分比是已用额度 · {}", styles.label(&config.style)),
@@ -345,21 +417,85 @@ impl Dashboard {
         }
     }
 
+    fn close_history(&mut self) {
+        if let Some(panel) = self.history.take() {
+            self.saved_history = Some(panel);
+        }
+    }
+    fn close_browser(&mut self, return_history: bool) {
+        if let Some(browser) = self.browser.take() {
+            self.saved_browser = Some(browser);
+        }
+        self.browser_generation = self.browser_generation.wrapping_add(1);
+        self.browser_loading = false;
+        self.notice = None;
+        if return_history && self.history_return {
+            self.history = self.saved_history.take();
+        }
+        self.history_return = false;
+    }
     fn open_history(&mut self, handle: &Handle) {
         use chrono::Datelike;
-        self.history = Some(HistoryPanel::new(
-            self.history_config.providers.clone(),
-            chrono::Local::now().year(),
-            false,
-        ));
+        if self.history.is_some() {
+            return;
+        }
+        self.close_browser(false);
+        self.history = Some(self.saved_history.take().unwrap_or_else(|| {
+            HistoryPanel::new(
+                self.history_config.providers.clone(),
+                chrono::Local::now().year(),
+                false,
+            )
+        }));
         self.start_history_load(handle);
     }
-
+    fn open_history_sessions(&mut self, handle: &Handle) {
+        let Some(panel) = &self.history else {
+            return;
+        };
+        if panel.loading {
+            return;
+        }
+        let filter = (panel.sources(), panel.session_query());
+        self.close_history();
+        self.saved_browser = None;
+        self.browser_filter = Some(filter);
+        self.open_browser(handle);
+        self.history_return = true;
+    }
+    fn apply_browser_usage(&mut self) {
+        let (sources, query, label) = self.browser_filter.as_ref().map_or_else(
+            || {
+                (
+                    self.history_config.providers.clone(),
+                    crate::history::HistoryQuery::default(),
+                    None,
+                )
+            },
+            |(s, q)| {
+                (
+                    s.clone(),
+                    q.clone(),
+                    Some(format!(
+                        "{} — {} · {}",
+                        q.from.map_or(String::new(), |d| d.to_string()),
+                        q.to.map_or(String::new(), |d| d.to_string()),
+                        s.join("+")
+                    )),
+                )
+            },
+        );
+        let usage = self.loaded_history.session_usage(&sources, &query);
+        if let Some(browser) = &mut self.browser {
+            browser.set_usage(usage, label);
+        }
+    }
     fn start_history_load(&mut self, handle: &Handle) {
         if self.history_loading {
             return;
         }
         self.history_loading = true;
+        self.last_history_refresh = std::time::Instant::now();
         if let Some(panel) = &mut self.history {
             panel.loading = true;
         }
@@ -367,14 +503,32 @@ impl Dashboard {
         let mut cache = self.history_cache.take().unwrap_or_default();
         let tx = self.tx.clone();
         handle.spawn_blocking(move || {
-            let history = cache.load(&config);
+            let history = cache.load_with_cached(&config, |history| {
+                let _ = tx.send(AppEvent::HistoryCached(history));
+            });
             let _ = tx.send(AppEvent::HistoryLoaded { history, cache });
         });
     }
 
     fn open_browser(&mut self, handle: &Handle) {
-        self.browser = Some(SessionBrowser::new(Vec::new()));
+        if self.browser.is_some() {
+            self.apply_browser_usage();
+            return;
+        }
+        self.close_history();
+        if self.providers.is_empty() && self.saved_history.is_some() {
+            self.history_return = true;
+        }
+        self.browser = Some(
+            self.saved_browser
+                .take()
+                .unwrap_or_else(|| SessionBrowser::new(Vec::new())),
+        );
+        self.apply_browser_usage();
         self.start_browser_load(handle);
+        if self.loaded_history.synced_at.is_none() {
+            self.start_history_load(handle);
+        }
     }
 
     fn start_browser_load(&mut self, handle: &Handle) {
@@ -432,12 +586,17 @@ impl Dashboard {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.browser = None;
-                self.browser_generation = self.browser_generation.wrapping_add(1);
-                self.browser_loading = false;
-                self.notice = None;
+                self.close_browser(true);
             }
-            KeyCode::Char('r') => self.start_browser_load(handle),
+            KeyCode::Char('r') => {
+                self.start_browser_load(handle);
+                self.start_history_load(handle);
+            }
+            KeyCode::Char('o') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.toggle_sort();
+                }
+            }
             KeyCode::Tab => {
                 if let Some(browser) = &mut self.browser {
                     browser.toggle_focus();
@@ -530,6 +689,9 @@ impl Dashboard {
     }
 
     fn refresh(&mut self, handle: &Handle) {
+        if self.pending > 0 {
+            return;
+        }
         self.notice = None;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -624,6 +786,22 @@ impl Dashboard {
     }
 
     fn maybe_auto_refresh(&mut self, handle: &Handle) -> bool {
+        if self.history.is_some() || self.browser.is_some() {
+            if self.browser.as_ref().is_some_and(|b| b.launching) {
+                return false;
+            }
+            if self.refresh_seconds > 0
+                && !self.history_loading
+                && self.last_history_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds)
+            {
+                if self.browser.is_some() {
+                    self.start_browser_load(handle);
+                }
+                self.start_history_load(handle);
+                return true;
+            }
+            return false;
+        }
         if self.refresh_seconds == 0
             || self.pending > 0
             || self.reset.is_some()
@@ -643,13 +821,24 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::HistoryCached(history) => {
+                    self.loaded_history = history.clone();
+                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
+                        panel.history = history;
+                    }
+                    self.apply_browser_usage();
+                    changed = true;
+                    continue;
+                }
                 AppEvent::HistoryLoaded { history, cache } => {
                     self.history_loading = false;
                     self.history_cache = Some(cache);
-                    if let Some(panel) = &mut self.history {
+                    self.loaded_history = history.clone();
+                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
                         panel.history = history;
                         panel.loading = false;
                     }
+                    self.apply_browser_usage();
                     changed = true;
                     continue;
                 }
@@ -701,7 +890,10 @@ impl Dashboard {
                         changed = true;
                         match result {
                             Ok(()) => {
-                                self.browser = None;
+                                if let Some(browser) = &mut self.browser {
+                                    browser.launching = false;
+                                }
+                                self.close_browser(true);
                                 self.notice = Some("已在 Ghostty 右侧恢复会话".into());
                             }
                             Err(error) => {
@@ -729,12 +921,15 @@ impl Dashboard {
                         if catalog.sessions.is_empty()
                             && self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
                         {
-                            self.browser = None;
+                            if self.browser_filter.is_none() {
+                                self.close_browser(true);
+                            }
                             self.notice = Some(message);
                         } else {
                             if let Some(browser) = &mut self.browser {
                                 browser.refresh(catalog.sessions);
                             }
+                            self.apply_browser_usage();
                             self.notice =
                                 if self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
                                     || !catalog.warnings.is_empty()
@@ -806,7 +1001,23 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
     ])
     .areas(frame.area());
     let status = if app.history.is_some() {
-        "本地 Token · 本地时区".to_string()
+        app.history
+            .as_ref()
+            .and_then(|p| p.history.synced_at)
+            .map_or_else(
+                || "本地 Token · 本地时区".into(),
+                |t| {
+                    format!(
+                        "本地 Token · 更新 {}{}",
+                        t.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                        if app.history_loading {
+                            " · 同步中"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            )
     } else if app.browser_loading {
         "正在读取本机会话…".to_string()
     } else {
@@ -825,11 +1036,11 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         })
     };
     let header_title = if app.history.is_some() {
-        " 贡献看板 "
+        " F1 额度  [F2 历史]  F3 会话 "
     } else if app.browser.is_some() {
-        " 会话 "
+        " F1 额度  F2 历史  [F3 会话] "
     } else {
-        " 用量 "
+        " [F1 额度]  F2 历史  F3 会话 "
     };
     Paragraph::new(Line::from(vec![header_title.bold(), status.dim()]))
         .style(
@@ -853,9 +1064,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
     }
     let footer_text = if app.history.is_some() {
         if frame.area().width >= 105 {
-            " ↑/↓ 日期  ←/→ 周  PgUp/PgDn 活跃日  m 日/月  Tab 来源  [/] 年  t 今天  r 更新  Esc 返回"
+            " ↑新 ↓旧  ←/→ 周  Enter 会话  v 范围  f 项目  M 模型  m 日/月  Tab 来源  c 清筛选  r 更新  Esc 返回"
         } else {
-            " ↑/↓ 选择  ←/→ 周  m 日/月  Tab 来源  [/] 年  r 更新  Esc 返回"
+            " ↑新 ↓旧  Enter 会话  v 范围  f 项目  M 模型  m 日/月  r 更新  Esc 返回"
         }
     } else if let Some(browser) = &app.browser {
         if app.browser_loading {
@@ -863,7 +1074,7 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         } else if browser.launching {
             " 正在 Ghostty 右侧打开会话… 请等待"
         } else {
-            " ↑/↓ 选择  Tab/←/→ 切换列表  Enter 进入/打开  / 搜索  c 清除  r 更新  Esc 返回"
+            " ↑/↓ 选择  Tab 列表  Enter 打开  / 搜索  o 排序  c 清除  r 更新  Esc 返回"
         }
     } else {
         match app.reset.as_ref().map(|flow| &flow.stage) {
@@ -1456,5 +1667,128 @@ mod tests {
         assert_eq!(app.scroll, 2);
         app.scroll_by(-1, 72);
         assert_eq!(app.scroll, 0);
+    }
+    struct CountingQuota(Arc<AtomicUsize>);
+    #[async_trait]
+    impl UsageProvider for CountingQuota {
+        fn id(&self) -> &'static str {
+            "codex"
+        }
+        fn display_name(&self) -> &'static str {
+            "Codex"
+        }
+        async fn query(&self) -> UsageSnapshot {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snapshot_not_found("codex", "Codex", None)
+        }
+    }
+    #[tokio::test]
+    async fn repeated_quota_refresh_joins_pending_work() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut app = Dashboard::new(
+            vec![Arc::new(CountingQuota(calls.clone()))],
+            AppConfig::default(),
+            "/tmp/test-config".into(),
+        );
+        let handle = Handle::current();
+        app.refresh(&handle);
+        app.refresh(&handle);
+        app.refresh(&handle);
+        drain_until(&mut app, |a| a.pending == 0).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn switching_history_preserves_date_source_and_monthly_view() {
+        use chrono::Datelike;
+        let root = std::env::temp_dir().join(format!("usage-ui-{}", uuid::Uuid::new_v4()));
+        let mut app = dashboard();
+        app.history_config.providers.clear();
+        app.history_cache = Some(crate::history::HistoryCache::at(
+            root.join("history.sqlite3"),
+        ));
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
+        app.history = Some(HistoryPanel::new(
+            vec!["codex".into(), "claude".into()],
+            date.year(),
+            true,
+        ));
+        let panel = app.history.as_mut().unwrap();
+        panel.selected = date;
+        panel.key(KeyCode::Char('1'));
+        app.close_history();
+        app.open_history(&Handle::current());
+        let panel = app.history.as_ref().unwrap();
+        assert_eq!(panel.selected, date);
+        assert!(panel.monthly);
+        assert_eq!(panel.sources(), vec!["codex"]);
+        drain_until(&mut app, |a| !a.history_loading).await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn drilldown_returns_to_saved_history_and_uses_selected_day_usage() {
+        let mut app = dashboard();
+        let selected = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let mut panel = HistoryPanel::new(vec!["codex".into()], 2026, false);
+        panel.selected = selected;
+        let record = crate::history::Record {
+            source: "codex".into(),
+            id: "event".into(),
+            session: "session".into(),
+            project: "/tmp/p".into(),
+            model: "gpt-test".into(),
+            time: selected
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc),
+            tokens: crate::history::Tokens {
+                input: 123,
+                ..Default::default()
+            },
+        };
+        app.loaded_history.records.push(record);
+        app.browser_filter = Some((panel.sources(), panel.session_query()));
+        app.saved_history = Some(panel);
+        app.history_return = true;
+        app.browser = Some(SessionBrowser::new(vec![Session {
+            provider: AgentKind::CODEX,
+            id: "session".into(),
+            cwd: "/tmp/p".into(),
+            title: "task".into(),
+            recency_at_ms: 0,
+            home: "/tmp".into(),
+        }]));
+        app.apply_browser_usage();
+        assert_eq!(app.browser.as_ref().unwrap().visible_count(), 1);
+        app.close_browser(true);
+        assert_eq!(app.history.as_ref().unwrap().selected, selected);
+    }
+    #[tokio::test]
+    async fn history_auto_refresh_scans_locally_and_skips_quota_network() {
+        let root = std::env::temp_dir().join(format!("usage-auto-{}", uuid::Uuid::new_v4()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut app = Dashboard::new(
+            vec![Arc::new(CountingQuota(calls.clone()))],
+            AppConfig::default(),
+            "/tmp/test-config".into(),
+        );
+        app.history_config.providers.clear();
+        app.history_cache = Some(crate::history::HistoryCache::at(
+            root.join("history.sqlite3"),
+        ));
+        app.history = Some(HistoryPanel::new(Vec::new(), 2026, false));
+        app.refresh_seconds = 1;
+        app.last_history_refresh = std::time::Instant::now() - Duration::from_secs(2);
+        assert!(app.maybe_auto_refresh(&Handle::current()));
+        assert!(app.history_loading);
+        drain_until(&mut app, |a| !a.history_loading).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        app.refresh_seconds = 0;
+        app.last_history_refresh = std::time::Instant::now() - Duration::from_secs(2);
+        assert!(!app.maybe_auto_refresh(&Handle::current()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

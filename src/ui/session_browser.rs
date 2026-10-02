@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
 use unicode_width::UnicodeWidthChar;
 
+use crate::history::{SessionUsage, Tokens, compact};
 use crate::sessions::{AgentKind, Session};
 
 const BLUE: Color = Color::Rgb(110, 168, 254);
@@ -23,6 +24,7 @@ struct Project {
     cwd: PathBuf,
     sessions: Vec<usize>,
     latest_ms: i64,
+    tokens: Tokens,
 }
 
 pub struct SessionBrowser {
@@ -35,6 +37,9 @@ pub struct SessionBrowser {
     pub query: String,
     pub searching: bool,
     pub launching: bool,
+    usage: HashMap<(String, String), SessionUsage>,
+    pub filter_label: Option<String>,
+    pub sort_tokens: bool,
 }
 
 impl SessionBrowser {
@@ -49,11 +54,31 @@ impl SessionBrowser {
             query: String::new(),
             searching: false,
             launching: false,
+            usage: HashMap::new(),
+            filter_label: None,
+            sort_tokens: false,
         };
         browser.rebuild();
         browser
     }
 
+    pub fn set_usage(
+        &mut self,
+        usage: HashMap<(String, String), SessionUsage>,
+        label: Option<String>,
+    ) {
+        self.usage = usage;
+        self.filter_label = label;
+        self.rebuild();
+    }
+    pub fn toggle_sort(&mut self) {
+        self.sort_tokens = !self.sort_tokens;
+        self.rebuild();
+    }
+    fn usage_for(&self, session: &Session) -> Option<&SessionUsage> {
+        self.usage
+            .get(&(session.provider.id().to_string(), session.id.clone()))
+    }
     pub fn focus(&self) -> Focus {
         self.focus
     }
@@ -172,6 +197,9 @@ impl SessionBrowser {
         let search_id = needle.chars().count() >= 6;
         let mut groups = HashMap::<PathBuf, Vec<usize>>::new();
         for (index, session) in self.sessions.iter().enumerate() {
+            if self.filter_label.is_some() && self.usage_for(session).is_none() {
+                continue;
+            }
             let path_matches = session
                 .cwd
                 .to_string_lossy()
@@ -189,6 +217,12 @@ impl SessionBrowser {
         self.projects = groups
             .into_iter()
             .map(|(cwd, mut sessions)| {
+                let mut tokens = Tokens::default();
+                for &index in &sessions {
+                    if let Some(usage) = self.usage_for(&self.sessions[index]) {
+                        tokens.add(usage.tokens);
+                    }
+                }
                 let latest_ms = sessions
                     .iter()
                     .map(|&index| self.sessions[index].recency_at_ms)
@@ -206,6 +240,19 @@ impl SessionBrowser {
                                 .cmp(self.sessions[b].provider.id())
                         })
                         .then_with(|| {
+                            if self.sort_tokens {
+                                self.usage_for(&self.sessions[b])
+                                    .map_or(0, |u| u.tokens.total())
+                                    .cmp(
+                                        &self
+                                            .usage_for(&self.sessions[a])
+                                            .map_or(0, |u| u.tokens.total()),
+                                    )
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        })
+                        .then_with(|| {
                             self.sessions[b]
                                 .recency_at_ms
                                 .cmp(&self.sessions[a].recency_at_ms)
@@ -215,13 +262,18 @@ impl SessionBrowser {
                     cwd,
                     sessions,
                     latest_ms,
+                    tokens,
                 }
             })
             .collect();
         self.projects.sort_by(|a, b| {
-            b.latest_ms
-                .cmp(&a.latest_ms)
-                .then_with(|| a.cwd.cmp(&b.cwd))
+            (if self.sort_tokens {
+                b.tokens.total().cmp(&a.tokens.total())
+            } else {
+                std::cmp::Ordering::Equal
+            })
+            .then_with(|| b.latest_ms.cmp(&a.latest_ms))
+            .then_with(|| a.cwd.cmp(&b.cwd))
         });
         self.project_selected = previous_project
             .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
@@ -249,7 +301,7 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let preview_height = if area.height >= 12 { 4 } else { 0 };
+    let preview_height = if area.height >= 12 { 5 } else { 0 };
     let [search_area, lists_area, preview_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -262,6 +314,19 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     } else {
         format!(" 搜索：{}{cursor}", browser.query)
     };
+    let search = format!(
+        "{}{} · {}",
+        browser
+            .filter_label
+            .as_ref()
+            .map_or(String::new(), |s| format!("{} · ", clean(s))),
+        search,
+        if browser.sort_tokens {
+            "Token 排序"
+        } else {
+            "最近活动"
+        }
+    );
     Paragraph::new(search)
         .style(Style::new().fg(DIM))
         .render(search_area, buf);
@@ -295,7 +360,25 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     let inner = block.inner(area);
     block.render(area, buf);
     let width = usize::from(inner.width);
+    let usage = browser.usage_for(session);
     let lines = vec![
+        Line::from(preview_text(
+            &usage.map_or_else(
+                || "尚无用量记录".into(),
+                |u| {
+                    format!(
+                        "{} Tokens · {}",
+                        compact(u.tokens.total()),
+                        if u.models.is_empty() {
+                            "模型未记录".into()
+                        } else {
+                            u.models.join(", ")
+                        }
+                    )
+                },
+            ),
+            width,
+        )),
         Line::from(preview_text(
             &format!("目录  {}", session.cwd.display()),
             width,
@@ -359,7 +442,12 @@ fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
                 |name| name.to_string_lossy().into_owned(),
             );
             ListItem::new(vec![
-                Line::from(format!("{}  ({})", clean(&name), project.sessions.len())),
+                Line::from(format!(
+                    "{}  ({}) · {}",
+                    clean(&name),
+                    project.sessions.len(),
+                    compact(project.tokens.total())
+                )),
                 Line::from(clean(&project.cwd.to_string_lossy())).dim(),
             ])
         })
@@ -429,6 +517,13 @@ fn render_sessions(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
                 .unwrap_or_default();
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(format!("{time}  "), Style::new().fg(DIM)),
+                Span::styled(
+                    browser.usage_for(session).map_or_else(
+                        || "—  ".into(),
+                        |u| format!("{}  ", compact(u.tokens.total())),
+                    ),
+                    Style::new().fg(BLUE),
+                ),
                 Span::raw(clean(&session.title)),
             ])));
             session_index += 1;
@@ -641,5 +736,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Custom Agent"), "{text}");
+    }
+    #[test]
+    fn usage_filter_and_token_sort_keep_selection_when_refreshing() {
+        let a = session(AgentKind::CODEX, "Small", "/tmp/a", 30);
+        let b = session(AgentKind::CODEX, "Large", "/tmp/b", 20);
+        let c = session(AgentKind::CLAUDE, "Outside day", "/tmp/c", 40);
+        let usage = |tokens| SessionUsage {
+            tokens: Tokens {
+                input: tokens,
+                ..Tokens::default()
+            },
+            models: vec!["test-model".into()],
+        };
+        let mut map = HashMap::new();
+        map.insert(("codex".into(), a.id.clone()), usage(100));
+        map.insert(("codex".into(), b.id.clone()), usage(1000));
+        let mut browser = SessionBrowser::new(vec![a, b, c]);
+        browser.set_usage(map, Some("selected date".into()));
+        assert_eq!(browser.visible_count(), 2);
+        assert_eq!(
+            browser.selected_project().unwrap(),
+            &PathBuf::from("/tmp/a")
+        );
+        browser.toggle_sort();
+        browser.move_by(-1);
+        assert_eq!(
+            browser.selected_project().unwrap(),
+            &PathBuf::from("/tmp/b")
+        );
+        let selected = browser.selected_session().unwrap().id.clone();
+        browser.refresh(browser.sessions.iter().rev().cloned().collect());
+        assert_eq!(browser.selected_session().unwrap().id, selected);
     }
 }

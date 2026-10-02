@@ -1,13 +1,55 @@
 //! Contribution calendar and daily/monthly token breakdown.
-use crate::history::{History, HistoryReport, SOURCES, Tokens, compact};
+use crate::history::{History, HistoryQuery, HistoryReport, SOURCES, Tokens, compact};
 use chrono::{Datelike, Duration, Local, Months, NaiveDate};
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{
+    Block, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
+};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeRange {
+    #[default]
+    Year,
+    Today,
+    Week,
+    ThirtyDays,
+    Month,
+    Custom,
+}
+impl TimeRange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Year => "全年",
+            Self::Today => "今天",
+            Self::Week => "近7天",
+            Self::ThirtyDays => "近30天",
+            Self::Month => "本月",
+            Self::Custom => "自定义",
+        }
+    }
+}
+struct DimensionPicker {
+    project: bool,
+    options: Vec<String>,
+    search: String,
+    selected: usize,
+}
+impl DimensionPicker {
+    fn visible(&self) -> Vec<Option<&str>> {
+        let mut options = vec![None];
+        options.extend(
+            self.options
+                .iter()
+                .filter(|s| s.to_lowercase().contains(&self.search.to_lowercase()))
+                .map(|s| Some(s.as_str())),
+        );
+        options
+    }
+}
 pub struct HistoryPanel {
     pub history: History,
     pub loading: bool,
@@ -15,6 +57,9 @@ pub struct HistoryPanel {
     pub monthly: bool,
     pub allowed: Vec<String>,
     filter: Option<String>,
+    pub query: HistoryQuery,
+    pub range: TimeRange,
+    picker: Option<DimensionPicker>,
 }
 impl HistoryPanel {
     pub fn new(allowed: Vec<String>, year: i32, monthly: bool) -> Self {
@@ -31,6 +76,9 @@ impl HistoryPanel {
             monthly,
             allowed,
             filter: None,
+            query: HistoryQuery::default(),
+            range: TimeRange::Year,
+            picker: None,
         }
     }
     pub fn sources(&self) -> Vec<String> {
@@ -38,7 +86,155 @@ impl HistoryPanel {
             .as_ref()
             .map_or_else(|| self.allowed.clone(), |s| vec![s.clone()])
     }
+    pub fn set_query(&mut self, query: HistoryQuery) {
+        if query.from.is_some() || query.to.is_some() {
+            self.range = TimeRange::Custom;
+            self.selected = query
+                .to
+                .or(query.from)
+                .unwrap_or(self.selected)
+                .min(Local::now().date_naive());
+        }
+        self.query = query;
+    }
+    pub fn effective_query(&self) -> HistoryQuery {
+        let mut query = self.query.clone();
+        let today = Local::now().date_naive();
+        if self.range != TimeRange::Custom {
+            let (from, to) = match self.range {
+                TimeRange::Year => (None, None),
+                TimeRange::Today => (Some(today), Some(today)),
+                TimeRange::Week => (Some(today - Duration::days(6)), Some(today)),
+                TimeRange::ThirtyDays => (Some(today - Duration::days(29)), Some(today)),
+                TimeRange::Month => (today.with_day(1), Some(today)),
+                TimeRange::Custom => unreachable!(),
+            };
+            query.from = from;
+            query.to = to;
+        }
+        query
+    }
+    pub fn session_query(&self) -> HistoryQuery {
+        let mut query = self.effective_query();
+        if self.monthly {
+            let first = self.selected.with_day(1).unwrap();
+            let last = first
+                .checked_add_months(Months::new(1))
+                .and_then(|d| d.pred_opt())
+                .unwrap_or(self.selected);
+            query.from = Some(query.from.map_or(first, |d| d.max(first)));
+            query.to = Some(query.to.map_or(last, |d| d.min(last)));
+        } else {
+            query.from = Some(self.selected);
+            query.to = Some(self.selected);
+        }
+        query
+    }
+    fn report(&self, year: i32, sources: &[String]) -> HistoryReport {
+        self.history
+            .report_query(year, sources, &self.effective_query())
+    }
+    fn open_picker(&mut self, project: bool) {
+        let mut options: Vec<String> = self
+            .history
+            .records
+            .iter()
+            .filter(|r| self.sources().contains(&r.source))
+            .map(|r| {
+                if project {
+                    r.project.clone()
+                } else {
+                    r.model.clone()
+                }
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        options.sort();
+        options.dedup();
+        let current = if project {
+            &self.query.project
+        } else {
+            &self.query.model
+        };
+        let selected = current
+            .as_ref()
+            .and_then(|v| options.iter().position(|s| s == v))
+            .map_or(0, |i| i + 1);
+        self.picker = Some(DimensionPicker {
+            project,
+            options,
+            search: String::new(),
+            selected,
+        });
+    }
+    pub fn is_editing(&self) -> bool {
+        self.picker.is_some()
+    }
     pub fn key(&mut self, key: KeyCode) {
+        if let Some(picker) = &mut self.picker {
+            match key {
+                KeyCode::Esc => self.picker = None,
+                KeyCode::Enter => {
+                    let value = picker
+                        .visible()
+                        .get(picker.selected)
+                        .and_then(|v| *v)
+                        .map(str::to_string);
+                    if picker.project {
+                        self.query.project = value;
+                    } else {
+                        self.query.model = value;
+                    }
+                    self.picker = None;
+                }
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.visible().len().saturating_sub(1))
+                }
+                KeyCode::Backspace => {
+                    picker.search.pop();
+                    picker.selected = 0;
+                }
+                KeyCode::Char(ch) => {
+                    picker.search.push(ch);
+                    picker.selected = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            KeyCode::Char('v') => {
+                self.range = match self.range {
+                    TimeRange::Year => TimeRange::Today,
+                    TimeRange::Today => TimeRange::Week,
+                    TimeRange::Week => TimeRange::ThirtyDays,
+                    TimeRange::ThirtyDays => TimeRange::Month,
+                    TimeRange::Month | TimeRange::Custom => TimeRange::Year,
+                };
+                if self.range != TimeRange::Year {
+                    self.selected = Local::now().date_naive();
+                }
+                return;
+            }
+            KeyCode::Char('f') => {
+                self.open_picker(true);
+                return;
+            }
+            KeyCode::Char('M') => {
+                self.open_picker(false);
+                return;
+            }
+            KeyCode::Char('c') => {
+                self.query.project = None;
+                self.query.model = None;
+                self.filter = None;
+                return;
+            }
+            _ => {}
+        }
+
         if self.monthly
             && matches!(
                 key,
@@ -46,11 +242,13 @@ impl HistoryPanel {
             )
         {
             let next = if matches!(key, KeyCode::Up | KeyCode::Char('k')) {
-                self.selected.checked_sub_months(Months::new(1))
-            } else {
                 self.selected.checked_add_months(Months::new(1))
+            } else {
+                self.selected.checked_sub_months(Months::new(1))
             };
-            if let Some(date) = next.filter(|date| *date <= Local::now().date_naive()) {
+            if let Some(date) = next.filter(|date| {
+                *date <= Local::now().date_naive() && self.effective_query().contains_date(*date)
+            }) {
                 self.selected = date;
             }
             return;
@@ -58,37 +256,44 @@ impl HistoryPanel {
         let shift = match key {
             KeyCode::Left => -7,
             KeyCode::Right => 7,
-            KeyCode::Up | KeyCode::Char('k') => -1,
-            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::Up | KeyCode::Char('k') => 1,
+            KeyCode::Down | KeyCode::Char('j') => -1,
             _ => 0,
         };
         if shift != 0 {
             if let Some(date) = self
                 .selected
                 .checked_add_signed(Duration::days(shift))
-                .filter(|date| *date <= Local::now().date_naive())
+                .filter(|date| {
+                    *date <= Local::now().date_naive()
+                        && self.effective_query().contains_date(*date)
+                })
             {
                 self.selected = date;
             }
             return;
         }
         if matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+            let report = self.report(self.selected.year(), &self.sources());
             let dates: Vec<_> = self
                 .history
                 .days
                 .keys()
                 .copied()
                 .filter(|date| {
-                    date.year() == self.selected.year()
-                        && self.history.day(*date, &self.sources()).total() > 0
+                    (self.range != TimeRange::Year || date.year() == self.selected.year())
+                        && report
+                            .daily
+                            .get(&date.to_string())
+                            .is_some_and(|t| t.total() > 0)
                 })
                 .collect();
             let next = if key == KeyCode::PageUp {
-                dates.into_iter().rev().find(|date| *date < self.selected)
-            } else {
                 dates
                     .into_iter()
                     .find(|date| *date > self.selected && *date <= Local::now().date_naive())
+            } else {
+                dates.into_iter().rev().find(|date| *date < self.selected)
             };
             if let Some(date) = next {
                 self.selected = date;
@@ -114,19 +319,30 @@ impl HistoryPanel {
                     Some(i) => self.allowed.get(i + 1).cloned(),
                 };
             }
-            KeyCode::Char('[') | KeyCode::Char(']') => {
+            KeyCode::Char('[') | KeyCode::Char(']') if self.range == TimeRange::Year => {
                 let year = self.selected.year() + if key == KeyCode::Char('[') { -1 } else { 1 };
                 if (1970..=Local::now().year()).contains(&year) {
                     self.selected =
                         NaiveDate::from_ymd_opt(year, self.selected.month(), self.selected.day())
                             .or_else(|| NaiveDate::from_ymd_opt(year, self.selected.month(), 28))
-                            .unwrap();
+                            .unwrap()
+                            .min(Local::now().date_naive());
                 }
             }
-            KeyCode::Char('t') => self.selected = Local::now().date_naive(),
+            KeyCode::Char('t') => {
+                let today = Local::now().date_naive();
+                if !self.effective_query().contains_date(today) {
+                    self.range = TimeRange::Year;
+                }
+                self.selected = today;
+            }
             _ => {}
         }
     }
+}
+
+fn clean_label(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(80).collect()
 }
 
 const MUTED: Color = Color::Rgb(130, 138, 153);
@@ -180,17 +396,18 @@ pub fn render(area: Rect, buf: &mut Buffer, panel: &HistoryPanel) {
         return;
     }
     let sources = panel.sources();
-    let report = panel.history.report(panel.selected.year(), &sources);
+    let report = panel.report(panel.selected.year(), &sources);
     let warning_height = u16::from(!panel.history.warnings.is_empty());
-    let calendar_height = if panel.monthly && content.height < 28 {
-        0
-    } else if content.height >= 28 {
-        11
-    } else if content.height >= 15 {
-        10
-    } else {
-        0
-    };
+    let calendar_height =
+        if panel.range == TimeRange::Today || (panel.monthly && content.height < 28) {
+            0
+        } else if content.height >= 28 {
+            11
+        } else if content.height >= 15 {
+            10
+        } else {
+            0
+        };
     let [summary, calendar, _gap, bottom, warning] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(calendar_height),
@@ -238,6 +455,57 @@ pub fn render(area: Rect, buf: &mut Buffer, panel: &HistoryPanel) {
         .style(Style::new().fg(Color::Yellow))
         .render(warning, buf);
     }
+    if let Some(picker) = &panel.picker {
+        render_picker(content, buf, picker);
+    }
+}
+
+fn render_picker(area: Rect, buf: &mut Buffer, picker: &DimensionPicker) {
+    let width = area.width.min(86);
+    let height = area.height.min(14);
+    if height < 4 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    Clear.render(popup, buf);
+    let block = Block::bordered()
+        .title(if picker.project {
+            " 项目筛选 "
+        } else {
+            " 模型筛选 "
+        })
+        .border_style(ACCENT);
+    let inner = block.inner(popup);
+    block.render(popup, buf);
+    let [search, list, hint] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    Paragraph::new(format!("搜索：{}▏", clean_label(&picker.search))).render(search, buf);
+    let items: Vec<_> = picker
+        .visible()
+        .into_iter()
+        .map(|v| ListItem::new(clean_label(v.unwrap_or("全部"))))
+        .collect();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    StatefulWidget::render(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::new().fg(ACCENT).bold()),
+        list,
+        buf,
+        &mut state,
+    );
+    Paragraph::new("输入搜索 · ↑/↓ 选择 · Enter 应用 · Esc 取消")
+        .style(Style::new().fg(MUTED))
+        .render(hint, buf);
 }
 
 fn render_summary(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &HistoryReport) {
@@ -274,7 +542,7 @@ fn render_summary(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &H
             report.totals.cached as f64 / report.totals.input as f64 * 100.0
         )
     };
-    let stats = if panel.loading {
+    let stats = if panel.loading && panel.history.synced_at.is_none() {
         "正在读取本地用量日志…".to_string()
     } else {
         format!(
@@ -284,7 +552,37 @@ fn render_summary(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &H
             cache
         )
     };
-    Paragraph::new(vec![Line::from(tabs), Line::from(stats).fg(MUTED)]).render(area, buf);
+    let project = panel.query.project.as_deref().unwrap_or("全部项目");
+    let model = panel.query.model.as_deref().unwrap_or("全部模型");
+    let q = panel.effective_query();
+    let range = q.from.zip(q.to).map_or_else(
+        || panel.range.label().to_string(),
+        |(from, to)| {
+            format!(
+                "{} {}–{}",
+                panel.range.label(),
+                from.format("%m-%d"),
+                to.format("%m-%d")
+            )
+        },
+    );
+    let filters = format!(
+        "v {}   f {}   M {}",
+        range,
+        clean_label(
+            std::path::Path::new(project)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(project)
+        ),
+        clean_label(model)
+    );
+    Paragraph::new(vec![
+        Line::from(tabs),
+        Line::from(stats).fg(MUTED),
+        Line::from(filters).fg(MUTED),
+    ])
+    .render(area, buf);
 }
 
 struct CalendarWindow {
@@ -297,7 +595,12 @@ struct CalendarWindow {
 fn calendar_window(panel: &HistoryPanel, width: u16) -> Option<CalendarWindow> {
     let year = panel.selected.year();
     let first = NaiveDate::from_ymd_opt(year, 1, 1)?;
+    let first = panel.effective_query().from.unwrap_or(first);
     let last = NaiveDate::from_ymd_opt(year, 12, 31)?.min(Local::now().date_naive());
+    let last = panel
+        .effective_query()
+        .to
+        .map_or(last, |date| date.min(Local::now().date_naive()));
     if last < first {
         return None;
     }
@@ -307,7 +610,7 @@ fn calendar_window(panel: &HistoryPanel, width: u16) -> Option<CalendarWindow> {
     if visible == 0 {
         return None;
     }
-    let selected_week = ((panel.selected.min(last) - start).num_days() / 7) as usize;
+    let selected_week = ((panel.selected.clamp(first, last) - start).num_days() / 7) as usize;
     let offset = selected_week
         .saturating_sub(visible / 2)
         .min(weeks - visible);
@@ -403,7 +706,11 @@ fn selected_tokens(panel: &HistoryPanel, report: &HistoryReport) -> Tokens {
             .copied()
             .unwrap_or_default()
     } else {
-        panel.history.day(panel.selected, &panel.sources())
+        report
+            .daily
+            .get(&panel.selected.to_string())
+            .copied()
+            .unwrap_or_default()
     }
 }
 fn source_color(source: &str) -> Color {
@@ -427,13 +734,18 @@ fn render_detail(
     for source in panel.sources() {
         let t = if panel.monthly {
             panel
-                .history
                 .report(panel.selected.year(), std::slice::from_ref(&source))
-                .monthly[&date]
+                .monthly
+                .get(&date)
+                .copied()
+                .unwrap_or_default()
         } else {
             panel
-                .history
-                .day(panel.selected, std::slice::from_ref(&source))
+                .report(panel.selected.year(), std::slice::from_ref(&source))
+                .daily
+                .get(&panel.selected.to_string())
+                .copied()
+                .unwrap_or_default()
         };
         sources.push(Span::styled(
             format!("{source} {}  ", compact(t.total())),
@@ -578,19 +890,15 @@ fn render_months(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &Hi
     let sources = panel.sources();
     let reports: Vec<_> = sources
         .iter()
-        .map(|s| {
-            panel
-                .history
-                .report(panel.selected.year(), std::slice::from_ref(s))
-        })
+        .map(|s| panel.report(panel.selected.year(), std::slice::from_ref(s)))
         .collect();
     let mut lines = vec![Line::from("月度趋势").bold()];
     for row in 0..rows {
         let mut spans = Vec::new();
         for col in 0..columns {
-            let month = row + col * rows + 1;
+            let month = 12 - (row + col * rows);
             let key = format!("{}-{month:02}", panel.selected.year());
-            let t = report.monthly[&key];
+            let t = report.monthly.get(&key).copied().unwrap_or_default();
             spans.push(Span::styled(
                 format!(
                     "{}{month:02} ",
@@ -612,7 +920,14 @@ fn render_months(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &Hi
             let mut used = 0;
             let mut cumulative = 0u64;
             for (source, report) in sources.iter().zip(&reports) {
-                cumulative = cumulative.saturating_add(report.monthly[&key].total());
+                cumulative = cumulative.saturating_add(
+                    report
+                        .monthly
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default()
+                        .total(),
+                );
                 let end = if t.total() == 0 {
                     0
                 } else {
@@ -686,6 +1001,44 @@ mod tests {
         assert_eq!(rows[0].0, p.selected);
         assert_eq!(rows.iter().filter(|(_, t)| t.total() == 0).count(), 1);
     }
+
+    #[test]
+    fn date_and_month_navigation_follow_newest_first_lists() {
+        let mut p = panel(false);
+        p.selected = NaiveDate::from_ymd_opt(2024, 9, 10).unwrap();
+        let report = p.report(2024, &p.sources());
+        let dates = recent_rows(&p, &report, MAX_RECENT);
+        let index = dates.iter().position(|(d, _)| *d == p.selected).unwrap();
+        p.key(KeyCode::Up);
+        assert_eq!(p.selected, dates[index - 1].0);
+        p.key(KeyCode::Char('j'));
+        assert_eq!(p.selected, dates[index].0);
+        p.key(KeyCode::Char('k'));
+        assert_eq!(p.selected, dates[index - 1].0);
+        p.key(KeyCode::Down);
+        assert_eq!(p.selected, dates[index].0);
+
+        p.monthly = true;
+        let area = Rect::new(0, 0, 80, 8);
+        let mut before = Buffer::empty(area);
+        render_months(area, &mut before, &p, &report);
+        let selected_row = |buf: &Buffer| {
+            (0..area.height)
+                .find(|&y| (0..area.width).any(|x| buf[(x, y)].symbol() == "›"))
+                .unwrap()
+        };
+        p.key(KeyCode::Up);
+        assert_eq!(p.selected.month(), 10);
+        let mut after = Buffer::empty(area);
+        render_months(area, &mut after, &p, &report);
+        assert_eq!(selected_row(&after) + 1, selected_row(&before));
+        p.key(KeyCode::Char('j'));
+        assert_eq!(p.selected.month(), 9);
+        p.key(KeyCode::Char('k'));
+        assert_eq!(p.selected.month(), 10);
+        p.key(KeyCode::Down);
+        assert_eq!(p.selected.month(), 9);
+    }
     #[test]
     fn heatmap_uses_separate_foreground_squares_and_sparse_labels() {
         let p = panel(false);
@@ -717,10 +1070,10 @@ mod tests {
         let mut p = HistoryPanel::new(vec!["codex".into()], today.year(), false);
         let window = calendar_window(&p, 112).unwrap();
         assert_eq!(window.last, today);
-        p.key(KeyCode::Down);
+        p.key(KeyCode::Up);
         assert_eq!(p.selected, today);
         p.key(KeyCode::Char('m'));
-        p.key(KeyCode::Down);
+        p.key(KeyCode::Up);
         assert_eq!(p.selected, today);
     }
     #[test]
@@ -759,9 +1112,9 @@ mod tests {
         p.key(KeyCode::Tab);
         assert_eq!(p.sources().len(), 3);
         p.selected = NaiveDate::from_ymd_opt(2024, 9, 20).unwrap();
-        p.key(KeyCode::PageUp);
-        assert_eq!(p.selected.day(), 19);
         p.key(KeyCode::PageDown);
+        assert_eq!(p.selected.day(), 19);
+        p.key(KeyCode::PageUp);
         assert_eq!(p.selected.day(), 20);
         for monthly in [false, true] {
             p.monthly = monthly;
@@ -770,5 +1123,61 @@ mod tests {
                 render(rect, &mut Buffer::empty(rect), &p);
             }
         }
+    }
+    #[test]
+    fn searchable_picker_applies_and_cancels_without_changing_date() {
+        let mut p = panel(false);
+        let date = p.selected;
+        p.history.records = vec![crate::history::Record {
+            source: "codex".into(),
+            id: "event".into(),
+            session: "s".into(),
+            project: "/tmp/alpha".into(),
+            model: "gpt-test".into(),
+            time: chrono::Utc::now(),
+            tokens: Tokens {
+                input: 10,
+                ..Tokens::default()
+            },
+        }];
+        p.key(KeyCode::Char('f'));
+        assert!(p.is_editing());
+        for ch in "alpha".chars() {
+            p.key(KeyCode::Char(ch));
+        }
+        p.key(KeyCode::Down);
+        p.key(KeyCode::Enter);
+        assert_eq!(p.query.project.as_deref(), Some("/tmp/alpha"));
+        assert!(!p.is_editing());
+        assert_eq!(p.selected, date);
+        p.key(KeyCode::Char('M'));
+        p.key(KeyCode::Down);
+        p.key(KeyCode::Esc);
+        assert!(p.query.model.is_none());
+        p.key(KeyCode::Char('M'));
+        for (width, height) in [(44, 16), (118, 32)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            render(area, &mut buf, &p);
+            assert!(text(&buf).contains("模型筛选"));
+        }
+    }
+    #[test]
+    fn range_restricts_calendar_navigation_and_month_drilldown() {
+        let mut p = panel(false);
+        p.range = TimeRange::Week;
+        p.selected = Local::now().date_naive();
+        let first = p.selected - Duration::days(6);
+        let window = calendar_window(&p, 100).unwrap();
+        assert_eq!(window.first, first);
+        assert_eq!(window.last, p.selected);
+        p.key(KeyCode::Left);
+        assert_eq!(p.selected, Local::now().date_naive());
+        p.key(KeyCode::Down);
+        assert_eq!(p.selected, Local::now().date_naive() - Duration::days(1));
+        p.monthly = true;
+        let query = p.session_query();
+        assert!(query.from.unwrap() >= first);
+        assert!(query.to.unwrap() <= Local::now().date_naive());
     }
 }
