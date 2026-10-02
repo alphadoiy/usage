@@ -12,6 +12,7 @@ pub struct Alert {
 #[derive(Default)]
 struct WindowState {
     high: bool,
+    pending_low: bool,
     last_low_alert: Option<DateTime<Utc>>,
     last_observed: Option<DateTime<Utc>>,
 }
@@ -52,13 +53,19 @@ impl QuotaMonitor {
             let remaining = (100.0 - tier.utilization).clamp(0.0, 100.0);
             let high = remaining <= f64::from(config.remaining_percent);
             let label = crate::labels::tier_label(&tier.name);
+            if high && !state.high {
+                state.pending_low = true;
+            } else if !high {
+                state.pending_low = false;
+            }
             if high
-                && !state.high
+                && state.pending_low
                 && state.last_low_alert.is_none_or(|t| {
                     (now - t).num_seconds().max(0) as u64 >= config.cooldown_seconds
                 })
             {
                 state.last_low_alert = Some(now);
+                state.pending_low = false;
                 alerts.push(Alert {
                     message: format!(
                         "{} · {} 剩余额度 {:.0}%",
@@ -218,6 +225,86 @@ mod tests {
                 .len(),
             1
         );
+    }
+    #[test]
+    fn suppressed_crossing_is_delivered_once_when_cooldown_expires() {
+        let now = Utc::now();
+        let config = AlertConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut monitor = QuotaMonitor::default();
+        for (seconds, used, count, recovered) in [
+            (0, 90.0, 1, false),
+            (1, 10.0, 1, true),
+            (2, 90.0, 0, false),
+            (299, 95.0, 0, false),
+            (300, 95.0, 1, false),
+            (600, 95.0, 0, false),
+        ] {
+            let t = now + Duration::seconds(seconds);
+            let alerts = monitor.observe(&snapshot(used, t, "a"), &config, t);
+            assert_eq!(alerts.len(), count, "at {seconds}s");
+            if let Some(alert) = alerts.first() {
+                assert_eq!(alert.recovered, recovered);
+            }
+        }
+    }
+    #[test]
+    fn invalid_or_stale_snapshots_do_not_clear_a_pending_alert() {
+        let now = Utc::now();
+        let config = AlertConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut monitor = QuotaMonitor::default();
+        for (seconds, used) in [(0, 90.0), (1, 10.0), (2, 90.0)] {
+            let t = now + Duration::seconds(seconds);
+            monitor.observe(&snapshot(used, t, "a"), &config, t);
+        }
+        let later = now + Duration::seconds(300);
+        let healthy = snapshot(10.0, later, "a");
+        let mut failed = healthy.clone();
+        failed.success = false;
+        let mut transient = healthy.clone();
+        transient.transient = true;
+        let mut expired = healthy.clone();
+        expired.credential_status = CredentialStatus::Expired;
+        let mut invalid = healthy;
+        invalid.tiers[0].utilization = f64::NAN;
+        let stale = snapshot(10.0, now + Duration::seconds(1), "a");
+        for s in [failed, transient, expired, invalid, stale] {
+            assert!(monitor.observe(&s, &config, later).is_empty());
+        }
+        let alerts = monitor.observe(&snapshot(90.0, later, "a"), &config, later);
+        assert_eq!(alerts.len(), 1);
+        assert!(!alerts[0].recovered);
+    }
+    #[test]
+    fn recovery_cancels_pending_alert_even_when_recovery_notifications_are_disabled() {
+        let now = Utc::now();
+        let config = AlertConfig {
+            enabled: true,
+            recovery: false,
+            ..Default::default()
+        };
+        let mut monitor = QuotaMonitor::default();
+        for (seconds, used, count) in [
+            (0, 90.0, 1),
+            (1, 10.0, 0),
+            (2, 90.0, 0),
+            (3, 10.0, 0),
+            (300, 10.0, 0),
+            (301, 90.0, 1),
+            (601, 90.0, 0),
+        ] {
+            let t = now + Duration::seconds(seconds);
+            assert_eq!(
+                monitor.observe(&snapshot(used, t, "a"), &config, t).len(),
+                count,
+                "at {seconds}s"
+            );
+        }
     }
     #[test]
     fn failed_disabled_and_invalid_snapshots_do_not_change_alert_state() {

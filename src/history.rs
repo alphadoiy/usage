@@ -53,6 +53,15 @@ pub struct Record {
     pub project: String,
     pub model: String,
 }
+impl Record {
+    pub fn session_key(&self) -> crate::sessions::SessionKey {
+        crate::sessions::SessionKey {
+            instance: self.instance.clone(),
+            provider: self.source.clone(),
+            id: self.session.clone(),
+        }
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct History {
     pub days: BTreeMap<NaiveDate, BTreeMap<String, Tokens>>,
@@ -150,20 +159,14 @@ impl History {
         &self,
         sources: &[String],
         query: &HistoryQuery,
-    ) -> HashMap<(String, String, String), SessionUsage> {
-        let mut sessions = HashMap::<(String, String, String), SessionUsage>::new();
+    ) -> HashMap<crate::sessions::SessionKey, SessionUsage> {
+        let mut sessions = HashMap::<crate::sessions::SessionKey, SessionUsage>::new();
         for record in self
             .records
             .iter()
             .filter(|r| sources.contains(&r.source) && query.matches(r))
         {
-            let usage = sessions
-                .entry((
-                    record.instance.clone(),
-                    record.source.clone(),
-                    record.session.clone(),
-                ))
-                .or_default();
+            let usage = sessions.entry(record.session_key()).or_default();
             usage.tokens.add(record.tokens);
             if !record.model.is_empty() && !usage.models.contains(&record.model) {
                 usage.models.push(record.model.clone());
@@ -1380,7 +1383,11 @@ mod tests {
         );
         let sessions = h.session_usage(&config.providers, &query);
         assert_eq!(
-            sessions[&("claude".into(), "claude".into(), "s".into())]
+            sessions[&crate::sessions::SessionKey {
+                instance: "claude".into(),
+                provider: "claude".into(),
+                id: "s".into(),
+            }]
                 .tokens
                 .total(),
             110
@@ -1435,6 +1442,20 @@ mod tests {
             h.report(2026, &config.providers).by_instance["work"].total(),
             220
         );
+        let usage = h.session_usage(&config.providers, &HistoryQuery::default());
+        assert_eq!(usage.len(), 2);
+        for (instance, total) in [("codex", 110), ("work", 220)] {
+            assert_eq!(
+                usage[&crate::sessions::SessionKey {
+                    instance: instance.into(),
+                    provider: "codex".into(),
+                    id: "same-session".into(),
+                }]
+                    .tokens
+                    .total(),
+                total
+            );
+        }
         let query = HistoryQuery {
             instance: Some("work".into()),
             ..Default::default()
@@ -1448,20 +1469,39 @@ mod tests {
         assert_eq!(h.session_usage(&config.providers, &query).len(), 1);
         // Recreate the previous ledger representation without an instance field.
         let db = open_database(&dbpath).unwrap();
-        for (path, entry) in read_database(&db).unwrap() {
-            let mut value = serde_json::to_value(entry).unwrap();
-            for record in value["records"].as_array_mut().unwrap() {
-                record.as_object_mut().unwrap().remove("instance");
-            }
-            db.execute(
-                "UPDATE history_files SET data=?1 WHERE path=?2",
-                rusqlite::params![value.to_string(), path.to_string_lossy()],
-            )
+        // Use the stored SQL keys, not normalized filesystem paths, and verify
+        // that this fixture really replaces every row with the legacy format.
+        let rows = db
+            .prepare("SELECT path,data FROM history_files")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (path, data) in rows {
+            let mut value: Value = serde_json::from_str(&data).unwrap();
+            let records = value["records"].as_array_mut().unwrap();
+            assert!(!records.is_empty());
+            for record in records {
+                assert!(record.as_object_mut().unwrap().remove("instance").is_some());
+            }
+            let changed = db
+                .execute(
+                    "UPDATE history_files SET data=?1 WHERE path=?2",
+                    rusqlite::params![value.to_string(), path],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
         }
         drop(db);
+        // Deleted logs cannot conceal a decoding failure by being reparsed.
+        fs::remove_dir_all(f.0.join("codex")).unwrap();
+        fs::remove_dir_all(f.0.join("work")).unwrap();
         let h = HistoryCache::at(dbpath).load(&config);
         assert_eq!(h.read_bytes, 0);
+        assert_eq!(h.report(2026, &config.providers).totals.total(), 330);
+        assert!(!h.warnings.iter().any(|w| w.contains("读取历史账本失败")));
         assert_eq!(
             h.report_query(2026, &config.providers, &query)
                 .totals

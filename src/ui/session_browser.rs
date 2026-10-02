@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidg
 use unicode_width::UnicodeWidthChar;
 
 use crate::history::{SessionUsage, Tokens, compact};
-use crate::sessions::{AgentKind, Session};
+use crate::sessions::{AgentKind, Session, SessionKey};
 
 const BLUE: Color = Color::Rgb(110, 168, 254);
 const DIM: Color = Color::Rgb(142, 142, 147);
@@ -37,7 +37,7 @@ pub struct SessionBrowser {
     pub query: String,
     pub searching: bool,
     pub launching: bool,
-    usage: HashMap<(String, String, String), SessionUsage>,
+    usage: HashMap<SessionKey, SessionUsage>,
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
     pub resume_mode: crate::config::ResumeMode,
@@ -64,11 +64,7 @@ impl SessionBrowser {
         browser
     }
 
-    pub fn set_usage(
-        &mut self,
-        usage: HashMap<(String, String, String), SessionUsage>,
-        label: Option<String>,
-    ) {
+    pub fn set_usage(&mut self, usage: HashMap<SessionKey, SessionUsage>, label: Option<String>) {
         self.usage = usage;
         self.filter_label = label;
         self.rebuild();
@@ -78,11 +74,7 @@ impl SessionBrowser {
         self.rebuild();
     }
     fn usage_for(&self, session: &Session) -> Option<&SessionUsage> {
-        self.usage.get(&(
-            session.instance.clone(),
-            session.provider.id().to_string(),
-            session.id.clone(),
-        ))
+        self.usage.get(&session.key())
     }
     pub fn focus(&self) -> Focus {
         self.focus
@@ -169,13 +161,7 @@ impl SessionBrowser {
 
     pub fn refresh(&mut self, sessions: Vec<Session>) {
         let previous_project = self.selected_project().cloned();
-        let previous_session = self.selected_session().map(|session| {
-            (
-                session.provider,
-                session.instance.clone(),
-                session.id.clone(),
-            )
-        });
+        let previous_session = self.selected_session().map(Session::key);
         self.sessions = sessions;
         self.launching = false;
         self.rebuild_with_selection(previous_project, previous_session);
@@ -183,20 +169,14 @@ impl SessionBrowser {
 
     fn rebuild(&mut self) {
         let previous_project = self.selected_project().cloned();
-        let previous_session = self.selected_session().map(|session| {
-            (
-                session.provider,
-                session.instance.clone(),
-                session.id.clone(),
-            )
-        });
+        let previous_session = self.selected_session().map(Session::key);
         self.rebuild_with_selection(previous_project, previous_session);
     }
 
     fn rebuild_with_selection(
         &mut self,
         previous_project: Option<PathBuf>,
-        previous_session: Option<(AgentKind, String, String)>,
+        previous_session: Option<SessionKey>,
     ) {
         self.kinds = self
             .sessions
@@ -292,16 +272,12 @@ impl SessionBrowser {
             .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
             .unwrap_or(0);
         self.session_selected = previous_session
-            .and_then(|(provider, instance, id)| {
+            .and_then(|key| {
                 self.projects
                     .get(self.project_selected)?
                     .sessions
                     .iter()
-                    .position(|&index| {
-                        self.sessions[index].provider == provider
-                            && self.sessions[index].instance == instance
-                            && self.sessions[index].id == id
-                    })
+                    .position(|&index| self.sessions[index].key() == key)
             })
             .unwrap_or(0);
     }
@@ -782,8 +758,8 @@ mod tests {
             models: vec!["test-model".into()],
         };
         let mut map = HashMap::new();
-        map.insert(("codex".into(), "codex".into(), a.id.clone()), usage(100));
-        map.insert(("codex".into(), "codex".into(), b.id.clone()), usage(1000));
+        map.insert(a.key(), usage(100));
+        map.insert(b.key(), usage(1000));
         let mut browser = SessionBrowser::new(vec![a, b, c]);
         browser.set_usage(map, Some("selected date".into()));
         assert_eq!(browser.visible_count(), 2);
@@ -807,10 +783,10 @@ mod tests {
         let mut b = a.clone();
         b.instance = "work".into();
         b.title = "Work".into();
-        let mut browser = SessionBrowser::new(vec![a, b.clone()]);
+        let mut browser = SessionBrowser::new(vec![a.clone(), b.clone()]);
         browser.set_usage(
             HashMap::from([(
-                ("work".into(), "codex".into(), b.id.clone()),
+                b.key(),
                 SessionUsage {
                     tokens: Tokens {
                         input: 1000,
@@ -823,7 +799,31 @@ mod tests {
         );
         assert_eq!(browser.visible_count(), 1);
         assert_eq!(browser.selected_session().unwrap().instance, "work");
+        // With both copies visible, selection and totals still follow the
+        // instance identity through sorting and a reordered catalog refresh.
+        let usage = |input| SessionUsage {
+            tokens: Tokens {
+                input,
+                ..Default::default()
+            },
+            models: Vec::new(),
+        };
+        browser.set_usage(
+            HashMap::from([(a.key(), usage(100)), (b.key(), usage(1000))]),
+            None,
+        );
+        assert_eq!(browser.visible_count(), 2);
+        assert_eq!(browser.selected_session().unwrap().key(), b.key());
+        browser.toggle_sort();
         browser.refresh(browser.sessions.iter().rev().cloned().collect());
         assert_eq!(browser.selected_session().unwrap().title, "Work");
+        assert_eq!(
+            browser
+                .usage_for(browser.selected_session().unwrap())
+                .unwrap()
+                .tokens
+                .input,
+            1000
+        );
     }
 }

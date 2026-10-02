@@ -116,6 +116,14 @@ impl Hash for AgentKind {
     }
 }
 
+/// A session ID is unique only within its provider and configured instance.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey {
+    pub instance: String,
+    pub provider: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub provider: AgentKind,
@@ -125,6 +133,16 @@ pub struct Session {
     pub title: String,
     pub recency_at_ms: i64,
     pub home: PathBuf,
+}
+
+impl Session {
+    pub fn key(&self) -> SessionKey {
+        SessionKey {
+            instance: self.instance.clone(),
+            provider: self.provider.id().into(),
+            id: self.id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]

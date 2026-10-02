@@ -147,7 +147,12 @@ pub fn resolved_data_path(path: &Path) -> PathBuf {
         let mut redirected = None;
         for ancestor in path.ancestors() {
             if let Ok(base) = ancestor.canonicalize() {
-                return base.join(path.strip_prefix(ancestor).unwrap());
+                let suffix = path.strip_prefix(ancestor).unwrap();
+                return if suffix.as_os_str().is_empty() {
+                    base
+                } else {
+                    base.join(suffix)
+                };
             }
             if let Ok(target) = std::fs::read_link(ancestor) {
                 let target = if target.is_absolute() {
@@ -455,6 +460,24 @@ struct RawPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_existing_file_and_directory_keep_valid_paths() {
+        let root = std::env::temp_dir().join(format!("usage-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("log.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        for path in [&file, &root] {
+            let resolved = resolved_data_path(path);
+            assert_eq!(
+                resolved.as_os_str(),
+                path.canonicalize().unwrap().as_os_str()
+            );
+            assert!(resolved.exists());
+        }
+        assert!(resolved_data_path(&file).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn old_both_config_uses_single_bar_view() {
