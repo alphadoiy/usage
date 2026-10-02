@@ -1,5 +1,6 @@
 //! 终端用量查询。界面使用 ratatui 的 Canvas 与 Braille 点阵。
 
+pub mod alerts;
 pub mod cli;
 pub mod config;
 pub mod credentials;

@@ -119,6 +119,7 @@ impl Hash for AgentKind {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub provider: AgentKind,
+    pub instance: String,
     pub id: String,
     pub cwd: PathBuf,
     pub title: String,
@@ -127,7 +128,10 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct SessionHomes(HashMap<String, PathBuf>);
+pub struct SessionHomes {
+    primary: HashMap<String, PathBuf>,
+    extra: Vec<(String, String, PathBuf)>,
+}
 
 impl SessionHomes {
     pub fn new() -> Self {
@@ -135,12 +139,30 @@ impl SessionHomes {
     }
 
     pub fn with(mut self, provider_id: &str, home: impl Into<PathBuf>) -> Self {
-        self.0.insert(provider_id.to_string(), home.into());
+        self.primary.insert(provider_id.to_string(), home.into());
         self
     }
 
+    pub fn with_instance(mut self, id: &str, provider: &str, home: impl Into<PathBuf>) -> Self {
+        self.extra.retain(|(existing, _, _)| existing != id);
+        self.extra.push((id.into(), provider.into(), home.into()));
+        self
+    }
+    fn all(&self, provider: &str) -> Vec<(&str, &Path)> {
+        let mut homes = Vec::new();
+        if let Some((id, path)) = self.primary.get_key_value(provider) {
+            homes.push((id.as_str(), path.as_path()));
+        }
+        homes.extend(
+            self.extra
+                .iter()
+                .filter(|(_, p, _)| p == provider)
+                .map(|(id, _, path)| (id.as_str(), path.as_path())),
+        );
+        homes
+    }
     pub fn get(&self, provider_id: &str) -> Option<&Path> {
-        self.0.get(provider_id).map(PathBuf::as_path)
+        self.primary.get(provider_id).map(PathBuf::as_path)
     }
 }
 
@@ -194,30 +216,31 @@ impl SessionRegistry {
     pub fn load_all(&self, homes: &SessionHomes) -> SessionCatalog {
         let mut catalog = SessionCatalog::default();
         for source in &self.sources {
-            let Some(home) = homes.get(source.kind.id()).filter(|home| home.is_dir()) else {
-                continue;
-            };
-            match (source.load)(home) {
-                Ok(records) => {
-                    catalog
-                        .sessions
-                        .extend(
-                            records
-                                .into_iter()
-                                .filter(is_local_record)
-                                .map(|record| Session {
+            for (instance, home) in homes.all(source.kind.id()) {
+                if !home.is_dir() {
+                    continue;
+                }
+                let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+                match (source.load)(&home) {
+                    Ok(records) => {
+                        catalog
+                            .sessions
+                            .extend(records.into_iter().filter(is_local_record).map(|record| {
+                                Session {
                                     provider: source.kind,
+                                    instance: instance.into(),
                                     id: record.id,
                                     cwd: record.cwd,
                                     title: record.title,
                                     recency_at_ms: record.recency_at_ms,
                                     home: home.to_path_buf(),
-                                }),
-                        )
+                                }
+                            }))
+                    }
+                    Err(error) => catalog
+                        .warnings
+                        .push(format!("{} / {instance}：{error}", source.kind.name())),
                 }
-                Err(error) => catalog
-                    .warnings
-                    .push(format!("{}：{error}", source.kind.name())),
             }
         }
         catalog.sessions.sort_by(|a, b| {
@@ -740,21 +763,158 @@ fn modified_ms(path: &Path) -> i64 {
         .unwrap_or(0)
 }
 
-pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
-    if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_none()
-        && std::env::var("TERM_PROGRAM").as_deref() != Ok("ghostty")
-    {
-        return Err("请在 Ghostty 中打开 usage，再使用右侧分屏".into());
+pub fn uses_ghostty(mode: crate::config::ResumeMode) -> bool {
+    match mode {
+        crate::config::ResumeMode::Ghostty => true,
+        crate::config::ResumeMode::Current => false,
+        crate::config::ResumeMode::Auto => {
+            cfg!(target_os = "macos")
+                && (std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+                    || std::env::var("TERM_PROGRAM").as_deref() == Ok("ghostty"))
+        }
     }
+}
+fn validate_resume(session: &Session) -> Result<(), String> {
     if uuid::Uuid::parse_str(&session.id).is_err() {
         return Err("无效的会话 ID".into());
     }
-    if !session.cwd.is_dir() {
+    if !session.cwd.is_absolute() || !session.cwd.is_dir() {
         return Err(format!("项目目录不存在：{}", session.cwd.display()));
     }
     if !session.home.is_dir() {
         return Err(format!("会话目录不存在：{}", session.home.display()));
     }
+    let key = session.provider.home_env();
+    if key.is_empty()
+        || key
+            .bytes()
+            .enumerate()
+            .any(|(i, c)| !(c == b'_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())))
+    {
+        return Err("无效的实例环境变量".into());
+    }
+    Ok(())
+}
+/// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
+pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
+    validate_resume(session)?;
+    let mut parts = session.provider.command().split_whitespace();
+    let program = parts.next().ok_or("恢复命令为空")?;
+    Command::new(program)
+        .args(parts)
+        .arg(&session.id)
+        .current_dir(&session.cwd)
+        .env(session.provider.home_env(), &session.home)
+        .status()
+        .map_err(|e| format!("无法运行 {}：{e}", session.provider.name()))
+}
+pub fn resume_shell_command(session: &Session) -> Result<String, String> {
+    validate_resume(session)?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let command = session
+            .provider
+            .command()
+            .split_whitespace()
+            .chain(std::iter::once(session.id.as_str()))
+            .map(quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!(
+            "cd -- {} && env {} {}",
+            quote(&session.cwd.to_string_lossy()),
+            quote(&format!(
+                "{}={}",
+                session.provider.home_env(),
+                session.home.display()
+            )),
+            command
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let command = session
+            .provider
+            .command()
+            .split_whitespace()
+            .chain(std::iter::once(session.id.as_str()))
+            .map(quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!(
+            "Set-Location -LiteralPath {}; $env:{}={}; & {}",
+            quote(&session.cwd.to_string_lossy()),
+            session.provider.home_env(),
+            quote(&session.home.to_string_lossy()),
+            command
+        ))
+    }
+}
+pub fn copy_resume_command(session: &Session) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let text = resume_shell_command(session)?;
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[("clip.exe", &[])];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (program, args) in candidates {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        let write = child
+            .stdin
+            .take()
+            .ok_or_else(|| "剪贴板未提供输入".to_string())
+            .and_then(|mut input| input.write_all(text.as_bytes()).map_err(|e| e.to_string()));
+        if write.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => break,
+                Ok(None) if started.elapsed() < std::time::Duration::from_secs(3) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+    }
+    Err("没有可用的系统剪贴板，请使用预览命令在终端恢复".into())
+}
+
+pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("Ghostty 分屏仅支持 macOS，请按 R 选择当前终端".into());
+    }
+    if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_none()
+        && std::env::var("TERM_PROGRAM").as_deref() != Ok("ghostty")
+    {
+        return Err("请在 Ghostty 中打开 usage，再使用右侧分屏".into());
+    }
+    validate_resume(session)?;
     let output = Command::new("osascript")
         .arg("-e")
         .arg(GHOSTTY_SCRIPT)
@@ -809,7 +969,7 @@ mod tests {
         let catalog = registry.load_all(&SessionHomes::new().with("custom", &root));
         assert_eq!(catalog.sessions.len(), 1);
         assert_eq!(catalog.sessions[0].provider, custom);
-        assert_eq!(catalog.sessions[0].home, root);
+        assert_eq!(catalog.sessions[0].home, root.canonicalize().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1103,6 +1263,76 @@ mod tests {
         )
         .unwrap();
         assert!(load_codex(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn registry_keeps_same_session_in_two_instances_and_correct_homes() {
+        let root =
+            std::env::temp_dir().join(format!("usage-instance-sessions-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let id = "123e4567-e89b-12d3-a456-426614174001";
+        for name in ["primary", "work"] {
+            let logs = root.join(name).join("projects/p");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join(format!("{id}.jsonl")),format!("{}\n",serde_json::json!({"type":"user","cwd":project,"sessionId":id,"message":{"content":"Task"}}))).unwrap();
+        }
+        let homes = SessionHomes::new()
+            .with("claude", root.join("primary"))
+            .with_instance("work", "claude", root.join("work"));
+        let catalog = builtin_registry().load_all(&homes);
+        assert_eq!(catalog.sessions.len(), 2);
+        assert!(
+            catalog.sessions.iter().any(
+                |s| s.instance == "work" && s.home == root.join("work").canonicalize().unwrap()
+            )
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn current_terminal_and_copied_command_keep_quoted_paths_and_instance_env() {
+        let root = std::env::temp_dir().join(format!("usage-resume-{}", uuid::Uuid::new_v4()));
+        let cwd = root.join("project ' with $ punctuation");
+        let home = root.join("home ' instance");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let script = root.join("agent.sh");
+        fs::write(
+            &script,
+            r#"{ pwd -P; printf '%s\n' "$CUSTOM_HOME" "$1"; } > "$CUSTOM_HOME/result.txt"
+"#,
+        )
+        .unwrap();
+        let command: &'static str =
+            Box::leak(format!("/bin/sh {}", script.display()).into_boxed_str());
+        let session = Session {
+            provider: AgentKind::new("custom", "Custom", None, command, "CUSTOM_HOME", 0),
+            instance: "work".into(),
+            id: "123e4567-e89b-12d3-a456-426614174001".into(),
+            cwd: cwd.clone(),
+            home: home.clone(),
+            title: "task".into(),
+            recency_at_ms: 0,
+        };
+        assert!(resume_in_current(&session).unwrap().success());
+        let first = fs::read_to_string(home.join("result.txt")).unwrap();
+        assert!(first.contains(&cwd.canonicalize().unwrap().to_string_lossy().to_string()));
+        assert!(first.contains(&home.to_string_lossy().to_string()));
+        assert!(first.contains(&session.id));
+        let copied = resume_shell_command(&session).unwrap();
+        assert!(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(copied)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(fs::read_to_string(home.join("result.txt")).unwrap(), first);
+        let mut invalid = session;
+        invalid.id = "$(touch bad)".into();
+        assert!(resume_shell_command(&invalid).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -36,6 +36,7 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    Notice(String),
     HistoryCached(crate::history::History),
     HistoryLoaded {
         history: crate::history::History,
@@ -167,6 +168,24 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     app.refresh(&handle);
     let result = loop {
         let (received, reset_consumed) = app.drain_events();
+        if !app.alerts_queue.is_empty() {
+            let alerts = std::mem::take(&mut app.alerts_queue);
+            if app.history_config.alerts.bell {
+                use std::io::Write;
+                let _ = write!(io::stdout(), "\x07");
+                let _ = io::stdout().flush();
+            }
+            if app.history_config.alerts.desktop {
+                let tx = app.tx.clone();
+                handle.spawn_blocking(move || {
+                    for alert in alerts {
+                        if let Err(e) = crate::alerts::notify_desktop(&alert.message) {
+                            let _ = tx.send(AppEvent::Notice(e));
+                        }
+                    }
+                });
+            }
+        }
         if reset_consumed {
             app.quota_refresh_due = app.pending > 0;
             app.refresh(&handle);
@@ -245,6 +264,22 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     }
                     if app.browser.is_some() {
                         app.handle_browser_key(key.code, &handle);
+                        if let Some(session) = app.resume_request.take() {
+                            ratatui::restore();
+                            let result = resume_in_terminal(&handle, &session);
+                            terminal = match ratatui::try_init() {
+                                Ok(t) => t,
+                                Err(e) => break Err(io::Error::other(e)),
+                            };
+                            if let Some(browser) = &mut app.browser {
+                                browser.launching = false;
+                            }
+                            app.notice = Some(match result {
+                                Ok(status) if status.success() => "会话已退出，返回会话列表".into(),
+                                Ok(status) => format!("会话退出：{status}"),
+                                Err(e) => e,
+                            });
+                        }
                         redraw.invalidate();
                         continue;
                     }
@@ -283,6 +318,22 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     result
 }
 
+fn resume_in_terminal(
+    handle: &Handle,
+    session: &sessions::Session,
+) -> Result<std::process::ExitStatus, String> {
+    // The child keeps the default SIGINT behavior. Keep the TUI parent alive when
+    // Ctrl-C reaches the foreground process group while raw mode is suspended.
+    let _runtime = handle.enter();
+    #[cfg(unix)]
+    let _interrupts = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .map_err(|e| format!("无法准备终端中断处理：{e}"))?;
+    #[cfg(windows)]
+    let _interrupts =
+        tokio::signal::windows::ctrl_c().map_err(|e| format!("无法准备终端中断处理：{e}"))?;
+    sessions::resume_in_current(session)
+}
+
 struct Dashboard {
     history: Option<HistoryPanel>,
     saved_history: Option<HistoryPanel>,
@@ -295,6 +346,9 @@ struct Dashboard {
     history_cache: Option<crate::history::HistoryCache>,
     history_loading: bool,
     quota_refresh_due: bool,
+    monitor: crate::alerts::QuotaMonitor,
+    alerts_queue: Vec<crate::alerts::Alert>,
+    resume_request: Option<sessions::Session>,
     providers: Vec<Arc<dyn UsageProvider>>,
     cards: Vec<CardSlot>,
     style_name: String,
@@ -332,7 +386,7 @@ impl Dashboard {
         config_path: std::path::PathBuf,
     ) -> Self {
         let home = home_dir();
-        let session_homes = sessions::SessionHomes::new()
+        let mut session_homes = sessions::SessionHomes::new()
             .with(
                 "claude",
                 config
@@ -354,6 +408,13 @@ impl Dashboard {
                     .clone()
                     .unwrap_or_else(|| home.join(".grok")),
             );
+        for instance in &config.instances {
+            session_homes = session_homes.with_instance(
+                &instance.id,
+                &instance.provider,
+                instance.path.clone(),
+            );
+        }
         Self::new_with_sessions(
             providers,
             config,
@@ -394,6 +455,9 @@ impl Dashboard {
             history_cache: Some(crate::history::HistoryCache::default()),
             history_loading: false,
             quota_refresh_due: false,
+            monitor: crate::alerts::QuotaMonitor::default(),
+            alerts_queue: Vec::new(),
+            resume_request: None,
             providers,
             cards,
             status: format!("百分比是已用额度 · {}", styles.label(&config.style)),
@@ -519,11 +583,11 @@ impl Dashboard {
         if self.providers.is_empty() && self.saved_history.is_some() {
             self.history_return = true;
         }
-        self.browser = Some(
-            self.saved_browser
-                .take()
-                .unwrap_or_else(|| SessionBrowser::new(Vec::new())),
-        );
+        self.browser = Some(self.saved_browser.take().unwrap_or_else(|| {
+            let mut browser = SessionBrowser::new(Vec::new());
+            browser.resume_mode = self.history_config.resume;
+            browser
+        }));
         self.apply_browser_usage();
         self.start_browser_load(handle);
         if self.loaded_history.synced_at.is_none() {
@@ -592,6 +656,27 @@ impl Dashboard {
                 self.start_browser_load(handle);
                 self.start_history_load(handle);
             }
+            KeyCode::Char('R') => {
+                if let Some(browser) = &mut self.browser {
+                    browser.resume_mode = browser.resume_mode.next();
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(session) = self
+                    .browser
+                    .as_ref()
+                    .and_then(|b| b.selected_session())
+                    .cloned()
+                {
+                    let tx = self.tx.clone();
+                    handle.spawn_blocking(move || {
+                        let result = sessions::copy_resume_command(&session)
+                            .map(|_| "已复制恢复命令（含项目及实例目录）".into())
+                            .unwrap_or_else(|e| e);
+                        let _ = tx.send(AppEvent::Notice(result));
+                    });
+                }
+            }
             KeyCode::Char('o') => {
                 if let Some(browser) = &mut self.browser {
                     browser.toggle_sort();
@@ -652,6 +737,10 @@ impl Dashboard {
                     return;
                 };
                 browser.launching = true;
+                if !sessions::uses_ghostty(browser.resume_mode) {
+                    self.resume_request = Some(session);
+                    return;
+                }
                 self.notice = Some("正在 Ghostty 右侧打开会话…".into());
                 let tx = self.tx.clone();
                 let generation = self.browser_generation;
@@ -821,6 +910,11 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::Notice(message) => {
+                    self.notice = Some(message);
+                    changed = true;
+                    continue;
+                }
                 AppEvent::HistoryCached(history) => {
                     self.loaded_history = history.clone();
                     if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
@@ -948,6 +1042,19 @@ impl Dashboard {
             }
             changed = true;
             self.pending = self.pending.saturating_sub(1);
+            let alerts =
+                self.monitor
+                    .observe(&event.snapshot, &self.history_config.alerts, Utc::now());
+            if !alerts.is_empty() {
+                self.notice = Some(
+                    alerts
+                        .iter()
+                        .map(|a| a.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+                self.alerts_queue.extend(alerts);
+            }
             if let Some(card) = self.cards.iter_mut().find(|card| card.id == event.tool) {
                 if event.snapshot.transient {
                     if card
@@ -1064,9 +1171,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
     }
     let footer_text = if app.history.is_some() {
         if frame.area().width >= 105 {
-            " ↑新 ↓旧  ←/→ 周  Enter 会话  v 范围  f 项目  M 模型  m 日/月  Tab 来源  c 清筛选  r 更新  Esc 返回"
+            " ↑新 ↓旧  ←/→ 周  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  Tab 来源  c 清筛选  r 更新  Esc 返回"
         } else {
-            " ↑新 ↓旧  Enter 会话  v 范围  f 项目  M 模型  m 日/月  r 更新  Esc 返回"
+            " ↑新 ↓旧  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  r 更新  Esc 返回"
         }
     } else if let Some(browser) = &app.browser {
         if app.browser_loading {
@@ -1074,7 +1181,7 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         } else if browser.launching {
             " 正在 Ghostty 右侧打开会话… 请等待"
         } else {
-            " ↑/↓ 选择  Tab 列表  Enter 打开  / 搜索  o 排序  c 清除  r 更新  Esc 返回"
+            " ↑/↓ 选择  Tab 列表  Enter 打开  / 搜索  o 排序  R 恢复方式  y 复制  c 清除  r 更新  Esc 返回"
         }
     } else {
         match app.reset.as_ref().map(|flow| &flow.stage) {
@@ -1382,6 +1489,7 @@ mod tests {
         app.browser = Some(SessionBrowser::new(vec![
             Session {
                 provider: AgentKind::CLAUDE,
+                instance: "claude".into(),
                 id: "123e4567-e89b-12d3-a456-426614174000".into(),
                 cwd: "/tmp/project".into(),
                 title: "Claude task".into(),
@@ -1390,6 +1498,7 @@ mod tests {
             },
             Session {
                 provider: AgentKind::CODEX,
+                instance: "codex".into(),
                 id: "123e4567-e89b-12d3-a456-426614174001".into(),
                 cwd: "/tmp/other".into(),
                 title: "Codex task".into(),
@@ -1733,6 +1842,7 @@ mod tests {
         panel.selected = selected;
         let record = crate::history::Record {
             source: "codex".into(),
+            instance: "codex".into(),
             id: "event".into(),
             session: "session".into(),
             project: "/tmp/p".into(),
@@ -1755,6 +1865,7 @@ mod tests {
         app.history_return = true;
         app.browser = Some(SessionBrowser::new(vec![Session {
             provider: AgentKind::CODEX,
+            instance: "codex".into(),
             id: "session".into(),
             cwd: "/tmp/p".into(),
             title: "task".into(),
@@ -1790,5 +1901,81 @@ mod tests {
         app.last_history_refresh = std::time::Instant::now() - Duration::from_secs(2);
         assert!(!app.maybe_auto_refresh(&Handle::current()));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn current_resume_is_requested_only_after_session_enter() {
+        let mut app = dashboard();
+        app.browser = Some(SessionBrowser::new(vec![sessions::Session {
+            provider: AgentKind::CODEX,
+            instance: "work".into(),
+            id: "123e4567-e89b-12d3-a456-426614174001".into(),
+            cwd: "/tmp/project".into(),
+            home: "/tmp/work".into(),
+            title: "Work".into(),
+            recency_at_ms: 0,
+        }]));
+        app.browser.as_mut().unwrap().resume_mode = crate::config::ResumeMode::Current;
+        app.handle_browser_key(KeyCode::Enter, &Handle::current());
+        assert!(app.resume_request.is_none());
+        app.handle_browser_key(KeyCode::Enter, &Handle::current());
+        assert_eq!(app.resume_request.as_ref().unwrap().instance, "work");
+        assert!(app.browser.as_ref().unwrap().launching);
+    }
+    #[test]
+    fn quota_events_queue_one_alert_and_failures_do_not_emit_recovery() {
+        let mut app = dashboard();
+        app.history_config.alerts.enabled = true;
+        let now = Utc::now();
+        let snapshot = snapshot_ok(
+            "codex",
+            "Codex",
+            vec![crate::model::QuotaTier {
+                name: "primary".into(),
+                utilization: 90.0,
+                resets_at: None,
+            }],
+            None,
+            now,
+        );
+        app.tx
+            .send(AppEvent::Quota(Box::new(RefreshEvent {
+                generation: app.generation,
+                tool: "codex".into(),
+                snapshot,
+            })))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.alerts_queue.len(), 1);
+        assert!(app.notice.as_deref().unwrap().contains("剩余额度"));
+        app.alerts_queue.clear();
+        app.tx
+            .send(AppEvent::Quota(Box::new(RefreshEvent {
+                generation: app.generation,
+                tool: "codex".into(),
+                snapshot: crate::model::snapshot_transient("codex", "Codex", "network"),
+            })))
+            .unwrap();
+        app.drain_events();
+        assert!(app.alerts_queue.is_empty());
+        let snapshot = snapshot_ok(
+            "codex",
+            "Codex",
+            vec![crate::model::QuotaTier {
+                name: "primary".into(),
+                utilization: 10.0,
+                resets_at: None,
+            }],
+            None,
+            now + ChronoDuration::seconds(1),
+        );
+        app.tx
+            .send(AppEvent::Quota(Box::new(RefreshEvent {
+                generation: app.generation,
+                tool: "codex".into(),
+                snapshot,
+            })))
+            .unwrap();
+        app.drain_events();
+        assert!(app.alerts_queue[0].recovered);
     }
 }

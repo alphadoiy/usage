@@ -25,6 +25,9 @@ pub struct AppConfig {
     pub claude_dir: Option<PathBuf>,
     pub codex_dir: Option<PathBuf>,
     pub grok_dir: Option<PathBuf>,
+    pub instances: Vec<DataInstance>,
+    pub alerts: AlertConfig,
+    pub resume: ResumeMode,
 }
 
 impl Default for AppConfig {
@@ -36,8 +39,132 @@ impl Default for AppConfig {
             claude_dir: None,
             codex_dir: None,
             grok_dir: None,
+            instances: Vec::new(),
+            alerts: AlertConfig::default(),
+            resume: ResumeMode::Auto,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataInstance {
+    pub id: String,
+    pub provider: String,
+    pub path: PathBuf,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertConfig {
+    pub enabled: bool,
+    /// Alert when remaining quota falls to this percentage or below.
+    pub remaining_percent: u8,
+    pub cooldown_seconds: u64,
+    pub recovery: bool,
+    pub bell: bool,
+    pub desktop: bool,
+}
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remaining_percent: 15,
+            cooldown_seconds: 300,
+            recovery: true,
+            bell: false,
+            desktop: false,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResumeMode {
+    #[default]
+    Auto,
+    Ghostty,
+    Current,
+}
+impl ResumeMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::Ghostty => "Ghostty 分屏",
+            Self::Current => "当前终端",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Ghostty,
+            Self::Ghostty => Self::Current,
+            Self::Current => Self::Auto,
+        }
+    }
+}
+impl AppConfig {
+    /// Built-in IDs identify the primary homes; explicit instances are additional read-only homes.
+    pub fn data_instances(&self) -> Vec<DataInstance> {
+        let home = home_dir();
+        let mut instances = vec![
+            DataInstance {
+                id: "codex".into(),
+                provider: "codex".into(),
+                path: self
+                    .codex_dir
+                    .clone()
+                    .unwrap_or_else(|| home.join(".codex")),
+            },
+            DataInstance {
+                id: "claude".into(),
+                provider: "claude".into(),
+                path: self
+                    .claude_dir
+                    .clone()
+                    .unwrap_or_else(|| home.join(".claude")),
+            },
+            DataInstance {
+                id: "grok".into(),
+                provider: "grok".into(),
+                path: self.grok_dir.clone().unwrap_or_else(|| home.join(".grok")),
+            },
+        ];
+        instances.extend(self.instances.clone());
+        for instance in &mut instances {
+            instance.path = resolved_data_path(&instance.path);
+        }
+        instances
+    }
+}
+
+/// Resolve existing ancestors as well as deleted log paths; ledger entries can
+/// outlive their files and retain the same identity through symlink aliases.
+pub fn resolved_data_path(path: &Path) -> PathBuf {
+    let mut path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    for _ in 0..16 {
+        let mut redirected = None;
+        for ancestor in path.ancestors() {
+            if let Ok(base) = ancestor.canonicalize() {
+                return base.join(path.strip_prefix(ancestor).unwrap());
+            }
+            if let Ok(target) = std::fs::read_link(ancestor) {
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    ancestor.parent().unwrap_or(Path::new("/")).join(target)
+                };
+                redirected = Some(target.join(path.strip_prefix(ancestor).unwrap()));
+                break;
+            }
+        }
+        match redirected {
+            Some(next) => path = next,
+            None => break,
+        }
+    }
+    path
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -65,6 +192,25 @@ refresh_seconds = 60
 
 # 查询顺序。已内置 claude、codex、grok
 providers = ["claude", "codex", "grok"]
+
+[alerts]
+# 达到剩余额度阈值时提醒；默认关闭
+enabled = false
+remaining_percent = 15
+cooldown_seconds = 300
+recovery = true
+bell = false
+desktop = false
+
+[sessions]
+# auto：Ghostty 中分屏，其它终端在当前终端恢复；也可设 ghostty / current
+resume = "auto"
+
+# 额外实例示例（数据只读）
+# [[instances]]
+# id = "work-codex"
+# provider = "codex"
+# path = "~/.codex-work"
 
 [paths]
 # 留空则使用 ~/.claude、~/.codex、~/.grok
@@ -195,6 +341,56 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
         config.codex_dir = optional_path(paths.codex);
         config.grok_dir = optional_path(paths.grok);
     }
+    if let Some(alerts) = raw.alerts {
+        if !(1..=100).contains(&alerts.remaining_percent) {
+            return Err(ConfigError(
+                "alerts.remaining_percent 必须在 1–100 之间".into(),
+            ));
+        }
+        config.alerts = alerts;
+    }
+    if let Some(sessions) = raw.sessions {
+        config.resume = sessions.resume;
+    }
+    config.instances = raw.instances.unwrap_or_default();
+    let mut ids = vec![
+        "codex".to_string(),
+        "claude".to_string(),
+        "grok".to_string(),
+    ];
+    for instance in &mut config.instances {
+        instance.id = instance.id.trim().into();
+        instance.provider = instance.provider.trim().into();
+        if instance.id.is_empty()
+            || instance.id.chars().any(char::is_control)
+            || ids.contains(&instance.id)
+        {
+            return Err(ConfigError(
+                "实例 ID 必须唯一、非空且不含控制字符（codex/claude/grok 为保留 ID）".into(),
+            ));
+        }
+        if !["codex", "claude", "grok"].contains(&instance.provider.as_str()) {
+            return Err(ConfigError(format!("未知实例来源：{}", instance.provider)));
+        }
+        if instance.path.as_os_str().is_empty() {
+            return Err(ConfigError("实例目录不能为空".into()));
+        }
+        instance.path = expand_user(instance.path.clone());
+        ids.push(instance.id.clone());
+    }
+    let instances = config.data_instances();
+    for (i, instance) in instances.iter().enumerate() {
+        if instances[..i].iter().any(|other| {
+            other.provider == instance.provider
+                && (other.path.starts_with(&instance.path)
+                    || instance.path.starts_with(&other.path))
+        }) {
+            return Err(ConfigError(format!(
+                "{} 的实例目录重复或嵌套，会导致重复统计",
+                instance.provider
+            )));
+        }
+    }
     Ok(config)
 }
 
@@ -231,6 +427,22 @@ struct RawConfig {
     refresh_seconds: Option<u64>,
     providers: Option<Vec<String>>,
     paths: Option<RawPaths>,
+    instances: Option<Vec<DataInstance>>,
+    alerts: Option<AlertConfig>,
+    sessions: Option<RawSessions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawSessions {
+    resume: ResumeMode,
+}
+impl Default for RawSessions {
+    fn default() -> Self {
+        Self {
+            resume: ResumeMode::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,5 +461,33 @@ mod tests {
         let raw: RawConfig = toml::from_str("style = 'both'").unwrap();
         assert_eq!(parse_raw(raw).unwrap().style, "bar");
         assert!(with_overrides(AppConfig::default(), Some("both"), None, None).is_err());
+    }
+    #[test]
+    fn stage_two_config_is_optional_and_validates_instances_and_thresholds() {
+        let config = parse_raw(toml::from_str(&default_toml("bar")).unwrap()).unwrap();
+        assert!(!config.alerts.enabled);
+        assert!(config.instances.is_empty());
+        assert_eq!(config.resume, ResumeMode::Auto);
+        let text = r#"[[instances]]
+id = "work-codex"
+provider = "codex"
+path = "/tmp/usage-work-codex"
+[alerts]
+enabled = true
+remaining_percent = 20
+[sessions]
+resume = "current"
+"#;
+        let config = parse_raw(toml::from_str(text).unwrap()).unwrap();
+        assert_eq!(config.instances[0].id, "work-codex");
+        assert_eq!(config.resume, ResumeMode::Current);
+        assert_eq!(config.alerts.remaining_percent, 20);
+        assert!(parse_raw(toml::from_str("[alerts]\nremaining_percent = 0").unwrap()).is_err());
+        assert!(parse_raw(toml::from_str(&text.replace("work-codex", "codex")).unwrap()).is_err());
+        assert!(
+            parse_raw(toml::from_str(&text.replace("/tmp/usage-work-codex", "~/.codex")).unwrap())
+                .is_err()
+        );
+        assert!(toml::from_str::<RawConfig>("[sessions]\nresume = 'unknown'").is_err());
     }
 }

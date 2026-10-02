@@ -70,6 +70,9 @@ enum Command {
         /// 模型名称包含的文字
         #[arg(long)]
         model: Option<String>,
+        /// 只统计指定实例 ID
+        #[arg(long)]
+        instance: Option<String>,
         /// 导出当前筛选范围的 CSV
         #[arg(long, conflicts_with_all = ["json", "once"])]
         csv: bool,
@@ -125,6 +128,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
             to,
             project,
             model,
+            instance,
             csv,
             monthly,
             once,
@@ -133,7 +137,16 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
             let path = cli.config.clone().unwrap_or_else(default_config_path);
             let config = load_config(&path, cli.config.is_some())?;
             let config = with_overrides(config, None, cli.providers.as_deref(), cli.refresh)?;
-            let query = history_query(range.as_deref(), from, to, project, model, year)?;
+            let mut query = history_query(range.as_deref(), from, to, project, model, year)?;
+            if let Some(id) = &instance
+                && !config
+                    .data_instances()
+                    .iter()
+                    .any(|i| i.id == *id && config.providers.contains(&i.provider))
+            {
+                return Err(CliError(format!("当前来源中没有实例：{id}")));
+            }
+            query.instance = instance;
             let year = year.unwrap_or_else(|| Local::now().year());
             if once || json || csv || cli.once || cli.json {
                 let sources = config.providers.clone();
@@ -273,6 +286,7 @@ fn history_query(
         to,
         project,
         model,
+        instance: None,
     })
 }
 

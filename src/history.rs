@@ -9,7 +9,9 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{AppConfig, home_dir};
+use crate::config::AppConfig;
+#[cfg(not(test))]
+use crate::config::home_dir;
 
 pub const SOURCES: [&str; 3] = ["codex", "claude", "grok"];
 
@@ -42,6 +44,8 @@ impl Tokens {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub source: String,
+    #[serde(default)]
+    pub instance: String,
     pub id: String,
     pub time: DateTime<Utc>,
     pub tokens: Tokens,
@@ -53,6 +57,7 @@ pub struct Record {
 pub struct History {
     pub days: BTreeMap<NaiveDate, BTreeMap<String, Tokens>>,
     pub warnings: Vec<String>,
+    pub instances: Vec<String>,
     pub records: Vec<Record>,
     pub scanned_files: usize,
     pub read_bytes: u64,
@@ -66,6 +71,7 @@ pub struct HistoryReport {
     pub totals: Tokens,
     pub daily: BTreeMap<String, Tokens>,
     pub monthly: BTreeMap<String, Tokens>,
+    pub by_instance: BTreeMap<String, Tokens>,
     pub warnings: Vec<String>,
     pub synced_at: Option<DateTime<Utc>>,
     pub scanned_files: usize,
@@ -79,6 +85,7 @@ pub struct HistoryQuery {
     pub to: Option<NaiveDate>,
     pub project: Option<String>,
     pub model: Option<String>,
+    pub instance: Option<String>,
 }
 impl HistoryQuery {
     pub fn contains_date(&self, date: NaiveDate) -> bool {
@@ -86,6 +93,10 @@ impl HistoryQuery {
     }
     pub fn matches(&self, record: &Record) -> bool {
         self.contains_date(record.time.with_timezone(&Local).date_naive())
+            && self
+                .instance
+                .as_ref()
+                .is_none_or(|id| *id == record.instance)
             && self
                 .project
                 .as_ref()
@@ -105,12 +116,17 @@ impl History {
     pub fn filtered(&self, query: &HistoryQuery) -> Self {
         let mut result = Self {
             warnings: self.warnings.clone(),
+            instances: self.instances.clone(),
             scanned_files: self.scanned_files,
             read_bytes: self.read_bytes,
             synced_at: self.synced_at,
             ..Self::default()
         };
-        if self.records.is_empty() && query.project.is_none() && query.model.is_none() {
+        if self.records.is_empty()
+            && query.project.is_none()
+            && query.model.is_none()
+            && query.instance.is_none()
+        {
             result.days = self
                 .days
                 .iter()
@@ -134,15 +150,19 @@ impl History {
         &self,
         sources: &[String],
         query: &HistoryQuery,
-    ) -> HashMap<(String, String), SessionUsage> {
-        let mut sessions = HashMap::<(String, String), SessionUsage>::new();
+    ) -> HashMap<(String, String, String), SessionUsage> {
+        let mut sessions = HashMap::<(String, String, String), SessionUsage>::new();
         for record in self
             .records
             .iter()
             .filter(|r| sources.contains(&r.source) && query.matches(r))
         {
             let usage = sessions
-                .entry((record.source.clone(), record.session.clone()))
+                .entry((
+                    record.instance.clone(),
+                    record.source.clone(),
+                    record.session.clone(),
+                ))
                 .or_default();
             usage.tokens.add(record.tokens);
             if !record.model.is_empty() && !usage.models.contains(&record.model) {
@@ -174,6 +194,18 @@ impl History {
             let to = query
                 .to
                 .unwrap_or_else(|| NaiveDate::from_ymd_opt(year, 12, 31).unwrap());
+            report.by_instance.clear();
+            for record in filtered
+                .records
+                .iter()
+                .filter(|r| sources.contains(&r.source))
+            {
+                report
+                    .by_instance
+                    .entry(record.instance.clone())
+                    .or_default()
+                    .add(record.tokens);
+            }
             report.daily.clear();
             report.monthly.clear();
             report.totals = Tokens::default();
@@ -214,6 +246,7 @@ impl History {
             totals: Tokens::default(),
             daily: BTreeMap::new(),
             monthly: BTreeMap::new(),
+            by_instance: BTreeMap::new(),
             warnings: self.warnings.clone(),
             synced_at: self.synced_at,
             scanned_files: self.scanned_files,
@@ -221,6 +254,17 @@ impl History {
             from: None,
             to: None,
         };
+        for record in self
+            .records
+            .iter()
+            .filter(|r| r.time.with_timezone(&Local).year() == year && sources.contains(&r.source))
+        {
+            report
+                .by_instance
+                .entry(record.instance.clone())
+                .or_default()
+                .add(record.tokens);
+        }
         let Some(mut date) = NaiveDate::from_ymd_opt(year, 1, 1) else {
             return report;
         };
@@ -308,59 +352,32 @@ impl HistoryCache {
         config: &AppConfig,
         cached: impl FnOnce(History),
     ) -> History {
-        let home = home_dir();
         let mut history = History::default();
         let mut paths = Vec::new();
-        for source in &config.providers {
-            let (root, name) = match source.as_str() {
-                "codex" => (
-                    config
-                        .codex_dir
-                        .clone()
-                        .unwrap_or_else(|| home.join(".codex")),
-                    None,
-                ),
-                "claude" => (
-                    config
-                        .claude_dir
-                        .clone()
-                        .unwrap_or_else(|| home.join(".claude")),
-                    None,
-                ),
-                "grok" => (
-                    config
-                        .grok_dir
-                        .clone()
-                        .unwrap_or_else(|| home.join(".grok")),
-                    Some("updates.jsonl"),
-                ),
-                _ => {
-                    history
-                        .warnings
-                        .push(format!("{source}: 没有历史日志读取器"));
-                    continue;
-                }
-            };
-            let roots = if source == "codex" {
-                vec![root.join("sessions"), root.join("archived_sessions")]
-            } else {
-                vec![root.join(if source == "claude" {
-                    "projects"
-                } else {
-                    "sessions"
-                })]
-            };
-            let before = paths.len();
-            for root in roots {
-                collect_files(&root, source, name, &mut paths, &mut history.warnings);
+        let roots = history_roots(config);
+        for (source, id, root) in &roots {
+            collect_files(
+                root,
+                source,
+                (source == "grok").then_some("updates.jsonl"),
+                &mut paths,
+                &mut history.warnings,
+            );
+            if !root.exists() && config.instances.iter().any(|i| i.id == *id) {
+                history.warnings.push(format!("实例 {id}: 数据目录不存在"));
             }
-            if before == paths.len() {
+        }
+        for source in &config.providers {
+            if !SOURCES.contains(&source.as_str()) {
+                history
+                    .warnings
+                    .push(format!("{source}: 没有历史日志读取器"));
+            } else if !paths.iter().any(|(_, s)| s == source) {
                 history
                     .warnings
                     .push(format!("{source}: 未找到本地历史日志"));
             }
         }
-        let roots = history_roots(config);
         let mut database = self.database.as_ref().map(|path| open_database(path));
         if let Some(Ok(db)) = &database {
             match read_database(db) {
@@ -469,22 +486,31 @@ impl HistoryCache {
 // Missing logs remain in the ledger. Configured roots isolate data directories.
 fn aggregate(
     files: &HashMap<PathBuf, CachedFile>,
-    roots: &[(String, PathBuf)],
+    roots: &[(String, String, PathBuf)],
     mut history: History,
 ) -> History {
-    let mut unique: HashMap<(String, String), Record> = HashMap::new();
+    history.instances = roots.iter().map(|(_, id, _)| id.clone()).collect();
+    history.instances.sort();
+    history.instances.dedup();
+    let mut unique: HashMap<(String, String, String), Record> = HashMap::new();
     let mut malformed = 0;
     for (path, entry) in files {
-        if !roots
+        let Some((_, instance, _)) = roots
             .iter()
-            .any(|(source, root)| *source == entry.source && path.starts_with(root))
-        {
+            .find(|(source, _, root)| *source == entry.source && path.starts_with(root))
+        else {
             continue;
-        }
+        };
         malformed += entry.malformed;
         for record in &entry.records {
+            let mut record = record.clone();
+            record.instance.clone_from(instance);
             unique
-                .entry((record.source.clone(), record.id.clone()))
+                .entry((
+                    record.instance.clone(),
+                    record.source.clone(),
+                    record.id.clone(),
+                ))
                 .and_modify(|r| {
                     r.tokens.merge(record.tokens);
                     r.time = r.time.min(record.time);
@@ -521,36 +547,25 @@ fn aggregate(
     }
     history
 }
-fn history_roots(config: &AppConfig) -> Vec<(String, PathBuf)> {
-    let home = home_dir();
+fn history_roots(config: &AppConfig) -> Vec<(String, String, PathBuf)> {
     let mut roots = Vec::new();
-    for source in &config.providers {
-        match source.as_str() {
-            "codex" => {
-                let root = config
-                    .codex_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".codex"));
-                roots.push((source.clone(), root.join("sessions")));
-                roots.push((source.clone(), root.join("archived_sessions")));
-            }
-            "claude" => roots.push((
-                source.clone(),
-                config
-                    .claude_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".claude"))
-                    .join("projects"),
-            )),
-            "grok" => roots.push((
-                source.clone(),
-                config
-                    .grok_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".grok"))
-                    .join("sessions"),
-            )),
-            _ => {}
+    for instance in config
+        .data_instances()
+        .into_iter()
+        .filter(|i| config.providers.contains(&i.provider))
+    {
+        let suffixes: &[&str] = match instance.provider.as_str() {
+            "codex" => &["sessions", "archived_sessions"],
+            "claude" => &["projects"],
+            "grok" => &["sessions"],
+            _ => &[],
+        };
+        for suffix in suffixes {
+            roots.push((
+                instance.provider.clone(),
+                instance.id.clone(),
+                instance.path.join(suffix),
+            ));
         }
     }
     roots
@@ -583,8 +598,17 @@ fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFil
     let mut files = HashMap::new();
     for row in rows {
         let (path, data) = row.map_err(|e| e.to_string())?;
-        let entry = serde_json::from_str(&data).map_err(|e| format!("无效的历史缓存：{e}"))?;
-        files.insert(path.into(), entry);
+        let entry: CachedFile =
+            serde_json::from_str(&data).map_err(|e| format!("无效的历史缓存：{e}"))?;
+        let path = crate::config::resolved_data_path(Path::new(&path));
+        files
+            .entry(path)
+            .and_modify(|existing: &mut CachedFile| {
+                if entry.modified >= existing.modified {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert(entry);
     }
     Ok(files)
 }
@@ -928,6 +952,7 @@ fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Re
                         for (name, counters) in by_model {
                             records.push(Record {
                                 source: source.into(),
+                                instance: source.into(),
                                 id: format!("{id}:{name}"),
                                 time,
                                 tokens: grok_tokens(counters),
@@ -941,6 +966,7 @@ fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Re
                 }
                 records.push(Record {
                     source: source.into(),
+                    instance: source.into(),
                     id,
                     time,
                     tokens,
@@ -1353,7 +1379,12 @@ mod tests {
             110
         );
         let sessions = h.session_usage(&config.providers, &query);
-        assert_eq!(sessions[&("claude".into(), "s".into())].tokens.total(), 110);
+        assert_eq!(
+            sessions[&("claude".into(), "claude".into(), "s".into())]
+                .tokens
+                .total(),
+            110
+        );
     }
     #[test]
     fn grok_model_usage_is_split_once_and_prompt_ids_are_scoped_by_session() {
@@ -1377,6 +1408,111 @@ mod tests {
             .totals
             .total(),
             220
+        );
+    }
+    #[test]
+    fn same_session_id_is_isolated_by_instance_and_legacy_cache_is_readable() {
+        let f = Fixture::new();
+        let mut config = f.config(&["codex"]);
+        let a = codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z");
+        f.write("codex/sessions/a.jsonl", &[meta("same-session"), a]);
+        f.write(
+            "work/sessions/a.jsonl",
+            &[
+                meta("same-session"),
+                codex(200, 80, 20, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        config.instances.push(crate::config::DataInstance {
+            id: "work".into(),
+            provider: "codex".into(),
+            path: f.0.join("work"),
+        });
+        let dbpath = f.0.join("ledger.sqlite3");
+        let h = HistoryCache::at(dbpath.clone()).load(&config);
+        assert_eq!(h.report(2026, &config.providers).totals.total(), 330);
+        assert_eq!(
+            h.report(2026, &config.providers).by_instance["work"].total(),
+            220
+        );
+        let query = HistoryQuery {
+            instance: Some("work".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            h.report_query(2026, &config.providers, &query)
+                .totals
+                .total(),
+            220
+        );
+        assert_eq!(h.session_usage(&config.providers, &query).len(), 1);
+        // Recreate the previous ledger representation without an instance field.
+        let db = open_database(&dbpath).unwrap();
+        for (path, entry) in read_database(&db).unwrap() {
+            let mut value = serde_json::to_value(entry).unwrap();
+            for record in value["records"].as_array_mut().unwrap() {
+                record.as_object_mut().unwrap().remove("instance");
+            }
+            db.execute(
+                "UPDATE history_files SET data=?1 WHERE path=?2",
+                rusqlite::params![value.to_string(), path.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let h = HistoryCache::at(dbpath).load(&config);
+        assert_eq!(h.read_bytes, 0);
+        assert_eq!(
+            h.report_query(2026, &config.providers, &query)
+                .totals
+                .total(),
+            220
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn deleted_legacy_log_under_symlink_keeps_its_history() {
+        let f = Fixture::new();
+        let config = f.config(&["codex"]);
+        let path = f.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let alias = f.0.join("alias");
+        std::os::unix::fs::symlink(f.0.join("codex"), &alias).unwrap();
+        let dbpath = f.0.join("ledger.sqlite3");
+        HistoryCache::at(dbpath.clone()).load(&config);
+        let db = open_database(&dbpath).unwrap();
+        db.execute(
+            "UPDATE history_files SET path=?1",
+            [alias.join("sessions/a.jsonl").to_string_lossy()],
+        )
+        .unwrap();
+        drop(db);
+        fs::remove_file(path).unwrap();
+        let config = AppConfig {
+            codex_dir: Some(alias),
+            ..config
+        };
+        assert_eq!(
+            HistoryCache::at(dbpath.clone())
+                .load(&config)
+                .report(2026, &config.providers)
+                .totals
+                .total(),
+            110
+        );
+        fs::remove_dir_all(f.0.join("codex")).unwrap();
+        assert_eq!(
+            HistoryCache::at(dbpath)
+                .load(&config)
+                .report(2026, &config.providers)
+                .totals
+                .total(),
+            110
         );
     }
 }

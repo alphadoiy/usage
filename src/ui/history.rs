@@ -32,8 +32,14 @@ impl TimeRange {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum Dimension {
+    Project,
+    Model,
+    Instance,
+}
 struct DimensionPicker {
-    project: bool,
+    dimension: Dimension,
     options: Vec<String>,
     search: String,
     selected: usize,
@@ -134,34 +140,35 @@ impl HistoryPanel {
         self.history
             .report_query(year, sources, &self.effective_query())
     }
-    fn open_picker(&mut self, project: bool) {
+    fn open_picker(&mut self, dimension: Dimension) {
         let mut options: Vec<String> = self
             .history
             .records
             .iter()
             .filter(|r| self.sources().contains(&r.source))
-            .map(|r| {
-                if project {
-                    r.project.clone()
-                } else {
-                    r.model.clone()
-                }
+            .map(|r| match dimension {
+                Dimension::Project => r.project.clone(),
+                Dimension::Model => r.model.clone(),
+                Dimension::Instance => r.instance.clone(),
             })
             .filter(|s| !s.is_empty())
             .collect();
+        if matches!(dimension, Dimension::Instance) {
+            options.extend(self.history.instances.clone());
+        }
         options.sort();
         options.dedup();
-        let current = if project {
-            &self.query.project
-        } else {
-            &self.query.model
+        let current = match dimension {
+            Dimension::Project => &self.query.project,
+            Dimension::Model => &self.query.model,
+            Dimension::Instance => &self.query.instance,
         };
         let selected = current
             .as_ref()
             .and_then(|v| options.iter().position(|s| s == v))
             .map_or(0, |i| i + 1);
         self.picker = Some(DimensionPicker {
-            project,
+            dimension,
             options,
             search: String::new(),
             selected,
@@ -180,10 +187,10 @@ impl HistoryPanel {
                         .get(picker.selected)
                         .and_then(|v| *v)
                         .map(str::to_string);
-                    if picker.project {
-                        self.query.project = value;
-                    } else {
-                        self.query.model = value;
+                    match picker.dimension {
+                        Dimension::Project => self.query.project = value,
+                        Dimension::Model => self.query.model = value,
+                        Dimension::Instance => self.query.instance = value,
                     }
                     self.picker = None;
                 }
@@ -219,16 +226,21 @@ impl HistoryPanel {
                 return;
             }
             KeyCode::Char('f') => {
-                self.open_picker(true);
+                self.open_picker(Dimension::Project);
                 return;
             }
             KeyCode::Char('M') => {
-                self.open_picker(false);
+                self.open_picker(Dimension::Model);
+                return;
+            }
+            KeyCode::Char('i') => {
+                self.open_picker(Dimension::Instance);
                 return;
             }
             KeyCode::Char('c') => {
                 self.query.project = None;
                 self.query.model = None;
+                self.query.instance = None;
                 self.filter = None;
                 return;
             }
@@ -409,7 +421,11 @@ pub fn render(area: Rect, buf: &mut Buffer, panel: &HistoryPanel) {
             0
         };
     let [summary, calendar, _gap, bottom, warning] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(if panel.history.instances.len() > panel.allowed.len() {
+            4
+        } else {
+            3
+        }),
         Constraint::Length(calendar_height),
         Constraint::Length(u16::from(calendar_height > 0 && content.height >= 28)),
         Constraint::Fill(1),
@@ -474,10 +490,10 @@ fn render_picker(area: Rect, buf: &mut Buffer, picker: &DimensionPicker) {
     );
     Clear.render(popup, buf);
     let block = Block::bordered()
-        .title(if picker.project {
-            " 项目筛选 "
-        } else {
-            " 模型筛选 "
+        .title(match picker.dimension {
+            Dimension::Project => " 项目筛选 ",
+            Dimension::Model => " 模型筛选 ",
+            Dimension::Instance => " 实例筛选 ",
         })
         .border_style(ACCENT);
     let inner = block.inner(popup);
@@ -577,12 +593,21 @@ fn render_summary(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &H
         ),
         clean_label(model)
     );
-    Paragraph::new(vec![
+    let mut lines = vec![
         Line::from(tabs),
         Line::from(stats).fg(MUTED),
         Line::from(filters).fg(MUTED),
-    ])
-    .render(area, buf);
+    ];
+    if panel.history.instances.len() > panel.allowed.len() {
+        lines.push(
+            Line::from(format!(
+                "i 实例 {}",
+                clean_label(panel.query.instance.as_deref().unwrap_or("全部"))
+            ))
+            .fg(MUTED),
+        );
+    }
+    Paragraph::new(lines).render(area, buf);
 }
 
 struct CalendarWindow {
@@ -1130,6 +1155,7 @@ mod tests {
         let date = p.selected;
         p.history.records = vec![crate::history::Record {
             source: "codex".into(),
+            instance: "codex".into(),
             id: "event".into(),
             session: "s".into(),
             project: "/tmp/alpha".into(),
@@ -1179,5 +1205,19 @@ mod tests {
         let query = p.session_query();
         assert!(query.from.unwrap() >= first);
         assert!(query.to.unwrap() <= Local::now().date_naive());
+    }
+    #[test]
+    fn instance_picker_includes_configured_empty_homes_and_clears_filter() {
+        let mut p = panel(false);
+        p.history.instances = vec!["codex".into(), "work".into()];
+        p.key(KeyCode::Char('i'));
+        for ch in "work".chars() {
+            p.key(KeyCode::Char(ch));
+        }
+        p.key(KeyCode::Down);
+        p.key(KeyCode::Enter);
+        assert_eq!(p.query.instance.as_deref(), Some("work"));
+        p.key(KeyCode::Char('c'));
+        assert!(p.query.instance.is_none());
     }
 }

@@ -37,9 +37,10 @@ pub struct SessionBrowser {
     pub query: String,
     pub searching: bool,
     pub launching: bool,
-    usage: HashMap<(String, String), SessionUsage>,
+    usage: HashMap<(String, String, String), SessionUsage>,
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
+    pub resume_mode: crate::config::ResumeMode,
 }
 
 impl SessionBrowser {
@@ -57,6 +58,7 @@ impl SessionBrowser {
             usage: HashMap::new(),
             filter_label: None,
             sort_tokens: false,
+            resume_mode: crate::config::ResumeMode::Auto,
         };
         browser.rebuild();
         browser
@@ -64,7 +66,7 @@ impl SessionBrowser {
 
     pub fn set_usage(
         &mut self,
-        usage: HashMap<(String, String), SessionUsage>,
+        usage: HashMap<(String, String, String), SessionUsage>,
         label: Option<String>,
     ) {
         self.usage = usage;
@@ -76,8 +78,11 @@ impl SessionBrowser {
         self.rebuild();
     }
     fn usage_for(&self, session: &Session) -> Option<&SessionUsage> {
-        self.usage
-            .get(&(session.provider.id().to_string(), session.id.clone()))
+        self.usage.get(&(
+            session.instance.clone(),
+            session.provider.id().to_string(),
+            session.id.clone(),
+        ))
     }
     pub fn focus(&self) -> Focus {
         self.focus
@@ -164,9 +169,13 @@ impl SessionBrowser {
 
     pub fn refresh(&mut self, sessions: Vec<Session>) {
         let previous_project = self.selected_project().cloned();
-        let previous_session = self
-            .selected_session()
-            .map(|session| (session.provider, session.id.clone()));
+        let previous_session = self.selected_session().map(|session| {
+            (
+                session.provider,
+                session.instance.clone(),
+                session.id.clone(),
+            )
+        });
         self.sessions = sessions;
         self.launching = false;
         self.rebuild_with_selection(previous_project, previous_session);
@@ -174,16 +183,20 @@ impl SessionBrowser {
 
     fn rebuild(&mut self) {
         let previous_project = self.selected_project().cloned();
-        let previous_session = self
-            .selected_session()
-            .map(|session| (session.provider, session.id.clone()));
+        let previous_session = self.selected_session().map(|session| {
+            (
+                session.provider,
+                session.instance.clone(),
+                session.id.clone(),
+            )
+        });
         self.rebuild_with_selection(previous_project, previous_session);
     }
 
     fn rebuild_with_selection(
         &mut self,
         previous_project: Option<PathBuf>,
-        previous_session: Option<(AgentKind, String)>,
+        previous_session: Option<(AgentKind, String, String)>,
     ) {
         self.kinds = self
             .sessions
@@ -279,13 +292,15 @@ impl SessionBrowser {
             .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
             .unwrap_or(0);
         self.session_selected = previous_session
-            .and_then(|(provider, id)| {
+            .and_then(|(provider, instance, id)| {
                 self.projects
                     .get(self.project_selected)?
                     .sessions
                     .iter()
                     .position(|&index| {
-                        self.sessions[index].provider == provider && self.sessions[index].id == id
+                        self.sessions[index].provider == provider
+                            && self.sessions[index].instance == instance
+                            && self.sessions[index].id == id
                     })
             })
             .unwrap_or(0);
@@ -353,8 +368,13 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     };
     let block = Block::bordered()
         .title(format!(
-            " 恢复预览 · {} · Ghostty 右侧分屏 ",
-            session.provider.name()
+            " 恢复预览 · {} · {} ",
+            session.provider.name(),
+            if crate::sessions::uses_ghostty(browser.resume_mode) {
+                "Ghostty 右侧分屏"
+            } else {
+                "当前终端"
+            }
         ))
         .border_style(DIM);
     let inner = block.inner(area);
@@ -364,10 +384,11 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     let lines = vec![
         Line::from(preview_text(
             &usage.map_or_else(
-                || "尚无用量记录".into(),
+                || format!("实例 {} · 尚无用量记录", session.instance),
                 |u| {
                     format!(
-                        "{} Tokens · {}",
+                        "实例 {} · {} Tokens · {}",
+                        session.instance,
                         compact(u.tokens.total()),
                         if u.models.is_empty() {
                             "模型未记录".into()
@@ -524,7 +545,15 @@ fn render_sessions(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
                     ),
                     Style::new().fg(BLUE),
                 ),
-                Span::raw(clean(&session.title)),
+                Span::raw(format!(
+                    "{}{}",
+                    if session.instance != session.provider.id() {
+                        format!("[{}] ", clean(&session.instance))
+                    } else {
+                        String::new()
+                    },
+                    clean(&session.title)
+                )),
             ])));
             session_index += 1;
         }
@@ -561,6 +590,7 @@ mod tests {
     fn session(provider: AgentKind, title: &str, cwd: &str, recency: i64) -> Session {
         Session {
             provider,
+            instance: provider.id().into(),
             id: format!("123e4567-e89b-12d3-a456-{recency:012}"),
             cwd: cwd.into(),
             title: title.into(),
@@ -641,11 +671,12 @@ mod tests {
 
     #[test]
     fn renders_two_levels_at_narrow_and_wide_widths() {
-        let browser = SessionBrowser::new(vec![
+        let mut browser = SessionBrowser::new(vec![
             session(AgentKind::GROK, "Analyze logs", "/tmp/beta", 20),
             session(AgentKind::CODEX, "Review UI", "/tmp/beta", 30),
             session(AgentKind::CLAUDE, "Fix parser", "/tmp/beta", 10),
         ]);
+        browser.resume_mode = crate::config::ResumeMode::Ghostty;
         for width in [44, 100] {
             let area = Rect::new(0, 0, width, 22);
             let mut buffer = Buffer::empty(area);
@@ -678,6 +709,7 @@ mod tests {
         ]);
         browser.focus_sessions();
         browser.move_by(1);
+        browser.resume_mode = crate::config::ResumeMode::Ghostty;
         let area = Rect::new(0, 0, 44, 20);
         let mut buffer = Buffer::empty(area);
         render(area, &mut buffer, &browser);
@@ -750,8 +782,8 @@ mod tests {
             models: vec!["test-model".into()],
         };
         let mut map = HashMap::new();
-        map.insert(("codex".into(), a.id.clone()), usage(100));
-        map.insert(("codex".into(), b.id.clone()), usage(1000));
+        map.insert(("codex".into(), "codex".into(), a.id.clone()), usage(100));
+        map.insert(("codex".into(), "codex".into(), b.id.clone()), usage(1000));
         let mut browser = SessionBrowser::new(vec![a, b, c]);
         browser.set_usage(map, Some("selected date".into()));
         assert_eq!(browser.visible_count(), 2);
@@ -768,5 +800,30 @@ mod tests {
         let selected = browser.selected_session().unwrap().id.clone();
         browser.refresh(browser.sessions.iter().rev().cloned().collect());
         assert_eq!(browser.selected_session().unwrap().id, selected);
+    }
+    #[test]
+    fn selected_same_id_session_and_usage_are_instance_specific() {
+        let a = session(AgentKind::CODEX, "Personal", "/tmp/project", 30);
+        let mut b = a.clone();
+        b.instance = "work".into();
+        b.title = "Work".into();
+        let mut browser = SessionBrowser::new(vec![a, b.clone()]);
+        browser.set_usage(
+            HashMap::from([(
+                ("work".into(), "codex".into(), b.id.clone()),
+                SessionUsage {
+                    tokens: Tokens {
+                        input: 1000,
+                        ..Default::default()
+                    },
+                    models: Vec::new(),
+                },
+            )]),
+            Some("work".into()),
+        );
+        assert_eq!(browser.visible_count(), 1);
+        assert_eq!(browser.selected_session().unwrap().instance, "work");
+        browser.refresh(browser.sessions.iter().rev().cloned().collect());
+        assert_eq!(browser.selected_session().unwrap().title, "Work");
     }
 }
