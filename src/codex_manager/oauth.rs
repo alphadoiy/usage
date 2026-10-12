@@ -4,6 +4,7 @@ use super::{
     AuthMode, Error, HomeBinding, Manager, Profile, Result, clear_auth_env, now, private_dir,
     private_write, validate_name,
 };
+use crate::logging;
 use base64::{
     Engine,
     engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
@@ -154,15 +155,20 @@ fn parse_auth(bytes: &[u8]) -> Result<Auth> {
 }
 
 pub fn read_auth(path: &Path) -> Result<Auth> {
-    let file = File::open(path).map_err(|_| {
-        Error::message("无法读取 OAuth 登录文件；请选择 auth.json / Cockpit 单账号文件，或重新登录")
-    })?;
-    let mut bytes = Vec::new();
-    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(Error::message("登录文件过大"));
-    }
-    parse_auth(&bytes)
+    logging::operation("codex.oauth_auth_read", |op| {
+        op.begin("auth_file_read");
+        let file = File::open(path).map_err(|_| {
+            Error::message(
+                "无法读取 OAuth 登录文件；请选择 auth.json / Cockpit 单账号文件，或重新登录",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err(Error::message("登录文件过大"));
+        }
+        op.step("auth_validate", || parse_auth(&bytes))
+    })
 }
 
 pub fn normalize_config(text: &str) -> Result<String> {
@@ -273,23 +279,29 @@ impl Drop for Stage {
 }
 
 fn acquire_lease(root: &Path, id: &str, exclusive: bool) -> Result<File> {
-    uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的账号 ID"))?;
-    let dir = root.join("locks");
-    private_dir(&dir)?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(dir.join(format!("{id}.lock")))?;
-    let result = if exclusive {
-        FileExt::try_lock_exclusive(&file)
-    } else {
-        FileExt::try_lock_shared(&file)
-    };
-    result.map_err(|error| {
+    logging::operation("codex.oauth_lease", |op| {
+        uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的账号 ID"))?;
+        op.account(id, 0, "oauth");
+        tracing::debug!(event = "lease_requested", exclusive);
+        op.begin("lease_file_prepare");
+        let dir = root.join("locks");
+        private_dir(&dir)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(dir.join(format!("{id}.lock")))?;
+        op.begin("lease_acquire");
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(&file)
+        } else {
+            FileExt::try_lock_shared(&file)
+        };
+        result.map_err(|error| {
+        tracing::warn!(event = "lease_failed", exclusive, busy = error.kind() == std::io::ErrorKind::WouldBlock, error_kind = ?error.kind());
         if error.kind() != std::io::ErrorKind::WouldBlock {
             return Error::from(error);
         }
@@ -299,7 +311,9 @@ fn acquire_lease(root: &Path, id: &str, exclusive: bool) -> Result<File> {
             "此 OAuth 账号正在更新登录；完成后可继续打开 Codex"
         })
     })?;
-    Ok(file)
+        tracing::debug!(event = "lease_acquired", exclusive);
+        Ok(file)
+    })
 }
 
 impl Manager {
@@ -320,18 +334,23 @@ impl Manager {
         source: &Path,
         account: Option<&str>,
     ) -> Result<Profile> {
-        let source = source
-            .canonicalize()
-            .map_err(|_| Error::message("无法读取 OAuth 登录文件"))?;
-        if source.starts_with(self.root.join("homes"))
-            || source.starts_with(self.root.join("login-staging"))
-        {
-            return Err(Error::message(
-                "托管账号不能作为外部导入来源；请使用重新登录功能",
-            ));
-        }
-        let auth = read_auth(&source)?;
-        self.save_oauth(name, text, auth, account, None)
+        logging::operation("codex.oauth_import", |op| {
+            op.begin("source_validate");
+            let source = source
+                .canonicalize()
+                .map_err(|_| Error::message("无法读取 OAuth 登录文件"))?;
+            if source.starts_with(self.root.join("homes"))
+                || source.starts_with(self.root.join("login-staging"))
+            {
+                return Err(Error::message(
+                    "托管账号不能作为外部导入来源；请使用重新登录功能",
+                ));
+            }
+            let auth = op.step("auth_read", || read_auth(&source))?;
+            op.step("account_save", || {
+                self.save_oauth(name, text, auth, account, None)
+            })
+        })
     }
 
     fn save_oauth(
@@ -342,89 +361,103 @@ impl Manager {
         account: Option<&str>,
         reserved_lease: Option<File>,
     ) -> Result<Profile> {
-        if let Some(name) = name {
-            validate_name(name)?;
-        }
-        let text = text.map(normalize_config).transpose()?;
-        // SQLite serializes identity deduplication, before choosing the account lease.
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT profile_id FROM oauth_accounts WHERE identity_key=?1",
-                [auth.identity.key()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let requested = if let Some(selector) = account {
-            // Resolve using this transaction's connection; never accept another account's login.
-            let matches: Vec<_> = super::list_profiles(&tx, true)?
-                .into_iter()
-                .filter(|p| p.id == selector || p.name == selector)
-                .collect();
-            if matches.len() != 1 {
-                return Err(Error::message(
-                    "重新登录目标不存在或名称重复；请使用账号 ID",
-                ));
+        logging::operation("codex.oauth_save", |op| {
+            op.begin("config_validate");
+            if let Some(name) = name {
+                validate_name(name)?;
             }
-            let p = &matches[0];
-            if p.auth_mode != AuthMode::Oauth
-                || p.oauth.as_ref().map(Identity::key) != Some(auth.identity.key())
-            {
-                return Err(Error::message(
-                    "登录身份与所选 OAuth 账号不一致；原登录已保留，请作为新账号添加",
-                ));
-            }
-            Some(p.id.clone())
-        } else {
-            None
-        };
-        let id = requested
-            .or(existing)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let _lease = match reserved_lease {
-            Some(file) => file,
-            None => acquire_lease(&self.root, &id, true)?,
-        };
-        let old: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT name,revision FROM profiles WHERE id=?1",
-                [&id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let chosen_name = name.unwrap_or_else(|| {
-            old.as_ref()
-                .map(|v| v.0.as_str())
-                .unwrap_or(&auth.identity.email)
-        });
-        validate_name(chosen_name)?;
-        if let Some((_, revision)) = &old {
-            let next = revision + i64::from(text.is_some());
-            if let Some(text) = &text {
+            let text = text.map(normalize_config).transpose()?;
+            // SQLite serializes identity deduplication, before choosing the account lease.
+            op.begin("database_transaction");
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT profile_id FROM oauth_accounts WHERE identity_key=?1",
+                    [auth.identity.key()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let requested = if let Some(selector) = account {
+                // Resolve using this transaction's connection; never accept another account's login.
+                let matches: Vec<_> = super::list_profiles(&tx, true)?
+                    .into_iter()
+                    .filter(|p| p.id == selector || p.name == selector)
+                    .collect();
+                if matches.len() != 1 {
+                    return Err(Error::message(
+                        "重新登录目标不存在或名称重复；请使用账号 ID",
+                    ));
+                }
+                let p = &matches[0];
+                if p.auth_mode != AuthMode::Oauth
+                    || p.oauth.as_ref().map(Identity::key) != Some(auth.identity.key())
+                {
+                    tracing::error!(
+                        event = "oauth_identity_mismatch",
+                        reason = "replacement_identity_changed"
+                    );
+                    return Err(Error::message(
+                        "登录身份与所选 OAuth 账号不一致；原登录已保留，请作为新账号添加",
+                    ));
+                }
+                Some(p.id.clone())
+            } else {
+                None
+            };
+            let id = requested
+                .or(existing)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            op.account(&id, 0, "oauth");
+            let _lease = match reserved_lease {
+                Some(file) => file,
+                None => acquire_lease(&self.root, &id, true)?,
+            };
+            let old: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT name,revision FROM profiles WHERE id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let chosen_name = name.unwrap_or_else(|| {
+                old.as_ref()
+                    .map(|v| v.0.as_str())
+                    .unwrap_or(&auth.identity.email)
+            });
+            validate_name(chosen_name)?;
+            if let Some((_, revision)) = &old {
+                let next = revision + i64::from(text.is_some());
+                if let Some(text) = &text {
+                    tx.execute(
+                        "INSERT INTO revisions VALUES (?1,?2,?3,'oauth',?4)",
+                        params![id, next, text, now()],
+                    )?;
+                }
+                tx.execute("UPDATE profiles SET name=?1,revision=?2,archived=0,source_status='已保存 OAuth 登录' WHERE id=?3", params![chosen_name,next,id])?;
+            } else {
+                tx.execute("INSERT INTO profiles(id,name,revision,source_status) VALUES (?1,?2,1,'已保存 OAuth 登录')", params![id,chosen_name])?;
                 tx.execute(
-                    "INSERT INTO revisions VALUES (?1,?2,?3,'oauth',?4)",
-                    params![id, next, text, now()],
+                    "INSERT INTO revisions VALUES (?1,1,?2,'oauth',?3)",
+                    params![id, text.unwrap_or(normalize_config("")?), now()],
                 )?;
             }
-            tx.execute("UPDATE profiles SET name=?1,revision=?2,archived=0,source_status='已保存 OAuth 登录' WHERE id=?3", params![chosen_name,next,id])?;
-        } else {
-            tx.execute("INSERT INTO profiles(id,name,revision,source_status) VALUES (?1,?2,1,'已保存 OAuth 登录')", params![id,chosen_name])?;
-            tx.execute(
-                "INSERT INTO revisions VALUES (?1,1,?2,'oauth',?3)",
-                params![id, text.unwrap_or(normalize_config("")?), now()],
-            )?;
-        }
-        tx.execute("INSERT INTO oauth_accounts VALUES (?1,?2,?3) ON CONFLICT(profile_id) DO UPDATE SET identity_key=excluded.identity_key,identity_json=excluded.identity_json",
+            tx.execute("INSERT INTO oauth_accounts VALUES (?1,?2,?3) ON CONFLICT(profile_id) DO UPDATE SET identity_key=excluded.identity_key,identity_json=excluded.identity_json",
             params![id,auth.identity.key(),serde_json::to_string(&auth.identity).map_err(|_| Error::message("无法保存账号信息"))?])?;
-        let home = self.root.join("homes").join(&id).join("r1");
-        private_dir(&home)?;
-        private_write(&home.join("auth.json"), &auth.bytes)?;
-        tx.commit()?;
-        let p = self.resolve(&id)?;
-        self.materialize_oauth(&id, p.revision)?;
-        Ok(p)
+            let home = self.root.join("homes").join(&id).join("r1");
+            private_dir(&home)?;
+            op.step("auth_write", || {
+                private_write(&home.join("auth.json"), &auth.bytes)
+            })?;
+            op.step("database_commit", || tx.commit())?;
+            let p = self.resolve(&id)?;
+            op.account(&id, p.revision, "oauth");
+            op.step("home_materialize", || {
+                self.materialize_oauth(&id, p.revision)
+            })?;
+            Ok(p)
+        })
     }
 
     pub fn login_oauth(
@@ -435,74 +468,98 @@ impl Manager {
         program: &Path,
         account: Option<&str>,
     ) -> Result<Profile> {
-        if let Some(name) = name {
-            validate_name(name)?;
-        }
-        let config = normalize_config(text.unwrap_or(""))?;
-        verify_cli_version(program)?;
-        // Check busy state before asking the user to sign in; reserve this account throughout login.
-        let target = account.map(|s| self.resolve(s)).transpose()?;
-        if target
-            .as_ref()
-            .is_some_and(|p| p.auth_mode != AuthMode::Oauth)
-        {
-            return Err(Error::message(
-                "BYOK 账号不能通过 OAuth 重新登录；请添加新账号",
-            ));
-        }
-        let lease = target
-            .as_ref()
-            .map(|p| self.oauth_lease(&p.id))
-            .transpose()?;
-        let stages = self.root.join("login-staging");
-        private_dir(&stages)?;
-        let stage = Stage(stages.join(uuid::Uuid::new_v4().to_string()));
-        private_dir(&stage.0)?;
-        private_write(&stage.0.join("config.toml"), config.as_bytes())?;
-        let mut cmd = Command::new(program);
-        clear_auth_env(&mut cmd);
-        cmd.env("CODEX_HOME", &stage.0).args(["login"]);
-        if device_auth {
-            cmd.arg("--device-auth");
-        }
-        let status = cmd.status().map_err(|_| {
-            Error::message("无法启动 Codex 登录；请安装 codex 或使用 --binary 指定路径")
-        })?;
-        if !status.success() {
-            return Err(Error::message("Codex 登录未完成；已有账号及登录保持原样"));
-        }
-        let auth = read_auth(&stage.0.join("auth.json"))?;
-        self.save_oauth(name, text, auth, account, lease)
+        logging::operation("codex.oauth_login", |op| {
+            op.begin("input_validate");
+            if let Some(name) = name {
+                validate_name(name)?;
+            }
+            let config = normalize_config(text.unwrap_or(""))?;
+            op.step("cli_version_detect", || verify_cli_version(program))?;
+            // Check busy state before asking the user to sign in; reserve this account throughout login.
+            let target = account.map(|s| self.resolve(s)).transpose()?;
+            if target
+                .as_ref()
+                .is_some_and(|p| p.auth_mode != AuthMode::Oauth)
+            {
+                return Err(Error::message(
+                    "BYOK 账号不能通过 OAuth 重新登录；请添加新账号",
+                ));
+            }
+            if let Some(p) = &target {
+                op.account(&p.id, p.revision, "oauth");
+            }
+            op.begin("lease_acquire");
+            let lease = target
+                .as_ref()
+                .map(|p| self.oauth_lease(&p.id))
+                .transpose()?;
+            op.begin("login_staging_prepare");
+            let stages = self.root.join("login-staging");
+            private_dir(&stages)?;
+            let stage = Stage(stages.join(uuid::Uuid::new_v4().to_string()));
+            private_dir(&stage.0)?;
+            private_write(&stage.0.join("config.toml"), config.as_bytes())?;
+            let mut cmd = Command::new(program);
+            clear_auth_env(&mut cmd);
+            cmd.env("CODEX_HOME", &stage.0).args(["login"]);
+            if device_auth {
+                cmd.arg("--device-auth");
+            }
+            op.begin("native_login");
+            let status = cmd.status().map_err(|_| {
+                Error::message("无法启动 Codex 登录；请安装 codex 或使用 --binary 指定路径")
+            })?;
+            tracing::info!(
+                event = "login_child_exited",
+                successful = status.success(),
+                exit_code = status.code()
+            );
+            if !status.success() {
+                return Err(Error::message("Codex 登录未完成；已有账号及登录保持原样"));
+            }
+            let auth = op.step("auth_read", || read_auth(&stage.0.join("auth.json")))?;
+            op.step("account_save", || {
+                self.save_oauth(name, text, auth, account, lease)
+            })
+        })
     }
 
     pub(crate) fn materialize_oauth(&self, id: &str, revision: i64) -> Result<PathBuf> {
-        let saved = self.revision(id, revision)?;
-        let home = self.home(id, revision)?;
-        private_dir(&home)?;
-        let profile = home.join(format!("usage-r{revision}.config.toml"));
-        if profile.exists() {
-            if fs::read_to_string(&profile)? != saved.config {
-                return Err(Error::message(
-                    "OAuth 配置版本被手动修改；请通过编辑保存新版本",
-                ));
+        logging::operation("codex.oauth_home_materialize", |op| {
+            op.account(id, revision, "oauth");
+            let saved = op.step("revision_read", || self.revision(id, revision))?;
+            let home = self.home(id, revision)?;
+            op.step("home_prepare", || private_dir(&home))?;
+            let profile = home.join(format!("usage-r{revision}.config.toml"));
+            op.begin("runtime_config_validate");
+            if profile.exists() {
+                if fs::read_to_string(&profile)? != saved.config {
+                    tracing::error!(event = "config_mismatch", reason = "oauth_profile_changed");
+                    return Err(Error::message(
+                        "OAuth 配置版本被手动修改；请通过编辑保存新版本",
+                    ));
+                }
+            } else {
+                op.step("profile_write", || {
+                    private_write(&profile, saved.config.as_bytes())
+                })?;
             }
-        } else {
-            private_write(&profile, saved.config.as_bytes())?;
-        }
-        // Codex may legitimately add project trust entries here; never overwrite its mutable base.
-        super::private_create(&home.join("config.toml"), normalize_config("")?.as_bytes())?;
-        private_write(
-            &home.join("usage-binding.json"),
-            &serde_json::to_vec(&HomeBinding {
-                profile_id: id.into(),
-                revision: 1,
-            })
-            .map_err(|_| Error::message("无法保存账号绑定"))?,
-        )?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO homes VALUES (?1,1,?2)",
-            params![id, home.to_string_lossy()],
-        )?;
-        Ok(home)
+            op.begin("binding_write");
+            // Codex may legitimately add project trust entries here; never overwrite its mutable base.
+            super::private_create(&home.join("config.toml"), normalize_config("")?.as_bytes())?;
+            private_write(
+                &home.join("usage-binding.json"),
+                &serde_json::to_vec(&HomeBinding {
+                    profile_id: id.into(),
+                    revision: 1,
+                })
+                .map_err(|_| Error::message("无法保存账号绑定"))?,
+            )?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO homes VALUES (?1,1,?2)",
+                params![id, home.to_string_lossy()],
+            )?;
+            Ok(home)
+        })
     }
 }

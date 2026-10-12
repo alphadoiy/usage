@@ -1340,3 +1340,74 @@ fn concurrent_native_processes_only_inherit_their_own_account_run_lease() {
     child_b.0.wait().unwrap();
     assert!(m.oauth_lease(&b.id).is_ok());
 }
+
+#[test]
+fn byok_cli_onboarding_and_migration_state_survive_relaunch() {
+    let f = Fixture::new();
+    let mut m = f.manager();
+    let p = m
+        .add(
+            "Native state",
+            &native("https://example.com/v1", "fixture-model"),
+            "fixture-key",
+        )
+        .unwrap();
+    let saved = m.revision(&p.id, 1).unwrap().config;
+    let home = m.materialize(&p.id, 1).unwrap();
+    let runtime = format!(
+        "{saved}\n[projects.\"/fixture/project\"]\ntrust_level='trusted'\n[notice.model_migrations]\nfixture-model='fixture-model-v2'\n[tui]\nscreen_reader_detection_done=true\n[tui.model_availability_nux]\nfixture-model-v2=1\n"
+    );
+    fs::write(home.join("config.toml"), &runtime).unwrap();
+    assert_eq!(m.materialize(&p.id, 1).unwrap(), home);
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        runtime
+    );
+    assert_eq!(m.revision(&p.id, 1).unwrap().config, saved);
+    // Runtime metadata never authorizes a changed endpoint or model.
+    let changed = config::patch(&runtime, Some("https://other.example/v1"), None, None).unwrap();
+    fs::write(home.join("config.toml"), &changed).unwrap();
+    assert!(m.materialize(&p.id, 1).is_err());
+}
+
+#[test]
+fn byok_runtime_metadata_requires_known_fields_and_valid_shapes() {
+    let saved = "model='m'\n[tui]\nnotifications=false\n";
+    let allowed = "model='m'\n[notice.model_migrations]\nm='new-model'\n[tui]\nnotifications=false\nscreen_reader_detection_done=true\n[tui.model_availability_nux]\nnew-model=1\n";
+    assert!(config::matches_runtime_config(allowed, saved));
+    assert!(!config::matches_runtime_config(
+        &allowed.replace("notifications=false", "notifications=true"),
+        saved
+    ));
+    assert!(!config::matches_runtime_config(
+        &allowed.replace(
+            "screen_reader_detection_done=true",
+            "screen_reader_detection_done='yes'"
+        ),
+        saved
+    ));
+    assert!(!config::matches_runtime_config(
+        &allowed.replace("m='new-model'", "m=1"),
+        saved
+    ));
+    assert!(!config::matches_runtime_config(
+        &allowed.replace("new-model=1", "new-model='yes'"),
+        saved
+    ));
+    assert!(!config::matches_runtime_config(
+        "model='m'\nnotice=1",
+        "model='m'"
+    ));
+    assert!(!config::matches_runtime_config(
+        "model='m'\ntui=1",
+        "model='m'"
+    ));
+    assert!(!config::matches_runtime_config(
+        "model='m'\n[tui]\nmodel_provider='other'",
+        "model='m'"
+    ));
+    assert!(!config::matches_runtime_config(
+        "model='m'\n[notice]\nmodel_provider='other'",
+        "model='m'"
+    ));
+}

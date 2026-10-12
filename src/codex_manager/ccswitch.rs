@@ -102,7 +102,25 @@ pub(super) fn read_with_hook(
                 config: text,
                 key,
             }),
-            Err(e) => result.skipped.push((name, e.to_string())),
+            Err(e) => {
+                let reason = match e.to_string().as_str() {
+                    "没有可导入的 API Key（可能是官方登录或环境变量认证）" => {
+                        "missing_api_key"
+                    }
+                    "此供应商绑定订阅账号，首版仅导入 BYOK" => {
+                        "managed_oauth_account"
+                    }
+                    "此供应商依赖 CC Switch 协议转换路由，不能直接启动" => {
+                        "protocol_conversion_required"
+                    }
+                    "此配置是 CC Switch 代理接管配置，需要原始供应商连接信息" => {
+                        "proxy_placeholder"
+                    }
+                    _ => "invalid_provider_config",
+                };
+                tracing::warn!(event = "source_provider_skipped", reason);
+                result.skipped.push((name, e.to_string()));
+            }
         }
     }
     Ok(result)

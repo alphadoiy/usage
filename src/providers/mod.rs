@@ -50,11 +50,38 @@ pub trait UsageReset: Send + Sync {
 }
 
 pub async fn query_with_timeout(provider: &dyn UsageProvider, timeout: Duration) -> UsageSnapshot {
-    tokio::time::timeout(timeout, provider.query())
-        .await
-        .unwrap_or_else(|_| {
+    let mut op = crate::logging::Operation::new("provider.query");
+    op.begin("query");
+    let span = op.span();
+    let snapshot = crate::logging::instrument(span, async {
+        let provider_name = match provider.id() {
+            "claude" => "claude",
+            "codex" => "codex",
+            "grok" => "grok",
+            _ => "other",
+        };
+        let result = tokio::time::timeout(timeout, provider.query()).await;
+        let timed_out = result.is_err();
+        let snapshot = result.unwrap_or_else(|_| {
             snapshot_transient(provider.id(), provider.display_name(), "用量查询超时")
-        })
+        });
+        if snapshot.success {
+            tracing::debug!(
+                event = "provider_query_result", provider = provider_name,
+                successful = true, credential_status = ?snapshot.credential_status
+            );
+        } else {
+            tracing::warn!(
+                event = "provider_query_result", provider = provider_name,
+                successful = false, timed_out, credential_status = ?snapshot.credential_status,
+                transient = snapshot.transient
+            );
+        }
+        snapshot
+    })
+    .await;
+    op.finish(snapshot.success);
+    snapshot
 }
 
 pub type KeychainReader = dyn Fn(&str, Option<&str>) -> Option<String> + Send + Sync;

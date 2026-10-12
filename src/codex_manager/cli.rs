@@ -144,6 +144,29 @@ pub enum CodexCommand {
     },
 }
 
+impl CodexCommand {
+    /// Fixed command names only; never format the enum (it contains user input).
+    pub(crate) fn log_name(&self) -> &'static str {
+        match self {
+            Self::Login { .. } => "codex.login",
+            Self::ImportAuth { .. } => "codex.import_auth",
+            Self::List { .. } => "codex.list",
+            Self::Add { .. } => "codex.add",
+            Self::Edit { .. } => "codex.edit",
+            Self::Copy { .. } => "codex.copy",
+            Self::Remove { .. } => "codex.remove",
+            Self::Detach { .. } => "codex.detach",
+            Self::Show { .. } => "codex.show",
+            Self::Export { .. } => "codex.export",
+            Self::Import { .. } => "codex.import",
+            Self::Sync { .. } => "codex.sync",
+            Self::Follow { .. } => "codex.follow",
+            Self::Run { .. } => "codex.run",
+            Self::Test { .. } => "codex.test",
+        }
+    }
+}
+
 #[derive(Debug, Default, Args)]
 #[group(multiple = false)]
 pub struct KeyInput {

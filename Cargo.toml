@@ -12,6 +12,7 @@ chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 ratatui = "0.30"
+quick-xml = { version = "0.38", features = ["serialize"] }
 reqwest = { version = "0.12", default-features = false, features = ["charset", "json", "rustls-tls"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +22,9 @@ shlex = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 toml = "0.8"
 toml_edit = "0.22"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "json", "env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 

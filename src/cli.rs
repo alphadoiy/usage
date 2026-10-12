@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use chrono::{Datelike, Duration, Local, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use tokio::runtime::Handle;
@@ -49,6 +51,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 查询 OpenAI、Claude、Grok 的官方服务状态（无需登录）
+    Status {
+        /// 输出状态、受影响组件和未解决事件的 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 查看最近的结构化日志；不初始化日志系统
+    Logs {
+        /// 只输出日志目录
+        #[arg(long)]
+        path: bool,
+        /// 输出最后 N 条事件
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        tail: u32,
+        /// 筛选操作 ID（UUID），跨日志文件查找
+        #[arg(long)]
+        operation: Option<uuid::Uuid>,
+    },
     /// Codex BYOK/OAuth 账号配置、CC Switch 导入/同步和多实例启动
     Codex {
         #[command(subcommand)]
@@ -114,18 +134,116 @@ enum Command {
 }
 
 pub async fn run() -> i32 {
-    let cli = Cli::parse();
-    match dispatch(cli).await {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = error.exit_code();
+            let _ = error.print();
+            return code;
+        }
+    };
+    if matches!(cli.command, Some(Command::Logs { .. })) {
+        return match dispatch(cli).await {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("{error}");
+                2
+            }
+        };
+    }
+    let command = match &cli.command {
+        Some(Command::Status { .. }) => "status",
+        Some(Command::Codex {
+            command: Some(command),
+        }) => command.log_name(),
+        Some(Command::Codex { command: None }) => "codex.manage",
+        Some(Command::History { .. }) => "history",
+        Some(Command::Statusline { .. }) => "statusline",
+        Some(Command::Providers) => "providers",
+        Some(Command::Styles) => "styles",
+        Some(Command::InitConfig { .. }) => "init_config",
+        Some(Command::Logs { .. }) => "logs",
+        None => "dashboard",
+    };
+    let logging_guard = match crate::logging::init(if command == "statusline" {
+        "warn"
+    } else {
+        "info"
+    }) {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("无法初始化文件日志；当前命令继续运行");
+            None
+        }
+    };
+    let mut op = crate::logging::Operation::new("cli.dispatch");
+    op.span().record("command", command);
+    op.span().in_scope(|| {
+        tracing::info!(
+            event = "process_started",
+            version = env!("CARGO_PKG_VERSION")
+        )
+    });
+    op.begin("dispatch");
+    let result = crate::logging::instrument(op.span(), dispatch(cli)).await;
+    let code = match result {
         Ok(code) => code,
         Err(error) => {
             eprintln!("{error}");
+
             2
         }
+    };
+    if code != 0 && logging_guard.is_some() {
+        eprintln!(
+            "日志目录：{}（操作 ID：{}）",
+            crate::logging::directory().display(),
+            op.id()
+        );
     }
+    op.span()
+        .in_scope(|| tracing::info!(event = "process_exited", exit_code = code));
+    op.finish(code == 0);
+    code
 }
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
+        Some(Command::Status { json }) => {
+            let sources = crate::service_status::select(
+                cli.providers.as_deref().unwrap_or("openai,claude,grok"),
+            )
+            .map_err(CliError)?;
+            let snapshots =
+                crate::service_status::collect(Arc::new(ReqwestClient::new()), &sources).await;
+            if json || cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&snapshots)
+                        .map_err(|e| CliError(e.to_string()))?
+                );
+            } else {
+                println!("{}", crate::service_status::render_text(&snapshots));
+            }
+            Ok(i32::from(snapshots.iter().any(|s| s.error.is_some())))
+        }
+        Some(Command::Logs {
+            path,
+            tail,
+            operation,
+        }) => {
+            if path {
+                println!("{}", crate::logging::directory().display());
+            } else {
+                let operation = operation.map(|id| id.to_string());
+                for line in crate::logging::recent(tail as usize, operation.as_deref())
+                    .map_err(|_| CliError("无法读取日志目录".into()))?
+                {
+                    println!("{line}");
+                }
+            }
+            Ok(0)
+        }
         Some(Command::Codex { command }) => {
             if let Some(command) = command {
                 crate::codex_manager::cli::dispatch(command)
@@ -133,10 +251,15 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                     .map_err(|e| CliError(e.to_string()))
             } else {
                 let handle = Handle::current();
-                tokio::task::spawn_blocking(move || crate::ui::run_codex(handle))
-                    .await
-                    .map_err(|e| CliError(e.to_string()))?
-                    .map_err(|e| CliError(e.to_string()))?;
+                {
+                    let span = tracing::Span::current();
+                    tokio::task::spawn_blocking(move || {
+                        span.in_scope(|| crate::ui::run_codex(handle))
+                    })
+                }
+                .await
+                .map_err(|e| CliError(e.to_string()))?
+                .map_err(|e| CliError(e.to_string()))?;
                 Ok(0)
             }
         }
@@ -169,8 +292,9 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
             let year = year.unwrap_or_else(|| Local::now().year());
             if once || json || csv || cli.once || cli.json {
                 let sources = config.providers.clone();
+                let span = tracing::Span::current();
                 let history = tokio::task::spawn_blocking(move || {
-                    crate::history::HistoryCache::default().load(&config)
+                    span.in_scope(|| crate::history::HistoryCache::default().load(&config))
                 })
                 .await
                 .map_err(|e| CliError(format!("历史读取失败: {e}")))?;
@@ -234,8 +358,13 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 }
             } else {
                 let handle = Handle::current();
+                let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
-                    crate::ui::run_history_with_query(handle, config, path, year, monthly, query)
+                    span.in_scope(|| {
+                        crate::ui::run_history_with_query(
+                            handle, config, path, year, monthly, query,
+                        )
+                    })
                 })
                 .await
                 .map_err(|e| CliError(format!("界面任务失败: {e}")))?
@@ -356,10 +485,15 @@ async fn query(cli: Cli) -> Result<i32, CliError> {
     let handle = Handle::current();
     let path = config_path;
     let style_config = config;
-    tokio::task::spawn_blocking(move || crate::ui::run(handle, providers, style_config, path))
-        .await
-        .map_err(|error| CliError(format!("界面任务失败: {error}")))?
-        .map_err(|error| CliError(error.to_string()))?;
+    {
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| crate::ui::run(handle, providers, style_config, path))
+        })
+    }
+    .await
+    .map_err(|error| CliError(format!("界面任务失败: {error}")))?
+    .map_err(|error| CliError(error.to_string()))?;
     Ok(0)
 }
 
@@ -400,12 +534,15 @@ async fn query_all(providers: &[Arc<dyn UsageProvider>]) -> Vec<UsageSnapshot> {
     let mut jobs = JoinSet::new();
     for (index, provider) in providers.iter().enumerate() {
         let provider = Arc::clone(provider);
-        jobs.spawn(async move {
-            (
-                index,
-                query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await,
-            )
-        });
+        jobs.spawn(
+            async move {
+                (
+                    index,
+                    query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await,
+                )
+            }
+            .in_current_span(),
+        );
     }
     let mut results = vec![None; providers.len()];
     while let Some(completion) = jobs.join_next().await {
@@ -505,6 +642,17 @@ impl std::error::Error for CliError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_accepts_provider_selection_and_json_on_either_side() {
+        use clap::Parser;
+        for args in [
+            vec!["usage", "status", "--providers", "openai,claude", "--json"],
+            vec!["usage", "--json", "--providers", "codex", "status"],
+        ] {
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            assert!(matches!(cli.command, Some(super::Command::Status { .. })));
+        }
+    }
     use std::time::Duration;
 
     use async_trait::async_trait;

@@ -1,5 +1,5 @@
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     let code = usage::cli::run().await;
-    std::process::exit(code);
+    std::process::ExitCode::from(code as u8)
 }

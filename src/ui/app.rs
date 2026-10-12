@@ -1,9 +1,12 @@
 //! 事件循环。查询在 tokio 任务里进行，界面保持可操作。
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
+
+use tracing::Instrument;
 
 use chrono::Utc;
 use ratatui::Frame;
@@ -20,11 +23,15 @@ use crate::model::UsageSnapshot;
 use crate::providers::{
     ProviderError, QUERY_TIMEOUT, ResetPreview, UsageProvider, query_with_timeout,
 };
+use crate::service_status::{self, ServiceStatus};
 use crate::sessions;
 use crate::ui::history::{self, HistoryPanel};
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{self, Focus, SessionBrowser};
-use crate::ui::widgets::{accent, preferred_height, render_card, render_loading};
+use crate::ui::widgets::{
+    accent, preferred_height, render_card, render_card_with_status, render_loading,
+    render_loading_with_status,
+};
 use crate::view::{CardView, builtin_styles};
 
 const MIN_CARD_WIDTH: u16 = 27;
@@ -37,6 +44,10 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    ServiceStatus {
+        generation: u64,
+        snapshot: ServiceStatus,
+    },
     Notice(String),
     HistoryCached(crate::history::History),
     HistoryLoaded {
@@ -353,6 +364,10 @@ fn resume_in_terminal(
 }
 
 struct Dashboard {
+    service_statuses: HashMap<String, ServiceStatus>,
+    service_generation: u64,
+    service_pending: usize,
+    service_http: Arc<dyn crate::http::HttpClient>,
     menu: Option<menu::Menu>,
     history: Option<HistoryPanel>,
     saved_history: Option<HistoryPanel>,
@@ -466,6 +481,10 @@ impl Dashboard {
             .collect();
         let styles = builtin_styles();
         Self {
+            service_statuses: HashMap::new(),
+            service_generation: 0,
+            service_pending: 0,
+            service_http: Arc::new(crate::http::ReqwestClient::new()),
             menu: None,
             history: None,
             saved_history: None,
@@ -837,6 +856,7 @@ impl Dashboard {
     }
 
     fn refresh(&mut self, handle: &Handle) {
+        self.refresh_service_statuses(handle);
         if self.pending > 0 {
             return;
         }
@@ -849,13 +869,44 @@ impl Dashboard {
         for provider in &self.providers {
             let provider = Arc::clone(provider);
             let tx = self.tx.clone();
+            handle.spawn(
+                async move {
+                    let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
+                    let _ = tx.send(AppEvent::Quota(Box::new(RefreshEvent {
+                        generation,
+                        tool: provider.id().to_string(),
+                        snapshot,
+                    })));
+                }
+                .in_current_span(),
+            );
+        }
+    }
+
+    fn refresh_service_statuses(&mut self, handle: &Handle) {
+        if self.service_pending > 0 {
+            return;
+        }
+        let mut sources = Vec::new();
+        for card in &self.cards {
+            if let Some(source) = service_status::source(&card.id)
+                && !sources.contains(&source)
+            {
+                sources.push(source);
+            }
+        }
+        self.service_generation = self.service_generation.wrapping_add(1);
+        let generation = self.service_generation;
+        self.service_pending = sources.len();
+        for source in sources {
+            let http = Arc::clone(&self.service_http);
+            let tx = self.tx.clone();
             handle.spawn(async move {
-                let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
-                let _ = tx.send(AppEvent::Quota(Box::new(RefreshEvent {
+                let snapshot = service_status::query(http.as_ref(), source).await;
+                let _ = tx.send(AppEvent::ServiceStatus {
                     generation,
-                    tool: provider.id().to_string(),
                     snapshot,
-                })));
+                });
             });
         }
     }
@@ -969,6 +1020,20 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::ServiceStatus {
+                    generation,
+                    snapshot,
+                } => {
+                    if generation == self.service_generation {
+                        self.service_pending = self.service_pending.saturating_sub(1);
+                        let id = snapshot.provider.clone();
+                        let previous = self.service_statuses.remove(&id);
+                        self.service_statuses
+                            .insert(id, ServiceStatus::merge(previous, snapshot));
+                        changed = true;
+                    }
+                    continue;
+                }
                 AppEvent::Notice(message) => {
                     self.notice = Some(message);
                     changed = true;
@@ -1378,11 +1443,17 @@ fn render_cards(area: Rect, buf: &mut Buffer, app: &Dashboard) {
             .zip(views.iter())
             .zip(column_areas.iter())
             .map(|((card, view), column)| {
-                if card.loading || view.is_none() {
+                let status_height = if service_status::source(&card.id).is_some() {
                     3
                 } else {
-                    preferred_height(view.as_ref().expect("view"), column.width)
-                }
+                    0
+                };
+                status_height
+                    + if card.loading || view.is_none() {
+                        3
+                    } else {
+                        preferred_height(view.as_ref().expect("view"), column.width)
+                    }
             })
             .max()
             .unwrap_or(0)
@@ -1393,10 +1464,28 @@ fn render_cards(area: Rect, buf: &mut Buffer, app: &Dashboard) {
                 height,
                 ..*column
             };
+            let source = service_status::source(&card.id);
+            let status = source.and_then(|source| app.service_statuses.get(source.id));
             if let Some(view) = view {
-                render_card(rect, buf, &card.id, &card.title, &view);
+                if source.is_some() {
+                    render_card_with_status(
+                        rect,
+                        buf,
+                        &card.id,
+                        &card.title,
+                        &view,
+                        source,
+                        status,
+                    );
+                } else {
+                    render_card(rect, buf, &card.id, &card.title, &view);
+                }
             } else {
-                render_loading(rect, buf, &card.id, &card.title);
+                if source.is_some() {
+                    render_loading_with_status(rect, buf, &card.id, &card.title, source, status);
+                } else {
+                    render_loading(rect, buf, &card.id, &card.title);
+                }
             }
         }
         y = y.saturating_add(height).saturating_add(1);
@@ -1468,14 +1557,16 @@ mod tests {
     }
 
     fn reset_dashboard(available: u32, consumed: Arc<AtomicUsize>) -> Dashboard {
-        Dashboard::new(
+        let mut app = Dashboard::new(
             vec![Arc::new(ResetTestProvider {
                 available,
                 consumed,
             })],
             AppConfig::default(),
             "/tmp/usage-reset-test.toml".into(),
-        )
+        );
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
+        app
     }
 
     async fn drain_until(
@@ -1502,6 +1593,7 @@ mod tests {
             AppConfig::default(),
             "/tmp/usage-test.toml".into(),
         );
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
         app.cards = vec![
             CardSlot {
                 id: "claude".into(),
@@ -1858,7 +1950,7 @@ mod tests {
 
         for x in [0, 30, 60] {
             assert_eq!(buffer[(x, 0)].symbol(), "╭");
-            assert_eq!(buffer[(x, 6)].symbol(), "╰");
+            assert_eq!(buffer[(x, 9)].symbol(), "╰");
         }
         assert!(row_text(&buffer, 0).contains("Claude Code"));
         assert!(row_text(&buffer, 0).contains("Codex"));
@@ -1869,18 +1961,100 @@ mod tests {
         assert_eq!(buffer[(32, 5)].symbol(), "⣿");
     }
 
+    #[tokio::test]
+    async fn homepage_status_updates_without_quota_credentials_and_marks_failed_refresh() {
+        let mut app = dashboard();
+        let http = Arc::new(crate::http::FakeHttp::new());
+        http.route(
+            service_status::CLAUDE.endpoint,
+            Ok(crate::http::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: br#"{"status":{"indicator":"none","description":"OK"},"components":[]}"#
+                    .to_vec(),
+            }),
+        );
+        app.service_http = http.clone();
+        app.refresh_service_statuses(&Handle::current());
+        app.refresh_service_statuses(&Handle::current());
+        drain_until(&mut app, |a| a.service_pending == 0).await;
+        assert_eq!(http.calls.lock().unwrap().len(), 3);
+        assert_eq!(app.pending, 0);
+        assert!(!app.cards[0].snapshot.as_ref().unwrap().success);
+        let time = app.service_statuses["claude"].fetched_at;
+        for style in ["bar", "ring", "statusline"] {
+            app.style_name = style.into();
+            for width in [28, 72, 110] {
+                let area = Rect::new(0, 0, width, 32);
+                let mut buffer = Buffer::empty(area);
+                render_cards(area, &mut buffer, &app);
+                let text = buffer
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                let compact = text.split_whitespace().collect::<String>();
+                assert!(compact.contains("官方正常"), "{style} {width}: {text}");
+                assert!(
+                    text.contains("status.claude.com"),
+                    "{style} {width}: {text}"
+                );
+            }
+        }
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
+        app.refresh_service_statuses(&Handle::current());
+        drain_until(&mut app, |a| a.service_pending == 0).await;
+        assert_eq!(app.service_statuses["claude"].fetched_at, time);
+        assert!(app.service_statuses["claude"].stale);
+        app.style_name = "bar".into();
+        let area = Rect::new(0, 0, 72, 32);
+        let mut buffer = Buffer::empty(area);
+        render_cards(area, &mut buffer, &app);
+        let text = buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            text.split_whitespace()
+                .collect::<String>()
+                .contains("更新失败"),
+            "{text}"
+        );
+        let stale_cell = buffer.content.iter().find(|c| c.symbol() == "●").unwrap();
+        assert_eq!(stale_cell.fg, Color::Rgb(255, 159, 10));
+    }
+
+    #[tokio::test]
+    async fn old_status_events_do_not_replace_the_current_generation() {
+        let mut app = dashboard();
+        app.service_generation = 2;
+        app.service_pending = 1;
+        let snapshot =
+            service_status::query(&crate::http::FakeHttp::new(), service_status::CLAUDE).await;
+        app.tx
+            .send(AppEvent::ServiceStatus {
+                generation: 1,
+                snapshot,
+            })
+            .unwrap();
+        assert_eq!(app.drain_events(), (false, false));
+        assert!(app.service_statuses.is_empty());
+        assert_eq!(app.service_pending, 1);
+    }
+
     #[test]
     fn cards_wrap_at_smaller_widths_and_scroll_by_row() {
         let mut app = dashboard();
         assert_eq!(card_columns(72, app.cards.len()), 2);
         assert_eq!(card_columns(52, app.cards.len()), 1);
-        let area = Rect::new(0, 0, 72, 15);
+        let area = Rect::new(0, 0, 72, 21);
         let mut buffer = Buffer::empty(area);
         render_cards(area, &mut buffer, &app);
         assert_eq!(buffer[(0, 0)].symbol(), "╭");
         assert_eq!(buffer[(37, 0)].symbol(), "╭");
-        assert_eq!(buffer[(0, 8)].symbol(), "╭");
-        assert!(row_text(&buffer, 8).contains("Grok"));
+        assert_eq!(buffer[(0, 11)].symbol(), "╭");
+        assert!(row_text(&buffer, 11).contains("Grok"));
 
         app.scroll_by(1, 88);
         assert_eq!(app.scroll, 0);
@@ -1912,6 +2086,7 @@ mod tests {
             AppConfig::default(),
             "/tmp/test-config".into(),
         );
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
         let handle = Handle::current();
         app.refresh(&handle);
         app.refresh(&handle);

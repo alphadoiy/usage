@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::labels::fmt_percent;
+use crate::service_status::{ServiceStatus, Source, State};
 use crate::theme;
 use crate::view::{BadgeKind, BarSpec, CardView, RingSpec, ViewKind};
 
@@ -48,6 +49,18 @@ fn reset_note_gap(view: &CardView) -> u16 {
 }
 
 pub fn render_card(area: Rect, buf: &mut Buffer, provider_id: &str, title: &str, view: &CardView) {
+    render_card_with_status(area, buf, provider_id, title, view, None, None);
+}
+
+pub fn render_card_with_status(
+    area: Rect,
+    buf: &mut Buffer,
+    provider_id: &str,
+    title: &str,
+    view: &CardView,
+    source: Option<Source>,
+    status: Option<&ServiceStatus>,
+) {
     let color = accent(provider_id);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -64,10 +77,22 @@ pub fn render_card(area: Rect, buf: &mut Buffer, provider_id: &str, title: &str,
     if inner.height == 0 || inner.width == 0 {
         return;
     }
-    render_body(inset_horizontal(inner), buf, provider_id, view);
+    let body = render_service_footer(inset_horizontal(inner), buf, source, status);
+    render_body(body, buf, provider_id, view);
 }
 
 pub fn render_loading(area: Rect, buf: &mut Buffer, provider_id: &str, title: &str) {
+    render_loading_with_status(area, buf, provider_id, title, None, None);
+}
+
+pub fn render_loading_with_status(
+    area: Rect,
+    buf: &mut Buffer,
+    provider_id: &str,
+    title: &str,
+    source: Option<Source>,
+    status: Option<&ServiceStatus>,
+) {
     let color = accent(provider_id);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -76,9 +101,92 @@ pub fn render_loading(area: Rect, buf: &mut Buffer, provider_id: &str, title: &s
         .title_top(Line::from(format!(" {title} ")).style(color).bold());
     let inner = block.inner(area);
     block.render(area, buf);
+    let body = render_service_footer(inset_horizontal(inner), buf, source, status);
     Paragraph::new("正在查询官方用量…")
         .style(Style::new().fg(DIM))
-        .render(inset_horizontal(inner), buf);
+        .render(body, buf);
+}
+
+fn render_service_footer(
+    area: Rect,
+    buf: &mut Buffer,
+    source: Option<Source>,
+    status: Option<&ServiceStatus>,
+) -> Rect {
+    let Some(source) = source else {
+        return area;
+    };
+    let height = area.height.min(3);
+    let body = Rect {
+        height: area.height.saturating_sub(height),
+        ..area
+    };
+    let footer = Rect {
+        y: area.y + body.height,
+        height,
+        ..area
+    };
+    let (label, detail, color) = if let Some(status) = status {
+        let label = if status.error.is_some() {
+            if status.stale
+                && let Some(time) = status.fetched_at
+            {
+                format!(
+                    "● 上次{} {} · 更新失败",
+                    status.label(),
+                    time.with_timezone(&chrono::Local).format("%H:%M")
+                )
+            } else if status.fetched_at.is_some() {
+                format!("● 官方{} · 详情失败", status.label())
+            } else {
+                "○ 官方状态 查询失败".into()
+            }
+        } else {
+            format!(
+                "● 官方{} {}",
+                status.label(),
+                status
+                    .fetched_at
+                    .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                    .unwrap_or_default()
+            )
+        };
+        let color = if status.error.is_some() {
+            WARNING
+        } else {
+            match status.state {
+                State::Operational => Color::Rgb(48, 209, 88),
+                State::Maintenance | State::Degraded => WARNING,
+                State::PartialOutage | State::MajorOutage => ERROR,
+                State::Unknown => DIM,
+            }
+        };
+        (label, status.summary(), color)
+    } else {
+        (
+            "○ 官方状态 查询中…".into(),
+            source
+                .page_url
+                .trim_start_matches("https://")
+                .trim_end_matches('/')
+                .into(),
+            DIM,
+        )
+    };
+    let skip = u16::from(height >= 3);
+    Paragraph::new(vec![
+        Line::from(label).style(color),
+        Line::from(detail).style(DIM),
+    ])
+    .render(
+        Rect {
+            y: footer.y + skip,
+            height: footer.height.saturating_sub(skip),
+            ..footer
+        },
+        buf,
+    );
+    body
 }
 
 fn inset_horizontal(area: Rect) -> Rect {

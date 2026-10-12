@@ -8,6 +8,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -270,10 +272,13 @@ pub async fn collect(
             continue;
         }
         let provider = Arc::clone(provider);
-        jobs.spawn(async move {
-            let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
-            (index, snapshot)
-        });
+        jobs.spawn(
+            async move {
+                let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
+                (index, snapshot)
+            }
+            .in_current_span(),
+        );
     }
 
     while let Some(Ok((index, snapshot))) = jobs.join_next().await {

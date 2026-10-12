@@ -59,6 +59,8 @@ cargo run -- --once
 usage                 # 打开 TUI
 usage --once          # 查询一次，打印文本
 usage --json          # 查询一次，打印 JSON
+usage status          # 查询 OpenAI、Claude、Grok 官方服务状态，无需登录
+usage status --providers openai,claude --json
 usage statusline --providers claude  # 给 Claude Code 等 agent 输出轻量状态栏
 usage --style ring    # 本次只用圆环
 usage --style statusline  # 本次使用圆点状态栏视图
@@ -105,6 +107,12 @@ grok = ""
 
 令牌过期时，界面会提示重新登录对应的 CLI。网络抖动或查询超时时保留上一份成功结果。TUI 空闲时按秒更新倒计时，查询结果和按键变化会立即重画。TUI 和一次性查询对单个工具最多等待 20 秒；Keychain 读取最多等待 10 秒。独立状态栏对单个工具最多等待 4 秒。
 
+首页用量卡片底部同步展示官方服务状态：Codex 对应 OpenAI，Claude Code 对应 Claude，Grok 对应 xAI。绿色表示官方正常，橙色表示降级或维护，红色表示故障；有未解决事件时显示数量和第一条标题。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
+
+数据直接来自 [OpenAI 官方 JSON](https://status.openai.com/api/v2/summary.json)（另读 `api/v2/incidents.json` 过滤已解决事件）、[Claude 官方 JSON](https://status.claude.com/api/v2/summary.json) 和 [xAI 官方 RSS](https://status.x.ai/feed.xml)。Grok 显示「未报告故障」表示 RSS 内没有未解决事件，不代表主动探测成功；OpenAI / Claude 是供应商整体状态，可能涉及你未使用的产品，也不保证单个账户的可用性。完整受影响组件和故障事件可用 `usage status` 或 `usage status --json` 查看；此命令不读取用量配置或登录文件，默认查询三个来源，`--providers` 支持 `openai` / `codex`、`claude` / `anthropic`、`grok` / `xai`。查询失败退出码为 1；供应商报告故障但查询成功时为 0。
+
+如需浏览更多 AI 服务，可参考 [aistatus.page](https://aistatus.page/)（OpenAI、Anthropic、Gemini、xAI、Cursor、Perplexity、Midjourney 的官方源聚合）或 [LLM Status](https://llm.status.compare/)；本程序直接读取上述官方源。
+
 Codex 的用量响应若提供主动重置次数，卡片会显示剩余次数。按 `x` 后会向 Codex 查询最新次数和最近到期时间；确认框显示当前账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。Claude Code 和 Grok 没有主动重置入口。
 
 按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 索引，无法打开时改读本机会话日志。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
@@ -134,7 +142,7 @@ usage codex test work                         # 仅检查配置，不发请求
 usage codex test work --request               # 发送小型 Responses 请求，可能计费
 ```
 
-BYOK 每次编辑或源配置更新生成新版本。不同账号、不同版本各自使用持久的 `CODEX_HOME`，运行中的版本不会被同步改写；同一版本多开共享会话目录。CLI 写入的合法项目信任设置保留在运行目录，不会改变保存的配置版本，也不会阻止下一次启动；模型、供应商、认证及其他设置的直接修改仍需要导入为新版本。历史与会话页自动收录已经启动过的托管目录，恢复时使用该会话绑定的账号、配置版本和密钥。也可显式运行 `usage codex run <ID> --revision 1 --resume <会话UUID>`。密钥轮换后若上游停用了旧 Key，旧会话绑定的 Key 也会失效。
+BYOK 每次编辑或源配置更新生成新版本。不同账号、不同版本各自使用持久的 `CODEX_HOME`，运行中的版本不会被同步改写；同一版本多开共享会话目录。CLI 写入的合法项目信任设置、模型迁移提示及界面引导状态保留在运行目录，不会改变保存的配置版本，也不会阻止下一次启动；模型、供应商、认证及其他设置的直接修改仍需要导入为新版本。历史与会话页自动收录已经启动过的托管目录，恢复时使用该会话绑定的账号、配置版本和密钥。也可显式运行 `usage codex run <ID> --revision 1 --resume <会话UUID>`。密钥轮换后若上游停用了旧 Key，旧会话绑定的 Key 也会失效。
 
 数据默认位于 `~/.local/share/usage/codex`，遵循 `XDG_DATA_HOME`；`USAGE_CODEX_DIR` 可指定一个专用目录。BYOK API Key 保存在该目录下的 `keys/<UUID>` 文件，SQLite 只保存密钥引用；macOS/Linux 的数据与密钥目录权限为 `700`，密钥文件权限为 `600`。文件内容为明文，权限控制不等于加密。BYOK 管理不访问 macOS Keychain，生成的 TOML 通过子进程环境变量取 Key。启动命令和复制的恢复命令不包含密钥，也会清除继承的默认 Codex/OpenAI 认证环境变量。移出列表会保留配置版本、密钥和历史，便于恢复旧会话。
 
@@ -285,6 +293,26 @@ path = "~/.claude-work"
 ```
 
 状态栏每个额度窗口占一行，例如 `Claude Code 5h ● ● ● ● ○ ○ ○ ○ 50% ⟳ 2h`。可将 `--providers` 设为 `claude,codex,grok` 来显示其他工具；`--cache-seconds 0` 会每次重新查询，`--no-color` 会关闭 ANSI 颜色。命令也可单独运行，不带 stdin 时仅显示额度。
+
+## 排查日志
+
+使用 `tracing`、`tracing-subscriber` 和 `tracing-appender` 写入 JSONL 文件日志。默认目录为 `~/.local/state/usage/logs`，设置 `XDG_STATE_HOME` 时使用 `$XDG_STATE_HOME/usage/logs`；可用 `USAGE_LOG_DIR` 单独覆盖。普通命令默认 `info`，轻量 `statusline` 默认 `warn`，没有事件时不创建日志文件。
+
+```bash
+usage logs --path                          # 查看目录
+usage logs --tail 100                      # 最新日志文件的最后 100 条事件
+usage logs --operation UUID --tail 1000    # 在保留文件中查找一次操作
+USAGE_LOG=debug usage codex run ACCOUNT --cwd /path/to/project
+USAGE_LOG=off usage codex list             # 关闭日志
+```
+
+Codex 账号保存、CC Switch 导入/跟随同步、配置校验、OAuth 凭据读写及共享/独占锁、原生登录、子进程启动/退出、Responses 测试和官方额度查询都有事件。每个操作包含操作 ID、进程 ID、阶段与耗时；账号链路另含内部账号 UUID、配置版本和认证方式。启动成功后，操作 ID 同时作为 SQLite `runs.id`，启动前失败也有操作 ID。CLI 错误会在 stderr 提示日志目录和入口操作 ID，用它能查到嵌套阶段。
+
+配置不一致会记录 `config_mismatch`、安全的字段名（例如 `model`、`model_providers.<entry>.base_url`），不记录配置值。日志不包含 API Key、OAuth token、邮箱、账号名称、完整配置、启动参数或 HTTP 请求/响应内容；第三方库事件即使在 `trace` 级别也被过滤。原生 Codex 的终端输出仍由它自己输出，不复制进文件日志。
+
+每次启动独立写文件，按 UTC 日期或约 5 MiB 轮换，单条事件保持完整。新目录权限 `700`，文件 `600`，已有父目录权限保持原样。初始化和轮换时清理超过 7 天的日志，并将保留量控制在约 50 MiB / 200 个文件；运行中锁定的文件不会被清理，因此多开时上限可能暂时超过。写入使用有界后台队列，队列满时回压而不主动丢弃事件，正常退出会刷新队列；强制终止可能丢失尚未写入的事件。
+
+`--help`、`usage logs` 不初始化日志；日志初始化失败会提示并继续执行原命令。详细阶段开始/结束在 `debug` 级别，失败阶段在默认级别也会保留。`USAGE_LOG` 支持级别或 tracing 过滤规则；规则无效时回退到 `info`，不回显原始规则。
 
 ## 扩展
 

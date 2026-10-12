@@ -3,33 +3,151 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 pub const KEY_ENV: &str = "USAGE_CODEX_API_KEY";
 
-/// Saved revisions are immutable; the CLI may persist project trust in the running Home.
-/// Ignore only valid trust entries, not arbitrary project or authentication overrides.
-pub(super) fn matches_runtime_config(runtime: &str, saved: &str) -> bool {
-    fn managed_settings(text: &str) -> Option<toml::Value> {
-        let mut doc: toml::Value = toml::from_str(text).ok()?;
-        if let Some(projects) = doc.get_mut("projects") {
-            let projects = projects.as_table_mut()?;
-            for (_, project) in projects.iter_mut() {
-                let project = project.as_table_mut()?;
-                if let Some(trust) = project.get("trust_level") {
-                    if !matches!(trust.as_str(), Some("trusted" | "untrusted")) {
-                        return None;
-                    }
-                    project.remove("trust_level");
+/// Saved revisions are immutable; the CLI persists trust and onboarding state in its Home.
+/// Ignore only known, correctly typed runtime state, not arbitrary settings or auth overrides.
+fn managed_settings(text: &str) -> Option<toml::Value> {
+    let mut doc: toml::Value = toml::from_str(text).ok()?;
+    if let Some(projects) = doc.get_mut("projects") {
+        let projects = projects.as_table_mut()?;
+        for (_, project) in projects.iter_mut() {
+            let project = project.as_table_mut()?;
+            if let Some(trust) = project.get("trust_level") {
+                if !matches!(trust.as_str(), Some("trusted" | "untrusted")) {
+                    return None;
                 }
-            }
-            projects.retain(|_, project| project.as_table().is_none_or(|t| !t.is_empty()));
-            if projects.is_empty() {
-                doc.as_table_mut()?.remove("projects");
+                project.remove("trust_level");
             }
         }
-        Some(doc)
+        projects.retain(|_, project| project.as_table().is_none_or(|t| !t.is_empty()));
+        if projects.is_empty() {
+            doc.as_table_mut()?.remove("projects");
+        }
     }
+    for (section, fields) in [
+        ("notice", &["model_migrations"][..]),
+        (
+            "tui",
+            &["screen_reader_detection_done", "model_availability_nux"][..],
+        ),
+    ] {
+        if let Some(table) = doc.get_mut(section) {
+            let table = table.as_table_mut()?;
+            for &field in fields {
+                if let Some(state) = table.get(field) {
+                    let valid = match field {
+                        "model_migrations" => state
+                            .as_table()
+                            .is_some_and(|t| t.values().all(|v| v.as_str().is_some())),
+                        "screen_reader_detection_done" => state.as_bool().is_some(),
+                        "model_availability_nux" => state
+                            .as_table()
+                            .is_some_and(|t| t.values().all(|v| v.as_integer().is_some())),
+                        _ => false,
+                    };
+                    if !valid {
+                        return None;
+                    }
+                    table.remove(field);
+                }
+            }
+            if table.is_empty() {
+                doc.as_table_mut()?.remove(section);
+            }
+        }
+    }
+    Some(doc)
+}
+
+pub(super) fn matches_runtime_config(runtime: &str, saved: &str) -> bool {
+    runtime_differences(runtime, saved).is_empty()
+}
+
+/// Only schema field names are emitted. User-selected table keys and all values stay private.
+pub(super) fn runtime_differences(runtime: &str, saved: &str) -> Vec<String> {
     match (managed_settings(runtime), managed_settings(saved)) {
-        (Some(runtime), Some(saved)) => runtime == saved,
-        _ => false,
+        (Some(runtime), Some(saved)) => configuration_differences(&runtime, &saved),
+        (None, _) => vec!["<invalid_runtime_config>".into()],
+        (_, None) => vec!["<invalid_saved_config>".into()],
     }
+}
+
+pub(super) fn configuration_differences(runtime: &toml::Value, saved: &toml::Value) -> Vec<String> {
+    fn compare(
+        a: Option<&toml::Value>,
+        b: Option<&toml::Value>,
+        path: &str,
+        dynamic: bool,
+        result: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if a == b || result.len() >= 16 {
+            return;
+        }
+        if depth < 8
+            && let (Some(toml::Value::Table(a)), Some(toml::Value::Table(b))) = (a, b)
+        {
+            let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+            for key in keys {
+                let safe = if dynamic {
+                    "<entry>"
+                } else {
+                    match key.as_str() {
+                        "model"
+                        | "model_provider"
+                        | "model_providers"
+                        | "model_reasoning_effort"
+                        | "base_url"
+                        | "name"
+                        | "env_key"
+                        | "wire_api"
+                        | "requires_openai_auth"
+                        | "http_headers"
+                        | "experimental_bearer_token"
+                        | "projects"
+                        | "trust_level"
+                        | "notice"
+                        | "tui"
+                        | "features"
+                        | "mcp_servers"
+                        | "notifications"
+                        | "status_line"
+                        | "cli_auth_credentials_store"
+                        | "forced_login_method"
+                        | "forced_chatgpt_workspace_id"
+                        | "sandbox_mode"
+                        | "approval_policy"
+                        | "profiles" => key.as_str(),
+                        _ => "<unknown>",
+                    }
+                };
+                let next = if path.is_empty() {
+                    safe.to_owned()
+                } else {
+                    format!("{path}.{safe}")
+                };
+                compare(
+                    a.get(key),
+                    b.get(key),
+                    &next,
+                    matches!(
+                        safe,
+                        "model_providers"
+                            | "projects"
+                            | "mcp_servers"
+                            | "http_headers"
+                            | "profiles"
+                    ),
+                    result,
+                    depth + 1,
+                );
+            }
+        } else if !result.iter().any(|p| p == path) {
+            result.push(path.into());
+        }
+    }
+    let mut result = Vec::new();
+    compare(Some(runtime), Some(saved), "", false, &mut result, 0);
+    result
 }
 
 pub fn parse(text: &str) -> Result<DocumentMut> {

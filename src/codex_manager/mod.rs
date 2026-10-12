@@ -6,6 +6,7 @@ mod launcher;
 pub mod oauth;
 mod secrets;
 
+use crate::logging;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,11 +33,15 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
+        tracing::debug!(event = "io_failed", error_kind = ?e.kind());
         Self(e.to_string())
     }
 }
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(code, _) = &e {
+            tracing::debug!(event = "sqlite_failed", sqlite_code = code.extended_code);
+        }
         Self(e.to_string())
     }
 }
@@ -124,6 +129,15 @@ pub enum AuthMode {
     Oauth,
 }
 
+impl AuthMode {
+    pub(crate) fn log_name(self) -> &'static str {
+        match self {
+            Self::Byok => "byok",
+            Self::Oauth => "oauth",
+        }
+    }
+}
+
 pub struct Revision {
     pub config: String,
     secret_ref: String,
@@ -137,6 +151,28 @@ pub struct SyncReport {
     pub skipped: Vec<(String, String)>,
     pub conflicts: Vec<String>,
     pub missing: Vec<String>,
+}
+impl SyncReport {
+    fn log(&self, dry_run: bool) {
+        tracing::info!(
+            event = "source_sync_summary",
+            dry_run,
+            created = self.created.len(),
+            updated = self.updated.len(),
+            unchanged = self.unchanged.len(),
+            skipped = self.skipped.len(),
+            conflicts = self.conflicts.len(),
+            missing = self.missing.len()
+        );
+        if !self.skipped.is_empty() || !self.conflicts.is_empty() || !self.missing.is_empty() {
+            tracing::warn!(
+                event = "source_sync_attention",
+                skipped = self.skipped.len(),
+                conflicts = self.conflicts.len(),
+                missing = self.missing.len()
+            );
+        }
+    }
 }
 impl std::fmt::Display for SyncReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -196,11 +232,15 @@ impl Manager {
     }
 
     pub fn open(root: PathBuf) -> Result<Self> {
-        private_dir(&root)?;
-        let root = root.canonicalize()?;
-        let conn = Connection::open(root.join("manager.sqlite3"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;
+        logging::operation("codex.manager_open", |op| {
+            op.step("directory_prepare", || private_dir(&root))?;
+            let root = root.canonicalize()?;
+            let conn = op.step("database_open", || {
+                Connection::open(root.join("manager.sqlite3"))
+            })?;
+            conn.busy_timeout(Duration::from_secs(5))?;
+            op.begin("database_schema");
+            conn.execute_batch("PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS profiles (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
                 source_path TEXT, source_provider TEXT, source_hash TEXT, source_revision INTEGER,
@@ -221,15 +261,16 @@ impl Manager {
             CREATE TABLE IF NOT EXISTS oauth_accounts (
                 profile_id TEXT PRIMARY KEY REFERENCES profiles(id),
                 identity_key TEXT UNIQUE NOT NULL, identity_json TEXT NOT NULL);")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                root.join("manager.sqlite3"),
-                fs::Permissions::from_mode(0o600),
-            )?;
-        }
-        Ok(Self { root, conn })
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    root.join("manager.sqlite3"),
+                    fs::Permissions::from_mode(0o600),
+                )?;
+            }
+            Ok(Self { root, conn })
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -275,21 +316,25 @@ impl Manager {
     }
 
     pub fn add(&mut self, name: &str, text: &str, key: &str) -> Result<Profile> {
-        validate_name(name)?;
-        let config = config::normalize(text)?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let tx = self.conn.transaction()?;
-        let secret_ref = secrets::put(&self.root, key)?;
-        tx.execute(
-            "INSERT INTO profiles(id,name,revision) VALUES (?1,?2,1)",
-            params![id, name],
-        )?;
-        tx.execute(
-            "INSERT INTO revisions VALUES (?1,1,?2,?3,?4)",
-            params![id, config, secret_ref, now()],
-        )?;
-        tx.commit()?;
-        self.resolve(&id)
+        logging::operation("codex.account_add", |op| {
+            op.step("name_validate", || validate_name(name))?;
+            let config = op.step("config_validate", || config::normalize(text))?;
+            let id = uuid::Uuid::new_v4().to_string();
+            op.account(&id, 1, "byok");
+            op.begin("database_transaction");
+            let tx = self.conn.transaction()?;
+            let secret_ref = op.step("credential_save", || secrets::put(&self.root, key))?;
+            tx.execute(
+                "INSERT INTO profiles(id,name,revision) VALUES (?1,?2,1)",
+                params![id, name],
+            )?;
+            tx.execute(
+                "INSERT INTO revisions VALUES (?1,1,?2,?3,?4)",
+                params![id, config, secret_ref, now()],
+            )?;
+            op.step("database_commit", || tx.commit())?;
+            self.resolve(&id)
+        })
     }
 
     /// Local edits detach from following. expected_revision implements optimistic conflict detection.
@@ -301,53 +346,63 @@ impl Manager {
         key: Option<&str>,
         name: Option<&str>,
     ) -> Result<Profile> {
-        let profile = self.resolve(selector)?;
-        if let Some(name) = name {
-            validate_name(name)?;
-        }
-        let config = match profile.auth_mode {
-            AuthMode::Byok => config::normalize(text)?,
-            AuthMode::Oauth => {
-                if key.is_some() {
-                    return Err(Error::message("OAuth 账号不能设置 API Key；请重新登录"));
-                }
-                oauth::normalize_config(text)?
+        logging::operation("codex.account_update", |op| {
+            let profile = op.step("account_resolve", || self.resolve(selector))?;
+            op.account(&profile.id, profile.revision, profile.auth_mode.log_name());
+            op.begin("config_validate");
+            if let Some(name) = name {
+                validate_name(name)?;
             }
-        };
-        let old = self.revision(&profile.id, profile.revision)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let revision: i64 = tx.query_row(
-            "SELECT revision FROM profiles WHERE id=?1",
-            [&profile.id],
-            |r| r.get(0),
-        )?;
-        if revision != expected_revision {
-            return Err(Error::message("配置已被其他进程更新；重新打开后再保存"));
-        }
-        let secret_ref = match key {
-            Some(key) => secrets::put(&self.root, key)?,
-            None => old.secret_ref,
-        };
-        let next = revision + 1;
-        tx.execute(
-            "INSERT INTO revisions VALUES (?1,?2,?3,?4,?5)",
-            params![profile.id, next, config, secret_ref, now()],
-        )?;
-        let status = if profile.auth_mode == AuthMode::Oauth {
-            "已保存 OAuth 配置"
-        } else if profile.source.is_some() {
-            "本地修改，已暂停跟随"
-        } else {
-            "本地配置"
-        };
-        tx.execute(
-            "UPDATE profiles SET name=?1,revision=?2,follow=0,source_status=?4 WHERE id=?3",
-            params![name.unwrap_or(&profile.name), next, profile.id, status],
-        )?;
-        tx.commit()?;
-        self.resolve(&profile.id)
+            let config = match profile.auth_mode {
+                AuthMode::Byok => config::normalize(text)?,
+                AuthMode::Oauth => {
+                    if key.is_some() {
+                        return Err(Error::message("OAuth 账号不能设置 API Key；请重新登录"));
+                    }
+                    oauth::normalize_config(text)?
+                }
+            };
+            let old = self.revision(&profile.id, profile.revision)?;
+            op.begin("database_transaction");
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let revision: i64 = tx.query_row(
+                "SELECT revision FROM profiles WHERE id=?1",
+                [&profile.id],
+                |r| r.get(0),
+            )?;
+            if revision != expected_revision {
+                tracing::warn!(
+                    event = "revision_conflict",
+                    expected_revision,
+                    current_revision = revision
+                );
+                return Err(Error::message("配置已被其他进程更新；重新打开后再保存"));
+            }
+            let secret_ref = match key {
+                Some(key) => op.step("credential_save", || secrets::put(&self.root, key))?,
+                None => old.secret_ref,
+            };
+            let next = revision + 1;
+            tx.execute(
+                "INSERT INTO revisions VALUES (?1,?2,?3,?4,?5)",
+                params![profile.id, next, config, secret_ref, now()],
+            )?;
+            let status = if profile.auth_mode == AuthMode::Oauth {
+                "已保存 OAuth 配置"
+            } else if profile.source.is_some() {
+                "本地修改，已暂停跟随"
+            } else {
+                "本地配置"
+            };
+            tx.execute(
+                "UPDATE profiles SET name=?1,revision=?2,follow=0,source_status=?4 WHERE id=?3",
+                params![name.unwrap_or(&profile.name), next, profile.id, status],
+            )?;
+            op.step("database_commit", || tx.commit())?;
+            self.resolve(&profile.id)
+        })
     }
 
     pub fn copy(&mut self, selector: &str, name: &str) -> Result<Profile> {
@@ -414,29 +469,41 @@ impl Manager {
         selected: &[String],
         dry_run: bool,
     ) -> Result<SyncReport> {
-        let source = ccswitch::read(path)?;
-        self.apply_source(source, follow, selected, dry_run, false)
+        logging::operation("codex.source_import", |op| {
+            let source = op.step("source_read", || ccswitch::read(path))?;
+            let report = op.step("source_apply", || {
+                self.apply_source(source, follow, selected, dry_run, false)
+            })?;
+            report.log(dry_run);
+            Ok(report)
+        })
     }
 
     pub fn sync(&mut self, dry_run: bool) -> Result<SyncReport> {
-        let sources: Vec<String> = self.conn.prepare("SELECT DISTINCT source_path FROM profiles WHERE follow=1 AND source_path IS NOT NULL")?
+        logging::operation("codex.source_sync", |op| {
+            op.begin("source_bindings_read");
+            let sources: Vec<String> = self.conn.prepare("SELECT DISTINCT source_path FROM profiles WHERE follow=1 AND source_path IS NOT NULL")?
             .query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-        let mut report = SyncReport::default();
-        for path in sources {
-            match ccswitch::read(Path::new(&path)) {
-                Ok(source) => {
-                    let one = self.apply_source(source, true, &[], dry_run, true)?;
-                    report.created.extend(one.created);
-                    report.updated.extend(one.updated);
-                    report.unchanged.extend(one.unchanged);
-                    report.skipped.extend(one.skipped);
-                    report.conflicts.extend(one.conflicts);
-                    report.missing.extend(one.missing);
+            let mut report = SyncReport::default();
+            for path in sources {
+                match op.step("source_read", || ccswitch::read(Path::new(&path))) {
+                    Ok(source) => {
+                        let one = op.step("source_apply", || {
+                            self.apply_source(source, true, &[], dry_run, true)
+                        })?;
+                        report.created.extend(one.created);
+                        report.updated.extend(one.updated);
+                        report.unchanged.extend(one.unchanged);
+                        report.skipped.extend(one.skipped);
+                        report.conflicts.extend(one.conflicts);
+                        report.missing.extend(one.missing);
+                    }
+                    Err(error) => report.skipped.push((path, error.to_string())),
                 }
-                Err(error) => report.skipped.push((path, error.to_string())),
             }
-        }
-        Ok(report)
+            report.log(dry_run);
+            Ok(report)
+        })
     }
 
     fn apply_source(
@@ -577,32 +644,44 @@ impl Manager {
 
     /// BYOK revisions own persistent Homes; OAuth versions share one account Home and native profiles.
     pub fn materialize(&self, id: &str, revision: i64) -> Result<PathBuf> {
-        if self.resolve(id)?.auth_mode == AuthMode::Oauth {
-            return self.materialize_oauth(id, revision);
-        }
-        let saved = self.revision(id, revision)?;
-        let home = self.home(id, revision)?;
-        let tx = self.conn.unchecked_transaction()?;
-        private_dir(&home)?;
-        let config_path = home.join("config.toml");
-        private_create(&config_path, saved.config.as_bytes())?;
-        if !config::matches_runtime_config(&fs::read_to_string(&config_path)?, &saved.config) {
-            return Err(Error::message(
-                "实例配置被手动修改；请导入为新版本后再启动，原文件已保留",
-            ));
-        }
-        let binding = serde_json::to_vec(&HomeBinding {
-            profile_id: id.into(),
-            revision,
+        logging::operation("codex.home_materialize", |op| {
+            op.account(id, revision, "byok");
+            if op.step("account_resolve", || self.resolve(id))?.auth_mode == AuthMode::Oauth {
+                op.account(id, revision, "oauth");
+                return self.materialize_oauth(id, revision);
+            }
+            let saved = op.step("revision_read", || self.revision(id, revision))?;
+            let home = self.home(id, revision)?;
+            let tx = self.conn.unchecked_transaction()?;
+            op.step("home_prepare", || private_dir(&home))?;
+            let config_path = home.join("config.toml");
+            op.step("config_initialize", || {
+                private_create(&config_path, saved.config.as_bytes())
+            })?;
+            let runtime = op.step("runtime_config_read", || fs::read_to_string(&config_path))?;
+            op.begin("runtime_config_validate");
+            if !config::matches_runtime_config(&runtime, &saved.config) {
+                tracing::error!(event = "config_mismatch", reason = "managed_settings_changed",
+                changed_fields = ?config::runtime_differences(&runtime, &saved.config));
+                return Err(Error::message(
+                    "实例配置被手动修改；请导入为新版本后再启动，原文件已保留",
+                ));
+            }
+            let binding = serde_json::to_vec(&HomeBinding {
+                profile_id: id.into(),
+                revision,
+            })
+            .map_err(|_| Error::message("无法保存实例绑定"))?;
+            op.step("binding_write", || {
+                private_write(&home.join("usage-binding.json"), &binding)
+            })?;
+            tx.execute(
+                "INSERT OR IGNORE INTO homes VALUES (?1,?2,?3)",
+                params![id, revision, home.to_string_lossy()],
+            )?;
+            op.step("database_commit", || tx.commit())?;
+            Ok(home)
         })
-        .map_err(|_| Error::message("无法保存实例绑定"))?;
-        private_write(&home.join("usage-binding.json"), &binding)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO homes VALUES (?1,?2,?3)",
-            params![id, revision, home.to_string_lossy()],
-        )?;
-        tx.commit()?;
-        Ok(home)
     }
 
     pub fn run(
@@ -614,148 +693,216 @@ impl Manager {
         program: &Path,
         args: &[String],
     ) -> Result<ExitStatus> {
-        // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
-        let report = self.sync(false)?;
-        if !report.skipped.is_empty() || !report.conflicts.is_empty() || !report.missing.is_empty()
-        {
-            eprintln!("{report}");
-        }
-        let profile = self.resolve(selector)?;
-        let revision = revision.unwrap_or(profile.revision);
-        let _oauth_lease = if profile.auth_mode == AuthMode::Oauth {
-            Some(self.oauth_run_lease(&profile.id)?)
-        } else {
-            None
-        };
-        let home = self.materialize(&profile.id, revision)?;
-        let saved = self.revision(&profile.id, revision)?;
-        let key = if profile.auth_mode == AuthMode::Byok {
-            Some(secrets::get(&self.root, &saved.secret_ref)?)
-        } else {
-            let auth = oauth::read_auth(&home.join("auth.json"))?;
-            if profile.oauth.as_ref().is_none_or(|o| {
-                o.account_id != auth.identity.account_id || o.user_id != auth.identity.user_id
-            }) {
-                return Err(Error::message("OAuth 登录文件与账号身份不匹配；请重新登录"));
+        logging::operation("codex.run", |op| {
+            // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
+            let report = op.step("source_sync", || self.sync(false))?;
+            if !report.skipped.is_empty()
+                || !report.conflicts.is_empty()
+                || !report.missing.is_empty()
+            {
+                eprintln!("{report}");
             }
-            None
-        };
-        let cwd = cwd
-            .canonicalize()
-            .map_err(|_| Error::message("项目目录不存在"))?;
-        if !cwd.is_dir() {
-            return Err(Error::message("项目路径不是目录"));
-        }
-        if let Some(id) = resume {
-            uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的会话 ID"))?;
-        }
-        if profile.auth_mode == AuthMode::Oauth {
-            oauth::validate_run_args(args)?;
-            oauth::verify_cli_version(program)?;
-        } else {
-            launcher::validate_run_args(args, profile.auth_mode)?;
-        }
-        let mut help = Command::new(program);
-        clear_auth_env(&mut help);
-        help.arg("--help");
-        let help = crate::credentials::output_with_timeout(help, Duration::from_secs(10))
+            let profile = op.step("account_resolve", || self.resolve(selector))?;
+            let revision = revision.unwrap_or(profile.revision);
+            op.account(&profile.id, revision, profile.auth_mode.log_name());
+            tracing::info!(event = "run_selected", resume = resume.is_some());
+            let _oauth_lease = if profile.auth_mode == AuthMode::Oauth {
+                Some(op.step("oauth_run_lease", || self.oauth_run_lease(&profile.id))?)
+            } else {
+                None
+            };
+            let home = op.step("home_materialize", || {
+                self.materialize(&profile.id, revision)
+            })?;
+            let saved = op.step("revision_read", || self.revision(&profile.id, revision))?;
+            let key = if profile.auth_mode == AuthMode::Byok {
+                Some(op.step("credential_read", || {
+                    secrets::get(&self.root, &saved.secret_ref)
+                })?)
+            } else {
+                let auth = op.step("oauth_auth_read", || {
+                    oauth::read_auth(&home.join("auth.json"))
+                })?;
+                if profile.oauth.as_ref().is_none_or(|o| {
+                    o.account_id != auth.identity.account_id || o.user_id != auth.identity.user_id
+                }) {
+                    tracing::error!(event = "oauth_identity_mismatch");
+                    return Err(Error::message("OAuth 登录文件与账号身份不匹配；请重新登录"));
+                }
+                None
+            };
+            op.begin("cwd_validate");
+            let cwd = cwd
+                .canonicalize()
+                .map_err(|_| Error::message("项目目录不存在"))?;
+            if !cwd.is_dir() {
+                return Err(Error::message("项目路径不是目录"));
+            }
+            if let Some(id) = resume {
+                uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的会话 ID"))?;
+            }
+            if profile.auth_mode == AuthMode::Oauth {
+                op.step("arguments_validate", || oauth::validate_run_args(args))?;
+                op.step("cli_version_detect", || oauth::verify_cli_version(program))?;
+            } else {
+                op.step("arguments_validate", || {
+                    launcher::validate_run_args(args, profile.auth_mode)
+                })?;
+            }
+            op.begin("cli_capability_detect");
+            let mut help = Command::new(program);
+            clear_auth_env(&mut help);
+            help.arg("--help");
+            let help = crate::credentials::output_with_timeout(help, Duration::from_secs(10))
             .ok_or_else(|| {
                 Error::message(
                     "无法运行 Codex CLI 或能力检测超时；请先安装 codex 或使用 --binary 指定路径",
                 )
             })?;
-        if !help.status.success() {
-            return Err(Error::message("Codex CLI 能力检测失败"));
-        }
-        let mut command = Command::new(program);
-        clear_auth_env(&mut command);
-        command.current_dir(&cwd).env("CODEX_HOME", &home);
-        if let Some(key) = key {
-            command.env(config::KEY_ENV, key);
-        }
-        if profile.auth_mode == AuthMode::Oauth {
-            if !String::from_utf8_lossy(&help.stdout).contains("--profile") {
-                return Err(Error::message(
-                    "OAuth 配置版本需要支持独立 profile 文件的新版 Codex CLI；请升级 codex",
-                ));
+            if !help.status.success() {
+                return Err(Error::message("Codex CLI 能力检测失败"));
             }
-            command.args(["--profile", &format!("usage-r{revision}")]);
-            command.args([
-                "-c",
-                "cli_auth_credentials_store=\"file\"",
-                "-c",
-                "forced_login_method=\"chatgpt\"",
-                "-c",
-                "model_provider=\"openai\"",
-            ]);
-            if let Some(identity) = &profile.oauth {
+            let mut command = Command::new(program);
+            clear_auth_env(&mut command);
+            command.current_dir(&cwd).env("CODEX_HOME", &home);
+            if let Some(key) = key {
+                command.env(config::KEY_ENV, key);
+            }
+            if profile.auth_mode == AuthMode::Oauth {
+                if !String::from_utf8_lossy(&help.stdout).contains("--profile") {
+                    return Err(Error::message(
+                        "OAuth 配置版本需要支持独立 profile 文件的新版 Codex CLI；请升级 codex",
+                    ));
+                }
+                command.args(["--profile", &format!("usage-r{revision}")]);
                 command.args([
                     "-c",
-                    &format!(
-                        "forced_chatgpt_workspace_id={}",
-                        toml_edit::value(&identity.account_id)
-                    ),
+                    "cli_auth_credentials_store=\"file\"",
+                    "-c",
+                    "forced_login_method=\"chatgpt\"",
+                    "-c",
+                    "model_provider=\"openai\"",
                 ]);
+                if let Some(identity) = &profile.oauth {
+                    command.args([
+                        "-c",
+                        &format!(
+                            "forced_chatgpt_workspace_id={}",
+                            toml_edit::value(&identity.account_id)
+                        ),
+                    ]);
+                }
             }
-        }
-        if String::from_utf8_lossy(&help.stdout).contains("--no-daemon") {
-            command.arg("--no-daemon");
-        }
-        if let Some(id) = resume {
-            command.args(["resume", id]);
-        }
-        command.args(args);
-        #[cfg(unix)]
-        if let Some(lease) = &_oauth_lease {
-            launcher::inherit_run_lease(&mut command, lease)?;
-        }
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let mut child = command.spawn()?;
-        if let Err(error)=self.conn.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
+            if String::from_utf8_lossy(&help.stdout).contains("--no-daemon") {
+                command.arg("--no-daemon");
+            }
+            if let Some(id) = resume {
+                command.args(["resume", id]);
+            }
+            command.args(args);
+            #[cfg(unix)]
+            if let Some(lease) = &_oauth_lease {
+                launcher::inherit_run_lease(&mut command, lease)?;
+            }
+            let run_id = op.id().to_owned();
+            let mut child = op.step("child_spawn", || command.spawn())?;
+            tracing::info!(event = "child_spawned", child_pid = child.id());
+            op.begin("run_record");
+            if let Err(error)=self.conn.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
             params![run_id,profile.id,revision,cwd.to_string_lossy(),now(),child.id()]) {
             let _=child.kill(); let _=child.wait(); return Err(error.into());
         }
-        let status = child.wait()?;
-        self.conn.execute(
-            "UPDATE runs SET finished_at=?1,exit_code=?2 WHERE id=?3",
-            params![now(), status.code(), run_id],
-        )?;
-        if profile.auth_mode == AuthMode::Oauth {
-            oauth::restrict_auth_permissions(&home)?;
-        }
-        Ok(status)
+            let status = op.step("child_wait", || child.wait())?;
+            if status.success() {
+                tracing::info!(
+                    event = "child_exited",
+                    exit_code = status.code(),
+                    successful = true
+                );
+            } else {
+                tracing::warn!(
+                    event = "child_exited",
+                    exit_code = status.code(),
+                    successful = false
+                );
+            }
+            op.begin("run_finish_record");
+            self.conn.execute(
+                "UPDATE runs SET finished_at=?1,exit_code=?2 WHERE id=?3",
+                params![now(), status.code(), run_id],
+            )?;
+            if profile.auth_mode == AuthMode::Oauth {
+                op.step("auth_permissions", || {
+                    oauth::restrict_auth_permissions(&home)
+                })?;
+            }
+            if !status.success() {
+                op.fail("child_exit");
+            }
+            Ok(status)
+        })
     }
 
     pub async fn test_connection(&self, selector: &str) -> Result<u16> {
-        let profile = self.resolve(selector)?;
-        if profile.auth_mode == AuthMode::Oauth {
-            return Err(Error::message(
-                "Responses API 测试仅用于 BYOK；OAuth 请打开 Codex 验证登录",
-            ));
-        }
-        let saved = self.revision(&profile.id, profile.revision)?;
-        let key = secrets::get(&self.root, &saved.secret_ref)?;
-        let url = format!("{}/responses", profile.base_url.trim_end_matches('/'));
-        let response = reqwest::Client::builder().timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| Error::message("无法初始化 HTTP 客户端"))?
-            .post(url).bearer_auth(key).json(&serde_json::json!({"model":profile.model,"input":"Reply with OK.","max_output_tokens":64,"stream":false}))
-            .send().await.map_err(|_| Error::message("Responses 测试请求失败（未记录请求内容或密钥）"))?;
-        let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|_| Error::message("上游返回成功状态，但响应不是有效 JSON"))?;
-            if body.get("object").and_then(serde_json::Value::as_str) != Some("response")
-                || !body.get("output").is_some_and(serde_json::Value::is_array)
-                || body.get("error").is_some_and(|e| !e.is_null())
-            {
+        let mut op = logging::Operation::new("codex.connection_test");
+        let span = op.span();
+        let result = logging::instrument(span, async {
+            let profile = op.step("account_resolve", || self.resolve(selector))?;
+            op.account(&profile.id, profile.revision, profile.auth_mode.log_name());
+            if profile.auth_mode == AuthMode::Oauth {
                 return Err(Error::message(
-                    "上游响应不符合 Responses API 或模型执行失败",
+                    "Responses API 测试仅用于 BYOK；OAuth 请打开 Codex 验证登录",
                 ));
             }
-        }
-        Ok(status)
+            let saved = op.step("revision_read", || {
+                self.revision(&profile.id, profile.revision)
+            })?;
+            let key = op.step("credential_read", || {
+                secrets::get(&self.root, &saved.secret_ref)
+            })?;
+            let url = format!("{}/responses", profile.base_url.trim_end_matches('/'));
+            op.begin("http_request");
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| Error::message("无法初始化 HTTP 客户端"))?;
+            let response = client
+                .post(url)
+                .bearer_auth(key)
+                .json(&serde_json::json!({
+                    "model": profile.model, "input": "Reply with OK.",
+                    "max_output_tokens": 64, "stream": false
+                }))
+                .send()
+                .await
+                .map_err(|_| Error::message("Responses 测试请求失败（未记录请求内容或密钥）"))?;
+            let status = response.status().as_u16();
+            if (200..300).contains(&status) {
+                tracing::info!(event = "http_response", status);
+            } else {
+                tracing::warn!(event = "http_response", status);
+            }
+            op.begin("http_response_validate");
+            if (200..300).contains(&status) {
+                let body: serde_json::Value = response
+                    .json()
+                    .await
+                    .map_err(|_| Error::message("上游返回成功状态，但响应不是有效 JSON"))?;
+                if body.get("object").and_then(serde_json::Value::as_str) != Some("response")
+                    || !body.get("output").is_some_and(serde_json::Value::is_array)
+                    || body.get("error").is_some_and(|e| !e.is_null())
+                {
+                    return Err(Error::message(
+                        "上游响应不符合 Responses API 或模型执行失败",
+                    ));
+                }
+            }
+            Ok(status)
+        })
+        .await;
+        op.finish(result.as_ref().is_ok_and(|s| (200..300).contains(s)));
+        result
     }
 
     pub fn export(&self, selector: &str, target: &Path) -> Result<()> {

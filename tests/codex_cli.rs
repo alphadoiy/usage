@@ -14,13 +14,42 @@ impl Fixture {
             path: path.canonicalize().unwrap(),
         }
     }
-    fn command(&self, args: &[&str]) -> Command {
+    fn root_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_usage"));
         command
-            .args(["codex"])
             .args(args)
-            .env("USAGE_CODEX_DIR", self.path.join("manager"));
+            .env("USAGE_CODEX_DIR", self.path.join("manager"))
+            .env("USAGE_LOG_DIR", self.path.join("logs"))
+            .env("USAGE_LOG", "debug");
         command
+    }
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = self.root_command(&["codex"]);
+        command.args(args);
+        command
+    }
+    fn log_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<_> = fs::read_dir(self.path.join("logs"))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        files.sort();
+        files
+    }
+    fn events(&self) -> Vec<serde_json::Value> {
+        self.log_files()
+            .iter()
+            .flat_map(|path| {
+                fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str(line).expect("complete JSON event after command exits")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
     fn run(&self, args: &[&str]) -> String {
         success(self.command(args).output().unwrap())
@@ -774,11 +803,19 @@ fn oauth_child_retains_the_run_lease_after_its_launcher_is_killed() {
         release,
         finished,
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !capture.exists() && std::time::Instant::now() < deadline {
+        if held.launcher.try_wait().unwrap().is_some() {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(capture.exists(), "mock Codex did not start");
+    assert!(
+        capture.exists(),
+        "mock Codex did not start; exit={:?}; events={}",
+        held.launcher.try_wait().unwrap(),
+        serde_json::to_string(&f.events()).unwrap()
+    );
     let record: serde_json::Value = serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
     let pid = record["pid"].as_i64().unwrap() as libc::pid_t;
     held.launcher.kill().unwrap();
@@ -837,7 +874,7 @@ fn oauth_child_retains_the_run_lease_after_its_launcher_is_killed() {
 
 #[cfg(unix)]
 #[test]
-fn byok_native_trust_update_does_not_break_the_next_cli_launch() {
+fn byok_native_runtime_state_does_not_break_the_next_cli_launch() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();
     let id = f.add();
@@ -853,7 +890,7 @@ assert os.environ['USAGE_CODEX_API_KEY']=='fixture-cli-secret'
 config=Path(os.environ['CODEX_HOME'])/'config.toml'
 text=config.read_text()
 if '[projects.' not in text:
-    config.write_text(text+'\n[projects."/fixture/project"]\ntrust_level="trusted"\n')
+    config.write_text(text+'\n[projects."/fixture/project"]\ntrust_level="trusted"\n[notice.model_migrations]\nfixture-model="fixture-model-v2"\n[tui]\nscreen_reader_detection_done=true\n[tui.model_availability_nux]\nfixture-model-v2=1\n')
 "#,
     )
     .unwrap();
@@ -870,6 +907,8 @@ if '[projects.' not in text:
     }
     let saved = f.run(&["show", &id]);
     assert!(!saved.contains("[projects."));
+    assert!(!saved.contains("model_migrations"));
+    assert!(!saved.contains("screen_reader_detection_done"));
     let runtime = fs::read_to_string(
         f.path
             .join("manager/homes")
@@ -880,4 +919,489 @@ if '[projects.' not in text:
     assert!(runtime.contains("trust_level=\"trusted\""));
     let profiles: serde_json::Value = serde_json::from_str(&f.run(&["list", "--json"])).unwrap();
     assert_eq!(profiles[0]["revision"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_launch_logs_correlate_database_run_and_flush_on_nonzero_exit() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let id = f.add();
+    let binary = f.path.join("exit codex");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = '--help' ]; then echo '--no-daemon'; exit 0; fi\nexit 7\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = f
+        .command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--",
+            "fixture-private-prompt",
+        ])
+        .env("USAGE_LOG", "trace")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let events = f.events();
+    let exit = events
+        .iter()
+        .find(|e| e["fields"]["event"] == "child_exited")
+        .unwrap();
+    assert_eq!(exit["fields"]["exit_code"], 7);
+    assert_eq!(exit["span"]["profile_id"], id);
+    let run_id: String = rusqlite::Connection::open(f.path.join("manager/manager.sqlite3"))
+        .unwrap()
+        .query_row("SELECT id FROM runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(exit["span"]["operation_id"], run_id);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "process_exited" && e["fields"]["exit_code"] == 7)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "operation_failed"
+                && e["span"]["operation"] == "cli.dispatch")
+    );
+    let logs = serde_json::to_string(&events).unwrap();
+    assert!(!logs.contains("fixture-cli-secret"));
+    assert!(!logs.contains("fixture-private-prompt"));
+    assert!(!logs.contains("fixture-model"));
+    for file in f.log_files() {
+        let lines: Vec<serde_json::Value> = fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        let pid = &lines[0]["span"]["pid"];
+        assert!(lines.iter().all(|e| &e["spans"][0]["pid"] == pid));
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        fs::metadata(f.path.join("logs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let count = f.log_files().len();
+    let filtered = success(
+        f.root_command(&["logs", "--operation", &run_id, "--tail", "10000"])
+            .output()
+            .unwrap(),
+    );
+    assert!(filtered.contains("child_spawned"));
+    assert!(filtered.contains("child_exited"));
+    assert!(!filtered.contains("account_add"));
+    assert_eq!(
+        f.log_files().len(),
+        count,
+        "reading logs must not create a new log"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tampered_config_logs_only_safe_field_names_and_identifies_failed_stage() {
+    let f = Fixture::new();
+    let id = f.add();
+    let manager = usage::codex_manager::Manager::open(f.path.join("manager")).unwrap();
+    let home = manager.materialize(&id, 1).unwrap();
+    let config = home.join("config.toml");
+    let mut doc: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
+    doc["model"] = toml::Value::String("private-tampered-value".into());
+    doc["model_providers"]["usage_byok"]["base_url"] =
+        toml::Value::String("https://private-endpoint.test/secret".into());
+    doc.as_table_mut().unwrap().insert(
+        "private-field-key".into(),
+        toml::Value::String("private-field-value".into()),
+    );
+    let changed = toml::to_string(&doc).unwrap();
+    fs::write(&config, &changed).unwrap();
+    let output = f
+        .command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            "nonexistent-codex-fixture",
+        ])
+        .env("USAGE_LOG", "error")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("实例配置被手动修改"));
+    assert!(stderr.contains("操作 ID："));
+    let events = f.events();
+    let mismatch = events
+        .iter()
+        .find(|e| e["fields"]["event"] == "config_mismatch")
+        .unwrap();
+    let fields = mismatch["fields"]["changed_fields"].as_str().unwrap();
+    assert!(fields.contains("model_providers.<entry>.base_url"));
+    assert!(fields.contains("model"));
+    assert!(fields.contains("<unknown>"));
+    assert_eq!(mismatch["span"]["profile_id"], id);
+    assert!(
+        events.iter().any(|e| e["fields"]["event"] == "stage_failed"
+            && e["fields"]["stage"] == "home_materialize")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["fields"]["event"] == "child_spawned")
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), changed);
+    let logs = serde_json::to_string(&events).unwrap();
+    for secret in [
+        "private-tampered-value",
+        "private-endpoint",
+        "private-field-key",
+        "private-field-value",
+        "fixture-cli-secret",
+    ] {
+        assert!(!logs.contains(secret));
+    }
+    let root_id = stderr
+        .split("操作 ID：")
+        .nth(1)
+        .unwrap()
+        .split('）')
+        .next()
+        .unwrap();
+    let tail = success(
+        f.root_command(&["logs", "--operation", root_id])
+            .output()
+            .unwrap(),
+    );
+    assert!(tail.contains("config_mismatch"));
+}
+
+#[test]
+fn logging_off_help_and_read_commands_have_no_side_effects_and_failure_is_optional() {
+    let f = Fixture::new();
+    success(f.root_command(&["--help"]).output().unwrap());
+    success(f.command(&["run", "--help"]).output().unwrap());
+    assert!(!f.path.join("logs").exists());
+    assert_eq!(
+        success(f.root_command(&["logs", "--path"]).output().unwrap()).trim(),
+        f.path.join("logs").to_str().unwrap()
+    );
+    assert!(success(f.root_command(&["logs"]).output().unwrap()).is_empty());
+    assert!(!f.path.join("logs").exists());
+    assert_eq!(
+        success(
+            f.command(&["list", "--json"])
+                .env("USAGE_LOG", "off")
+                .output()
+                .unwrap()
+        )
+        .trim(),
+        "[]"
+    );
+    assert!(!f.path.join("logs").exists());
+    let blocked = f.path.join("blocked-log-path");
+    fs::write(&blocked, "existing file").unwrap();
+    let output = f
+        .command(&["list", "--json"])
+        .env("USAGE_LOG_DIR", &blocked)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("无法初始化文件日志"));
+    assert_eq!(success(output).trim(), "[]");
+    assert_eq!(fs::read_to_string(blocked).unwrap(), "existing file");
+    let output = f
+        .command(&["list", "--json"])
+        .env("USAGE_LOG", "private-filter-invalid=bogus")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("日志级别配置无效"));
+    assert!(!stderr.contains("private-filter-invalid"));
+    assert_eq!(success(output).trim(), "[]");
+    assert!(
+        !serde_json::to_string(&f.events())
+            .unwrap()
+            .contains("private-filter-invalid")
+    );
+    let files = f.log_files().len();
+    let tail = success(f.root_command(&["logs", "--tail", "1"]).output().unwrap());
+    assert_eq!(tail.lines().count(), 1);
+    assert_eq!(f.log_files().len(), files);
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_logs_record_shared_lock_contention_without_identity_or_tokens() {
+    use fs2::FileExt;
+    let f = Fixture::new();
+    let source = oauth_source(&f, "private-workspace");
+    let id = oauth_id(&f, &source, "Private OAuth Account");
+    let binary = oauth_binary(&f);
+    let capture = f.path.join("capture.json");
+    success(
+        f.command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("CAPTURE_FILE", &capture)
+        .env("USAGE_LOG", "trace")
+        .output()
+        .unwrap(),
+    );
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(f.path.join("manager/locks").join(format!("{id}.lock")))
+        .unwrap();
+    FileExt::try_lock_exclusive(&lock).unwrap();
+    let output = f
+        .command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("USAGE_LOG", "trace")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let events = f.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "lease_acquired" && e["fields"]["exclusive"] == false)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "lease_failed" && e["fields"]["busy"] == true)
+    );
+    let logs = serde_json::to_string(&events).unwrap();
+    let auth: serde_json::Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+    for field in ["id_token", "access_token", "refresh_token"] {
+        assert!(!logs.contains(auth["tokens"][field].as_str().unwrap()));
+    }
+    for private in [
+        "fixture-refresh-rotated",
+        "Private OAuth Account",
+        "private-workspace",
+        "fixture@example.com",
+    ] {
+        assert!(!logs.contains(private));
+    }
+}
+
+#[test]
+fn async_http_failure_logs_status_and_context_without_request_or_response_secrets() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    let f = Fixture::new();
+    let id = f.add();
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = server.local_addr().unwrap();
+    f.run(&["edit", &id, "--base-url", &format!("http://{address}/v1")]);
+    let thread = std::thread::spawn(move || {
+        server.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut socket = loop {
+            match server.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "test client never connected"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("mock server: {e}"),
+            }
+        };
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let len = socket.read(&mut buf).unwrap();
+            assert!(len > 0);
+            request.extend_from_slice(&buf[..len]);
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let body = "{\"error\":\"private-upstream-response-token\"}";
+        write!(socket, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let output = f
+        .command(&["test", &id, "--request"])
+        .env("USAGE_LOG", "trace")
+        .output()
+        .unwrap();
+    thread.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let events = f.events();
+    let http = events
+        .iter()
+        .find(|e| e["fields"]["event"] == "http_response")
+        .unwrap();
+    assert_eq!(http["fields"]["status"], 401);
+    assert_eq!(http["level"], "WARN");
+    assert_eq!(http["span"]["operation"], "codex.connection_test");
+    assert_eq!(http["spans"][0]["operation"], "cli.dispatch");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "operation_failed"
+                && e["span"]["operation"] == "codex.connection_test")
+    );
+    let logs = serde_json::to_string(&events).unwrap();
+    for private in [
+        "fixture-cli-secret",
+        "private-upstream-response-token",
+        "Reply with OK",
+        "127.0.0.1",
+    ] {
+        assert!(!logs.contains(private));
+    }
+}
+
+#[test]
+fn cc_switch_skip_diagnostics_use_static_reasons_and_counts() {
+    let f = Fixture::new();
+    let path = f.path.join("source.sqlite3");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE providers(id TEXT,app_type TEXT,name TEXT,settings_config TEXT,meta TEXT)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO providers VALUES ('private-source-id','codex','private-source-name',?1,'{}')",
+        [serde_json::json!({"config":"model = 'private-source-model'", "auth":{}}).to_string()],
+    )
+    .unwrap();
+    let output = f.run(&["import", "--source", path.to_str().unwrap(), "--dry-run"]);
+    assert!(output.contains("跳过 1"));
+    let events = f.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "source_provider_skipped"
+                && e["fields"]["reason"] == "missing_api_key")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["fields"]["event"] == "source_sync_summary"
+                && e["fields"]["skipped"] == 1
+                && e["fields"]["dry_run"] == true)
+    );
+    let logs = serde_json::to_string(&events).unwrap();
+    for private in [
+        "private-source-id",
+        "private-source-name",
+        "private-source-model",
+    ] {
+        assert!(!logs.contains(private));
+    }
+}
+
+#[test]
+fn successful_statusline_defaults_to_warn_without_creating_an_empty_log_file() {
+    let f = Fixture::new();
+    let config = f.path.join("usage.toml");
+    fs::write(&config, "providers = ['claude']").unwrap();
+    let mut child = f
+        .root_command(&[
+            "statusline",
+            "--config",
+            config.to_str().unwrap(),
+            "--no-color",
+        ])
+        .env_remove("USAGE_LOG")
+        .env("XDG_CACHE_HOME", f.path.join("cache"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"rate_limits\":{\"five_hour\":{\"used_percentage\":57.4}}}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.stderr.is_empty());
+    assert!(success(output).contains("57.4%"));
+    assert!(f.log_files().is_empty());
+}
+
+#[test]
+fn concurrently_spawned_provider_query_keeps_cli_operation_context() {
+    let f = Fixture::new();
+    let config = f.path.join("usage.toml");
+    let mut value = toml::map::Map::new();
+    value.insert(
+        "providers".into(),
+        toml::Value::Array(vec![toml::Value::String("codex".into())]),
+    );
+    let codex_home = f.path.join("empty-codex");
+    let mut paths = toml::map::Map::new();
+    paths.insert(
+        "codex".into(),
+        toml::Value::String(codex_home.to_string_lossy().into()),
+    );
+    value.insert("paths".into(), toml::Value::Table(paths));
+    fs::write(&config, toml::to_string(&value).unwrap()).unwrap();
+    assert_eq!(
+        usage::config::load_config(&config, true).unwrap().codex_dir,
+        Some(codex_home)
+    );
+    let output = f
+        .root_command(&["--once", "--config", config.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let events = f.events();
+    let event = events
+        .iter()
+        .find(|e| e["fields"]["event"] == "provider_query_result")
+        .unwrap();
+    assert_eq!(event["fields"]["provider"], "codex");
+    assert_eq!(event["span"]["operation"], "provider.query");
+    assert_eq!(event["spans"][0]["operation"], "cli.dispatch");
+    assert_eq!(event["fields"]["credential_status"], "NotFound");
 }
