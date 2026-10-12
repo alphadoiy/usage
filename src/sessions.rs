@@ -816,6 +816,23 @@ fn validate_resume(session: &Session) -> Result<(), String> {
 /// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
 pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
     validate_resume(session)?;
+    if session.provider == AgentKind::CODEX
+        && let Some((profile, revision)) =
+            crate::codex_manager::binding_for_home(&session.home).map_err(|e| e.to_string())?
+    {
+        return crate::codex_manager::Manager::open_default()
+            .and_then(|mut manager| {
+                manager.run(
+                    &profile,
+                    &session.cwd,
+                    Some(revision),
+                    Some(&session.id),
+                    Path::new("codex"),
+                    &[],
+                )
+            })
+            .map_err(|e| e.to_string());
+    }
     let mut parts = session.provider.command().split_whitespace();
     let program = parts.next().ok_or("恢复命令为空")?;
     Command::new(program)
@@ -828,6 +845,18 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
 }
 pub fn resume_shell_command(session: &Session) -> Result<String, String> {
     validate_resume(session)?;
+    if session.provider == AgentKind::CODEX
+        && let Some((profile, revision)) =
+            crate::codex_manager::binding_for_home(&session.home).map_err(|e| e.to_string())?
+    {
+        return crate::codex_manager::launch_shell_command(
+            &profile,
+            &session.cwd,
+            Some(revision),
+            Some(&session.id),
+        )
+        .map_err(|e| e.to_string());
+    }
     #[cfg(not(target_os = "windows"))]
     {
         let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
@@ -924,6 +953,13 @@ pub fn copy_resume_command(session: &Session) -> Result<(), String> {
 }
 
 pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
+    if session.provider == AgentKind::CODEX
+        && crate::codex_manager::binding_for_home(&session.home)
+            .map_err(|e| e.to_string())?
+            .is_some()
+    {
+        return command_in_ghostty(&session.cwd, &resume_shell_command(session)?);
+    }
     if !cfg!(target_os = "macos") {
         return Err("Ghostty 分屏仅支持 macOS，请按 R 选择当前终端".into());
     }
@@ -950,6 +986,45 @@ pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Open a launcher command containing identifiers, never credentials, in a fresh Ghostty split.
+pub fn command_in_ghostty(cwd: &Path, command: &str) -> Result<(), String> {
+    if !uses_ghostty(crate::config::ResumeMode::Auto) {
+        return Err("请在 macOS Ghostty 中使用 --split".into());
+    }
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|_| "项目目录不存在".to_string())?;
+    if !cwd.is_dir() {
+        return Err("项目路径不是目录".into());
+    }
+    let script = r#"on run argv
+        tell application "Ghostty"
+            set currentTerm to focused terminal of selected tab of front window
+            if currentTerm is missing value then error "找不到当前 Ghostty 终端"
+            set cfg to new surface configuration
+            set initial working directory of cfg to item 1 of argv
+            set newTerm to split currentTerm direction right with configuration cfg
+            input text (item 2 of argv) to newTerm
+            send key "enter" to newTerm
+            focus newTerm
+        end tell
+    end run"#;
+    let output = Command::new("osascript")
+        .args(["-e", script])
+        .arg(cwd)
+        .arg(command)
+        .output()
+        .map_err(|e| format!("无法打开 Ghostty：{e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Ghostty 分屏失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(test)]

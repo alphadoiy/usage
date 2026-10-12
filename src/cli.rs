@@ -49,6 +49,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Codex BYOK/OAuth 账号配置、CC Switch 导入/同步和多实例启动
+    Codex {
+        #[command(subcommand)]
+        command: Option<crate::codex_manager::cli::CodexCommand>,
+    },
     /// TUI 贡献看板：年度热力图、每日明细和月度趋势
     #[command(visible_alias = "dashboard")]
     History {
@@ -121,6 +126,20 @@ pub async fn run() -> i32 {
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
+        Some(Command::Codex { command }) => {
+            if let Some(command) = command {
+                crate::codex_manager::cli::dispatch(command)
+                    .await
+                    .map_err(|e| CliError(e.to_string()))
+            } else {
+                let handle = Handle::current();
+                tokio::task::spawn_blocking(move || crate::ui::run_codex(handle))
+                    .await
+                    .map_err(|e| CliError(e.to_string()))?
+                    .map_err(|e| CliError(e.to_string()))?;
+                Ok(0)
+            }
+        }
         Some(Command::History {
             year,
             range,
@@ -429,7 +448,18 @@ fn print_styles() {
 }
 
 pub fn make_context(config: &AppConfig) -> Arc<ProviderContext> {
+    make_context_with_keychain(config, Arc::new(read_macos_keychain))
+}
+
+fn make_context_with_keychain(
+    config: &AppConfig,
+    keychain: Arc<crate::providers::KeychainReader>,
+) -> Arc<ProviderContext> {
     let home = home_dir();
+    let custom_codex_home = config.codex_dir.as_ref().is_some_and(|dir| {
+        crate::config::resolved_data_path(dir)
+            != crate::config::resolved_data_path(&home.join(".codex"))
+    });
     Arc::new(ProviderContext {
         claude_dir: config
             .claude_dir
@@ -444,7 +474,14 @@ pub fn make_context(config: &AppConfig) -> Arc<ProviderContext> {
             .clone()
             .unwrap_or_else(|| home.join(".grok")),
         http: Arc::new(ReqwestClient::new()),
-        keychain: Arc::new(read_macos_keychain),
+        keychain: Arc::new(move |service, account| {
+            // A custom home must not silently query another account's default Keychain item.
+            if custom_codex_home && service == crate::credentials::CODEX_KEYCHAIN_SERVICE {
+                None
+            } else {
+                keychain(service, account)
+            }
+        }),
         now: Arc::new(Utc::now),
     })
 }
@@ -475,6 +512,32 @@ mod tests {
 
     use super::*;
     use crate::model::snapshot_not_found;
+
+    #[test]
+    fn custom_codex_home_never_falls_back_to_the_default_keychain_account() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader: Arc<crate::providers::KeychainReader> = {
+            let reads = reads.clone();
+            Arc::new(move |_, _| {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Some("fixture-default-account".into())
+            })
+        };
+        let config = AppConfig {
+            codex_dir: Some(
+                std::env::temp_dir().join(format!("usage-custom-home-{}", uuid::Uuid::new_v4())),
+            ),
+            ..Default::default()
+        };
+        let custom = make_context_with_keychain(&config, reader.clone());
+        assert!((custom.keychain)(crate::credentials::CODEX_KEYCHAIN_SERVICE, None).is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!((custom.keychain)(crate::credentials::CLAUDE_KEYCHAIN_SERVICE, None).is_some());
+        let default = make_context_with_keychain(&AppConfig::default(), reader);
+        assert!((default.keychain)(crate::credentials::CODEX_KEYCHAIN_SERVICE, None).is_some());
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn parses_tui_dashboard_alias_and_history_exports() {

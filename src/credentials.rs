@@ -1,6 +1,8 @@
 //! 从本机 Keychain 或 CLI 凭据文件读取令牌。只读，不刷新、不写回。
 
+use std::io::Read;
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -103,24 +105,86 @@ pub fn read_macos_keychain(service: &str, account: Option<&str>) -> Option<Strin
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
     let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+    let result = (|| {
+        let mut stdout = child.stdout.take()?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: stdout owns this valid pipe fd; only its read end is changed.
+            // Nonblocking reads also let the reader honor the deadline when a
+            // descendant keeps the pipe open after the immediate child exits.
+            unsafe {
+                let fd = stdout.as_raw_fd();
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags == -1 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+                    return None;
+                }
             }
         }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("usage-child-output".into())
+            .spawn(move || {
+                let output = (|| {
+                    const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+                    let mut output = Vec::new();
+                    let mut buffer = [0u8; 8192];
+                    while started.elapsed() < timeout {
+                        match stdout.read(&mut buffer) {
+                            Ok(0) => return Some(output),
+                            Ok(n) if output.len() + n <= MAX_OUTPUT => {
+                                output.extend_from_slice(&buffer[..n]);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    None
+                })();
+                let _ = sender.send(output);
+            })
+            .ok()?;
+        let mut output = None;
+        let status = loop {
+            if started.elapsed() >= timeout {
+                return None;
+            }
+            if output.is_none() {
+                match receiver.try_recv() {
+                    Ok(Some(bytes)) => output = Some(bytes),
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => return None,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            match child.try_wait().ok()? {
+                Some(status) => break status,
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        };
+        let stdout = output.or_else(|| {
+            receiver
+                .recv_timeout(timeout.saturating_sub(started.elapsed()))
+                .ok()
+                .flatten()
+        })?;
+        Some(Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        })
+    })();
+    if result.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    child.wait_with_output().ok()
+    result
 }
 
 pub fn parse_claude_credentials(content: &str, now: DateTime<Utc>) -> CredentialRead {
@@ -400,5 +464,31 @@ mod tests {
         let started = Instant::now();
         assert!(output_with_timeout(stalled, Duration::from_millis(40)).is_none());
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_output_drains_large_pipes_and_rejects_unbounded_output() {
+        let mut large = Command::new("python3");
+        large.args(["-c", "import sys; sys.stdout.write('x'*1048576)"]);
+        let output = output_with_timeout(large, Duration::from_secs(2)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1024 * 1024);
+        let mut unlimited = Command::new("python3");
+        unlimited.args(["-c", "import sys; sys.stdout.write('x'*(5*1048576))"]);
+        assert!(output_with_timeout(unlimited, Duration::from_secs(2)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_child_does_not_wait_forever_for_descendant_stdout() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import os,time; pid=os.fork(); time.sleep(0.7) if pid==0 else None",
+        ]);
+        let start = Instant::now();
+        assert!(output_with_timeout(command, Duration::from_millis(100)).is_none());
+        assert!(start.elapsed() < Duration::from_millis(600));
     }
 }

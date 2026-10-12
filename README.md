@@ -10,7 +10,7 @@
 
 终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。Braille 进度条会随卡片宽度延伸；窄卡片会把额度信息和进度条分成两行，避免截断。
 
-查询方式对齐 cc-switch 的官方订阅额度：只读取本机已有登录凭据，不负责登录，也不把令牌写回磁盘。
+官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。另有 Codex BYOK/OAuth 账号管理入口，可保存配置和登录、导入 CC Switch 供应商并启动多个账号。
 
 | 工具 | 凭据 | 接口 |
 | --- | --- | --- |
@@ -85,6 +85,8 @@ TUI 按键：
 | `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
 | `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
+| `m` / `F10` | 打开功能菜单，选择额度、历史、会话或 Codex 账号管理；`m` 用于额度主页 |
+| `F4` | 管理 Codex BYOK/OAuth 账号配置、导入 CC Switch、打开独立实例 |
 | `j` / `k` | 滚动 |
 | `q` | 退出 |
 
@@ -108,6 +110,79 @@ Codex 的用量响应若提供主动重置次数，卡片会显示剩余次数�
 按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 索引，无法打开时改读本机会话日志。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
+
+## Codex 账号配置与多开（BYOK / OAuth）
+
+运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Codex 账号管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 选择添加方式（BYOK / OAuth 登录 / 导入 OAuth），`l` 重新登录选中的 OAuth 账号，`e` 编辑常用字段，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
+
+在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
+
+```bash
+usage codex
+usage codex add work --base-url https://example.com/v1 --model your-model --key-stdin
+# 输入 API Key 后按 Ctrl+D；也可用 --key-env 变量名 或 --key-file 文件路径
+usage codex list
+usage codex run work --cwd ~/Coding/project
+usage codex run work --cwd ~/Coding/project --split
+usage codex run work --cwd ~/Coding/project --worktree
+usage codex run work --cwd ~/Coding/project -- --sandbox workspace-write
+usage codex edit work --model another-model --effort high
+usage codex edit work                         # 用编辑器修改完整 TOML
+usage codex copy work personal
+usage codex export work --output ./codex.toml  # 不含 API Key
+usage codex test work                         # 仅检查配置，不发请求
+usage codex test work --request               # 发送小型 Responses 请求，可能计费
+```
+
+BYOK 每次编辑或源配置更新生成新版本。不同账号、不同版本各自使用持久的 `CODEX_HOME`，运行中的版本不会被同步改写；同一版本多开共享会话目录。CLI 写入的合法项目信任设置保留在运行目录，不会改变保存的配置版本，也不会阻止下一次启动；模型、供应商、认证及其他设置的直接修改仍需要导入为新版本。历史与会话页自动收录已经启动过的托管目录，恢复时使用该会话绑定的账号、配置版本和密钥。也可显式运行 `usage codex run <ID> --revision 1 --resume <会话UUID>`。密钥轮换后若上游停用了旧 Key，旧会话绑定的 Key 也会失效。
+
+数据默认位于 `~/.local/share/usage/codex`，遵循 `XDG_DATA_HOME`；`USAGE_CODEX_DIR` 可指定一个专用目录。BYOK API Key 保存在该目录下的 `keys/<UUID>` 文件，SQLite 只保存密钥引用；macOS/Linux 的数据与密钥目录权限为 `700`，密钥文件权限为 `600`。文件内容为明文，权限控制不等于加密。BYOK 管理不访问 macOS Keychain，生成的 TOML 通过子进程环境变量取 Key。启动命令和复制的恢复命令不包含密钥，也会清除继承的默认 Codex/OpenAI 认证环境变量。移出列表会保留配置版本、密钥和历史，便于恢复旧会话。
+
+如果此前保存过旧版 Keychain 配置，可编辑账号重新输入 API Key；从 CC Switch 导入的配置也可重新导入，源内容一致时会修复原配置的密钥引用，保留版本和会话目录。不会访问或删除以前的钥匙串条目。已有的官方订阅额度查询仍可读取 Claude/Codex 自己的 Keychain 登录凭据。
+
+### ChatGPT OAuth 账号
+
+在账号管理页按 `a`，选择「OAuth · 登录 ChatGPT」，填写名称，再选择浏览器登录或设备码登录。也可以选择「导入 OAuth」并指定官方 `auth.json` 或 Cockpit Tools 的单账号 JSON；界面只展示邮箱、套餐和账号 ID，预览后按 `Enter` 保存。列表显示账号的 OAuth / BYOK 类型及 OAuth 身份；按 `l` 重新登录，登录到另一个用户或工作区时会拒绝替换原账号。
+
+```bash
+usage codex login personal
+usage codex login work --device-auth
+usage codex login --account personal             # 重新认证，保留名称和配置
+usage codex import-auth --source ~/.codex/auth.json --name personal
+usage codex import-auth --source /path/to/cockpit/account.json --name work
+usage codex login personal --config ./oauth.toml # 可选完整配置
+usage codex edit personal --model your-model --effort high
+usage codex run personal --cwd ~/Coding/project
+```
+
+登录和 refresh token 刷新交给官方 Codex CLI，不自行实现 OAuth 端点或在应用中硬编码 client ID。[官方认证文档](https://learn.chatgpt.com/docs/auth)说明 CLI 支持浏览器 / 设备码登录，以及文件凭据存储。设备码授权需要个人或工作区启用该功能。新增账号默认使用 CLI 的默认模型，也可选择账号可用的模型。
+
+OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `auth.json`；目录权限 `700`，凭据文件权限 `600`，明文存储，不接入 Keychain。SQLite 保存身份信息和配置，令牌不进入数据库、导出的 TOML、账号列表或启动命令。配置版本使用 `usage-rN.config.toml`，通过原生 `--profile` 选择；需要 **Codex CLI 0.134.0 或更新版本**（[原生 profile 文档](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)）。修改配置不会复制或还原旧 token，CLI 刷新后继续使用最新凭据。历史和会话页恢复到原账号，默认使用该账号当前配置；可用 `run --revision N --resume UUID` 显式选择旧配置，仍使用最新登录。
+
+不同 OAuth 账号、同一 OAuth 账号都可以并行运行。同账号实例共用一个 `CODEX_HOME` 和 `auth.json`，通过原生 profile 选择各自配置版本，token 刷新及凭据重新加载由 Codex CLI 处理。macOS/Linux 的运行实例及其仍存活的子任务持有共享锁，不限制多开；即使 `usage` 启动器异常退出，也不会提前释放运行锁。重新登录和导入替换凭据需要独占锁，必须先关闭该账号的所有托管实例和子任务。运行中允许保存新的配置版本。OAuth 不能复制为另一个账号，以免复制 refresh token。重新登录失败、取消或身份不符时，原账号登录保留。登录暂存目录在流程结束后清理。
+
+导入只读取指定文件，是一次性登录快照，不与 Cockpit / 默认 Codex 目录双向同步，也不读取系统 Keychain。相同用户和工作区重复导入会更新已有账号，不同工作区分别保存；运行中的账号拒绝导入更新。已有 refresh token 若仍被来源工具使用，来源刷新后导入副本可能失效，因此长期并行使用建议为托管账号独立登录。导入要求完整 id / access / refresh token；凭据是否仍有效由官方 CLI 验证，失效时按 `l` 重新登录。`test` 可检查本地配置和登录结构，`test --request` 的 Responses API 请求仅用于 BYOK。
+
+### 从 CC Switch 导入和跟随
+
+界面按 `i`，指定数据库或目录并预览，按 `Enter` 一次性导入，或按 `f` 导入并跟随。默认读取 `~/.cc-switch/cc-switch.db`，支持自定义目录。命令行可按供应商 ID 选择导入范围：
+
+```bash
+usage codex import --dry-run
+usage codex import --follow
+usage codex import --source /path/to/cc-switch.db --provider vendor-id --follow
+usage codex sync --dry-run
+usage codex sync
+usage codex sync --watch --interval 15
+usage codex follow work --off
+usage codex detach work
+```
+
+导入只读源 SQLite，并读取已提交的 WAL 数据，不迁移或改写 CC Switch 数据库。重复导入通过“来源路径 + 供应商 ID”识别同一账号。开启跟随后，启动前自动同步，管理界面每 15 秒同步一次；只更新已跟随的供应商，CC Switch 切换当前供应商不会改变这里选用的账号，也不会自动导入源中新增加的供应商。
+
+本地编辑会暂停跟随，再次导入遇到本地修改会报告冲突并保留本地配置。需要同时保留本地版和源版本时，先 `detach` 解除来源绑定，再导入创建新的配置；名称重复时使用 `list` 显示的完整 ID 选择。源供应商被删除或数据库暂时不可读时，已保存的配置和历史仍然可用。
+
+CC Switch 自动导入支持原生 Responses API 的 Codex BYOK 配置，导入供应商 TOML 和旧版显式启用的公共配置片段。CC Switch 中的官方订阅 OAuth（请通过上述登录 / 导入登录文件入口添加）、接管代理占位配置、需要 Chat Completions/Anthropic 协议转换的路由会跳过并说明原因。新版 CC Switch 仅保存在当前 Codex 配置文件中的全局设置、MCP、独立命名 profile 文件尚不自动同步；可通过 `add --config` 或 `edit --config` 导入完整 TOML 补充。暂不支持 SQL 导出文件、云同步或写回 CC Switch。
 
 ## TUI 贡献看板
 

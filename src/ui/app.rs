@@ -22,6 +22,7 @@ use crate::providers::{
 };
 use crate::sessions;
 use crate::ui::history::{self, HistoryPanel};
+use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{self, Focus, SessionBrowser};
 use crate::ui::widgets::{accent, preferred_height, render_card, render_loading};
 use crate::view::{CardView, builtin_styles};
@@ -217,21 +218,38 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
-                    if matches!(key.code, KeyCode::F(1..=3))
-                        && app.reset.is_none()
-                        && !app.browser.as_ref().is_some_and(|b| b.launching)
-                    {
-                        match key.code {
-                            KeyCode::F(1) if !app.providers.is_empty() => {
+                    if let Some(command) = app.handle_navigation_key(key.code) {
+                        match command {
+                            MenuCommand::Activate(MenuAction::Quit) => break Ok(()),
+                            MenuCommand::Activate(MenuAction::Quotas) => {
                                 app.close_history();
                                 app.close_browser(false);
                             }
-                            KeyCode::F(2) => app.open_history(&handle),
-                            KeyCode::F(3) => {
+                            MenuCommand::Activate(MenuAction::History) => app.open_history(&handle),
+                            MenuCommand::Activate(MenuAction::Sessions) => {
                                 app.browser_filter = None;
                                 app.open_browser(&handle);
                             }
-                            _ => {}
+                            MenuCommand::Activate(MenuAction::Codex) => {
+                                ratatui::restore();
+                                let result = crate::ui::run_codex(handle.clone());
+                                terminal = match ratatui::try_init() {
+                                    Ok(t) => t,
+                                    Err(e) => break Err(io::Error::other(e)),
+                                };
+                                app.notice = result.err().map(|e| e.to_string());
+                                for instance in app.history_config.data_instances() {
+                                    if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
+                                        continue;
+                                    }
+                                    app.session_homes = app.session_homes.clone().with_instance(
+                                        &instance.id,
+                                        &instance.provider,
+                                        &instance.path,
+                                    );
+                                }
+                            }
+                            MenuCommand::Stay | MenuCommand::Dismiss => {}
                         }
                         redraw.invalidate();
                         continue;
@@ -335,6 +353,7 @@ fn resume_in_terminal(
 }
 
 struct Dashboard {
+    menu: Option<menu::Menu>,
     history: Option<HistoryPanel>,
     saved_history: Option<HistoryPanel>,
     saved_browser: Option<SessionBrowser>,
@@ -408,7 +427,10 @@ impl Dashboard {
                     .clone()
                     .unwrap_or_else(|| home.join(".grok")),
             );
-        for instance in &config.instances {
+        for instance in config.data_instances() {
+            if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
+                continue;
+            }
             session_homes = session_homes.with_instance(
                 &instance.id,
                 &instance.provider,
@@ -444,6 +466,7 @@ impl Dashboard {
             .collect();
         let styles = builtin_styles();
         Self {
+            menu: None,
             history: None,
             saved_history: None,
             saved_browser: None,
@@ -478,6 +501,42 @@ impl Dashboard {
             browser: None,
             browser_generation: 0,
             browser_loading: false,
+        }
+    }
+
+    /// Menu navigation is handled before page keys, so Enter cannot launch a session beneath it.
+    fn handle_navigation_key(&mut self, key: KeyCode) -> Option<MenuCommand> {
+        if self.reset.is_some() || self.browser.as_ref().is_some_and(|b| b.launching) {
+            return None;
+        }
+        if let Some(menu) = &mut self.menu {
+            let command = menu.key(key);
+            if command != MenuCommand::Stay {
+                self.menu = None;
+            }
+            return Some(command);
+        }
+        if key == KeyCode::F(10)
+            || (key == KeyCode::Char('m') && self.history.is_none() && self.browser.is_none())
+        {
+            let current = if self.history.is_some() {
+                MenuAction::History
+            } else if self.browser.is_some() {
+                MenuAction::Sessions
+            } else {
+                MenuAction::Quotas
+            };
+            self.menu = Some(menu::Menu::new(current, !self.providers.is_empty()));
+            return Some(MenuCommand::Stay);
+        }
+        match key {
+            KeyCode::F(1) if !self.providers.is_empty() => {
+                Some(MenuCommand::Activate(MenuAction::Quotas))
+            }
+            KeyCode::F(2) => Some(MenuCommand::Activate(MenuAction::History)),
+            KeyCode::F(3) => Some(MenuCommand::Activate(MenuAction::Sessions)),
+            KeyCode::F(4) => Some(MenuCommand::Activate(MenuAction::Codex)),
+            _ => None,
         }
     }
 
@@ -1143,11 +1202,11 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         })
     };
     let header_title = if app.history.is_some() {
-        " F1 额度  [F2 历史]  F3 会话 "
+        " F10 菜单  F1 额度  [F2 历史]  F3 会话  F4 账号 "
     } else if app.browser.is_some() {
-        " F1 额度  F2 历史  [F3 会话] "
+        " F10 菜单  F1 额度  F2 历史  [F3 会话]  F4 账号 "
     } else {
-        " [F1 额度]  F2 历史  F3 会话 "
+        " F10 菜单  [F1 额度]  F2 历史  F3 会话  F4 账号 "
     };
     Paragraph::new(Line::from(vec![header_title.bold(), status.dim()]))
         .style(
@@ -1193,10 +1252,10 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
                 .iter()
                 .any(|provider| provider.reset().is_some()) =>
             {
-                " q 退出  r 刷新  1 点阵  2 圆环  3 圆点  h 历史  p 会话  x 重置  s 保存  j/k 滚动"
+                " m 菜单  q 退出  r 刷新  1 点阵  2 圆环  3 圆点  h 历史  p 会话  x 重置  s 保存  j/k 滚动"
             }
             None => {
-                " q 退出   r 刷新   1 点阵   2 圆环   3 圆点   h 历史   p 会话   s 保存   j/k 滚动"
+                " m 菜单  q 退出  r 刷新  1 点阵  2 圆环  3 圆点  h 历史  p 会话  s 保存  j/k 滚动"
             }
         }
     };
@@ -1208,6 +1267,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         )
         .render(footer, frame.buffer_mut());
     draw_reset_modal(frame, app);
+    if let Some(menu) = &app.menu {
+        menu.render(frame);
+    }
 }
 
 fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
@@ -1734,6 +1796,56 @@ mod tests {
             assert!(compact.contains("将消耗1次"), "{rendered}");
             assert!(compact.contains("按y确认"), "{rendered}");
         }
+    }
+
+    #[test]
+    fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
+        let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::Char('m')),
+            Some(MenuCommand::Stay)
+        );
+        assert!(app.menu.is_some());
+        for _ in 0..3 {
+            assert_eq!(
+                app.handle_navigation_key(KeyCode::Down),
+                Some(MenuCommand::Stay)
+            );
+        }
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::Enter),
+            Some(MenuCommand::Activate(MenuAction::Codex))
+        );
+        assert!(app.menu.is_none());
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::F(4)),
+            Some(MenuCommand::Activate(MenuAction::Codex))
+        );
+        app.history = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
+        assert_eq!(app.handle_navigation_key(KeyCode::Char('m')), None);
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::F(10)),
+            Some(MenuCommand::Stay)
+        );
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::Esc),
+            Some(MenuCommand::Dismiss)
+        );
+        assert!(app.menu.is_none());
+        assert!(app.history.as_ref().unwrap().monthly);
+    }
+
+    #[test]
+    fn menu_does_not_intercept_reset_confirmation() {
+        let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
+        app.reset = Some(ResetFlow {
+            provider_id: "codex".into(),
+            provider_name: "Codex".into(),
+            generation: 1,
+            stage: ResetStage::Loading,
+        });
+        assert_eq!(app.handle_navigation_key(KeyCode::F(10)), None);
+        assert!(app.menu.is_none());
     }
 
     #[test]

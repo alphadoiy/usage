@@ -128,6 +128,18 @@ impl AppConfig {
             },
         ];
         instances.extend(self.instances.clone());
+        if let Ok(managed) = crate::codex_manager::managed_instances() {
+            for instance in managed {
+                if !instances.iter().any(|i| {
+                    i.id == instance.id
+                        || (i.provider == instance.provider
+                            && (resolved_data_path(&i.path).starts_with(&instance.path)
+                                || instance.path.starts_with(resolved_data_path(&i.path))))
+                }) {
+                    instances.push(instance);
+                }
+            }
+        }
         for instance in &mut instances {
             instance.path = resolved_data_path(&instance.path);
         }
