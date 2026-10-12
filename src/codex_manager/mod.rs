@@ -1,4 +1,5 @@
 //! Saved BYOK/OAuth accounts, isolated Codex homes, and read-only configuration imports.
+pub mod bark;
 pub mod ccswitch;
 pub mod cli;
 pub mod config;
@@ -796,6 +797,16 @@ impl Manager {
             if String::from_utf8_lossy(&help.stdout).contains("--no-daemon") {
                 command.arg("--no-daemon");
             }
+            let run_id = op.id().to_owned();
+            op.step("notification_inject", || {
+                bark::inject(
+                    &mut command,
+                    &self.root,
+                    &profile.name,
+                    &run_id,
+                    &saved.config,
+                )
+            })?;
             if let Some(id) = resume {
                 command.args(["resume", id]);
             }
@@ -804,7 +815,6 @@ impl Manager {
             if let Some(lease) = &_oauth_lease {
                 launcher::inherit_run_lease(&mut command, lease)?;
             }
-            let run_id = op.id().to_owned();
             let mut child = op.step("child_spawn", || command.spawn())?;
             tracing::info!(event = "child_spawned", child_pid = child.id());
             op.begin("run_record");
@@ -964,6 +974,7 @@ fn clear_auth_env(command: &mut Command) {
         "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
         "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
         config::KEY_ENV,
+        bark::CONTEXT_ENV,
     ] {
         command.env_remove(key);
     }

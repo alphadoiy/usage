@@ -171,6 +171,29 @@ OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `au
 
 导入只读取指定文件，是一次性登录快照，不与 Cockpit / 默认 Codex 目录双向同步，也不读取系统 Keychain。相同用户和工作区重复导入会更新已有账号，不同工作区分别保存；运行中的账号拒绝导入更新。已有 refresh token 若仍被来源工具使用，来源刷新后导入副本可能失效，因此长期并行使用建议为托管账号独立登录。导入要求完整 id / access / refresh token；凭据是否仍有效由官方 CLI 验证，失效时按 `l` 重新登录。`test` 可检查本地配置和登录结构，`test --request` 的 Responses API 请求仅用于 BYOK。
 
+### Bark 会话通知（动态注入）
+
+安装 iPhone 上的 [Bark](https://github.com/Finb/Bark)，复制 App 中的推送 URL，再配置 `usage`：
+
+```bash
+usage codex bark configure --url-stdin  # 粘贴 URL，回车后按 Ctrl+D；不会发送推送
+usage codex bark status                # 只显示开关与服务器，不显示设备密钥
+usage codex bark test                  # 显式发送测试推送
+usage codex run personal --cwd ~/Coding/project
+usage codex bark disable               # 运行中的会话也停止推送后续事件
+usage codex bark enable                # 重新开启已保存配置
+```
+
+也可通过 `configure --url-env BARK_URL` 从指定环境变量读取 URL。`configure --no-approval` 只提醒本轮完成，`--no-completion` 只提醒权限审批请求。Bark 配置在管理数据目录的 `bark.json` 中，权限 `600`、明文存储；通过 `USAGE_CODEX_DIR` 可以分别管理不同通知设置。账号导出和 CC Switch 同步不携带 Bark 配置。
+
+开启后，`usage` 仅向它启动的 Codex 子进程传入临时 `-c notify=...` 和 `-c hooks.PermissionRequest=...`，并通过子进程环境传递本次运行上下文。CLI、账号管理页、Ghostty 分屏和托管会话恢复共用这个入口。不会将通知回调写进默认 `~/.codex`、托管账号配置或项目配置；直接运行 `codex`，即使使用相同托管 `CODEX_HOME`，也不会获得 `usage` 的 Bark 通知。账号原有的 `notify` 回调仍会收到原完成事件，已有 hook 来源保留。
+
+完成提醒表示**本轮回答结束**，不保证整个需求已经实现。审批提醒表示**出现权限审批请求**，其他审批机制可能随后处理请求；通知 hook 不会批准或拒绝操作。审批使用异步 hook，需要支持生命周期 hooks 的新版 CLI（已用 0.162.1 验证）；首次在 Codex 中打开 `/hooks`，审阅并信任 `usage` 的 PermissionRequest hook。账号和配置版本的运行目录不同，可能需要分别信任；可执行文件路径或 hook 定义变化后需要重新审阅。遵循已有的 hooks 开关和管理员策略，不自动绕过信任检查。CLI 保存的合法 hook 信任状态可以保留，账号配置版本仍不变。等待普通问题回答、额度耗尽、网络卡住暂不单独检测。
+
+通知包含账号名、项目目录末段、会话 ID 前缀和状态；不发送用户提示词、助手回答、命令内容或完整项目路径。每次启动有独立分组，同一次运行的重复事件去重；关闭后重新开启，已有去重记录仍保留。发送使用 JSON POST、5 秒超时，推送失败不阻止 Codex；重复事件可以重新尝试失败的推送，不做后台自动重试。
+
+在 iPhone 的 Watch App 中打开 Bark 的通知镜像；手机锁屏、手表佩戴且解锁时，通常由 Watch 提醒。专注模式会影响通知，Mac 需要保持唤醒、联网。详见 [Apple Watch 通知规则](https://support.apple.com/zh-cn/108369)、[Codex 单次配置覆盖及 notify](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)、[hooks 信任说明](https://learn.chatgpt.com/docs/hooks)。
+
 ### 从 CC Switch 导入和跟随
 
 界面按 `i`，指定数据库或目录并预览，按 `Enter` 一次性导入，或按 `f` 导入并跟随。默认读取 `~/.cc-switch/cc-switch.db`，支持自定义目录。命令行可按供应商 ID 选择导入范围：

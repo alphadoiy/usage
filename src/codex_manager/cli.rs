@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum CodexCommand {
+    /// 管理仅对 usage 启动会话生效的 Bark 通知
+    Bark {
+        #[command(subcommand)]
+        command: super::bark::BarkCommand,
+    },
+    #[command(hide = true)]
+    Notify {
+        #[arg(long, value_enum)]
+        event: super::bark::Event,
+        payload: Option<String>,
+    },
     /// 使用官方 Codex CLI 登录 ChatGPT OAuth（浏览器或设备码）
     Login {
         /// 新账号名称；重新登录时可省略
@@ -148,6 +159,8 @@ impl CodexCommand {
     /// Fixed command names only; never format the enum (it contains user input).
     pub(crate) fn log_name(&self) -> &'static str {
         match self {
+            Self::Bark { .. } => "codex.bark",
+            Self::Notify { .. } => "codex.notify",
             Self::Login { .. } => "codex.login",
             Self::ImportAuth { .. } => "codex.import_auth",
             Self::List { .. } => "codex.list",
@@ -210,8 +223,20 @@ fn fs_text(path: &Path) -> Result<String> {
 }
 
 pub async fn dispatch(command: CodexCommand) -> Result<i32> {
+    let command = match command {
+        CodexCommand::Notify { event, payload } => {
+            super::bark::callback(event, payload).await;
+            return Ok(0);
+        }
+        CodexCommand::Bark { command } => {
+            super::bark::dispatch(&super::default_root(), command).await?;
+            return Ok(0);
+        }
+        command => command,
+    };
     let mut manager = Manager::open(super::default_root())?;
     match command {
+        CodexCommand::Notify { .. } | CodexCommand::Bark { .. } => unreachable!(),
         CodexCommand::Login {
             name,
             account,

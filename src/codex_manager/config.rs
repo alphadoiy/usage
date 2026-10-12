@@ -55,6 +55,33 @@ fn managed_settings(text: &str) -> Option<toml::Value> {
             }
         }
     }
+    // /hooks saves reviewed hashes and enablement in the Home. These are runtime
+    // metadata; hook definitions themselves must still match the saved revision.
+    if let Some(hooks) = doc.get_mut("hooks") {
+        let hooks = hooks.as_table_mut()?;
+        if let Some(state) = hooks.get("state") {
+            for entry in state.as_table()?.values() {
+                for (key, value) in entry.as_table()? {
+                    let valid = match key.as_str() {
+                        "enabled" => value.as_bool().is_some(),
+                        "trusted_hash" => value.as_str().is_some_and(|hash| {
+                            hash.strip_prefix("sha256:").is_some_and(|hash| {
+                                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                        }),
+                        _ => false,
+                    };
+                    if !valid {
+                        return None;
+                    }
+                }
+            }
+            hooks.remove("state");
+        }
+        if hooks.is_empty() {
+            doc.as_table_mut()?.remove("hooks");
+        }
+    }
     Some(doc)
 }
 

@@ -103,6 +103,381 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
+
+#[cfg(unix)]
+struct BarkServer {
+    url: String,
+    messages: std::sync::mpsc::Receiver<serde_json::Value>,
+    code: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl BarkServer {
+    fn new() -> Self {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "http://{}/fixture-bark-device-secret/test-body",
+            listener.local_addr().unwrap()
+        );
+        let (send, messages) = std::sync::mpsc::channel();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let code = std::sync::Arc::new(AtomicU16::new(200));
+        let stopped = stop.clone();
+        let response_code = code.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let (header_end, length) = loop {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        assert!(headers.starts_with("post /push http/1.1"));
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let n = socket.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let response = format!("{{\"code\":{}}}", response_code.load(Ordering::Relaxed));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                send.send(payload).unwrap();
+            }
+        });
+        Self {
+            url,
+            messages,
+            code,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn receive(&self) -> serde_json::Value {
+        self.messages
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BarkServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = self.thread.take().unwrap().join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_bark(f: &Fixture, server: &BarkServer) {
+    let output = success(
+        f.command(&["bark", "configure", "--url-env", "FIXTURE_BARK_URL"])
+            .env("FIXTURE_BARK_URL", &server.url)
+            .output()
+            .unwrap(),
+    );
+    assert!(!output.contains("fixture-bark-device-secret"));
+}
+
+#[cfg(unix)]
+fn bark_binary(f: &Fixture) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = f.path.join("mock bark codex");
+    fs::write(&binary, r#"#!/usr/bin/env python3
+import json, os, subprocess, sys
+if '--help' in sys.argv:
+    print('--profile --no-daemon'); sys.exit(0)
+if '--version' in sys.argv:
+    print('codex-cli 0.162.1'); sys.exit(0)
+args = sys.argv[1:]
+with open(os.environ['CAPTURE_FILE'], 'w') as file:
+    json.dump({'args':args,'context':os.environ.get('USAGE_CODEX_BARK_CONTEXT'),'home':os.environ['CODEX_HOME']}, file)
+notify = next((arg[len('notify='):] for arg in args if arg.startswith('notify=')), None)
+if notify is not None:
+    payload = json.dumps({'type':'agent-turn-complete','thread-id':'fixture-thread','turn-id':'fixture-turn','cwd':os.getcwd(),
+                         'last-assistant-message':'private assistant output','input-messages':['private prompt']})
+    for _ in range(2):
+        subprocess.run(json.loads(notify)+[payload], check=True)
+"#).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+#[cfg(unix)]
+#[test]
+fn bark_is_injected_per_managed_run_without_changing_byok_or_oauth_homes() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let server = BarkServer::new();
+    configure_bark(&f, &server);
+    assert_eq!(
+        fs::metadata(f.path.join("manager/bark.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let accounts = [
+        f.add(),
+        oauth_id(&f, &oauth_source(&f, "workspace-bark"), "OAuth Bark"),
+    ];
+    let binary = bark_binary(&f);
+    let mut groups = std::collections::HashSet::new();
+    for id in &accounts {
+        let before = f.run(&["show", id]);
+        let mut children = Vec::new();
+        for i in 0..2 {
+            let capture = f.path.join(format!("bark-{id}-{i}.json"));
+            let child = f
+                .command(&[
+                    "run",
+                    id,
+                    "--cwd",
+                    f.path.to_str().unwrap(),
+                    "--binary",
+                    binary.to_str().unwrap(),
+                ])
+                .env("CAPTURE_FILE", &capture)
+                .spawn()
+                .unwrap();
+            children.push((child, capture));
+        }
+        for (mut child, capture) in children {
+            assert!(child.wait().unwrap().success());
+            let run: serde_json::Value =
+                serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+            let args = run["args"].as_array().unwrap();
+            assert!(
+                args.iter()
+                    .any(|arg| arg.as_str().is_some_and(|arg| arg.starts_with("notify=")))
+            );
+            let hook = args
+                .iter()
+                .filter_map(|arg| arg.as_str())
+                .find(|arg| arg.starts_with("hooks.PermissionRequest="))
+                .unwrap();
+            let parsed: toml::Value = toml::from_str(hook).unwrap();
+            let callback = parsed["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(callback.contains("codex notify --event approval"));
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "--dangerously-bypass-hook-trust")
+            );
+            assert!(
+                !serde_json::to_string(&run)
+                    .unwrap()
+                    .contains("fixture-bark-device-secret")
+            );
+            let home = PathBuf::from(run["home"].as_str().unwrap());
+            assert!(
+                !fs::read_to_string(home.join("config.toml"))
+                    .unwrap()
+                    .contains("notify")
+            );
+            assert!(!home.join("hooks.json").exists());
+            let message = server.receive();
+            assert_eq!(message["device_key"], "fixture-bark-device-secret");
+            assert!(message["body"].as_str().unwrap().contains("fixture-thre"));
+            assert!(!message.to_string().contains("private assistant output"));
+            assert!(!message.to_string().contains("private prompt"));
+            assert!(groups.insert(message["group"].as_str().unwrap().to_string()));
+            // A direct Codex launch using even the SAME managed home has no flags or marker.
+            success(
+                Command::new(&binary)
+                    .env("CODEX_HOME", &home)
+                    .env("CAPTURE_FILE", &capture)
+                    .env_remove("USAGE_CODEX_BARK_CONTEXT")
+                    .output()
+                    .unwrap(),
+            );
+            let direct: serde_json::Value =
+                serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+            assert_eq!(direct["args"], serde_json::json!([]));
+            assert!(direct["context"].is_null());
+        }
+        assert_eq!(f.run(&["show", id]), before);
+    }
+    assert_eq!(groups.len(), 4);
+    assert!(server.messages.try_recv().is_err()); // repeated completion events are deduplicated
+    let logs = f
+        .log_files()
+        .iter()
+        .map(|file| fs::read_to_string(file).unwrap())
+        .collect::<String>();
+    assert!(!logs.contains("fixture-bark-device-secret"));
+    assert!(!logs.contains("private prompt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bark_approval_is_advisory_and_failed_delivery_can_retry_then_disable_immediately() {
+    let f = Fixture::new();
+    let server = BarkServer::new();
+    configure_bark(&f, &server);
+    let id = f.add();
+    let binary = bark_binary(&f);
+    let capture = f.path.join("bark-context.json");
+    success(
+        f.command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("CAPTURE_FILE", &capture)
+        .output()
+        .unwrap(),
+    );
+    server.receive();
+    let run: serde_json::Value = serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+    let context = run["context"].as_str().unwrap();
+    let callback = |context: Option<&str>| {
+        let mut command = f.command(&["notify", "--event", "approval"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(context) = context {
+            command.env("USAGE_CODEX_BARK_CONTEXT", context);
+        } else {
+            command.env_remove("USAGE_CODEX_BARK_CONTEXT");
+        }
+        let mut child = command.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(br#"{"hook_event_name":"PermissionRequest","session_id":"fixture-session","turn_id":"fixture-turn","cwd":"/private/project","tool_input":{"command":"secret-command"}}"#).unwrap();
+        let output = success(child.wait_with_output().unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            serde_json::json!({})
+        );
+    };
+    callback(None);
+    assert!(server.messages.try_recv().is_err());
+    server.code.store(400, std::sync::atomic::Ordering::Relaxed);
+    callback(Some(context)); // even a rejected push returns no permission decision
+    server.receive();
+    server.code.store(200, std::sync::atomic::Ordering::Relaxed);
+    callback(Some(context));
+    let message = server.receive();
+    assert_eq!(message["level"], "timeSensitive");
+    assert!(!message.to_string().contains("secret-command"));
+    callback(Some(context));
+    assert!(server.messages.try_recv().is_err());
+    f.run(&["bark", "disable"]);
+    let new_payload =
+        r#"{"type":"agent-turn-complete","thread-id":"fixture-thread","turn-id":"another-turn"}"#;
+    success(
+        f.command(&["notify", "--event", "complete", new_payload])
+            .env("USAGE_CODEX_BARK_CONTEXT", context)
+            .output()
+            .unwrap(),
+    );
+    assert!(server.messages.try_recv().is_err());
+    let capture = f.path.join("bark-disabled.json");
+    success(
+        f.command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("CAPTURE_FILE", &capture)
+        .env("USAGE_CODEX_BARK_CONTEXT", context)
+        .output()
+        .unwrap(),
+    );
+    let disabled: serde_json::Value = serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+    assert!(disabled["context"].is_null());
+    assert!(
+        !disabled["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.as_str().unwrap().starts_with("notify="))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bark_preserves_existing_notify_and_never_saves_it_into_account_revision() {
+    let f = Fixture::new();
+    let server = BarkServer::new();
+    configure_bark(&f, &server);
+    let id = f.add();
+    let config = f.path.join("saved-notify.toml");
+    let capture = f.path.join("original-notify.json");
+    let argv = toml::Value::try_from(vec![
+        "/bin/sh",
+        "-c",
+        "printf '%s' \"$1\" > \"$CAPTURE_ORIGINAL_NOTIFY\"",
+        "notify",
+    ])
+    .unwrap();
+    fs::write(&config, format!("notify={argv}\n{}", f.run(&["show", &id]))).unwrap();
+    f.run(&["edit", &id, "--config", config.to_str().unwrap()]);
+    let before = f.run(&["show", &id]);
+    let binary = bark_binary(&f);
+    success(
+        f.command(&[
+            "run",
+            &id,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("CAPTURE_FILE", f.path.join("bark-run.json"))
+        .env("CAPTURE_ORIGINAL_NOTIFY", &capture)
+        .output()
+        .unwrap(),
+    );
+    server.receive();
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+    assert_eq!(original["type"], "agent-turn-complete");
+    assert_eq!(
+        original["last-assistant-message"],
+        "private assistant output"
+    );
+    assert_eq!(f.run(&["show", &id]), before);
+    let status = f.run(&["bark", "status"]);
+    assert!(!status.contains("fixture-bark-device-secret"));
+    assert!(!server.messages.try_iter().any(|_| true));
+}
 fn success(output: Output) -> String {
     assert!(
         output.status.success(),

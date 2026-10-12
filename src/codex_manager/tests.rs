@@ -1411,3 +1411,39 @@ fn byok_runtime_metadata_requires_known_fields_and_valid_shapes() {
         "model='m'"
     ));
 }
+
+#[test]
+fn byok_hook_review_state_survives_relaunch_without_allowing_new_definitions() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let profile = manager
+        .add(
+            "Hooks",
+            &native("https://example.test/v1", "m"),
+            "fixture-key",
+        )
+        .unwrap();
+    let home = manager.materialize(&profile.id, 1).unwrap();
+    let saved = manager.revision(&profile.id, 1).unwrap().config;
+    let runtime = format!(
+        "{saved}\n[hooks.state.\"/<session-flags>/config.toml:permission_request:0:0\"]\nenabled=true\ntrusted_hash='sha256:{}'\n",
+        "a".repeat(64)
+    );
+    fs::write(home.join("config.toml"), &runtime).unwrap();
+    manager.materialize(&profile.id, 1).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        runtime
+    );
+    assert_eq!(manager.revision(&profile.id, 1).unwrap().config, saved);
+    for invalid in [
+        runtime.replace("enabled=true", "enabled='yes'"),
+        runtime.replace("trusted_hash='sha256:", "trusted_hash='invalid:"),
+        format!("{runtime}\ncommand='run another hook'\n"),
+        format!(
+            "{runtime}\n[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]\ntype='command'\ncommand='new hook'\n"
+        ),
+    ] {
+        assert!(!config::matches_runtime_config(&invalid, &saved));
+    }
+}
