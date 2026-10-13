@@ -802,6 +802,7 @@ impl Manager {
                 bark::inject(
                     &mut command,
                     &self.root,
+                    &home,
                     &profile.name,
                     &run_id,
                     &saved.config,

@@ -110,7 +110,8 @@ impl Operation {
             "operation", operation = name, operation_id = %id,
             process_id = process_id(), pid = std::process::id(),
             profile_id = tracing::field::Empty, revision = tracing::field::Empty,
-            auth_mode = tracing::field::Empty, command = tracing::field::Empty
+            auth_mode = tracing::field::Empty, command = tracing::field::Empty,
+            run_id = tracing::field::Empty
         );
         span.in_scope(|| tracing::info!(event = "operation_started"));
         Self {
@@ -135,6 +136,12 @@ impl Operation {
         }
         self.span.record("revision", revision);
         self.span.record("auth_mode", mode);
+    }
+
+    pub(crate) fn link_run(&self, id: &str) {
+        if let Ok(id) = uuid::Uuid::parse_str(id) {
+            self.span.record("run_id", id.to_string());
+        }
     }
 
     pub(crate) fn begin(&mut self, stage: &'static str) {
@@ -372,6 +379,19 @@ impl Write for LogWriter {
     }
 }
 
+fn matches_operation(value: &serde_json::Value, id: &str) -> bool {
+    let matches = |span: &serde_json::Value| {
+        ["operation_id", "run_id"]
+            .iter()
+            .any(|field| span.get(field).and_then(|s| s.as_str()) == Some(id))
+    };
+    value.get("span").is_some_and(matches)
+        || value
+            .get("spans")
+            .and_then(|s| s.as_array())
+            .is_some_and(|spans| spans.iter().any(matches))
+}
+
 pub(crate) fn recent(lines: usize, operation: Option<&str>) -> io::Result<Vec<String>> {
     let mut files = files(&directory())?;
     if operation.is_none() {
@@ -390,23 +410,10 @@ pub(crate) fn recent(lines: usize, operation: Option<&str>) -> io::Result<Vec<St
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
-            if let Some(id) = operation {
-                let matches = value
-                    .get("span")
-                    .and_then(|s| s.get("operation_id"))
-                    .and_then(|s| s.as_str())
-                    == Some(id)
-                    || value
-                        .get("spans")
-                        .and_then(|s| s.as_array())
-                        .is_some_and(|spans| {
-                            spans
-                                .iter()
-                                .any(|s| s.get("operation_id").and_then(|s| s.as_str()) == Some(id))
-                        });
-                if !matches {
-                    continue;
-                }
+            if let Some(id) = operation
+                && !matches_operation(&value, id)
+            {
+                continue;
             }
             tail.push_back(line);
             if tail.len() > lines {
@@ -415,6 +422,45 @@ pub(crate) fn recent(lines: usize, operation: Option<&str>) -> io::Result<Vec<St
         }
     }
     Ok(tail.into_iter().collect())
+}
+
+/// Notifications run in separate processes; merge their events by timestamp,
+/// rather than selecting whichever process last created a log file.
+pub(crate) fn recent_bark(lines: usize, run: Option<&str>) -> io::Result<Vec<String>> {
+    let mut tail = std::collections::BTreeMap::new();
+    let mut sequence = 0u64;
+    for entry in files(&directory())? {
+        let file = match File::open(entry.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let is_bark = value["fields"]["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("bark_"))
+                || value["span"]["operation"] == "codex.bark_notify";
+            if !is_bark || run.is_some_and(|id| !matches_operation(&value, id)) {
+                continue;
+            }
+            sequence += 1;
+            tail.insert(
+                (
+                    value["timestamp"].as_str().unwrap_or("").to_string(),
+                    sequence,
+                ),
+                line,
+            );
+            if tail.len() > lines {
+                tail.pop_first();
+            }
+        }
+    }
+    Ok(tail.into_values().collect())
 }
 
 #[cfg(test)]

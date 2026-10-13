@@ -2,15 +2,20 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand, ValueEnum};
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::{Error, Result};
+use crate::logging;
+mod content;
+mod presence;
+mod source;
+#[cfg(all(test, unix))]
+mod tests;
 
 pub(super) const CONTEXT_ENV: &str = "USAGE_CODEX_BARK_CONTEXT";
 const MAX_INPUT: u64 = 1024 * 1024;
@@ -36,6 +41,14 @@ pub enum BarkCommand {
     Enable,
     /// 向已配置的设备发送测试推送
     Test,
+    /// 查看跨通知进程的 Bark 日志；不初始化日志系统
+    Logs {
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10000))]
+        tail: u32,
+        /// 筛选某次 usage 启动实例的运行 ID
+        #[arg(long)]
+        run: Option<uuid::Uuid>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -64,9 +77,11 @@ struct Settings {
     approval: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Context {
     root: PathBuf,
+    #[serde(default)]
+    home: Option<PathBuf>,
     account: String,
     run_id: String,
     previous_notify: Vec<String>,
@@ -128,6 +143,12 @@ fn from_url(text: &str, completion: bool, approval: bool) -> Result<Settings> {
 
 pub async fn dispatch(root: &Path, command: BarkCommand) -> Result<()> {
     match command {
+        BarkCommand::Logs { tail, run } => {
+            let run = run.map(|id| id.to_string());
+            for line in logging::recent_bark(tail as usize, run.as_deref())? {
+                println!("{line}");
+            }
+        }
         BarkCommand::Configure {
             url,
             no_completion,
@@ -169,6 +190,8 @@ pub async fn dispatch(root: &Path, command: BarkCommand) -> Result<()> {
                     settings.approval
                 );
                 println!("服务器：{}", settings.server);
+                println!("自动通知：仅锁屏或所有显示器熄屏时发送");
+                println!("当前状态：{}", presence::current().label());
             }
             None => println!("Bark：未配置"),
         },
@@ -207,6 +230,7 @@ pub async fn dispatch(root: &Path, command: BarkCommand) -> Result<()> {
 pub(super) fn inject(
     command: &mut Command,
     root: &Path,
+    home: &Path,
     account: &str,
     run_id: &str,
     saved_config: &str,
@@ -226,6 +250,7 @@ pub(super) fn inject(
         .unwrap_or_default();
     let context = Context {
         root: root.to_path_buf(),
+        home: Some(home.to_path_buf()),
         account: account.into(),
         run_id: run_id.into(),
         previous_notify,
@@ -280,10 +305,16 @@ pub async fn callback(event: Event, payload: Option<String>) {
 
 async fn callback_inner(event: Event, payload: Option<String>) -> Result<()> {
     let Some(context) = std::env::var(CONTEXT_ENV).ok() else {
+        tracing::info!(event = "bark_ignored", reason = "context_missing");
         return Ok(());
     };
-    let context: Context =
+    let mut context: Context =
         serde_json::from_str(&context).map_err(|_| Error::message("通知上下文无效"))?;
+    // Running sessions started before this field was added already inherit the
+    // managed CODEX_HOME. Keep their callbacks compatible with the new filter.
+    if context.home.is_none() {
+        context.home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    }
     uuid::Uuid::parse_str(&context.run_id).map_err(|_| Error::message("通知运行 ID 无效"))?;
     let payload = if let Some(payload) = payload {
         payload
@@ -297,67 +328,141 @@ async fn callback_inner(event: Event, payload: Option<String>) -> Result<()> {
     if payload.len() as u64 > MAX_INPUT {
         return Err(Error::message("通知事件过大"));
     }
-    let data: Value = serde_json::from_str(&payload).map_err(|_| Error::message("通知事件无效"))?;
-    let (kind, status) = match event {
-        Event::Complete if data["type"] == "agent-turn-complete" => ("complete", "本轮执行结束"),
-        Event::Approval if data["hook_event_name"] == "PermissionRequest" => {
-            ("approval", "请求权限审批")
+    handle_event(&context, event, &payload, presence::current).await
+}
+
+async fn handle_event(
+    context: &Context,
+    event: Event,
+    payload: &str,
+    read_presence: impl Fn() -> presence::Presence,
+) -> Result<()> {
+    let mut op = logging::Operation::new("codex.bark_notify");
+    op.link_run(&context.run_id);
+    let span = op.span();
+    let result = logging::instrument(
+        span,
+        handle_event_logged(context, event, payload, read_presence, &mut op),
+    )
+    .await;
+    op.finish(result.is_ok());
+    result
+}
+
+async fn handle_event_logged(
+    context: &Context,
+    event: Event,
+    payload: &str,
+    read_presence: impl Fn() -> presence::Presence,
+    op: &mut logging::Operation,
+) -> Result<()> {
+    op.begin("event_decode");
+    let data: Value = serde_json::from_str(payload).map_err(|_| Error::message("通知事件无效"))?;
+    let kind = match event {
+        Event::Complete if data["type"] == "agent-turn-complete" => "complete",
+        Event::Approval if data["hook_event_name"] == "PermissionRequest" => "approval",
+        _ => {
+            tracing::info!(event = "bark_ignored", reason = "unsupported_event");
+            return Ok(());
         }
-        _ => return Ok(()),
     };
+    let thread = data
+        .get("thread-id")
+        .or_else(|| data.get("thread_id"))
+        .or_else(|| data.get("session_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(&context.run_id);
+    let turn = data
+        .get("turn-id")
+        .or_else(|| data.get("turn_id"))
+        .and_then(Value::as_str);
+    let mut hash = Sha256::new();
+    hash.update(kind);
+    hash.update(thread);
+    hash.update(if matches!(event, Event::Complete) {
+        turn.unwrap_or(payload)
+    } else {
+        payload
+    });
+    let event_id = format!("{:x}", hash.finalize());
+    tracing::info!(
+        event = "bark_event_received",
+        kind,
+        event_id,
+        callback_type = data["type"].as_str().or(data["hook_event_name"].as_str()),
+        thread_id = thread,
+        turn_id = turn,
+        client = data["client"].as_str(),
+        account = context.account,
+        project = content::project(&data),
+        payload_bytes = payload.len(),
+        tool_name = data["tool_name"].as_str(),
+        agent_id = data["agent_id"].as_str(),
+        agent_type = data["agent_type"].as_str(),
+        input_message_count = data["input-messages"].as_array().map(Vec::len)
+    );
+    if matches!(event, Event::Complete) {
+        let reply = content::reply(&data).unwrap_or("");
+        tracing::info!(
+            event = "bark_completion_content",
+            assistant_chars = reply.chars().count(),
+            assistant_preview = content::excerpt(reply, 200)
+        );
+    }
     if matches!(event, Event::Complete)
         && let Some((program, args)) = context.previous_notify.split_first()
     {
         let mut previous = Command::new(program);
-        previous.args(args).arg(&payload).env_remove(CONTEXT_ENV);
-        let _ = crate::credentials::output_with_timeout(previous, Duration::from_secs(10));
+        previous.args(args).arg(payload).env_remove(CONTEXT_ENV);
+        op.begin("previous_notify");
+        let output = crate::credentials::output_with_timeout(previous, Duration::from_secs(10));
+        if output.is_none_or(|output| !output.status.success()) {
+            tracing::warn!(event = "bark_previous_notify_failed");
+        }
     }
-    let Some(settings) = read_settings(&context.root)?.filter(|s| s.enabled) else {
+    let Some(settings) = op
+        .step("settings_read", || read_settings(&context.root))?
+        .filter(|s| s.enabled)
+    else {
+        tracing::info!(event = "bark_suppressed", reason = "disabled");
         return Ok(());
     };
     if (matches!(event, Event::Complete) && !settings.completion)
         || (matches!(event, Event::Approval) && !settings.approval)
     {
+        tracing::info!(event = "bark_suppressed", reason = "event_disabled");
         return Ok(());
     }
-    let thread = data
-        .get("thread-id")
-        .or_else(|| data.get("session_id"))
-        .and_then(Value::as_str)
-        .unwrap_or(&context.run_id);
-    let cwd = data.get("cwd").and_then(Value::as_str).unwrap_or("");
-    let project = Path::new(cwd)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Codex");
-    let title = format!("Codex · {status}");
-    let body = format!(
-        "账号：{}\n项目：{}\n会话：{}",
-        context.account,
-        project,
-        thread.chars().take(12).collect::<String>()
+    if matches!(event, Event::Complete) {
+        op.begin("thread_source_check");
+        let origin = source::classify(context.home.as_deref(), thread);
+        tracing::info!(event = "bark_thread_source", origin = origin.label());
+        if origin != source::Origin::User {
+            tracing::info!(event = "bark_suppressed", reason = origin.reason());
+            return Ok(());
+        }
+    }
+    op.begin("presence_check");
+    let state = read_presence();
+    if state != presence::Presence::Away {
+        tracing::info!(
+            event = "bark_suppressed",
+            reason = if state == presence::Presence::Present {
+                "screen_active"
+            } else {
+                "screen_state_unknown"
+            }
+        );
+        return Ok(());
+    }
+    let (title, body) = content::notification(event, &data, &context.account);
+    tracing::info!(
+        event = "bark_notification_prepared",
+        title,
+        body_preview = content::excerpt(&body, 300),
+        body_chars = body.chars().count()
     );
-    // Do not send commands, prompts, full paths, or assistant messages to Bark.
-    let mut hash = Sha256::new();
-    hash.update(kind);
-    hash.update(thread);
-    match event {
-        Event::Complete => hash.update(
-            data.get("turn-id")
-                .and_then(Value::as_str)
-                .unwrap_or(&payload),
-        ),
-        Event::Approval => hash.update(&payload),
-    }
-    let event_id = format!("{:x}", hash.finalize());
-    let conn = delivery_database(&context.root)?;
-    let claimed = conn.execute(
-        "INSERT OR IGNORE INTO deliveries VALUES (?1,?2,unixepoch())",
-        params![context.run_id, event_id],
-    )?;
-    if claimed == 0 {
-        return Ok(());
-    }
+    op.begin("bark_request");
     let result = send(
         &settings,
         &title,
@@ -367,27 +472,9 @@ async fn callback_inner(event: Event, payload: Option<String>) -> Result<()> {
     )
     .await;
     if result.is_err() {
-        conn.execute(
-            "DELETE FROM deliveries WHERE run_id=?1 AND event_id=?2",
-            params![context.run_id, event_id],
-        )?;
+        op.fail("bark_request");
     }
     result
-}
-
-fn delivery_database(root: &Path) -> Result<Connection> {
-    let path = root.join("bark-deliveries.sqlite3");
-    // Create with private permissions before SQLite opens the file.
-    super::private_create(&path, b"")?;
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(2))?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS deliveries (
-        run_id TEXT NOT NULL, event_id TEXT NOT NULL, created_at INTEGER NOT NULL,
-        PRIMARY KEY(run_id,event_id));
-        DELETE FROM deliveries WHERE created_at < unixepoch()-604800;",
-    )?;
-    Ok(conn)
 }
 
 async fn send(
@@ -397,11 +484,13 @@ async fn send(
     group: &str,
     attention: bool,
 ) -> Result<()> {
+    let started = Instant::now();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| Error::message("无法创建 Bark HTTP 客户端"))?;
+    tracing::info!(event = "bark_request_started", timeout_seconds = 5);
     let response = client
         .post(&settings.server)
         .json(&json!({
@@ -410,17 +499,49 @@ async fn send(
         }))
         .send()
         .await
-        .map_err(|_| Error::message("Bark 请求失败"))?;
+        .map_err(|error| {
+            tracing::warn!(
+                event = "bark_request_failed",
+                reason = if error.is_timeout() {
+                    "timeout"
+                } else if error.is_connect() {
+                    "connection"
+                } else {
+                    "transport"
+                },
+                elapsed_ms = started.elapsed().as_millis() as u64
+            );
+            Error::message("Bark 请求失败")
+        })?;
+    tracing::info!(
+        event = "bark_response_received",
+        http_status = response.status().as_u16(),
+        elapsed_ms = started.elapsed().as_millis() as u64
+    );
     if !response.status().is_success() {
+        tracing::warn!(
+            event = "bark_request_failed",
+            reason = "http_status",
+            http_status = response.status().as_u16()
+        );
         return Err(Error::message("Bark 返回 HTTP 错误"));
     }
-    let response: Value = response
-        .json()
-        .await
-        .map_err(|_| Error::message("Bark 响应无效"))?;
+    let response: Value = response.json().await.map_err(|_| {
+        tracing::warn!(event = "bark_request_failed", reason = "invalid_response");
+        Error::message("Bark 响应无效")
+    })?;
     if response["code"] != 200 {
+        tracing::warn!(
+            event = "bark_request_failed",
+            reason = "backend_rejected",
+            backend_code = response["code"].as_i64()
+        );
         return Err(Error::message("Bark 未接受推送"));
     }
-    tracing::info!(event = "bark_delivered", attention);
+    tracing::info!(
+        event = "bark_delivered",
+        attention,
+        elapsed_ms = started.elapsed().as_millis() as u64
+    );
     Ok(())
 }

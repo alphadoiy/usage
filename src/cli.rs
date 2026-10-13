@@ -142,7 +142,15 @@ pub async fn run() -> i32 {
             return code;
         }
     };
-    if matches!(cli.command, Some(Command::Logs { .. })) {
+    if matches!(
+        cli.command,
+        Some(Command::Logs { .. })
+            | Some(Command::Codex {
+                command: Some(crate::codex_manager::cli::CodexCommand::Bark {
+                    command: crate::codex_manager::bark::BarkCommand::Logs { .. }
+                })
+            })
+    ) {
         return match dispatch(cli).await {
             Ok(code) => code,
             Err(error) => {
