@@ -1,12 +1,18 @@
 //! Billing/resource adapters are independent of the agent that consumes them.
 //! Legacy subscription readers remain behind a compatibility capability.
 
+mod api;
+pub mod connections;
+mod new_api;
+mod openai_costs;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tracing::Instrument;
 
 use crate::model::{CredentialStatus, UsageSnapshot};
 use crate::providers::{ProviderContext, UsageProvider, UsageReset};
@@ -59,6 +65,11 @@ pub enum ResourceMetric {
     Balance {
         remaining: Money,
     },
+    Cost {
+        used: Money,
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+    },
     Spending {
         used: Option<f64>,
         limit: Option<f64>,
@@ -66,17 +77,29 @@ pub enum ResourceMetric {
     },
     /// Raw vendor quota stays raw until the service's conversion is known.
     Allowance {
-        remaining: Option<f64>,
-        used: Option<f64>,
+        remaining: Option<String>,
+        used: Option<String>,
         unit: String,
         unlimited: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResourceScope {
+    Unspecified,
+    Account,
+    Token,
+    Organization,
+    Project { id: String },
+    ApiKey { id: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResourceSnapshot {
     pub binding: ResourceBinding,
     pub service: String,
+    pub scope: ResourceScope,
     pub state: ResourceState,
     pub metrics: Vec<ResourceMetric>,
     pub queried_at: Option<DateTime<Utc>>,
@@ -87,6 +110,9 @@ pub struct ResourceSnapshot {
 pub trait ResourceReader: Send + Sync {
     fn service(&self) -> &str;
     fn binding(&self) -> &ResourceBinding;
+    fn scope(&self) -> ResourceScope {
+        ResourceScope::Unspecified
+    }
     /// The calling query boundary (Hub) owns the deadline, including credential loading.
     async fn read(&self) -> ResourceSnapshot;
 
@@ -109,6 +135,8 @@ pub type CredentialResolver = dyn Fn(&str) -> Result<String, String> + Send + Sy
 pub struct ApiConnection {
     pub base_url: String,
     pub credential_ref: String,
+    /// Validated by each service's factory, independently of other protocols.
+    pub options: serde_json::Value,
     pub http: Arc<dyn crate::http::HttpClient>,
     pub credentials: Arc<CredentialResolver>,
     pub now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -135,6 +163,9 @@ impl ResourceReader for SubscriptionResource {
     }
     fn binding(&self) -> &ResourceBinding {
         &self.binding
+    }
+    fn scope(&self) -> ResourceScope {
+        ResourceScope::Account
     }
     fn legacy_usage(&self) -> Option<&dyn UsageProvider> {
         Some(self.usage.as_ref())
@@ -171,6 +202,7 @@ impl ResourceReader for SubscriptionResource {
         ResourceSnapshot {
             binding: self.binding.clone(),
             service: self.service.into(),
+            scope: self.scope(),
             state,
             metrics,
             queried_at: snapshot.queried_at,
@@ -212,6 +244,9 @@ pub fn builtin_registry() -> ResourceRegistry {
             })
             .expect("内置资源服务 ID 唯一");
     }
+    api::register::<new_api::Token>(&mut registry);
+    api::register::<new_api::Account>(&mut registry);
+    api::register::<openai_costs::Costs>(&mut registry);
     registry
 }
 
@@ -266,6 +301,49 @@ pub(crate) fn local_context(
         },
         connection: ResourceConnection::LocalSubscription(legacy),
     }
+}
+
+pub(crate) async fn collect_with_deadline(
+    readers: &[Arc<dyn ResourceReader>],
+    timeout: std::time::Duration,
+) -> Vec<ResourceSnapshot> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut indices = std::collections::HashMap::new();
+    for (index, reader) in readers.iter().enumerate() {
+        let reader = Arc::clone(reader);
+        let task = tasks.spawn(
+            async move { tokio::time::timeout(timeout, reader.read()).await }.in_current_span(),
+        );
+        indices.insert(task.id(), index);
+    }
+    let mut snapshots = Vec::with_capacity(readers.len());
+    while let Some(result) = tasks.join_next_with_id().await {
+        let (id, result) = match result {
+            Ok((id, snapshot)) => (id, snapshot.map_err(|_| "资源查询超时")),
+            Err(error) => (error.id(), Err("资源查询任务中断")),
+        };
+        let index = indices[&id];
+        let snapshot = result.unwrap_or_else(|message| {
+                let reader = &readers[index];
+                tracing::warn!(event = "resource_query_failed", service = reader.service(),
+                    target = %reader.binding().cache_key(reader.service()), task = %id, reason = message);
+                ResourceSnapshot {
+                    binding: reader.binding().clone(),
+                    service: reader.service().into(),
+                    scope: reader.scope(),
+                    state: crate::resources::ResourceState::TransientFailure,
+                    metrics: Vec::new(),
+                    queried_at: None,
+                    message: Some(message.into()),
+                }
+            });
+        snapshots.push((index, snapshot));
+    }
+    snapshots.sort_by_key(|(index, _)| *index);
+    snapshots
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+        .collect()
 }
 
 #[cfg(test)]

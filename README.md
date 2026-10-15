@@ -70,9 +70,13 @@ usage history --providers codex,claude --monthly
 usage history --year 2026 --json  # 导出日/月 Token 汇总
 usage providers       # 列出已注册的工具
 usage codex runs --json  # 查看运行记录及启动时选中的账号、配置版本
+usage resources --list   # 列出独立资源连接，不读取凭据或请求网络
+usage resources --json   # 查询 New API 余额/额度与 OpenAI 官方费用
 usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
+
+`usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)；当前这些资源通过 CLI 查询，首页迁移尚未完成。
 
 `--once` 和 `--json` 会并发查询所选工具，输出仍按 `providers` 的配置顺序排列。
 

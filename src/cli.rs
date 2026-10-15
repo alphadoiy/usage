@@ -51,6 +51,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 查询配置的 API 余额、原始额度与官方费用
+    Resources {
+        /// 资源连接 ID；省略时查询全部连接
+        ids: Vec<String>,
+        /// 仅查询显式关联到此 Codex 账号的连接（名称或 UUID）
+        #[arg(long)]
+        profile: Option<String>,
+        /// 只列出连接，不读取凭据或请求网络
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// 查询 OpenAI、Claude、Grok 的官方服务状态（无需登录）
     Status {
         /// 输出状态、受影响组件和未解决事件的 JSON
@@ -160,6 +173,7 @@ pub async fn run() -> i32 {
         };
     }
     let command = match &cli.command {
+        Some(Command::Resources { .. }) => "resources",
         Some(Command::Status { .. }) => "status",
         Some(Command::Codex {
             command: Some(command),
@@ -217,6 +231,67 @@ pub async fn run() -> i32 {
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
+        Some(Command::Resources {
+            ids,
+            profile,
+            list,
+            json,
+        }) => {
+            use crate::resources::connections::{ResourceService, render_text, select};
+            let path = cli.config.clone().unwrap_or_else(default_config_path);
+            let config = load_config(&path, cli.config.is_some())?;
+            let profile_id = profile
+                .map(|selector| {
+                    crate::codex_manager::Manager::open_default()
+                        .and_then(|manager| manager.resolve(&selector))
+                        .map(|profile| profile.id)
+                        .map_err(|error| CliError(error.to_string()))
+                })
+                .transpose()?;
+            let selected = select(&config.resources, &ids, profile_id.as_deref())
+                .map_err(|error| CliError(error.to_string()))?;
+            let service = ResourceService::from_environment(crate::hub::Hub::default().resources);
+            if list {
+                // Validate factories/options without resolving any secret.
+                for connection in &selected {
+                    service
+                        .prepare(connection)
+                        .map_err(|error| CliError(error.to_string()))?;
+                }
+                let descriptors: Vec<_> =
+                    selected.iter().map(|config| config.descriptor()).collect();
+                if json || cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&descriptors)
+                            .map_err(|error| CliError(error.to_string()))?
+                    );
+                } else if descriptors.is_empty() {
+                    println!("尚未配置资源连接；在配置文件中添加 [[resources]]");
+                } else {
+                    for item in descriptors {
+                        println!("{} · {} · {}", item.id, item.label, item.service);
+                    }
+                }
+                return Ok(0);
+            }
+            let reports = service
+                .query(&selected)
+                .await
+                .map_err(|error| CliError(error.to_string()))?;
+            if json || cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&reports)
+                        .map_err(|error| CliError(error.to_string()))?
+                );
+            } else {
+                println!("{}", render_text(&reports));
+            }
+            Ok(i32::from(reports.iter().any(|report| {
+                report.snapshot.state != crate::resources::ResourceState::Ready
+            })))
+        }
         Some(Command::Status { json }) => {
             let sources = crate::service_status::select(
                 cli.providers.as_deref().unwrap_or("openai,claude,grok"),

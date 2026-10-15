@@ -141,41 +141,7 @@ impl Provider {
         if self.resources.is_empty() {
             return Err(CapabilityError::Unsupported("resources"));
         }
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut indices = std::collections::HashMap::new();
-        for (index, reader) in self.resources.iter().enumerate() {
-            let reader = Arc::clone(reader);
-            let task =
-                tasks.spawn(async move { tokio::time::timeout(timeout, reader.read()).await });
-            indices.insert(task.id(), index);
-        }
-        let mut snapshots = Vec::with_capacity(self.resources.len());
-        while let Some(result) = tasks.join_next_with_id().await {
-            let (id, result) = match result {
-                Ok((id, snapshot)) => (id, snapshot.map_err(|_| "资源查询超时")),
-                Err(error) => (error.id(), Err("资源查询任务中断")),
-            };
-            let index = indices[&id];
-            let snapshot = result.unwrap_or_else(|message| {
-                let reader = &self.resources[index];
-                tracing::warn!(event = "resource_query_failed", service = reader.service(),
-                    target = %reader.binding().cache_key(reader.service()), task = %id, reason = message);
-                ResourceSnapshot {
-                    binding: reader.binding().clone(),
-                    service: reader.service().into(),
-                    state: crate::resources::ResourceState::TransientFailure,
-                    metrics: Vec::new(),
-                    queried_at: None,
-                    message: Some(message.into()),
-                }
-            });
-            snapshots.push((index, snapshot));
-        }
-        snapshots.sort_by_key(|(index, _)| *index);
-        Ok(snapshots
-            .into_iter()
-            .map(|(_, snapshot)| snapshot)
-            .collect())
+        Ok(crate::resources::collect_with_deadline(&self.resources, timeout).await)
     }
 
     /// A home catalog is not proof that every conversation belongs to a particular run.
@@ -290,6 +256,7 @@ mod tests {
             ResourceSnapshot {
                 binding: self.binding.clone(),
                 service: self.service().into(),
+                scope: self.scope(),
                 state: ResourceState::Ready,
                 metrics: vec![ResourceMetric::Balance {
                     remaining: Money {
@@ -312,6 +279,7 @@ mod tests {
             connection: ResourceConnection::Api(ApiConnection {
                 base_url: "https://example.invalid".into(),
                 credential_ref: "fixture-ref".into(),
+                options: serde_json::json!({}),
                 http: Arc::new(crate::http::FakeHttp::new()),
                 credentials: Arc::new(|_| panic!("factory must not read secrets")),
                 now: Arc::new(chrono::Utc::now),
@@ -457,6 +425,7 @@ mod regression_tests {
             ResourceSnapshot {
                 binding: self.binding.clone(),
                 service: "probe".into(),
+                scope: self.scope(),
                 state: ResourceState::Ready,
                 metrics: Vec::new(),
                 queried_at: None,

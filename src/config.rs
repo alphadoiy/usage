@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub codex_dir: Option<PathBuf>,
     pub grok_dir: Option<PathBuf>,
     pub instances: Vec<DataInstance>,
+    pub resources: Vec<crate::resources::connections::ConnectionConfig>,
     pub alerts: AlertConfig,
     pub resume: ResumeMode,
 }
@@ -40,6 +41,7 @@ impl Default for AppConfig {
             codex_dir: None,
             grok_dir: None,
             instances: Vec::new(),
+            resources: Vec::new(),
             alerts: AlertConfig::default(),
             resume: ResumeMode::Auto,
         }
@@ -234,6 +236,14 @@ resume = "auto"
 claude = ""
 codex = ""
 grok = ""
+
+# 独立资源连接；用 usage resources 查询。凭据只填写环境变量名称
+# [[resources]]
+# id = "relay-token"
+# service = "new_api_token"
+# base_url = "https://relay.example" # New API 站点根路径，非推理 /v1
+# credential_env = "RELAY_USAGE_KEY"
+# options = {{}} # 默认保留原始额度；换算金额需显式提供比例与币种
 "#
     )
 }
@@ -369,6 +379,16 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
     if let Some(sessions) = raw.sessions {
         config.resume = sessions.resume;
     }
+    config.resources = raw.resources.unwrap_or_default();
+    let mut resource_ids = std::collections::HashSet::new();
+    for resource in &config.resources {
+        resource
+            .validate()
+            .map_err(|error| ConfigError(error.to_string()))?;
+        if !resource_ids.insert(&resource.id) {
+            return Err(ConfigError("资源连接 id 不能重复".into()));
+        }
+    }
     config.instances = raw.instances.unwrap_or_default();
     let mut ids = vec![
         "codex".to_string(),
@@ -445,6 +465,7 @@ struct RawConfig {
     providers: Option<Vec<String>>,
     paths: Option<RawPaths>,
     instances: Option<Vec<DataInstance>>,
+    resources: Option<Vec<crate::resources::connections::ConnectionConfig>>,
     alerts: Option<AlertConfig>,
     sessions: Option<RawSessions>,
 }
