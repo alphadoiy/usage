@@ -29,6 +29,10 @@ pub const QUERY_TIMEOUT: Duration = Duration::from_secs(20);
 pub trait UsageProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
+    /// Identity of the configured query target, separate from its tool type.
+    fn cache_key(&self) -> String {
+        self.id().into()
+    }
     async fn query(&self) -> UsageSnapshot;
 
     fn reset(&self) -> Option<&dyn UsageReset> {
@@ -134,7 +138,7 @@ impl std::error::Error for UnknownProviderError {}
 
 #[derive(Default)]
 pub struct ProviderRegistry {
-    factories: Vec<(String, ProviderFactoryFn)>,
+    factories: crate::registry::FactoryRegistry<Arc<ProviderContext>, Box<dyn UsageProvider>>,
 }
 
 impl ProviderRegistry {
@@ -147,24 +151,17 @@ impl ProviderRegistry {
         provider_id: &str,
         factory: ProviderFactoryFn,
     ) -> Result<(), ProviderError> {
-        let provider_id = provider_id.trim();
-        if provider_id.is_empty() {
-            return Err(ProviderError("提供方 id 不能为空".into()));
-        }
-        if let Some(existing) = self.factories.iter_mut().find(|(id, _)| id == provider_id) {
-            existing.1 = factory;
-        } else {
-            self.factories.push((provider_id.to_string(), factory));
-        }
-        Ok(())
+        self.factories
+            .register(provider_id, move |ctx| Ok(factory(ctx)))
+            .map_err(|error| ProviderError(error.to_string()))
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.factories.iter().map(|(id, _)| id.clone()).collect()
+        self.factories.ids()
     }
 
     pub fn contains(&self, provider_id: &str) -> bool {
-        self.factories.iter().any(|(id, _)| id == provider_id)
+        self.factories.contains(provider_id)
     }
 
     pub fn create(
@@ -172,16 +169,10 @@ impl ProviderRegistry {
         provider_id: &str,
         ctx: Arc<ProviderContext>,
     ) -> Result<Box<dyn UsageProvider>, ProviderError> {
-        let Some((_, factory)) = self.factories.iter().find(|(id, _)| id == provider_id) else {
-            return Err(ProviderError(
-                UnknownProviderError {
-                    missing: vec![provider_id.to_string()],
-                    known: self.ids(),
-                }
-                .to_string(),
-            ));
-        };
-        let provider = factory(ctx);
+        let provider = self
+            .factories
+            .create(provider_id, ctx)
+            .map_err(|error| ProviderError(error.to_string()))?;
         if provider.id() != provider_id {
             return Err(ProviderError(format!(
                 "提供方 {provider_id} 的工厂返回了 id={}",
@@ -257,15 +248,28 @@ impl Default for ProviderFactory {
 
 pub fn builtin_factory() -> ProviderFactory {
     let mut factory = ProviderFactory::new();
-    factory
-        .register(ClaudeProvider::ID, |ctx| Box::new(ClaudeProvider::new(ctx)))
-        .expect("claude");
-    factory
-        .register(CodexProvider::ID, |ctx| Box::new(CodexProvider::new(ctx)))
-        .expect("codex");
-    factory
-        .register(GrokProvider::ID, |ctx| Box::new(GrokProvider::new(ctx)))
-        .expect("grok");
+    let resources = Arc::new(crate::resources::builtin_registry());
+    for (id, service) in [
+        ("claude", "claude_subscription"),
+        ("codex", "chatgpt_subscription"),
+        ("grok", "grok_subscription"),
+    ] {
+        let resources = Arc::clone(&resources);
+        factory
+            .register(id, move |ctx| {
+                let home = match id {
+                    "claude" => &ctx.claude_dir,
+                    "codex" => &ctx.codex_dir,
+                    _ => &ctx.grok_dir,
+                };
+                let context = crate::resources::local_context(service, home, Arc::clone(&ctx));
+                let reader = resources
+                    .create(service, context)
+                    .expect("内置资源工厂有效");
+                Box::new(crate::resources::LegacyUsageAdapter::new(reader))
+            })
+            .expect("内置工具 ID 唯一");
+    }
     factory
 }
 
@@ -353,6 +357,21 @@ mod tests {
             panic!("expected mismatched id");
         };
         assert!(error.to_string().contains("other"));
+    }
+
+    #[test]
+    fn builtin_cache_identity_tracks_home_instead_of_tool_type() {
+        let factory = builtin_factory();
+        let a = empty_ctx();
+        let mut b = empty_ctx();
+        Arc::get_mut(&mut b).unwrap().codex_dir = PathBuf::from("/nonexistent/usage-other-account");
+        let first = factory.create("codex", a.clone()).unwrap();
+        let same = factory.create("codex", a).unwrap();
+        let second = factory.create("codex", b).unwrap();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(first.cache_key(), same.cache_key());
+        assert_ne!(first.cache_key(), second.cache_key());
+        assert!(!second.cache_key().contains("usage-other-account"));
     }
 
     fn empty_ctx() -> Arc<ProviderContext> {

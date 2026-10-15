@@ -39,7 +39,7 @@ const CARD_GAP: u16 = 2;
 
 struct RefreshEvent {
     generation: u64,
-    tool: String,
+    target: String,
     snapshot: UsageSnapshot,
 }
 
@@ -81,6 +81,7 @@ enum ResetStage {
 
 struct ResetFlow {
     provider_id: String,
+    target: String,
     provider_name: String,
     generation: u64,
     stage: ResetStage,
@@ -406,7 +407,10 @@ struct Dashboard {
 }
 
 struct CardSlot {
+    /// Tool type controls styling and shared service status.
     id: String,
+    /// Configured resource identity controls result routing and account actions.
+    target: String,
     title: String,
     loading: bool,
     snapshot: Option<UsageSnapshot>,
@@ -473,6 +477,7 @@ impl Dashboard {
             .iter()
             .map(|provider| CardSlot {
                 id: provider.id().to_string(),
+                target: provider.cache_key(),
                 title: provider.display_name().to_string(),
                 loading: true,
                 snapshot: None,
@@ -871,10 +876,11 @@ impl Dashboard {
             let tx = self.tx.clone();
             handle.spawn(
                 async move {
+                    let target = provider.cache_key();
                     let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
                     let _ = tx.send(AppEvent::Quota(Box::new(RefreshEvent {
                         generation,
-                        tool: provider.id().to_string(),
+                        target,
                         snapshot,
                     })));
                 }
@@ -926,6 +932,7 @@ impl Dashboard {
         let generation = self.reset_generation;
         self.reset = Some(ResetFlow {
             provider_id: provider.id().into(),
+            target: provider.cache_key(),
             provider_name: provider.display_name().into(),
             generation,
             stage: ResetStage::Loading,
@@ -965,7 +972,7 @@ impl Dashboard {
         let Some(provider) = self
             .providers
             .iter()
-            .find(|provider| provider.id() == flow.provider_id)
+            .find(|provider| provider.cache_key() == flow.target)
             .cloned()
         else {
             self.reset = None;
@@ -1164,11 +1171,21 @@ impl Dashboard {
             if event.generation != self.generation {
                 continue;
             }
+            let Some(card) = self
+                .cards
+                .iter_mut()
+                .find(|card| card.target == event.target)
+            else {
+                continue;
+            };
             changed = true;
             self.pending = self.pending.saturating_sub(1);
-            let alerts =
-                self.monitor
-                    .observe(&event.snapshot, &self.history_config.alerts, Utc::now());
+            let alerts = self.monitor.observe(
+                &event.target,
+                &event.snapshot,
+                &self.history_config.alerts,
+                Utc::now(),
+            );
             if !alerts.is_empty() {
                 self.notice = Some(
                     alerts
@@ -1179,24 +1196,22 @@ impl Dashboard {
                 );
                 self.alerts_queue.extend(alerts);
             }
-            if let Some(card) = self.cards.iter_mut().find(|card| card.id == event.tool) {
-                if event.snapshot.transient {
-                    if card
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.success)
-                    {
-                        card.warning = event.snapshot.error;
-                    } else {
-                        card.loading = false;
-                        card.snapshot = Some(event.snapshot);
-                        card.warning = None;
-                    }
+            if event.snapshot.transient {
+                if card
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.success)
+                {
+                    card.warning = event.snapshot.error;
                 } else {
                     card.loading = false;
                     card.snapshot = Some(event.snapshot);
                     card.warning = None;
                 }
+            } else {
+                card.loading = false;
+                card.snapshot = Some(event.snapshot);
+                card.warning = None;
             }
             if self.pending == 0 {
                 let ok = self
@@ -1516,6 +1531,7 @@ mod tests {
     use crate::sessions::{AgentKind, Session};
 
     struct ResetTestProvider {
+        target: &'static str,
         available: u32,
         consumed: Arc<AtomicUsize>,
     }
@@ -1528,6 +1544,10 @@ mod tests {
 
         fn display_name(&self) -> &'static str {
             "Codex"
+        }
+
+        fn cache_key(&self) -> String {
+            self.target.into()
         }
 
         async fn query(&self) -> UsageSnapshot {
@@ -1559,6 +1579,7 @@ mod tests {
     fn reset_dashboard(available: u32, consumed: Arc<AtomicUsize>) -> Dashboard {
         let mut app = Dashboard::new(
             vec![Arc::new(ResetTestProvider {
+                target: "codex",
                 available,
                 consumed,
             })],
@@ -1597,6 +1618,7 @@ mod tests {
         app.cards = vec![
             CardSlot {
                 id: "claude".into(),
+                target: "claude".into(),
                 title: "Claude Code".into(),
                 loading: false,
                 snapshot: Some(snapshot_not_found("claude", "Claude Code", None)),
@@ -1604,6 +1626,7 @@ mod tests {
             },
             CardSlot {
                 id: "codex".into(),
+                target: "codex".into(),
                 title: "Codex".into(),
                 loading: false,
                 snapshot: Some(snapshot_ok(
@@ -1628,6 +1651,7 @@ mod tests {
             },
             CardSlot {
                 id: "grok".into(),
+                target: "grok".into(),
                 title: "Grok".into(),
                 loading: false,
                 snapshot: Some(snapshot_not_found("grok", "Grok", None)),
@@ -1642,6 +1666,7 @@ mod tests {
         let mut app = dashboard();
         app.browser = Some(SessionBrowser::new(vec![
             Session {
+                agent: None,
                 provider: AgentKind::CLAUDE,
                 instance: "claude".into(),
                 id: "123e4567-e89b-12d3-a456-426614174000".into(),
@@ -1651,6 +1676,7 @@ mod tests {
                 home: "/tmp/claude".into(),
             },
             Session {
+                agent: None,
                 provider: AgentKind::CODEX,
                 instance: "codex".into(),
                 id: "123e4567-e89b-12d3-a456-426614174001".into(),
@@ -1802,7 +1828,7 @@ mod tests {
         app.tx
             .send(AppEvent::Quota(Box::new(RefreshEvent {
                 generation: 1,
-                tool: "codex".into(),
+                target: "codex".into(),
                 snapshot: snapshot_not_found("codex", "Codex", None),
             })))
             .unwrap();
@@ -1811,7 +1837,7 @@ mod tests {
         app.tx
             .send(AppEvent::Quota(Box::new(RefreshEvent {
                 generation: 2,
-                tool: "codex".into(),
+                target: "codex".into(),
                 snapshot: snapshot_not_found("codex", "Codex", None),
             })))
             .unwrap();
@@ -1851,6 +1877,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reset_consumes_the_confirmed_account_even_when_another_has_the_same_tool() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let mut app = Dashboard::new(
+            vec![
+                Arc::new(ResetTestProvider {
+                    target: "a",
+                    available: 2,
+                    consumed: first.clone(),
+                }),
+                Arc::new(ResetTestProvider {
+                    target: "b",
+                    available: 2,
+                    consumed: second.clone(),
+                }),
+            ],
+            AppConfig::default(),
+            "/tmp/usage-reset-accounts.toml".into(),
+        );
+        app.reset = Some(ResetFlow {
+            provider_id: "codex".into(),
+            target: "b".into(),
+            provider_name: "Codex".into(),
+            generation: 0,
+            stage: ResetStage::Confirm(ResetPreview {
+                available: 2,
+                next_expires_at: None,
+                account_label: Some("b".into()),
+            }),
+        });
+        app.handle_reset_key(KeyCode::Char('y'), &Handle::current());
+        drain_until(&mut app, |app| app.reset.is_none()).await;
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn zero_reset_credits_never_open_confirmation() {
         let consumed = Arc::new(AtomicUsize::new(0));
         let mut app = reset_dashboard(0, Arc::clone(&consumed));
@@ -1865,6 +1928,7 @@ mod tests {
         let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
         app.reset = Some(ResetFlow {
             provider_id: "codex".into(),
+            target: "codex".into(),
             provider_name: "Codex".into(),
             generation: 1,
             stage: ResetStage::Confirm(ResetPreview {
@@ -1932,6 +1996,7 @@ mod tests {
         let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
         app.reset = Some(ResetFlow {
             provider_id: "codex".into(),
+            target: "codex".into(),
             provider_name: "Codex".into(),
             generation: 1,
             stage: ResetStage::Loading,
@@ -2151,6 +2216,7 @@ mod tests {
         app.saved_history = Some(panel);
         app.history_return = true;
         app.browser = Some(SessionBrowser::new(vec![Session {
+            agent: None,
             provider: AgentKind::CODEX,
             instance: "codex".into(),
             id: "session".into(),
@@ -2193,6 +2259,7 @@ mod tests {
     async fn current_resume_is_requested_only_after_session_enter() {
         let mut app = dashboard();
         app.browser = Some(SessionBrowser::new(vec![sessions::Session {
+            agent: None,
             provider: AgentKind::CODEX,
             instance: "work".into(),
             id: "123e4567-e89b-12d3-a456-426614174001".into(),
@@ -2227,7 +2294,7 @@ mod tests {
         app.tx
             .send(AppEvent::Quota(Box::new(RefreshEvent {
                 generation: app.generation,
-                tool: "codex".into(),
+                target: "codex".into(),
                 snapshot,
             })))
             .unwrap();
@@ -2238,7 +2305,7 @@ mod tests {
         app.tx
             .send(AppEvent::Quota(Box::new(RefreshEvent {
                 generation: app.generation,
-                tool: "codex".into(),
+                target: "codex".into(),
                 snapshot: crate::model::snapshot_transient("codex", "Codex", "network"),
             })))
             .unwrap();
@@ -2258,11 +2325,75 @@ mod tests {
         app.tx
             .send(AppEvent::Quota(Box::new(RefreshEvent {
                 generation: app.generation,
-                tool: "codex".into(),
+                target: "codex".into(),
                 snapshot,
             })))
             .unwrap();
         app.drain_events();
         assert!(app.alerts_queue[0].recovered);
+    }
+}
+
+#[cfg(test)]
+mod account_regression_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct Account(&'static str);
+    #[async_trait]
+    impl UsageProvider for Account {
+        fn id(&self) -> &'static str {
+            "codex"
+        }
+        fn display_name(&self) -> &'static str {
+            "Codex"
+        }
+        fn cache_key(&self) -> String {
+            self.0.into()
+        }
+        async fn query(&self) -> UsageSnapshot {
+            crate::model::snapshot_ok(
+                "codex",
+                self.0,
+                vec![crate::model::QuotaTier {
+                    name: "five_hour".into(),
+                    utilization: 95.0,
+                    resets_at: None,
+                }],
+                None,
+                Utc::now(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn two_accounts_receive_their_own_card_results() {
+        let mut app = Dashboard::new(
+            vec![Arc::new(Account("a")), Arc::new(Account("b"))],
+            AppConfig::default(),
+            "/nonexistent/usage-ablation.toml".into(),
+        );
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
+        app.history_config.alerts.enabled = true;
+        app.refresh(&Handle::current());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while app.pending > 0 {
+                app.drain_events();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.alerts_queue.len(), 2);
+        let names: Vec<_> = app
+            .cards
+            .iter()
+            .map(|card| card.snapshot.as_ref().map(|s| s.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [Some("a"), Some("b")],
+            "refresh events still select the first card by tool type"
+        );
     }
 }

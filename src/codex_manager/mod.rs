@@ -144,6 +144,34 @@ pub struct Revision {
     secret_ref: String,
 }
 
+/// Selected account/revision at launch. A home can contain many runs and conversations.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub revision: i64,
+    pub cwd: PathBuf,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+}
+
+impl RunRecord {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            profile_id: row.get(1)?,
+            revision: row.get(2)?,
+            cwd: PathBuf::from(row.get::<_, String>(3)?),
+            started_at: row.get(4)?,
+            finished_at: row.get(5)?,
+            pid: row.get(6)?,
+            exit_code: row.get(7)?,
+        })
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct SyncReport {
     pub created: Vec<String>,
@@ -694,6 +722,19 @@ impl Manager {
         program: &Path,
         args: &[String],
     ) -> Result<ExitStatus> {
+        self.run_recorded(selector, cwd, revision, resume, program, args)
+            .map(|(status, _)| status)
+    }
+
+    pub fn run_recorded(
+        &mut self,
+        selector: &str,
+        cwd: &Path,
+        revision: Option<i64>,
+        resume: Option<&str>,
+        program: &Path,
+        args: &[String],
+    ) -> Result<(ExitStatus, RunRecord)> {
         logging::operation("codex.run", |op| {
             // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
             let report = op.step("source_sync", || self.sync(false))?;
@@ -850,8 +891,30 @@ impl Manager {
             if !status.success() {
                 op.fail("child_exit");
             }
-            Ok(status)
+            let run = self
+                .run_record(&run_id)?
+                .ok_or_else(|| Error::message("启动记录不存在"))?;
+            Ok((status, run))
         })
+    }
+
+    /// Read persisted runs without guessing liveness from an unfinished record.
+    pub fn runs(&self, profile_id: Option<&str>) -> Result<Vec<RunRecord>> {
+        let mut query = self.conn.prepare(
+            "SELECT id,profile_id,revision,cwd,started_at,finished_at,pid,exit_code FROM runs
+             WHERE (?1 IS NULL OR profile_id=?1) ORDER BY started_at DESC,id DESC",
+        )?;
+        let records = query
+            .query_map([profile_id], RunRecord::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
+        Ok(self.conn.query_row(
+            "SELECT id,profile_id,revision,cwd,started_at,finished_at,pid,exit_code FROM runs WHERE id=?1",
+            [id], RunRecord::from_row,
+        ).optional()?)
     }
 
     pub async fn test_connection(&self, selector: &str) -> Result<u16> {

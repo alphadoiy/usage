@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
@@ -16,105 +16,7 @@ const CODEX_METADATA_SCAN_LINES: usize = 8;
 const CODEX_TITLE_SCAN_LINES: usize = 256;
 const GROK_TITLE_SCAN_LINES: usize = 256;
 const TITLE_MAX_CHARS: usize = 120;
-const GHOSTTY_SCRIPT: &str = r#"
-on run argv
-    set projectDir to item 1 of argv
-    set sessionId to item 2 of argv
-    set agentCommand to item 3 of argv
-    set homeKey to item 4 of argv
-    set agentHome to item 5 of argv
-    tell application "Ghostty"
-        set currentTerm to focused terminal of selected tab of front window
-        if currentTerm is missing value then error "找不到当前 Ghostty 终端"
-        set cfg to new surface configuration
-        set initial working directory of cfg to projectDir
-        set environment variables of cfg to {homeKey & "=" & agentHome}
-        set newTerm to split currentTerm direction right with configuration cfg
-        input text agentCommand & " " & sessionId to newTerm
-        send key "enter" to newTerm
-        focus newTerm
-    end tell
-end run
-"#;
-
-/// Metadata needed to group, color, and resume one session provider.
-#[derive(Debug, Clone, Copy)]
-pub struct AgentKind {
-    id: &'static str,
-    name: &'static str,
-    accent: Option<crate::theme::Rgb>,
-    command: &'static str,
-    home_env: &'static str,
-    order: u16,
-}
-
-impl AgentKind {
-    pub const CLAUDE: Self = Self::new(
-        "claude",
-        "Claude Code",
-        None,
-        "claude --resume",
-        "CLAUDE_CONFIG_DIR",
-        0,
-    );
-    pub const CODEX: Self = Self::new("codex", "Codex", None, "codex resume", "CODEX_HOME", 1);
-    pub const GROK: Self = Self::new("grok", "Grok", None, "grok --resume", "GROK_HOME", 2);
-
-    /// `accent = None` uses the shared theme; `order` controls group position.
-    pub const fn new(
-        id: &'static str,
-        name: &'static str,
-        accent: Option<crate::theme::Rgb>,
-        command: &'static str,
-        home_env: &'static str,
-        order: u16,
-    ) -> Self {
-        Self {
-            id,
-            name,
-            accent,
-            command,
-            home_env,
-            order,
-        }
-    }
-
-    pub fn id(self) -> &'static str {
-        self.id
-    }
-    pub fn name(self) -> &'static str {
-        self.name
-    }
-    pub fn accent(self) -> crate::theme::Rgb {
-        self.accent.unwrap_or_else(|| crate::theme::accent(self.id))
-    }
-    pub fn order(self) -> u16 {
-        self.order
-    }
-    fn command(self) -> &'static str {
-        self.command
-    }
-    pub fn resume_command(self, id: &str) -> String {
-        format!("{} {id}", self.command)
-    }
-    fn home_env(self) -> &'static str {
-        self.home_env
-    }
-}
-
-impl PartialEq for AgentKind {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for AgentKind {}
-
-impl Hash for AgentKind {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-    }
-}
+pub use crate::agents::AgentKind;
 
 /// A session ID is unique only within its provider and configured instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,6 +28,8 @@ pub struct SessionKey {
 
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// Adapter selected when discovering this configured instance. None for legacy source-only records.
+    pub agent: Option<Arc<dyn crate::agents::AgentAdapter>>,
     pub provider: AgentKind,
     pub instance: String,
     pub id: String,
@@ -209,6 +113,7 @@ pub struct SessionSource {
 #[derive(Clone, Default)]
 pub struct SessionRegistry {
     sources: Vec<SessionSource>,
+    agents: Option<Arc<crate::agents::AgentRegistry>>,
 }
 
 impl SessionRegistry {
@@ -221,9 +126,13 @@ impl SessionRegistry {
             return Err("会话来源 ID 不能为空".into());
         }
         if self
-            .sources
-            .iter()
-            .any(|existing| existing.kind.id() == source.kind.id())
+            .agents
+            .as_ref()
+            .is_some_and(|agents| agents.contains(source.kind.id()))
+            || self
+                .sources
+                .iter()
+                .any(|existing| existing.kind.id() == source.kind.id())
         {
             return Err(format!("会话来源已注册：{}", source.kind.id()));
         }
@@ -235,29 +144,37 @@ impl SessionRegistry {
         let mut catalog = SessionCatalog::default();
         for source in &self.sources {
             for (instance, home) in homes.all(source.kind.id()) {
-                if !home.is_dir() {
-                    continue;
-                }
-                let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-                match (source.load)(&home) {
-                    Ok(records) => {
-                        catalog
-                            .sessions
-                            .extend(records.into_iter().filter(is_local_record).map(|record| {
-                                Session {
-                                    provider: source.kind,
-                                    instance: instance.into(),
-                                    id: record.id,
-                                    cwd: record.cwd,
-                                    title: record.title,
-                                    recency_at_ms: record.recency_at_ms,
-                                    home: home.to_path_buf(),
-                                }
-                            }))
+                load_source(&mut catalog, *source, instance, home, None);
+            }
+        }
+        if let Some(agents) = &self.agents {
+            for id in agents.ids() {
+                for (instance, home) in homes.all(&id) {
+                    if !home.is_dir() {
+                        continue;
                     }
-                    Err(error) => catalog
-                        .warnings
-                        .push(format!("{} / {instance}：{error}", source.kind.name())),
+                    match agents.create(
+                        &id,
+                        crate::agents::AgentContext::Local {
+                            home: home.to_path_buf(),
+                        },
+                    ) {
+                        Ok(agent) if agent.kind().id() != id => catalog
+                            .warnings
+                            .push(format!("{id} / {instance}：Agent 工厂返回的类型不匹配")),
+                        Ok(agent) => {
+                            if let Some(source) = agent.session_source() {
+                                load_source(
+                                    &mut catalog,
+                                    source,
+                                    instance,
+                                    home,
+                                    Some(agent.clone()),
+                                );
+                            }
+                        }
+                        Err(error) => catalog.warnings.push(format!("{id} / {instance}：{error}")),
+                    }
                 }
             }
         }
@@ -270,25 +187,64 @@ impl SessionRegistry {
     }
 }
 
-pub fn builtin_registry() -> SessionRegistry {
-    let mut registry = SessionRegistry::new();
-    for source in [
-        SessionSource {
-            kind: AgentKind::CLAUDE,
-            load: load_claude,
-        },
-        SessionSource {
-            kind: AgentKind::CODEX,
-            load: load_codex,
-        },
-        SessionSource {
-            kind: AgentKind::GROK,
-            load: load_grok,
-        },
-    ] {
-        registry.register(source).expect("内置会话来源 ID 唯一");
+impl SessionRegistry {
+    pub fn from_agents(agents: Arc<crate::agents::AgentRegistry>) -> Self {
+        Self {
+            sources: Vec::new(),
+            agents: Some(agents),
+        }
     }
-    registry
+}
+
+fn load_source(
+    catalog: &mut SessionCatalog,
+    source: SessionSource,
+    instance: &str,
+    home: &Path,
+    agent: Option<Arc<dyn crate::agents::AgentAdapter>>,
+) {
+    if !home.is_dir() {
+        return;
+    }
+    if agent
+        .as_ref()
+        .is_some_and(|agent| agent.kind() != source.kind)
+    {
+        catalog.warnings.push(format!(
+            "{} / {instance}：会话来源与 Agent 不匹配",
+            source.kind.id()
+        ));
+        return;
+    }
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    match (source.load)(&home) {
+        Ok(records) => catalog.sessions.extend(
+            records
+                .into_iter()
+                .filter(|record| {
+                    source.kind.valid_session_id(&record.id)
+                        && record.cwd.is_absolute()
+                        && record.cwd.is_dir()
+                })
+                .map(|record| Session {
+                    agent: agent.clone(),
+                    provider: source.kind,
+                    instance: instance.into(),
+                    id: record.id,
+                    cwd: record.cwd,
+                    title: record.title,
+                    recency_at_ms: record.recency_at_ms,
+                    home: home.clone(),
+                }),
+        ),
+        Err(error) => catalog
+            .warnings
+            .push(format!("{} / {instance}：{error}", source.kind.name())),
+    }
+}
+
+pub fn builtin_registry() -> SessionRegistry {
+    SessionRegistry::from_agents(Arc::new(crate::agents::builtin_registry()))
 }
 
 pub fn load_all(homes: &SessionHomes) -> SessionCatalog {
@@ -303,7 +259,7 @@ struct CodexRow {
     recency_at_ms: i64,
 }
 
-fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
+pub(crate) fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
     match load_codex_index(home) {
         Ok(sessions) => Ok(sessions),
         Err(index_error) => match load_codex_rollouts(home) {
@@ -538,7 +494,7 @@ fn codex_rollout_metadata(path: &Path, titles: &HashMap<String, String>) -> Opti
     })
 }
 
-fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
+pub(crate) fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
     let root = home.join("projects");
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -631,7 +587,7 @@ fn claude_metadata(path: &Path) -> Option<(PathBuf, String)> {
     Some((cwd?, named?))
 }
 
-fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
+pub(crate) fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
     let root = home.join("sessions");
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -793,7 +749,14 @@ pub fn uses_ghostty(mode: crate::config::ResumeMode) -> bool {
     }
 }
 fn validate_resume(session: &Session) -> Result<(), String> {
-    if uuid::Uuid::parse_str(&session.id).is_err() {
+    if session
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.kind() != session.provider)
+    {
+        return Err("会话来源与 Agent 不匹配".into());
+    }
+    if !session.provider.valid_session_id(&session.id) {
         return Err("无效的会话 ID".into());
     }
     if !session.cwd.is_absolute() || !session.cwd.is_dir() {
@@ -816,22 +779,40 @@ fn validate_resume(session: &Session) -> Result<(), String> {
 /// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
 pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
     validate_resume(session)?;
+    if let Some(agent) = &session.agent {
+        let program = session
+            .provider
+            .command()
+            .split_whitespace()
+            .next()
+            .ok_or("恢复命令为空")?;
+        return agent
+            .launcher()
+            .ok_or("此 Agent 不支持恢复会话")?
+            .spawn(&crate::agents::SpawnRequest {
+                cwd: session.cwd.clone(),
+                program: program.into(),
+                args: Vec::new(),
+                resume: Some(session.id.clone()),
+            })
+            .map(|outcome| outcome.status);
+    }
     if session.provider == AgentKind::CODEX
         && let Some((profile, revision)) =
             crate::codex_manager::binding_for_home(&session.home).map_err(|e| e.to_string())?
     {
-        return crate::codex_manager::Manager::open_default()
-            .and_then(|mut manager| {
-                manager.run(
-                    &profile,
-                    &session.cwd,
-                    Some(revision),
-                    Some(&session.id),
-                    Path::new("codex"),
-                    &[],
-                )
-            })
-            .map_err(|e| e.to_string());
+        return crate::hub::spawn_managed_codex(
+            &crate::codex_manager::default_root(),
+            &profile,
+            Some(revision),
+            &crate::agents::SpawnRequest {
+                cwd: session.cwd.clone(),
+                program: "codex".into(),
+                args: Vec::new(),
+                resume: Some(session.id.clone()),
+            },
+        )
+        .map(|outcome| outcome.status);
     }
     let mut parts = session.provider.command().split_whitespace();
     let program = parts.next().ok_or("恢复命令为空")?;
@@ -844,6 +825,17 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
         .map_err(|e| format!("无法运行 {}：{e}", session.provider.name()))
 }
 pub fn resume_shell_command(session: &Session) -> Result<String, String> {
+    validate_resume(session)?;
+    match &session.agent {
+        Some(agent) => agent
+            .launcher()
+            .ok_or("此 Agent 不支持恢复会话")?
+            .resume_shell_command(session),
+        None => local_resume_shell_command(session),
+    }
+}
+
+pub(crate) fn local_resume_shell_command(session: &Session) -> Result<String, String> {
     validate_resume(session)?;
     if session.provider == AgentKind::CODEX
         && let Some((profile, revision)) =
@@ -953,39 +945,7 @@ pub fn copy_resume_command(session: &Session) -> Result<(), String> {
 }
 
 pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
-    if session.provider == AgentKind::CODEX
-        && crate::codex_manager::binding_for_home(&session.home)
-            .map_err(|e| e.to_string())?
-            .is_some()
-    {
-        return command_in_ghostty(&session.cwd, &resume_shell_command(session)?);
-    }
-    if !cfg!(target_os = "macos") {
-        return Err("Ghostty 分屏仅支持 macOS，请按 R 选择当前终端".into());
-    }
-    if std::env::var_os("GHOSTTY_RESOURCES_DIR").is_none()
-        && std::env::var("TERM_PROGRAM").as_deref() != Ok("ghostty")
-    {
-        return Err("请在 Ghostty 中打开 usage，再使用右侧分屏".into());
-    }
-    validate_resume(session)?;
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(GHOSTTY_SCRIPT)
-        .arg(&session.cwd)
-        .arg(&session.id)
-        .arg(session.provider.command())
-        .arg(session.provider.home_env())
-        .arg(&session.home)
-        .output()
-        .map_err(|e| format!("无法调用 Ghostty AppleScript：{e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Ghostty 分屏失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
+    command_in_ghostty(&session.cwd, &resume_shell_command(session)?)
 }
 
 /// Open a launcher command containing identifiers, never credentials, in a fresh Ghostty split.
@@ -1400,6 +1360,7 @@ mod tests {
         let command: &'static str =
             Box::leak(format!("/bin/sh {}", script.display()).into_boxed_str());
         let session = Session {
+            agent: None,
             provider: AgentKind::new("custom", "Custom", None, command, "CUSTOM_HOME", 0),
             instance: "work".into(),
             id: "123e4567-e89b-12d3-a456-426614174001".into(),

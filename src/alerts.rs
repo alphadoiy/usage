@@ -18,11 +18,12 @@ struct WindowState {
 }
 #[derive(Default)]
 pub struct QuotaMonitor {
-    windows: HashMap<(String, String, String), WindowState>,
+    windows: HashMap<(String, String, String, String), WindowState>,
 }
 impl QuotaMonitor {
     pub fn observe(
         &mut self,
+        target: &str,
         snapshot: &UsageSnapshot,
         config: &AlertConfig,
         now: DateTime<Utc>,
@@ -41,6 +42,7 @@ impl QuotaMonitor {
                 continue;
             }
             let key = (
+                target.to_owned(),
                 snapshot.tool.clone(),
                 snapshot.account_email.clone().unwrap_or_default(),
                 tier.name.clone(),
@@ -168,19 +170,20 @@ mod tests {
         let mut monitor = QuotaMonitor::default();
         assert!(
             monitor
-                .observe(&snapshot(80.0, now, "a"), &config, now)
+                .observe("local", &snapshot(80.0, now, "a"), &config, now)
                 .is_empty()
         );
         let later = now + Duration::seconds(1);
         assert_eq!(
             monitor
-                .observe(&snapshot(90.0, later, "a"), &config, later)
+                .observe("local", &snapshot(90.0, later, "a"), &config, later)
                 .len(),
             1
         );
         assert!(
             monitor
                 .observe(
+                    "local",
                     &snapshot(95.0, later + Duration::seconds(1), "a"),
                     &config,
                     later
@@ -188,6 +191,7 @@ mod tests {
                 .is_empty()
         );
         let recovered = monitor.observe(
+            "local",
             &snapshot(10.0, later + Duration::seconds(2), "a"),
             &config,
             later,
@@ -196,6 +200,7 @@ mod tests {
         assert!(
             monitor
                 .observe(
+                    "local",
                     &snapshot(90.0, later + Duration::seconds(3), "a"),
                     &config,
                     later
@@ -204,20 +209,21 @@ mod tests {
         );
         assert_eq!(
             monitor
-                .observe(&snapshot(90.0, later, "b"), &config, later)
+                .observe("local", &snapshot(90.0, later, "b"), &config, later)
                 .len(),
             1
         );
         assert!(
             monitor
-                .observe(&snapshot(80.0, now, "b"), &config, later)
+                .observe("local", &snapshot(80.0, now, "b"), &config, later)
                 .is_empty()
         ); // stale response
         let later = now + Duration::seconds(400);
-        monitor.observe(&snapshot(10.0, later, "a"), &config, later);
+        monitor.observe("local", &snapshot(10.0, later, "a"), &config, later);
         assert_eq!(
             monitor
                 .observe(
+                    "local",
                     &snapshot(90.0, later + Duration::seconds(1), "a"),
                     &config,
                     later
@@ -243,7 +249,7 @@ mod tests {
             (600, 95.0, 0, false),
         ] {
             let t = now + Duration::seconds(seconds);
-            let alerts = monitor.observe(&snapshot(used, t, "a"), &config, t);
+            let alerts = monitor.observe("local", &snapshot(used, t, "a"), &config, t);
             assert_eq!(alerts.len(), count, "at {seconds}s");
             if let Some(alert) = alerts.first() {
                 assert_eq!(alert.recovered, recovered);
@@ -260,7 +266,7 @@ mod tests {
         let mut monitor = QuotaMonitor::default();
         for (seconds, used) in [(0, 90.0), (1, 10.0), (2, 90.0)] {
             let t = now + Duration::seconds(seconds);
-            monitor.observe(&snapshot(used, t, "a"), &config, t);
+            monitor.observe("local", &snapshot(used, t, "a"), &config, t);
         }
         let later = now + Duration::seconds(300);
         let healthy = snapshot(10.0, later, "a");
@@ -274,9 +280,9 @@ mod tests {
         invalid.tiers[0].utilization = f64::NAN;
         let stale = snapshot(10.0, now + Duration::seconds(1), "a");
         for s in [failed, transient, expired, invalid, stale] {
-            assert!(monitor.observe(&s, &config, later).is_empty());
+            assert!(monitor.observe("local", &s, &config, later).is_empty());
         }
-        let alerts = monitor.observe(&snapshot(90.0, later, "a"), &config, later);
+        let alerts = monitor.observe("local", &snapshot(90.0, later, "a"), &config, later);
         assert_eq!(alerts.len(), 1);
         assert!(!alerts[0].recovered);
     }
@@ -300,7 +306,9 @@ mod tests {
         ] {
             let t = now + Duration::seconds(seconds);
             assert_eq!(
-                monitor.observe(&snapshot(used, t, "a"), &config, t).len(),
+                monitor
+                    .observe("local", &snapshot(used, t, "a"), &config, t)
+                    .len(),
                 count,
                 "at {seconds}s"
             );
@@ -316,12 +324,16 @@ mod tests {
         let mut monitor = QuotaMonitor::default();
         let mut s = snapshot(90.0, now, "a");
         s.transient = true;
-        assert!(monitor.observe(&s, &config, now).is_empty());
+        assert!(monitor.observe("local", &s, &config, now).is_empty());
         s.transient = false;
-        assert!(monitor.observe(&s, &AlertConfig::default(), now).is_empty());
+        assert!(
+            monitor
+                .observe("local", &s, &AlertConfig::default(), now)
+                .is_empty()
+        );
         s.tiers[0].utilization = f64::NAN;
-        assert!(monitor.observe(&s, &config, now).is_empty());
+        assert!(monitor.observe("local", &s, &config, now).is_empty());
         s.tiers[0].utilization = 90.0;
-        assert_eq!(monitor.observe(&s, &config, now).len(), 1);
+        assert_eq!(monitor.observe("local", &s, &config, now).len(), 1);
     }
 }

@@ -565,6 +565,7 @@ mod tests {
 
     fn session(provider: AgentKind, title: &str, cwd: &str, recency: i64) -> Session {
         Session {
+            agent: None,
             provider,
             instance: provider.id().into(),
             id: format!("123e4567-e89b-12d3-a456-{recency:012}"),

@@ -69,6 +69,7 @@ usage history         # TUI 贡献看板（也可用 usage dashboard）
 usage history --providers codex,claude --monthly
 usage history --year 2026 --json  # 导出日/月 Token 汇总
 usage providers       # 列出已注册的工具
+usage codex runs --json  # 查看运行记录及启动时选中的账号、配置版本
 usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
@@ -345,9 +346,11 @@ Codex 账号保存、CC Switch 导入/跟随同步、配置校验、OAuth 凭据
 
 ## 扩展
 
-工具和画法都是注册进去的，界面只认识统一的用量快照。
+Agent 和资源服务分别通过工厂注册表扩展，再由 `hub::Hub` 组合成配置实例。Agent 提供启动与会话能力，资源适配器提供额度、余额或支出快照。现有界面通过兼容层继续使用统一用量快照。完整结构和迁移边界见 [Provider 架构](docs/provider-architecture.md)。
 
-新增一个工具：实现 `UsageProvider`，在 `builtin_factory()` 里登记工厂。
+新增 Agent 实现 `AgentAdapter`，注册到 `AgentRegistry`；新增资源服务实现 `ResourceReader`，注册到 `ResourceRegistry`。注册 ID 重复会返回错误，不再静默覆盖。
+
+现有额度视图仍支持旧的 `UsageProvider` 扩展方式，在 `builtin_factory()` 里登记工厂。多账号扩展应覆盖 `cache_key()`，为每个账号和配置版本提供独立标识。
 
 ```rust
 factory.register("gemini", |ctx| Box::new(GeminiProvider::new(ctx)))?;

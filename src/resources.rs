@@ -1,0 +1,296 @@
+//! Billing/resource adapters are independent of the agent that consumes them.
+//! Legacy subscription readers remain behind a compatibility capability.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::model::{CredentialStatus, UsageSnapshot};
+use crate::providers::{ProviderContext, UsageProvider, UsageReset};
+use crate::registry::FactoryRegistry;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceBinding {
+    /// Configured account/connection identity, never a credential value.
+    pub account: String,
+    /// Saved configuration revision; empty for an unmanaged local home.
+    pub revision: String,
+}
+
+impl ResourceBinding {
+    pub fn cache_key(&self, service: &str) -> String {
+        let mut digest = Sha256::new();
+        for part in [service, &self.account, &self.revision] {
+            digest.update((part.len() as u64).to_le_bytes());
+            digest.update(part.as_bytes());
+        }
+        format!("resource-v1:{:x}", digest.finalize())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceState {
+    Ready,
+    NeedsConfiguration,
+    AuthenticationFailed,
+    TransientFailure,
+    Failure,
+}
+
+/// Monetary values retain the service's decimal representation and currency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Money {
+    pub amount: String,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResourceMetric {
+    QuotaWindow {
+        name: String,
+        used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    Balance {
+        remaining: Money,
+    },
+    Spending {
+        used: Option<f64>,
+        limit: Option<f64>,
+        currency: Option<String>,
+    },
+    /// Raw vendor quota stays raw until the service's conversion is known.
+    Allowance {
+        remaining: Option<f64>,
+        used: Option<f64>,
+        unit: String,
+        unlimited: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceSnapshot {
+    pub binding: ResourceBinding,
+    pub service: String,
+    pub state: ResourceState,
+    pub metrics: Vec<ResourceMetric>,
+    pub queried_at: Option<DateTime<Utc>>,
+    pub message: Option<String>,
+}
+
+#[async_trait]
+pub trait ResourceReader: Send + Sync {
+    fn service(&self) -> &str;
+    fn binding(&self) -> &ResourceBinding;
+    /// The calling query boundary (Hub) owns the deadline, including credential loading.
+    async fn read(&self) -> ResourceSnapshot;
+
+    /// Transitional capability for the current quota-only CLI and views.
+    fn legacy_usage(&self) -> Option<&dyn UsageProvider> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct ResourceContext {
+    pub binding: ResourceBinding,
+    pub connection: ResourceConnection,
+}
+
+/// Secrets are resolved during query, never during registration or construction.
+pub type CredentialResolver = dyn Fn(&str) -> Result<String, String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct ApiConnection {
+    pub base_url: String,
+    pub credential_ref: String,
+    pub http: Arc<dyn crate::http::HttpClient>,
+    pub credentials: Arc<CredentialResolver>,
+    pub now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub enum ResourceConnection {
+    LocalSubscription(Arc<ProviderContext>),
+    Api(ApiConnection),
+}
+
+pub type ResourceRegistry = FactoryRegistry<ResourceContext, Arc<dyn ResourceReader>>;
+
+struct SubscriptionResource {
+    service: &'static str,
+    binding: ResourceBinding,
+    usage: Box<dyn UsageProvider>,
+}
+
+#[async_trait]
+impl ResourceReader for SubscriptionResource {
+    fn service(&self) -> &str {
+        self.service
+    }
+    fn binding(&self) -> &ResourceBinding {
+        &self.binding
+    }
+    fn legacy_usage(&self) -> Option<&dyn UsageProvider> {
+        Some(self.usage.as_ref())
+    }
+    async fn read(&self) -> ResourceSnapshot {
+        let snapshot = self.usage.query().await;
+        let state = if snapshot.success {
+            ResourceState::Ready
+        } else if snapshot.transient {
+            ResourceState::TransientFailure
+        } else {
+            match snapshot.credential_status {
+                CredentialStatus::NotFound => ResourceState::NeedsConfiguration,
+                CredentialStatus::Expired => ResourceState::AuthenticationFailed,
+                _ => ResourceState::Failure,
+            }
+        };
+        let mut metrics: Vec<_> = snapshot
+            .tiers
+            .into_iter()
+            .map(|tier| ResourceMetric::QuotaWindow {
+                name: tier.name,
+                used_percent: tier.utilization,
+                resets_at: tier.resets_at,
+            })
+            .collect();
+        if let Some(extra) = snapshot.extra_usage.filter(|extra| extra.is_enabled) {
+            metrics.push(ResourceMetric::Spending {
+                used: extra.used_credits,
+                limit: extra.monthly_limit,
+                currency: extra.currency,
+            });
+        }
+        ResourceSnapshot {
+            binding: self.binding.clone(),
+            service: self.service.into(),
+            state,
+            metrics,
+            queried_at: snapshot.queried_at,
+            message: snapshot.error.or(snapshot.credential_message),
+        }
+    }
+}
+
+pub fn builtin_registry() -> ResourceRegistry {
+    use crate::providers::{ClaudeProvider, CodexProvider, GrokProvider};
+    let mut registry = ResourceRegistry::new();
+    type Constructor = fn(Arc<ProviderContext>) -> Box<dyn UsageProvider>;
+    for (service, constructor) in [
+        (
+            "claude_subscription",
+            (|ctx| Box::new(ClaudeProvider::new(ctx))) as Constructor,
+        ),
+        (
+            "chatgpt_subscription",
+            (|ctx| Box::new(CodexProvider::new(ctx))) as Constructor,
+        ),
+        (
+            "grok_subscription",
+            (|ctx| Box::new(GrokProvider::new(ctx))) as Constructor,
+        ),
+    ] {
+        registry
+            .register(service, move |context: ResourceContext| {
+                let ResourceConnection::LocalSubscription(legacy) = context.connection else {
+                    return Err(crate::registry::RegistryError::Factory(
+                        "订阅资源需要本地登录配置".into(),
+                    ));
+                };
+                Ok(Arc::new(SubscriptionResource {
+                    service,
+                    binding: context.binding,
+                    usage: constructor(legacy),
+                }) as Arc<dyn ResourceReader>)
+            })
+            .expect("内置资源服务 ID 唯一");
+    }
+    registry
+}
+
+/// Keeps existing output/reset behavior while assigning a scoped cache identity.
+pub(crate) struct LegacyUsageAdapter {
+    reader: Arc<dyn ResourceReader>,
+}
+
+impl LegacyUsageAdapter {
+    pub(crate) fn new(reader: Arc<dyn ResourceReader>) -> Self {
+        assert!(
+            reader.legacy_usage().is_some(),
+            "legacy usage capability required"
+        );
+        Self { reader }
+    }
+    fn usage(&self) -> &dyn UsageProvider {
+        self.reader.legacy_usage().expect("checked at construction")
+    }
+}
+
+#[async_trait]
+impl UsageProvider for LegacyUsageAdapter {
+    fn id(&self) -> &'static str {
+        self.usage().id()
+    }
+    fn display_name(&self) -> &'static str {
+        self.usage().display_name()
+    }
+    fn cache_key(&self) -> String {
+        self.reader.binding().cache_key(self.reader.service())
+    }
+    fn reset(&self) -> Option<&dyn UsageReset> {
+        self.usage().reset()
+    }
+    async fn query(&self) -> UsageSnapshot {
+        self.usage().query().await
+    }
+}
+
+/// Existing local-home configuration gets a stable identity without exposing its path in cache keys.
+pub(crate) fn local_context(
+    service: &str,
+    home: &std::path::Path,
+    legacy: Arc<ProviderContext>,
+) -> ResourceContext {
+    let path = crate::config::resolved_data_path(home);
+    ResourceContext {
+        binding: ResourceBinding {
+            account: format!("{service}:{}", path.display()),
+            revision: String::new(),
+        },
+        connection: ResourceConnection::LocalSubscription(legacy),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registered_subscription_reports_missing_configuration_as_resource_state() {
+        let legacy = Arc::new(ProviderContext {
+            claude_dir: "/nonexistent/usage-resource-test-claude".into(),
+            codex_dir: "/nonexistent/usage-resource-test-codex".into(),
+            grok_dir: "/nonexistent/usage-resource-test-grok".into(),
+            http: Arc::new(crate::http::FakeHttp::new()),
+            keychain: Arc::new(|_, _| None),
+            now: Arc::new(|| DateTime::UNIX_EPOCH),
+        });
+        let context = local_context("chatgpt_subscription", &legacy.codex_dir, legacy.clone());
+        let binding = context.binding.clone();
+        let reader = builtin_registry()
+            .create("chatgpt_subscription", context)
+            .unwrap();
+        let snapshot = reader.read().await;
+        assert_eq!(snapshot.state, ResourceState::NeedsConfiguration);
+        assert_eq!(snapshot.binding, binding);
+        assert!(snapshot.metrics.is_empty());
+        assert!(reader.legacy_usage().unwrap().reset().is_some());
+    }
+}

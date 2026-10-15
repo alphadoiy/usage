@@ -428,14 +428,18 @@ pub fn run(handle: Handle) -> io::Result<()> {
                                 let _interrupts = tokio::signal::unix::signal(
                                     tokio::signal::unix::SignalKind::interrupt(),
                                 )?;
-                                manager.run(
+                                crate::hub::spawn_managed_codex(
+                                    manager.root(),
                                     &p.id,
-                                    &cwd,
                                     None,
-                                    None,
-                                    std::path::Path::new("codex"),
-                                    &[],
+                                    &crate::agents::SpawnRequest {
+                                        cwd: cwd.clone(),
+                                        program: "codex".into(),
+                                        args: Vec::new(),
+                                        resume: None,
+                                    },
                                 )
+                                .map(|outcome| outcome.status)
                             };
                             terminal = ratatui::try_init().map_err(io::Error::other)?;
                             notice = status

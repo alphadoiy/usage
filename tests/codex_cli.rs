@@ -107,6 +107,63 @@ impl Drop for Fixture {
 include!("support/bark_server.rs");
 
 #[cfg(unix)]
+#[test]
+fn registry_launches_have_distinct_runs_bound_to_their_actual_revisions() {
+    let f = Fixture::new();
+    let id = f.add();
+    let binary = f.binary();
+    f.run(&["edit", &id, "--model", "revision-two"]);
+    let children: Vec<_> = ["1", "2"]
+        .into_iter()
+        .map(|revision| {
+            f.command(&[
+                "run",
+                &id,
+                "--cwd",
+                f.path.to_str().unwrap(),
+                "--revision",
+                revision,
+                "--binary",
+                binary.to_str().unwrap(),
+            ])
+            .env("CAPTURE_FILE", f.path.join(format!("capture-{revision}")))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+        })
+        .collect();
+    for child in children {
+        success(child.wait_with_output().unwrap());
+    }
+    let all: serde_json::Value = serde_json::from_str(&f.run(&["runs", "--json"])).unwrap();
+    let selected: serde_json::Value =
+        serde_json::from_str(&f.run(&["runs", &id, "--json"])).unwrap();
+    assert_eq!(all, selected);
+    let runs = all.as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_ne!(runs[0]["id"], runs[1]["id"]);
+    let mut revisions: Vec<_> = runs
+        .iter()
+        .map(|run| run["revision"].as_i64().unwrap())
+        .collect();
+    revisions.sort();
+    assert_eq!(revisions, [1, 2]);
+    for run in runs {
+        assert_eq!(run["profile_id"], id);
+        assert_eq!(run["cwd"], f.path.to_str().unwrap());
+        assert!(run["finished_at"].is_string());
+        assert_eq!(run["exit_code"], 0);
+        assert!(run["pid"].as_u64().unwrap() > 0);
+    }
+    assert!(!all.to_string().contains("fixture-cli-secret"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&f.run(&["list", "--json"])).unwrap()[0]["revision"],
+        2
+    );
+}
+
+#[cfg(unix)]
 fn configure_bark(f: &Fixture, server: &BarkServer) {
     let output = success(
         f.command(&["bark", "configure", "--url-env", "FIXTURE_BARK_URL"])
@@ -1081,6 +1138,7 @@ fn managed_resume_command_reenters_the_account_launcher() {
     let p = m.add("Resume", &config, "fixture-key").unwrap();
     let home = m.materialize(&p.id, 1).unwrap();
     let session = usage::sessions::Session {
+        agent: None,
         provider: usage::sessions::AgentKind::CODEX,
         instance: "probe".into(),
         id: uuid::Uuid::new_v4().to_string(),

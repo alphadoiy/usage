@@ -50,6 +50,12 @@ pub enum CodexCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 查看启动记录及其实际使用的账号和配置版本
+    Runs {
+        profile: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// 保存 BYOK 账号配置；密钥从 stdin、环境变量或文件读取
     Add {
         name: String,
@@ -164,6 +170,7 @@ impl CodexCommand {
             Self::Login { .. } => "codex.login",
             Self::ImportAuth { .. } => "codex.import_auth",
             Self::List { .. } => "codex.list",
+            Self::Runs { .. } => "codex.runs",
             Self::Add { .. } => "codex.add",
             Self::Edit { .. } => "codex.edit",
             Self::Copy { .. } => "codex.copy",
@@ -309,6 +316,34 @@ pub async fn dispatch(command: CodexCommand) -> Result<i32> {
                         } else {
                             "BYOK · 独立".into()
                         }
+                    );
+                }
+            }
+        }
+        CodexCommand::Runs { profile, json } => {
+            let profile_id = profile
+                .as_deref()
+                .map(|selector| manager.resolve(selector).map(|p| p.id))
+                .transpose()?;
+            let runs = manager.runs(profile_id.as_deref())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&runs)
+                        .map_err(|_| Error::message("序列化失败"))?
+                );
+            } else {
+                for run in runs {
+                    println!(
+                        "{}  {}  v{}  {}  {}  {}",
+                        run.id,
+                        run.profile_id,
+                        run.revision,
+                        run.cwd.display(),
+                        run.started_at,
+                        run.finished_at
+                            .map(|_| format!("已结束 ({:?})", run.exit_code))
+                            .unwrap_or_else(|| "未记录结束（进程状态未知）".into())
                     );
                 }
             }
@@ -488,9 +523,19 @@ pub async fn dispatch(command: CodexCommand) -> Result<i32> {
                 #[cfg(unix)]
                 let _interrupts =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-                let status =
-                    manager.run(&profile, &cwd, revision, resume.as_deref(), &binary, &args)?;
-                return Ok(status.code().unwrap_or(130));
+                let outcome = crate::hub::spawn_managed_codex(
+                    manager.root(),
+                    &profile,
+                    revision,
+                    &crate::agents::SpawnRequest {
+                        cwd,
+                        program: binary,
+                        args,
+                        resume,
+                    },
+                )
+                .map_err(Error::message)?;
+                return Ok(outcome.status.code().unwrap_or(130));
             }
         }
         CodexCommand::Test { profile, request } => {

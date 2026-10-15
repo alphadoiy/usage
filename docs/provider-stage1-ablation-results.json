@@ -1,0 +1,208 @@
+{
+  "source_unchanged": true,
+  "artifact_directory": "/private/tmp/usage-stage1-ablation-20261015",
+  "original_regression_tests": 218,
+  "added_positive_contract_tests": 1,
+  "results": [
+    {
+      "label": "baseline",
+      "exit_code": 0,
+      "elapsed_seconds": 27.809,
+      "passed": 219,
+      "failed": 0,
+      "ignored": 0,
+      "failures": [],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/baseline.log",
+      "manager_opens_per_cli_run": 2
+    },
+    {
+      "label": "bypass_hub_launch",
+      "exit_code": 0,
+      "elapsed_seconds": 26.697,
+      "passed": 219,
+      "failed": 0,
+      "ignored": 0,
+      "failures": [],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/bypass_hub_launch.log",
+      "manager_opens_per_cli_run": 2
+    },
+    {
+      "label": "flatten_legacy_bridge",
+      "exit_code": 0,
+      "elapsed_seconds": 20.166,
+      "passed": 219,
+      "failed": 0,
+      "ignored": 0,
+      "failures": [],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/flatten_legacy_bridge.log"
+    },
+    {
+      "label": "hardcode_builtin_sessions",
+      "exit_code": 0,
+      "elapsed_seconds": 19.774,
+      "passed": 219,
+      "failed": 0,
+      "ignored": 0,
+      "failures": [],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/hardcode_builtin_sessions.log"
+    },
+    {
+      "label": "allow_duplicate_registration",
+      "exit_code": 101,
+      "elapsed_seconds": 20.048,
+      "passed": 217,
+      "failed": 2,
+      "ignored": 0,
+      "failures": [
+        "async_http_failure_logs_status_and_context_without_request_or_response_secrets",
+        "registry::tests::factories_are_lazy_repeatable_and_registration_is_unambiguous"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/allow_duplicate_registration.log"
+    },
+    {
+      "label": "collapse_cache_scope",
+      "exit_code": 101,
+      "elapsed_seconds": 19.105,
+      "passed": 217,
+      "failed": 2,
+      "ignored": 0,
+      "failures": [
+        "phase1_probe_builtin_accounts_do_not_share_cached_results",
+        "providers::tests::builtin_cache_identity_tracks_home_instead_of_tool_type"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/collapse_cache_scope.log"
+    },
+    {
+      "label": "force_uuid_session_ids",
+      "exit_code": 101,
+      "elapsed_seconds": 19.654,
+      "passed": 218,
+      "failed": 1,
+      "ignored": 0,
+      "failures": [
+        "hub::tests::custom_agent_and_balance_service_compose_without_changing_builtin_dispatch"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/force_uuid_session_ids.log"
+    },
+    {
+      "label": "remove_query_deadline",
+      "exit_code": 101,
+      "elapsed_seconds": 20.886,
+      "passed": 217,
+      "failed": 2,
+      "ignored": 0,
+      "failures": [
+        "providers::tests::blocking_credential_reader_does_not_hold_the_deadline",
+        "providers::tests::query_deadline_returns_transient_snapshot"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/remove_query_deadline.log"
+    },
+    {
+      "label": "ignore_ui_generation",
+      "exit_code": 101,
+      "elapsed_seconds": 19.255,
+      "passed": 218,
+      "failed": 1,
+      "ignored": 0,
+      "failures": [
+        "ui::app::tests::only_current_query_results_trigger_redraw"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/ignore_ui_generation.log"
+    },
+    {
+      "label": "ignore_bark_source_gate",
+      "exit_code": 101,
+      "elapsed_seconds": 18.891,
+      "passed": 217,
+      "failed": 2,
+      "ignored": 0,
+      "failures": [
+        "codex_manager::bark::tests::ephemeral_title_and_subagent_completions_are_filtered_by_source",
+        "codex_manager::bark::tests::logs_correlate_screen_decisions_and_transport_failures_without_private_content"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/ignore_bark_source_gate.log"
+    },
+    {
+      "label": "disable_history_incremental",
+      "exit_code": 101,
+      "elapsed_seconds": 19.957,
+      "passed": 218,
+      "failed": 1,
+      "ignored": 0,
+      "failures": [
+        "history::tests::append_cursor_preserves_model_and_dedup_state_across_restart"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/disable_history_incremental.log"
+    },
+    {
+      "label": "boundary_audit",
+      "exit_code": 101,
+      "elapsed_seconds": 5.519,
+      "passed": 0,
+      "failed": 4,
+      "ignored": 0,
+      "failures": [
+        "hub::phase1_audit_probes::phase1_probe_independent_accounts_receive_independent_quota_alerts",
+        "hub::phase1_audit_probes::phase1_probe_one_panicking_resource_preserves_healthy_result",
+        "hub::phase1_audit_probes::phase1_probe_session_resume_uses_registered_launcher",
+        "ui::app::phase1_audit_probes::phase1_probe_two_accounts_receive_their_own_card_results"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/boundary_audit.log"
+    },
+    {
+      "label": "reuse_open_manager",
+      "exit_code": 0,
+      "elapsed_seconds": 19.629,
+      "passed": 219,
+      "failed": 0,
+      "ignored": 0,
+      "failures": [],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/reuse_open_manager.log",
+      "variant": "reuse_open_manager",
+      "manager_opens_per_cli_run": 1
+    },
+    {
+      "label": "allow_duplicate_registration_repeat",
+      "exit_code": 101,
+      "elapsed_seconds": 21.796,
+      "passed": 218,
+      "failed": 1,
+      "ignored": 0,
+      "failures": [
+        "registry::tests::factories_are_lazy_repeatable_and_registration_is_unambiguous"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/allow_duplicate_registration_repeat.log",
+      "variant": "allow_duplicate_registration"
+    },
+    {
+      "label": "boundary_audit_repeat",
+      "exit_code": 101,
+      "elapsed_seconds": 6.019,
+      "passed": 0,
+      "failed": 4,
+      "ignored": 0,
+      "failures": [
+        "hub::phase1_audit_probes::phase1_probe_independent_accounts_receive_independent_quota_alerts",
+        "hub::phase1_audit_probes::phase1_probe_one_panicking_resource_preserves_healthy_result",
+        "hub::phase1_audit_probes::phase1_probe_session_resume_uses_registered_launcher",
+        "ui::app::phase1_audit_probes::phase1_probe_two_accounts_receive_their_own_card_results"
+      ],
+      "compile_error": false,
+      "log": "/private/tmp/usage-stage1-ablation-20261015/boundary_audit_repeat.log"
+    }
+  ]
+}

@@ -233,6 +233,7 @@ pub async fn collect(
 
     for (index, provider) in providers.iter().enumerate() {
         let id = provider.id();
+        let cache_key = provider.cache_key();
         if id == "claude" && !input.rate_tiers.is_empty() {
             let snapshot = snapshot_ok(
                 id,
@@ -241,7 +242,7 @@ pub async fn collect(
                 None,
                 now,
             );
-            let should_cache = cache.entries.get(id).is_none_or(|entry| {
+            let should_cache = cache.entries.get(&cache_key).is_none_or(|entry| {
                 !within_age(
                     entry.saved_at,
                     now,
@@ -250,7 +251,7 @@ pub async fn collect(
             });
             if should_cache {
                 cache.entries.insert(
-                    id.into(),
+                    cache_key.clone(),
                     CacheEntry {
                         saved_at: now,
                         snapshot: snapshot.clone(),
@@ -261,7 +262,7 @@ pub async fn collect(
             results[index] = Some(snapshot);
             continue;
         }
-        if let Some(entry) = cache.entries.get(id)
+        if let Some(entry) = cache.entries.get(&cache_key)
             && within_age(
                 entry.saved_at,
                 now,
@@ -282,15 +283,15 @@ pub async fn collect(
     }
 
     while let Some(Ok((index, snapshot))) = jobs.join_next().await {
-        let id = providers[index].id();
+        let cache_key = providers[index].cache_key();
         let usable = if snapshot.transient {
-            cache.entries.get(id).and_then(|entry| {
+            cache.entries.get(&cache_key).and_then(|entry| {
                 (entry.snapshot.success && within_age(entry.saved_at, now, STALE_MAX_AGE))
                     .then(|| entry.snapshot.clone())
             })
         } else {
             cache.entries.insert(
-                id.into(),
+                cache_key,
                 CacheEntry {
                     saved_at: now,
                     snapshot: snapshot.clone(),
@@ -562,5 +563,79 @@ mod tests {
         assert_eq!(second[0].tiers[0].utilization, 57.0);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cache_and_transient_fallback_are_isolated_between_accounts() {
+        struct Scoped {
+            account: &'static str,
+            transient: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl UsageProvider for Scoped {
+            fn id(&self) -> &'static str {
+                "codex"
+            }
+            fn display_name(&self) -> &'static str {
+                "Codex"
+            }
+            fn cache_key(&self) -> String {
+                format!("codex:{}", self.account)
+            }
+            async fn query(&self) -> UsageSnapshot {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.transient {
+                    return crate::model::snapshot_transient("codex", "Codex", "offline");
+                }
+                let mut snapshot = snapshot_ok("codex", "Codex", Vec::new(), None, Utc::now());
+                snapshot.display_name = self.account.into();
+                snapshot
+            }
+        }
+        let now = parse_time(NOW).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("usage-scoped-cache-{}.json", uuid::Uuid::new_v4()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = |account, transient| {
+            Arc::new(Scoped {
+                account,
+                transient,
+                calls: calls.clone(),
+            }) as Arc<dyn UsageProvider>
+        };
+        collect(
+            &[provider("a", false)],
+            &StatusInput::default(),
+            &path,
+            60,
+            now,
+        )
+        .await;
+        let results = collect(
+            &[provider("a", false), provider("b", false)],
+            &StatusInput::default(),
+            &path,
+            60,
+            now,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(results[0].display_name, "a");
+        assert_eq!(results[1].display_name, "b");
+        let later = now + chrono::Duration::seconds(61);
+        let results = collect(
+            &[provider("a", true), provider("c", true)],
+            &StatusInput::default(),
+            &path,
+            60,
+            later,
+        )
+        .await;
+        assert_eq!(results[0].display_name, "a");
+        assert!(results[0].success);
+        assert!(results[1].transient);
+        assert!(!results[1].success);
+        fs::remove_file(path).unwrap();
     }
 }
