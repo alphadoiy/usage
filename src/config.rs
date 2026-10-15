@@ -244,6 +244,7 @@ grok = ""
 # base_url = "https://relay.example" # New API 站点根路径，非推理 /v1
 # credential_env = "RELAY_USAGE_KEY"
 # options = {{}} # 默认保留原始额度；换算金额需显式提供比例与币种
+# inference = {{ base_url = "https://relay.example/v1", credential_env = "RELAY_USAGE_KEY" }}
 "#
     )
 }

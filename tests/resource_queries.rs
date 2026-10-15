@@ -17,6 +17,7 @@ fn config(service: &str, options: Value) -> ConnectionConfig {
         revision: String::new(),
         options,
         profile_ids: Vec::new(),
+        inference: None,
     }
 }
 fn response(status: u16, body: &str) -> Result<HttpResponse, TransportError> {

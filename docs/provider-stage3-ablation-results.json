@@ -1,0 +1,829 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-16",
+  "base_commit": "28c36b7",
+  "scope": "uncommitted stage-3 run resource binding",
+  "source_unchanged": true,
+  "input_files": 60,
+  "input_manifest_sha256": "8d9523c215829832496e4c1e2980bf7c46da9688a93174259b8050be33089e7e",
+  "harness_sha256": {
+    "scripts/ablate-run-bindings.py": "625c9d2108802312914fc094379f43ee9369b3afcaf1f7c6f02acfa0e4a0f53a",
+    "scripts/ablation/run_identity_probes.rs": "97d86fae8c9e9fa293420d067627000f2b774f4da1193fac54e4b6914f60c9d8",
+    "scripts/ablation/run_binding_probes.rs": "5f0e31af8f5ceed5f9f7c2ba5afc52bf2c3b17023d5234b4518dc6d74499a00c"
+  },
+  "raw_output": "/private/tmp/usage-stage3-ablation-20261016",
+  "fixture_normalization": "/private/tmp/usage-stage3-ablation-20261016/fixture-normalization.diff",
+  "summary": {
+    "removals": 19,
+    "caught_by_original": 12,
+    "additionally_caught_by_probes": 6,
+    "unobserved": [
+      "remove_child_env_pinning"
+    ],
+    "structural_controls": 2,
+    "fix_controls": 1
+  },
+  "metrics": {
+    "manager_opens_per_cli_launch": 2,
+    "binary_variant": "recognize_nested_exec_subcommands",
+    "log": "/private/tmp/usage-stage3-ablation-20261016/manager-open-metric.log"
+  },
+  "excluded_pilot_runs": [
+    {
+      "label": "baseline",
+      "exit_code": 101,
+      "passed": 241,
+      "failed": 1,
+      "failures": [
+        "async_http_failure_logs_status_and_context_without_request_or_response_secrets"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 23.547,
+      "log": "/private/tmp/usage-stage3-ablation-20261016/baseline.log"
+    }
+  ],
+  "experiments": [
+    {
+      "variant": "baseline",
+      "description": "完整基线",
+      "full": {
+        "label": "baseline_repeat1",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 12.542,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/baseline_repeat1.log",
+        "variant": "baseline"
+      },
+      "audit": {
+        "label": "baseline_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 13.079,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/baseline_audit.log",
+        "variant": "baseline",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/baseline.diff"
+    },
+    {
+      "variant": "remove_endpoint_match",
+      "description": "移除推理端点核对",
+      "full": {
+        "label": "remove_endpoint_match",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "endpoint_override_without_matching_inference_key_cannot_bind_an_account_balance"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 17.165,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_endpoint_match.log",
+        "variant": "remove_endpoint_match"
+      },
+      "audit": {
+        "label": "remove_endpoint_match_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.113,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_endpoint_match_audit.log",
+        "variant": "remove_endpoint_match",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_endpoint_match.diff"
+    },
+    {
+      "variant": "remove_inference_key_match",
+      "description": "移除推理密钥核对",
+      "full": {
+        "label": "remove_inference_key_match",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "endpoint_override_without_matching_inference_key_cannot_bind_an_account_balance"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 16.665,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_key_match.log",
+        "variant": "remove_inference_key_match"
+      },
+      "audit": {
+        "label": "remove_inference_key_match_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.221,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_key_match_audit.log",
+        "variant": "remove_inference_key_match",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_key_match.diff"
+    },
+    {
+      "variant": "remove_token_key_match",
+      "description": "移除 Token 查询密钥同一性核对",
+      "full": {
+        "label": "remove_token_key_match",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credentials"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 16.654,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_token_key_match.log",
+        "variant": "remove_token_key_match"
+      },
+      "audit": {
+        "label": "remove_token_key_match_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.382,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_token_key_match_audit.log",
+        "variant": "remove_token_key_match",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_token_key_match.diff"
+    },
+    {
+      "variant": "remove_revision_check",
+      "description": "移除连接配置版本核对",
+      "full": {
+        "label": "remove_revision_check",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "run_selection_rejects_config_changes_secret_rotation_and_unbound_requests"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 16.775,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_revision_check.log",
+        "variant": "remove_revision_check"
+      },
+      "audit": {
+        "label": "remove_revision_check_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_inference_configuration_changes_invalidate_the_link",
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.857,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_revision_check_audit.log",
+        "variant": "remove_revision_check",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "ablation_probe_inference_configuration_changes_invalidate_the_link"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_revision_check.diff"
+    },
+    {
+      "variant": "remove_inference_from_revision",
+      "description": "推理配置不参与版本摘要",
+      "full": {
+        "label": "remove_inference_from_revision",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 17.171,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_from_revision.log",
+        "variant": "remove_inference_from_revision"
+      },
+      "audit": {
+        "label": "remove_inference_from_revision_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_inference_configuration_changes_invalidate_the_link",
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.588,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_from_revision_audit.log",
+        "variant": "remove_inference_from_revision",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "ablation_probe_inference_configuration_changes_invalidate_the_link"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_from_revision.diff"
+    },
+    {
+      "variant": "remove_profile_recheck",
+      "description": "移除当前账号关联复核",
+      "full": {
+        "label": "remove_profile_recheck",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 16.923,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_profile_recheck.log",
+        "variant": "remove_profile_recheck"
+      },
+      "audit": {
+        "label": "remove_profile_recheck_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved",
+          "ablation_probe_removing_profile_membership_invalidates_the_link"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.421,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_profile_recheck_audit.log",
+        "variant": "remove_profile_recheck",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "ablation_probe_removing_profile_membership_invalidates_the_link"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_profile_recheck.diff"
+    },
+    {
+      "variant": "remove_query_credential_proof",
+      "description": "移除查询凭据摘要核对",
+      "full": {
+        "label": "remove_query_credential_proof",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "run_selection_rejects_config_changes_secret_rotation_and_unbound_requests"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 16.806,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_query_credential_proof.log",
+        "variant": "remove_query_credential_proof"
+      },
+      "audit": {
+        "label": "remove_query_credential_proof_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.372,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_query_credential_proof_audit.log",
+        "variant": "remove_query_credential_proof",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_query_credential_proof.diff"
+    },
+    {
+      "variant": "remove_inference_credential_proof",
+      "description": "移除推理凭据摘要核对",
+      "full": {
+        "label": "remove_inference_credential_proof",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "run_selection_rejects_config_changes_secret_rotation_and_unbound_requests"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 17.539,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_credential_proof.log",
+        "variant": "remove_inference_credential_proof"
+      },
+      "audit": {
+        "label": "remove_inference_credential_proof_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.479,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_credential_proof_audit.log",
+        "variant": "remove_inference_credential_proof",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_inference_credential_proof.diff"
+    },
+    {
+      "variant": "remove_credential_freezing",
+      "description": "查询 resolver 重新读取环境",
+      "full": {
+        "label": "remove_credential_freezing",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 18.881,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_credential_freezing.log",
+        "variant": "remove_credential_freezing"
+      },
+      "audit": {
+        "label": "remove_credential_freezing_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved",
+          "runs::ablation_binding_probes::ablation_probe_query_resolver_keeps_validated_values_without_reopening_environment"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.61,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_credential_freezing_audit.log",
+        "variant": "remove_credential_freezing",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "runs::ablation_binding_probes::ablation_probe_query_resolver_keeps_validated_values_without_reopening_environment"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_credential_freezing.diff"
+    },
+    {
+      "variant": "remove_child_env_pinning",
+      "description": "不再显式注入子进程所用环境凭据",
+      "full": {
+        "label": "remove_child_env_pinning",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 17.368,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_child_env_pinning.log",
+        "variant": "remove_child_env_pinning"
+      },
+      "audit": {
+        "label": "remove_child_env_pinning_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.932,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_child_env_pinning_audit.log",
+        "variant": "remove_child_env_pinning",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_child_env_pinning.diff"
+    },
+    {
+      "variant": "reverse_model_precedence",
+      "description": "反转模型参数与配置的优先级",
+      "full": {
+        "label": "reverse_model_precedence",
+        "exit_code": 101,
+        "passed": 240,
+        "failed": 2,
+        "failures": [
+          "codex_manager::tests::launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly",
+          "concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credentials"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 17.196,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/reverse_model_precedence.log",
+        "variant": "reverse_model_precedence"
+      },
+      "audit": {
+        "label": "reverse_model_precedence_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 8.8,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/reverse_model_precedence_audit.log",
+        "variant": "reverse_model_precedence",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/reverse_model_precedence.diff"
+    },
+    {
+      "variant": "merge_assigned_tables",
+      "description": "表值赋值误作合并",
+      "full": {
+        "label": "merge_assigned_tables",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "codex_manager::tests::launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 17.532,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/merge_assigned_tables.log",
+        "variant": "merge_assigned_tables"
+      },
+      "audit": {
+        "label": "merge_assigned_tables_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 9.721,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/merge_assigned_tables_audit.log",
+        "variant": "merge_assigned_tables",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/merge_assigned_tables.diff"
+    },
+    {
+      "variant": "ignore_unknown_flags",
+      "description": "忽略未知启动选项",
+      "full": {
+        "label": "ignore_unknown_flags",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "unresolved_sources_are_explicit_and_never_fall_back_to_profile_associations"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 19.919,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_unknown_flags.log",
+        "variant": "ignore_unknown_flags"
+      },
+      "audit": {
+        "label": "ignore_unknown_flags_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 10.125,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_unknown_flags_audit.log",
+        "variant": "ignore_unknown_flags",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/ignore_unknown_flags.diff"
+    },
+    {
+      "variant": "ignore_project_layer",
+      "description": "忽略项目配置层",
+      "full": {
+        "label": "ignore_project_layer",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "unresolved_sources_are_explicit_and_never_fall_back_to_profile_associations"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 18.998,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_project_layer.log",
+        "variant": "ignore_project_layer"
+      },
+      "audit": {
+        "label": "ignore_project_layer_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 10.121,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_project_layer_audit.log",
+        "variant": "ignore_project_layer",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/ignore_project_layer.diff"
+    },
+    {
+      "variant": "ignore_resume_gate",
+      "description": "忽略显式恢复状态",
+      "full": {
+        "label": "ignore_resume_gate",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "codex_manager::tests::launch_identity_does_not_treat_option_values_or_delimited_prompts_as_overrides"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 19.061,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_resume_gate.log",
+        "variant": "ignore_resume_gate"
+      },
+      "audit": {
+        "label": "ignore_resume_gate_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 10.3,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_resume_gate_audit.log",
+        "variant": "ignore_resume_gate",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/ignore_resume_gate.diff"
+    },
+    {
+      "variant": "ignore_resource_factory_validation",
+      "description": "忽略启动时资源工厂验证",
+      "full": {
+        "label": "ignore_resource_factory_validation",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 17.703,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_resource_factory_validation.log",
+        "variant": "ignore_resource_factory_validation"
+      },
+      "audit": {
+        "label": "ignore_resource_factory_validation_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved",
+          "ablation_probe_unknown_resource_factory_cannot_be_marked_matched"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 9.233,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/ignore_resource_factory_validation_audit.log",
+        "variant": "ignore_resource_factory_validation",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "ablation_probe_unknown_resource_factory_cannot_be_marked_matched"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/ignore_resource_factory_validation.diff"
+    },
+    {
+      "variant": "remove_run_transaction",
+      "description": "移除 Run 与 Context 的共同事务",
+      "full": {
+        "label": "remove_run_transaction",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 18.968,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_run_transaction.log",
+        "variant": "remove_run_transaction"
+      },
+      "audit": {
+        "label": "remove_run_transaction_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_context_insert_failure_does_not_leave_an_orphan_run",
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 9.36,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_run_transaction_audit.log",
+        "variant": "remove_run_transaction",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "ablation_probe_context_insert_failure_does_not_leave_an_orphan_run"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_run_transaction.diff"
+    },
+    {
+      "variant": "remove_redundant_service_guard",
+      "description": "移除服务元数据一致性检查",
+      "full": {
+        "label": "remove_redundant_service_guard",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 18.62,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_redundant_service_guard.log",
+        "variant": "remove_redundant_service_guard"
+      },
+      "audit": {
+        "label": "remove_redundant_service_guard_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved",
+          "runs::ablation_binding_probes::ablation_probe_inconsistent_service_metadata_is_rejected"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 9.394,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_redundant_service_guard_audit.log",
+        "variant": "remove_redundant_service_guard",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "runs::ablation_binding_probes::ablation_probe_inconsistent_service_metadata_is_rejected"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_redundant_service_guard.diff"
+    },
+    {
+      "variant": "remove_select_identity_guard",
+      "description": "移除查询前身份状态检查",
+      "full": {
+        "label": "remove_select_identity_guard",
+        "exit_code": 101,
+        "passed": 241,
+        "failed": 1,
+        "failures": [
+          "unresolved_sources_are_explicit_and_never_fall_back_to_profile_associations"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 17.889,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_select_identity_guard.log",
+        "variant": "remove_select_identity_guard"
+      },
+      "audit": {
+        "label": "remove_select_identity_guard_audit",
+        "exit_code": 101,
+        "passed": 9,
+        "failed": 3,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved",
+          "runs::ablation_binding_probes::ablation_probe_inconsistent_unresolved_context_is_rejected"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 9.438,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/remove_select_identity_guard_audit.log",
+        "variant": "remove_select_identity_guard",
+        "kind": "audit"
+      },
+      "new_audit_failures": [
+        "runs::ablation_binding_probes::ablation_probe_inconsistent_unresolved_context_is_rejected"
+      ],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/remove_select_identity_guard.diff"
+    },
+    {
+      "variant": "consolidate_context_read",
+      "description": "优化对照：合并上下文读取",
+      "full": {
+        "label": "consolidate_context_read",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 22.241,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/consolidate_context_read.log",
+        "variant": "consolidate_context_read"
+      },
+      "audit": {
+        "label": "consolidate_context_read_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 10.633,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/consolidate_context_read_audit.log",
+        "variant": "consolidate_context_read",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/consolidate_context_read.diff"
+    },
+    {
+      "variant": "lazy_resource_service",
+      "description": "优化对照：延迟资源服务构造",
+      "full": {
+        "label": "lazy_resource_service",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 19.412,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/lazy_resource_service.log",
+        "variant": "lazy_resource_service"
+      },
+      "audit": {
+        "label": "lazy_resource_service_audit",
+        "exit_code": 101,
+        "passed": 10,
+        "failed": 2,
+        "failures": [
+          "ablation_probe_nested_exec_resume_is_unresolved",
+          "ablation_probe_nested_exec_review_is_unresolved"
+        ],
+        "compile_error": false,
+        "elapsed_seconds": 10.171,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/lazy_resource_service_audit.log",
+        "variant": "lazy_resource_service",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/lazy_resource_service.diff"
+    },
+    {
+      "variant": "recognize_nested_exec_subcommands",
+      "description": "修复对照：识别嵌套 exec 子命令",
+      "full": {
+        "label": "recognize_nested_exec_subcommands",
+        "exit_code": 0,
+        "passed": 242,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 19.263,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/recognize_nested_exec_subcommands.log",
+        "variant": "recognize_nested_exec_subcommands"
+      },
+      "audit": {
+        "label": "recognize_nested_exec_subcommands_audit",
+        "exit_code": 0,
+        "passed": 12,
+        "failed": 0,
+        "failures": [],
+        "compile_error": false,
+        "elapsed_seconds": 10.277,
+        "log": "/private/tmp/usage-stage3-ablation-20261016/recognize_nested_exec_subcommands_audit.log",
+        "variant": "recognize_nested_exec_subcommands",
+        "kind": "audit"
+      },
+      "new_audit_failures": [],
+      "mutation_diff": "/private/tmp/usage-stage3-ablation-20261016/recognize_nested_exec_subcommands.diff"
+    }
+  ]
+}

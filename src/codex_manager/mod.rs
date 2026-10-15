@@ -3,6 +3,7 @@ pub mod bark;
 pub mod ccswitch;
 pub mod cli;
 pub mod config;
+mod effective;
 mod launcher;
 pub mod oauth;
 mod secrets;
@@ -155,6 +156,8 @@ pub struct RunRecord {
     pub finished_at: Option<String>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    /// Absent for records written before launch identity capture was introduced.
+    pub context: Option<crate::runs::RunContext>,
 }
 
 impl RunRecord {
@@ -168,6 +171,20 @@ impl RunRecord {
             finished_at: row.get(5)?,
             pid: row.get(6)?,
             exit_code: row.get(7)?,
+            context: row
+                .get::<_, Option<String>>(8)?
+                .map(|text| {
+                    serde_json::from_str::<crate::runs::CapturedContext>(&text)
+                        .map(|capture| capture.context)
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })
+                })
+                .transpose()?,
         })
     }
 }
@@ -289,7 +306,10 @@ impl Manager {
                 FOREIGN KEY(profile_id,revision) REFERENCES revisions(profile_id,revision));
             CREATE TABLE IF NOT EXISTS oauth_accounts (
                 profile_id TEXT PRIMARY KEY REFERENCES profiles(id),
-                identity_key TEXT UNIQUE NOT NULL, identity_json TEXT NOT NULL);")?;
+                identity_key TEXT UNIQUE NOT NULL, identity_json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_contexts (
+                run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                context_json TEXT NOT NULL);")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -735,6 +755,20 @@ impl Manager {
         program: &Path,
         args: &[String],
     ) -> Result<(ExitStatus, RunRecord)> {
+        self.run_recorded_with_config(selector, cwd, revision, resume, program, args, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_recorded_with_config(
+        &mut self,
+        selector: &str,
+        cwd: &Path,
+        revision: Option<i64>,
+        resume: Option<&str>,
+        program: &Path,
+        args: &[String],
+        usage_config: Option<&Path>,
+    ) -> Result<(ExitStatus, RunRecord)> {
         logging::operation("codex.run", |op| {
             // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
             let report = op.step("source_sync", || self.sync(false))?;
@@ -807,7 +841,7 @@ impl Manager {
             let mut command = Command::new(program);
             clear_auth_env(&mut command);
             command.current_dir(&cwd).env("CODEX_HOME", &home);
-            if let Some(key) = key {
+            if let Some(key) = &key {
                 command.env(config::KEY_ENV, key);
             }
             if profile.auth_mode == AuthMode::Oauth {
@@ -839,6 +873,32 @@ impl Manager {
                 command.arg("--no-daemon");
             }
             let run_id = op.id().to_owned();
+            let capture = op.step("run_identity_capture", || {
+                let environment = |name: &str| std::env::var(name).ok();
+                let effective = effective::resolve(&saved.config, profile.auth_mode, &cwd, resume.is_some(), args, key.as_deref(), &environment);
+                if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
+                    command.env(env, key);
+                }
+                let path = usage_config.map(Path::to_path_buf).unwrap_or_else(crate::config::default_config_path);
+                let config = crate::config::load_config(&path, usage_config.is_some());
+                let resources = std::cell::OnceCell::new();
+                let captured = crate::runs::CapturedContext::capture(
+                    &run_id, &profile.id, effective.identity, effective.key.as_deref(),
+                    config.as_ref().map(|c| c.resources.as_slice()).map_err(|_| "启动时资源配置读取失败"),
+                    &environment,
+                    &|config| resources.get_or_init(|| crate::resources::connections::ResourceService::from_environment(crate::resources::builtin_registry())).prepare(config).ok().map(|reader| reader.scope()),
+                );
+                tracing::info!(event="run_identity_captured", state=?captured.context.identity.state,
+                    reason=captured.context.identity.reason.as_deref(),
+                    resource_count=captured.context.resources.len(),
+                    matched_resources=captured.context.resources.iter().filter(|l| l.state == crate::runs::LinkState::Matched).count(),
+                    resources_error=captured.context.resources_error.as_deref());
+                for link in &captured.context.resources {
+                    tracing::info!(event="run_resource_link", connection_id=link.binding.account,
+                        service=link.service, revision=link.binding.revision, state=?link.state);
+                }
+                serde_json::to_string(&captured).map_err(|_| Error::message("运行身份无法序列化"))
+            })?;
             op.step("notification_inject", || {
                 bark::inject(
                     &mut command,
@@ -860,10 +920,22 @@ impl Manager {
             let mut child = op.step("child_spawn", || command.spawn())?;
             tracing::info!(event = "child_spawned", child_pid = child.id());
             op.begin("run_record");
-            if let Err(error)=self.conn.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![run_id,profile.id,revision,cwd.to_string_lossy(),now(),child.id()]) {
-            let _=child.kill(); let _=child.wait(); return Err(error.into());
-        }
+            let recorded = (|| -> Result<()> {
+                let tx = self.conn.transaction()?;
+                tx.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![run_id,profile.id,revision,cwd.to_string_lossy(),now(),child.id()])?;
+                tx.execute(
+                    "INSERT INTO run_contexts(run_id,context_json) VALUES (?1,?2)",
+                    params![run_id, capture],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            if let Err(error) = recorded {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
             let status = op.step("child_wait", || child.wait())?;
             if status.success() {
                 tracing::info!(
@@ -901,8 +973,9 @@ impl Manager {
     /// Read persisted runs without guessing liveness from an unfinished record.
     pub fn runs(&self, profile_id: Option<&str>) -> Result<Vec<RunRecord>> {
         let mut query = self.conn.prepare(
-            "SELECT id,profile_id,revision,cwd,started_at,finished_at,pid,exit_code FROM runs
-             WHERE (?1 IS NULL OR profile_id=?1) ORDER BY started_at DESC,id DESC",
+            "SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,c.context_json FROM runs r
+             LEFT JOIN run_contexts c ON c.run_id=r.id
+             WHERE (?1 IS NULL OR r.profile_id=?1) ORDER BY r.started_at DESC,r.id DESC",
         )?;
         let records = query
             .query_map([profile_id], RunRecord::from_row)?
@@ -912,9 +985,37 @@ impl Manager {
 
     pub fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
         Ok(self.conn.query_row(
-            "SELECT id,profile_id,revision,cwd,started_at,finished_at,pid,exit_code FROM runs WHERE id=?1",
+            "SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,c.context_json FROM runs r
+             LEFT JOIN run_contexts c ON c.run_id=r.id WHERE r.id=?1",
             [id], RunRecord::from_row,
         ).optional()?)
+    }
+
+    pub fn resources_for_run(
+        &self,
+        id: &str,
+        configs: &[crate::resources::connections::ConnectionConfig],
+        ids: &[String],
+    ) -> Result<crate::runs::PinnedResources> {
+        let (profile_id, text): (String, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT r.profile_id,c.context_json FROM runs r
+                 LEFT JOIN run_contexts c ON c.run_id=r.id WHERE r.id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::message("找不到运行记录"))?;
+        let captured: crate::runs::CapturedContext = serde_json::from_str(
+            &text.ok_or_else(|| Error::message("旧运行未记录实际配置，不能推断资源关联"))?,
+        )
+        .map_err(|_| Error::message("运行身份记录无法解析"))?;
+        captured
+            .select(id, &profile_id, configs, ids, &|name| {
+                std::env::var(name).ok()
+            })
+            .map_err(Error::message)
     }
 
     pub async fn test_connection(&self, selector: &str) -> Result<u16> {
@@ -1024,22 +1125,23 @@ fn source_digest(name: &str, config: &str, key: &str) -> String {
     }
     format!("{:x}", hash.finalize())
 }
+const CLEARED_AUTH_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "CODEX_HOME",
+    "CODEX_API_KEY",
+    "CODEX_AUTH_TOKEN",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_API_KEY_FILE",
+    "CODEX_WIF_PROVIDER",
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+    "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    config::KEY_ENV,
+    bark::CONTEXT_ENV,
+];
 fn clear_auth_env(command: &mut Command) {
-    for key in [
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "CODEX_HOME",
-        "CODEX_API_KEY",
-        "CODEX_AUTH_TOKEN",
-        "CODEX_ACCESS_TOKEN",
-        "CODEX_API_KEY_FILE",
-        "CODEX_WIF_PROVIDER",
-        "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-        "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
-        "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
-        config::KEY_ENV,
-        bark::CONTEXT_ENV,
-    ] {
+    for key in CLEARED_AUTH_ENV {
         command.env_remove(key);
     }
 }
@@ -1145,6 +1247,19 @@ pub fn binding_for_home(home: &Path) -> Result<Option<(String, i64)>> {
     }
     let manager = Manager::open_default()?;
     manager.instance_binding(home)
+}
+
+pub fn with_usage_config(command: String, config: Option<&Path>) -> Result<String> {
+    match config {
+        Some(path) => {
+            let path = std::path::absolute(path)?;
+            Ok(format!(
+                "env USAGE_CONFIG={} {command}",
+                shell_quote(&path.to_string_lossy())
+            ))
+        }
+        None => Ok(command),
+    }
 }
 
 pub fn launch_shell_command(

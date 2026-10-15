@@ -341,6 +341,7 @@ mod tests {
             program: "unavailable".into(),
             args: Vec::new(),
             resume: None,
+            usage_config: None,
         };
         assert!(matches!(
             provider.spawn(&request),

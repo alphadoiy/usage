@@ -1639,6 +1639,7 @@ fn async_http_failure_logs_status_and_context_without_request_or_response_secret
                 Err(e) => panic!("mock server: {e}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();

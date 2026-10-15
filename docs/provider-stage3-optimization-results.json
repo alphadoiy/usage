@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-16",
+  "base_commit": "28c36b7",
+  "scope": "stage-3 fixes and migrated production regressions",
+  "full_suite": {
+    "passed": 253,
+    "failed": 0,
+    "command": "USAGE_CODEX_DIR=/private/tmp/usage-stage3-fix-20261016 RUST_BACKTRACE=0 cargo test --offline --quiet --no-fail-fast -- --test-threads=1"
+  },
+  "checks": {
+    "fmt": true,
+    "clippy_all_targets_deny_warnings": true,
+    "diff_check": true,
+    "mutation_anchors": 23
+  },
+  "focused_source_unchanged": true,
+  "focused_results": [
+    {
+      "label": "baseline",
+      "exit_code": 0,
+      "passed": 11,
+      "failed": 0,
+      "failures": [],
+      "compile_error": false,
+      "elapsed_seconds": 3.993,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/baseline.log",
+      "variant": "baseline"
+    },
+    {
+      "label": "ignore_nested_exec_subcommands",
+      "exit_code": 101,
+      "passed": 9,
+      "failed": 2,
+      "failures": [
+        "run_binding_nested_exec_review_is_unresolved",
+        "run_binding_nested_session_commands_are_unresolved"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 16.816,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/ignore_nested_exec_subcommands.log",
+      "variant": "ignore_nested_exec_subcommands"
+    },
+    {
+      "label": "remove_inference_from_revision",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "run_binding_inference_configuration_changes_invalidate_the_link"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.072,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/remove_inference_from_revision.log",
+      "variant": "remove_inference_from_revision"
+    },
+    {
+      "label": "remove_profile_recheck",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "run_binding_removing_profile_membership_invalidates_the_link"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.176,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/remove_profile_recheck.log",
+      "variant": "remove_profile_recheck"
+    },
+    {
+      "label": "remove_credential_freezing",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "runs::binding_tests::run_binding_query_resolver_keeps_validated_values_without_reopening_environment"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.545,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/remove_credential_freezing.log",
+      "variant": "remove_credential_freezing"
+    },
+    {
+      "label": "ignore_resource_factory_validation",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "run_binding_unknown_resource_factory_cannot_be_marked_matched"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.41,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/ignore_resource_factory_validation.log",
+      "variant": "ignore_resource_factory_validation"
+    },
+    {
+      "label": "remove_run_transaction",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "run_binding_context_insert_failure_does_not_leave_an_orphan_run"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.585,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/remove_run_transaction.log",
+      "variant": "remove_run_transaction"
+    },
+    {
+      "label": "remove_redundant_service_guard",
+      "exit_code": 101,
+      "passed": 10,
+      "failed": 1,
+      "failures": [
+        "runs::binding_tests::run_binding_inconsistent_service_metadata_is_rejected"
+      ],
+      "compile_error": false,
+      "elapsed_seconds": 8.189,
+      "log": "/private/tmp/usage-stage3-fix-regressions-20261016/remove_redundant_service_guard.log",
+      "variant": "remove_redundant_service_guard"
+    }
+  ],
+  "raw_output": "/private/tmp/usage-stage3-fix-regressions-20261016"
+}

@@ -46,6 +46,105 @@ impl Drop for Fixture {
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
+
+#[cfg(unix)]
+#[test]
+fn run_bound_query_uses_pinned_token_and_rejects_rotation_before_http() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.config("");
+    fs::create_dir(fixture.0.join(".git")).unwrap();
+    let server = Server::new(
+        r#"{"code":true,"data":{"object":"token_usage","total_available":50,"total_used":1,"unlimited_quota":false}}"#,
+    );
+    let endpoint = format!("{}/v1", server.url);
+    let mut child = fixture
+        .command(&[
+            "codex",
+            "add",
+            "Bound",
+            "--base-url",
+            &endpoint,
+            "--model",
+            "fixture",
+            "--key-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"synthetic-bound-token\n")
+        .unwrap();
+    let added = child.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+    let profiles = fixture
+        .command(&["codex", "list", "--json"])
+        .output()
+        .unwrap();
+    let profiles: serde_json::Value = serde_json::from_slice(&profiles.stdout).unwrap();
+    let profile = profiles[0]["id"].as_str().unwrap();
+    fixture.config(&format!("{}\nprofile_ids=[\"{profile}\"]\ninference={{base_url=\"{endpoint}\",credential_env=\"USAGE_RESOURCE_FIXTURE_KEY\"}}",config(&server.url,"new_api_token","{}")));
+    let binary = fixture.0.join("mock-codex");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = --help ]; then echo --no-daemon; fi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let launched = fixture
+        .command(&[
+            "codex",
+            "run",
+            profile,
+            "--cwd",
+            fixture.0.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("USAGE_RESOURCE_FIXTURE_KEY", "synthetic-bound-token")
+        .output()
+        .unwrap();
+    assert!(launched.status.success(), "{launched:?}");
+    let runs = fixture
+        .command(&["codex", "runs", "--json"])
+        .output()
+        .unwrap();
+    let runs: serde_json::Value = serde_json::from_slice(&runs.stdout).unwrap();
+    assert_eq!(runs[0]["context"]["resources"][0]["state"], "matched");
+    let run = runs[0]["id"].as_str().unwrap();
+    let output = fixture
+        .command(&["resources", "--run", run, "--json"])
+        .env("USAGE_RESOURCE_FIXTURE_KEY", "synthetic-bound-token")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value[0]["snapshot"]["metrics"][0]["remaining"], "50");
+    let request = server
+        .requests
+        .recv_timeout(Duration::from_secs(3))
+        .unwrap();
+    assert!(request.starts_with("GET /api/usage/token HTTP/1.1"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer synthetic-bound-token")
+    );
+    let rotated = fixture
+        .command(&["resources", "--run", run, "--json"])
+        .env("USAGE_RESOURCE_FIXTURE_KEY", "rotated-bound-token")
+        .output()
+        .unwrap();
+    assert_eq!(rotated.status.code(), Some(2));
+    assert!(server.requests.try_recv().is_err());
+    assert!(!fixture.logs().contains("synthetic-bound-token"));
+    assert!(!stdout(&output).contains("synthetic-bound-token"));
+}
 fn config(base: &str, kind: &str, options: &str) -> String {
     format!(
         r#"

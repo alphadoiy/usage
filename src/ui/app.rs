@@ -244,7 +244,10 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                             }
                             MenuCommand::Activate(MenuAction::Codex) => {
                                 ratatui::restore();
-                                let result = crate::ui::run_codex(handle.clone());
+                                let result = crate::ui::run_codex_with_config(
+                                    handle.clone(),
+                                    Some(app.config_path.clone()),
+                                );
                                 terminal = match ratatui::try_init() {
                                     Ok(t) => t,
                                     Err(e) => break Err(io::Error::other(e)),

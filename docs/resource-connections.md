@@ -30,7 +30,7 @@ usage resources --profile 工作账号 --json
 usage --config /path/to/config.toml resources --json
 ```
 
-不指定资源 ID 时查询所有连接；`--profile` 接受 Codex 账号名称或 UUID，只查询显式关联的连接。`--list` 校验配置和服务工厂，但不读取资源凭据或请求网络。
+不指定资源 ID 时查询所有连接；`--profile` 接受 Codex 账号名称或 UUID，只查询显式关联的连接。普通 `--list` 校验配置和服务工厂，但不读取资源凭据或请求网络。`--run <UUID>` 查询启动时匹配的连接，需额外配置 `inference`，见 [运行资源关联](run-resource-binding.md)；此模式即使只列出连接也会核对凭据，但不会请求网络。
 
 返回码：全部成功或未配置连接为 0，至少一个资源查询失败为 1，配置、选择或工厂错误为 2。不同资源并发查询，输出保持配置顺序；某个资源失败不丢弃其他资源的结果。
 
@@ -78,7 +78,7 @@ options = { days = 30, project_id = "proj-your-project" }
 
 每个连接有唯一 `id`。资源绑定版本由服务、规范化端点、凭据环境变量名称、显式 revision 和服务选项计算摘要；修改查询范围或换算设置不会继续使用旧版本身份。当前新查询没有持久缓存，也不回退到其他账号或过期快照。
 
-`profile_ids` 仅表示用户配置的关联，不证明该资源凭据与某次运行最终采用的凭据相同。当前不会读取或复用 Codex 的私有密钥文件，也不会将组织 Admin API Key 注入 Agent。`RunRecord.revision`、CLI 参数覆盖和新会话绑定仍需后续贯通。
+`profile_ids` 仅表示用户配置的关联，不证明该资源凭据与某次运行最终采用的凭据相同。新增的 `inference` 声明用于启动时核对端点与凭据并保存版本关联；`resources --run` 仅接受启动时已匹配且未变更的连接。查询器不会读取 Codex 私有密钥文件，也不会将组织 Admin API Key 注入 Agent。会话绑定及 Agent 回传的实际配置仍待贯通。
 
 HTTP 状态、查询状态、连接 ID、资源身份哈希和独立查询操作 ID 写入结构化日志。并发任务继承入口追踪上下文；HTTP 事件与查询结果可用操作 ID 和资源标识关联。日志不写 Authorization、凭据值、响应原文和查询 URL；服务错误以固定原因表达，防止服务端错误文本回显密钥。
 

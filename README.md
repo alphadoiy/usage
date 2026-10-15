@@ -72,11 +72,14 @@ usage providers       # 列出已注册的工具
 usage codex runs --json  # 查看运行记录及启动时选中的账号、配置版本
 usage resources --list   # 列出独立资源连接，不读取凭据或请求网络
 usage resources --json   # 查询 New API 余额/额度与 OpenAI 官方费用
+usage resources --run <运行UUID> --json # 查询启动时匹配且仍有效的资源连接
 usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
 
 `usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)；当前这些资源通过 CLI 查询，首页迁移尚未完成。
+
+托管运行可以保存启动侧解析的模型、端点与资源关联，通过 `usage codex runs --json` 查看。`resources --run` 会核对启动时的连接版本和凭据，配置方法与解析边界见[运行资源关联](docs/run-resource-binding.md)。
 
 `--once` 和 `--json` 会并发查询所选工具，输出仍按 `providers` 的配置顺序排列。
 

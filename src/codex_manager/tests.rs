@@ -33,6 +33,94 @@ impl Drop for Fixture {
 fn native(url: &str, model: &str) -> String {
     config::new_config(url, model, Some("high")).unwrap()
 }
+
+#[test]
+fn launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly() {
+    let f = Fixture::new();
+    fs::create_dir(f.path.join(".git")).unwrap();
+    let text = native("https://a.invalid/v1", "saved");
+    let args = [
+        "--config=model='first'",
+        "-cmodel='second'",
+        "-c",
+        "model_providers.\"a.b\"={base_url='https://b.invalid/v1',env_key='OTHER'}",
+        "-c",
+        "model_provider='a.b'",
+        "--model=flag-model",
+    ];
+    let resolution = effective::resolve(
+        &text,
+        AuthMode::Byok,
+        &f.path,
+        false,
+        &args.map(str::to_string),
+        Some("managed-key"),
+        &|name| (name == "OTHER").then(|| "other-key".into()),
+    );
+    assert_eq!(
+        resolution.identity.state,
+        crate::runs::IdentityState::Resolved
+    );
+    assert_eq!(resolution.identity.model.as_deref(), Some("flag-model"));
+    assert_eq!(
+        resolution.identity.endpoint.as_deref(),
+        Some("https://b.invalid/v1")
+    );
+    assert_eq!(resolution.key.as_deref(), Some("other-key"));
+    // Replacing the provider table must not retain the old managed env_key.
+    let args = [
+        "-c",
+        "model_providers.usage_byok={base_url='https://b.invalid/v1'}",
+    ];
+    let resolution = effective::resolve(
+        &text,
+        AuthMode::Byok,
+        &f.path,
+        false,
+        &args.map(str::to_string),
+        Some("managed-key"),
+        &|_| None,
+    );
+    assert_eq!(
+        resolution.identity.state,
+        crate::runs::IdentityState::Unresolved
+    );
+    assert!(resolution.key.is_none());
+}
+
+#[test]
+fn launch_identity_does_not_treat_option_values_or_delimited_prompts_as_overrides() {
+    let f = Fixture::new();
+    fs::create_dir(f.path.join(".git")).unwrap();
+    let text = native("https://a.invalid/v1", "saved");
+    for args in [
+        vec!["--image", "--profile", "--", "--oss"],
+        vec!["exec", "--", "-c", "model_provider='secret'"],
+    ] {
+        let resolution = effective::resolve(
+            &text,
+            AuthMode::Byok,
+            &f.path,
+            false,
+            &args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            Some("key"),
+            &|_| None,
+        );
+        assert_eq!(
+            resolution.identity.state,
+            crate::runs::IdentityState::Resolved
+        );
+        assert_eq!(resolution.identity.model.as_deref(), Some("saved"));
+    }
+    for (mode, resume) in [(AuthMode::Oauth, false), (AuthMode::Byok, true)] {
+        let resolution =
+            effective::resolve(&text, mode, &f.path, resume, &[], Some("key"), &|_| None);
+        assert_eq!(
+            resolution.identity.state,
+            crate::runs::IdentityState::Unresolved
+        );
+    }
+}
 fn insert(conn: &Connection, id: &str, name: &str, text: &str, key: &str, meta: serde_json::Value) {
     conn.execute(
         "INSERT OR REPLACE INTO providers VALUES (?1,'codex',?2,?3,?4)",

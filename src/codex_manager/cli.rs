@@ -229,7 +229,7 @@ fn fs_text(path: &Path) -> Result<String> {
     Ok(std::fs::read_to_string(path)?)
 }
 
-pub async fn dispatch(command: CodexCommand) -> Result<i32> {
+pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> Result<i32> {
     let command = match command {
         CodexCommand::Notify { event, payload } => {
             super::bark::callback(event, payload).await;
@@ -505,6 +505,7 @@ pub async fn dispatch(command: CodexCommand) -> Result<i32> {
             if split {
                 let mut command =
                     super::launch_shell_command(&profile, &cwd, revision, resume.as_deref())?;
+                command = super::with_usage_config(command, usage_config.as_deref())?;
                 command.push_str(" --binary ");
                 command.push_str(&super::shell_quote(&binary.to_string_lossy()));
                 if !args.is_empty() {
@@ -532,6 +533,7 @@ pub async fn dispatch(command: CodexCommand) -> Result<i32> {
                         program: binary,
                         args,
                         resume,
+                        usage_config,
                     },
                 )
                 .map_err(Error::message)?;

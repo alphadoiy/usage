@@ -58,7 +58,10 @@ enum Command {
         /// 仅查询显式关联到此 Codex 账号的连接（名称或 UUID）
         #[arg(long)]
         profile: Option<String>,
-        /// 只列出连接，不读取凭据或请求网络
+        /// 只查询启动时与此运行匹配且配置未变更的连接
+        #[arg(long, conflicts_with = "profile")]
+        run: Option<uuid::Uuid>,
+        /// 只列出连接，不请求网络；--run 仍需校验凭据
         #[arg(long)]
         list: bool,
         #[arg(long)]
@@ -234,6 +237,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         Some(Command::Resources {
             ids,
             profile,
+            run,
             list,
             json,
         }) => {
@@ -248,9 +252,27 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                         .map_err(|error| CliError(error.to_string()))
                 })
                 .transpose()?;
-            let selected = select(&config.resources, &ids, profile_id.as_deref())
-                .map_err(|error| CliError(error.to_string()))?;
-            let service = ResourceService::from_environment(crate::hub::Hub::default().resources);
+            let (selected, credentials) = if let Some(run) = run {
+                let pinned = crate::codex_manager::Manager::open_default()
+                    .and_then(|manager| {
+                        manager.resources_for_run(&run.to_string(), &config.resources, &ids)
+                    })
+                    .map_err(|error| CliError(error.to_string()))?;
+                let credentials = pinned.credential_resolver();
+                tracing::info!(event="resource_run_selected", run_id=%run, resource_count=pinned.configs.len());
+                (pinned.configs, Some(credentials))
+            } else {
+                (
+                    select(&config.resources, &ids, profile_id.as_deref())
+                        .map_err(|error| CliError(error.to_string()))?,
+                    None,
+                )
+            };
+            let mut service =
+                ResourceService::from_environment(crate::hub::Hub::default().resources);
+            if let Some(credentials) = credentials {
+                service = service.with_credentials(credentials);
+            }
             if list {
                 // Validate factories/options without resolving any secret.
                 for connection in &selected {
@@ -329,7 +351,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         }
         Some(Command::Codex { command }) => {
             if let Some(command) = command {
-                crate::codex_manager::cli::dispatch(command)
+                crate::codex_manager::cli::dispatch(command, cli.config)
                     .await
                     .map_err(|e| CliError(e.to_string()))
             } else {
@@ -337,7 +359,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 {
                     let span = tracing::Span::current();
                     tokio::task::spawn_blocking(move || {
-                        span.in_scope(|| crate::ui::run_codex(handle))
+                        span.in_scope(|| crate::ui::run_codex_with_config(handle, cli.config))
                     })
                 }
                 .await

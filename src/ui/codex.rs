@@ -29,6 +29,10 @@ enum Prompt {
 }
 
 pub fn run(handle: Handle) -> io::Result<()> {
+    run_with_config(handle, None)
+}
+
+pub fn run_with_config(handle: Handle, usage_config: Option<PathBuf>) -> io::Result<()> {
     let mut manager = Manager::open_default().map_err(io::Error::other)?;
     let mut profiles = manager.list().map_err(io::Error::other)?;
     let mut selected = 0usize;
@@ -415,6 +419,12 @@ pub fn run(handle: Handle) -> io::Result<()> {
                         if crate::sessions::uses_ghostty(crate::config::ResumeMode::Auto) {
                             notice = codex_manager::launch_shell_command(&p.id, &cwd, None, None)
                                 .and_then(|command| {
+                                    codex_manager::with_usage_config(
+                                        command,
+                                        usage_config.as_deref(),
+                                    )
+                                })
+                                .and_then(|command| {
                                     crate::sessions::command_in_ghostty(&cwd, &command)
                                         .map_err(codex_manager::Error::message)
                                 })
@@ -437,6 +447,7 @@ pub fn run(handle: Handle) -> io::Result<()> {
                                         program: "codex".into(),
                                         args: Vec::new(),
                                         resume: None,
+                                        usage_config: usage_config.clone(),
                                     },
                                 )
                                 .map(|outcome| outcome.status)

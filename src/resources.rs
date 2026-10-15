@@ -18,7 +18,7 @@ use crate::model::{CredentialStatus, UsageSnapshot};
 use crate::providers::{ProviderContext, UsageProvider, UsageReset};
 use crate::registry::FactoryRegistry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ResourceBinding {
     /// Configured account/connection identity, never a credential value.
     pub account: String,
@@ -149,6 +149,13 @@ pub enum ResourceConnection {
 }
 
 pub type ResourceRegistry = FactoryRegistry<ResourceContext, Arc<dyn ResourceReader>>;
+
+/// Canonical endpoint validation shared with launch identity matching.
+pub(crate) fn api_endpoint(value: &str) -> Option<String> {
+    api::validate_base_url(value)
+        .ok()
+        .map(|url| url.to_string())
+}
 
 struct SubscriptionResource {
     service: &'static str,

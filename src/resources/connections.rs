@@ -26,6 +26,16 @@ pub struct ConnectionConfig {
     /// Explicit managed Codex profile IDs. Association, not proof of an effective run binding.
     #[serde(default)]
     pub profile_ids: Vec<String>,
+    /// Explicit inference identity expected by this resource connection.
+    #[serde(default)]
+    pub inference: Option<InferenceBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceBinding {
+    pub base_url: String,
+    pub credential_env: String,
 }
 impl ConnectionConfig {
     pub fn validate(&self) -> Result<(), RegistryError> {
@@ -53,6 +63,14 @@ impl ConnectionConfig {
             }
         }
         super::api::validate_base_url(&self.base_url)?;
+        if let Some(inference) = &self.inference {
+            super::api::validate_base_url(&inference.base_url)?;
+            if !valid_env_name(&inference.credential_env) {
+                return Err(RegistryError::Factory(
+                    "inference.credential_env 必须为环境变量名称".into(),
+                ));
+            }
+        }
         Ok(())
     }
     pub fn binding(&self) -> ResourceBinding {
@@ -67,6 +85,7 @@ impl ConnectionConfig {
             self.credential_env,
             self.revision,
             self.options,
+            self.inference,
         ]))
         .expect("JSON values serialize");
         ResourceBinding {
@@ -138,6 +157,10 @@ impl ResourceService {
             }),
             Arc::new(Utc::now),
         )
+    }
+    pub fn with_credentials(mut self, credentials: Arc<CredentialResolver>) -> Self {
+        self.credentials = credentials;
+        self
     }
     pub fn prepare(
         &self,

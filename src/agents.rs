@@ -117,6 +117,7 @@ pub struct SpawnRequest {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub resume: Option<String>,
+    pub usage_config: Option<PathBuf>,
 }
 
 pub struct SpawnOutcome {
@@ -199,13 +200,14 @@ impl Launcher for LocalAgent {
                 revision,
             } => crate::codex_manager::Manager::open(root.clone())
                 .and_then(|mut manager| {
-                    manager.run_recorded(
+                    manager.run_recorded_with_config(
                         account,
                         &request.cwd,
                         *revision,
                         request.resume.as_deref(),
                         &request.program,
                         &request.args,
+                        request.usage_config.as_deref(),
                     )
                 })
                 .map(|(status, run)| SpawnOutcome {

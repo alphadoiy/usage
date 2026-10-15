@@ -794,6 +794,7 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
                 program: program.into(),
                 args: Vec::new(),
                 resume: Some(session.id.clone()),
+                usage_config: None,
             })
             .map(|outcome| outcome.status);
     }
@@ -810,6 +811,7 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
                 program: "codex".into(),
                 args: Vec::new(),
                 resume: Some(session.id.clone()),
+                usage_config: None,
             },
         )
         .map(|outcome| outcome.status);
