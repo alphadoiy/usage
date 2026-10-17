@@ -816,6 +816,22 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
         )
         .map(|outcome| outcome.status);
     }
+    if session.provider == AgentKind::CODEX {
+        use crate::agents::RunningAgent;
+        return crate::codex_manager::start_local_codex(
+            &session.home,
+            &crate::agents::SpawnRequest {
+                cwd: session.cwd.clone(),
+                program: "codex".into(),
+                args: Vec::new(),
+                resume: Some(session.id.clone()),
+                usage_config: None,
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .wait()
+        .map(|outcome| outcome.status);
+    }
     let mut parts = session.provider.command().split_whitespace();
     let program = parts.next().ok_or("恢复命令为空")?;
     Command::new(program)
@@ -850,6 +866,14 @@ pub(crate) fn local_resume_shell_command(session: &Session) -> Result<String, St
             Some(&session.id),
         )
         .map_err(|e| e.to_string());
+    }
+    if session.provider == AgentKind::CODEX {
+        return crate::codex_manager::local_resume_shell_command(
+            &session.home,
+            &session.cwd,
+            &session.id,
+        )
+        .map_err(|error| error.to_string());
     }
     #[cfg(not(target_os = "windows"))]
     {

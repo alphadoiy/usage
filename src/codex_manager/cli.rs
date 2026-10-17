@@ -5,6 +5,27 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum CodexCommand {
+    #[command(hide = true)]
+    ResumeLocal {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value = "codex")]
+        binary: PathBuf,
+    },
+    #[command(hide = true)]
+    Event,
+    /// 查看某次运行的进程与会话事件（不包含对话内容）
+    RunEvents {
+        run: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// 管理仅对 usage 启动会话生效的 Bark 通知
     Bark {
         #[command(subcommand)]
@@ -165,6 +186,9 @@ impl CodexCommand {
     /// Fixed command names only; never format the enum (it contains user input).
     pub(crate) fn log_name(&self) -> &'static str {
         match self {
+            Self::ResumeLocal { .. } => "codex.resume_local",
+            Self::Event => "codex.event",
+            Self::RunEvents { .. } => "codex.run_events",
             Self::Bark { .. } => "codex.bark",
             Self::Notify { .. } => "codex.notify",
             Self::Login { .. } => "codex.login",
@@ -231,6 +255,34 @@ fn fs_text(path: &Path) -> Result<String> {
 
 pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> Result<i32> {
     let command = match command {
+        CodexCommand::ResumeLocal {
+            home,
+            cwd,
+            session,
+            binary,
+        } => {
+            use crate::agents::RunningAgent;
+            #[cfg(unix)]
+            let _interrupts =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let outcome = super::start_local_codex(
+                &home,
+                &crate::agents::SpawnRequest {
+                    cwd,
+                    program: binary,
+                    args: Vec::new(),
+                    resume: Some(session),
+                    usage_config,
+                },
+            )?
+            .wait()
+            .map_err(Error::message)?;
+            return Ok(outcome.status.code().unwrap_or(1));
+        }
+        CodexCommand::Event => {
+            super::runtime::callback();
+            return Ok(0);
+        }
         CodexCommand::Notify { event, payload } => {
             super::bark::callback(event, payload).await;
             return Ok(0);
@@ -243,7 +295,32 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
     };
     let mut manager = Manager::open(super::default_root())?;
     match command {
-        CodexCommand::Notify { .. } | CodexCommand::Bark { .. } => unreachable!(),
+        CodexCommand::ResumeLocal { .. }
+        | CodexCommand::Event
+        | CodexCommand::Notify { .. }
+        | CodexCommand::Bark { .. } => {
+            unreachable!()
+        }
+        CodexCommand::RunEvents { run, limit, json } => {
+            let events = manager.run_events(&run, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&events)
+                        .map_err(|_| Error::message("序列化失败"))?
+                );
+            } else {
+                for event in events {
+                    println!(
+                        "{}  {}  {}  {}",
+                        event.observed_at,
+                        event.kind,
+                        event.session_id.as_deref().unwrap_or("—"),
+                        event.model.as_deref().unwrap_or("—")
+                    );
+                }
+            }
+        }
         CodexCommand::Login {
             name,
             account,

@@ -1,7 +1,8 @@
 //! 事件循环。查询在 tokio 任务里进行，界面保持可操作。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -38,6 +39,10 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    HomeActivityLoaded {
+        generation: u64,
+        result: Result<HashMap<sessions::SessionKey, crate::runs::SessionRuntime>, String>,
+    },
     OverviewLoaded {
         generation: u64,
         result: Result<(crate::provider_catalog::Catalog, usize), String>,
@@ -225,6 +230,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
             app.quota_refresh_due = false;
             app.refresh_background(&handle);
         }
+        app.maybe_refresh_home_activity(&handle);
         let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
         if received || reset_consumed || refresh_started {
             redraw.invalidate();
@@ -409,6 +415,14 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    home_activity: HashMap<sessions::SessionKey, crate::runs::SessionRuntime>,
+    home_activity_error: Option<String>,
+    home_activity_task: Option<tokio::task::JoinHandle<()>>,
+    home_activity_pending: bool,
+    home_activity_dirty: bool,
+    home_activity_generation: u64,
+    home_activity_last_poll: std::time::Instant,
+    home_activity_root: PathBuf,
     home_focus: super::home::Focus,
     home_connections: super::home::Connections,
     home_sessions: SessionBrowser,
@@ -469,6 +483,9 @@ struct Dashboard {
 
 impl Drop for Dashboard {
     fn drop(&mut self) {
+        if let Some(task) = self.home_activity_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.overview_task.take() {
             task.abort();
         }
@@ -553,6 +570,14 @@ impl Dashboard {
             .collect();
         let styles = builtin_styles();
         Self {
+            home_activity: HashMap::new(),
+            home_activity_error: None,
+            home_activity_task: None,
+            home_activity_pending: false,
+            home_activity_dirty: true,
+            home_activity_generation: 0,
+            home_activity_last_poll: std::time::Instant::now(),
+            home_activity_root: crate::codex_manager::default_root(),
             home_focus: super::home::Focus::Providers,
             home_connections: super::home::Connections::default(),
             home_sessions: {
@@ -930,6 +955,41 @@ impl Dashboard {
             Ok(()) => self.notice = Some(format!("已写入 {}", self.config_path.display())),
             Err(ConfigError(message)) => self.notice = Some(message),
         }
+    }
+
+    fn maybe_refresh_home_activity(&mut self, handle: &Handle) {
+        if self.history.is_some()
+            || self.browser.is_some()
+            || self.home_activity_pending
+            || self.home_sessions_loading
+            || self.home_sessions.sessions.is_empty()
+            || (!self.home_activity_dirty
+                && (self.refresh_seconds == 0
+                    || self.home_activity_last_poll.elapsed() < Duration::from_secs(2)))
+        {
+            return;
+        }
+        self.home_activity_dirty = false;
+        self.home_activity_pending = true;
+        self.home_activity_generation = self.home_activity_generation.wrapping_add(1);
+        let generation = self.home_activity_generation;
+        self.home_activity_last_poll = std::time::Instant::now();
+        let root = self.home_activity_root.clone();
+        let sessions = self.home_sessions.sessions.clone();
+        let tx = self.tx.clone();
+        self.home_activity_task = Some(handle.spawn_blocking(move || {
+            let result = (|| {
+                let Some(manager) = crate::codex_manager::Manager::open_read_only(root)
+                    .map_err(|_| "运行状态读取失败".to_string())?
+                else {
+                    return Ok(HashMap::new());
+                };
+                manager
+                    .session_activity(&sessions)
+                    .map_err(|_| "运行状态读取失败".to_string())
+            })();
+            let _ = tx.send(AppEvent::HomeActivityLoaded { generation, result });
+        }));
     }
 
     fn start_home_sessions_load(&mut self, handle: &Handle) {
@@ -1390,6 +1450,26 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::HomeActivityLoaded { generation, result } => {
+                    if generation == self.home_activity_generation {
+                        self.home_activity_pending = false;
+                        match result {
+                            Ok(activity) => {
+                                changed |= self.home_activity != activity
+                                    || self.home_activity_error.is_some();
+                                self.home_activity = activity;
+                                self.home_activity_error = None;
+                            }
+                            Err(error) => {
+                                changed |= !self.home_activity.is_empty()
+                                    || self.home_activity_error.as_ref() != Some(&error);
+                                self.home_activity.clear();
+                                self.home_activity_error = Some(error);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 AppEvent::HomeSessionsLoaded {
                     generation,
                     catalog,
@@ -1402,6 +1482,20 @@ impl Dashboard {
                             Some(catalog.warnings.join(" · "))
                         };
                         self.home_sessions.refresh(catalog.sessions);
+                        if let Some(task) = self.home_activity_task.take() {
+                            task.abort();
+                        }
+                        self.home_activity_generation =
+                            self.home_activity_generation.wrapping_add(1);
+                        self.home_activity_pending = false;
+                        self.home_activity_dirty = true;
+                        let keys: HashSet<_> = self
+                            .home_sessions
+                            .sessions
+                            .iter()
+                            .map(sessions::Session::key)
+                            .collect();
+                        self.home_activity.retain(|key, _| keys.contains(key));
                         changed = true;
                     }
                     continue;
@@ -1949,7 +2043,11 @@ fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
         )
     };
     let mut inner = home::board(projects, buf, &title, app.home_focus == HomeFocus::Projects);
-    if let Some(warning) = &app.home_sessions_warning {
+    if let Some(warning) = app
+        .home_sessions_warning
+        .as_ref()
+        .or(app.home_activity_error.as_ref())
+    {
         Paragraph::new(format!("读取警告 · {}", super::overview::clean(warning)))
             .fg(Color::Yellow)
             .render(
@@ -1974,19 +2072,26 @@ fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
             .render(inner, buf);
     } else {
         session_browser::render_compact(inner, buf, &app.home_sessions, &|session| {
-            if let Some(binding) = session.instance.strip_prefix("managed-") {
+            let account = if let Some(binding) = session.instance.strip_prefix("managed-") {
                 if let Some((id, revision)) = binding.rsplit_once("-r")
                     && let Some(account) = app.overview.as_ref().and_then(|snapshot| {
                         snapshot.providers.iter().find(|account| account.id == id)
                     })
                 {
-                    return format!("{} · r{revision}", account.name);
+                    format!("{} · r{revision}", account.name)
+                } else {
+                    "托管账号（名称未加载）".into()
                 }
-                "托管账号（名称未加载）".into()
             } else if session.instance == session.provider.id() {
                 session.provider.name().into()
             } else {
                 session.instance.clone()
+            };
+            match app.home_activity.get(&session.key()) {
+                Some(activity) if !activity.runs.is_empty() => {
+                    format!("{account} · {}", activity.label())
+                }
+                _ => account,
             }
         });
     }
@@ -3580,6 +3685,17 @@ mod home_board_tests {
         let mut session = session(&format!("managed-{id}-r2"), "ProjectA", 1);
         session.title = session.id.clone();
         app.home_sessions.refresh(vec![session]);
+        app.home_activity.insert(
+            app.home_sessions.sessions[0].key(),
+            crate::runs::SessionRuntime {
+                runs: vec![crate::runs::SessionRun {
+                    run_id: "private-run-uuid".into(),
+                    process: crate::runs::RunState::Running,
+                    activity: crate::runs::SessionActivity::Working,
+                    model: Some("reported-model".into()),
+                }],
+            },
+        );
         app.overview = Some(crate::provider_catalog::Catalog {
             providers: vec![crate::provider_catalog::Provider {
                 id: id.into(),
@@ -3605,6 +3721,10 @@ mod home_board_tests {
         assert!(output.contains("未命名会话"));
         assert!(output.contains("工作账号"));
         assert!(output.contains("r2"));
+        assert!(output.contains("执行中"));
+        assert!(output.contains("ProjectA(1)"));
+        assert!(!output.contains("(1)·0"));
+        assert!(!output.contains("private-run-uuid"));
         assert!(!output.contains("123e4567"));
     }
 
@@ -3638,6 +3758,80 @@ mod home_board_tests {
         app.drain_events();
         assert!(app.home_sessions.launching);
         assert_eq!(app.home_sessions.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_poll_is_read_only_rejects_stale_events_and_does_not_refresh_provider() {
+        let root = std::env::temp_dir().join(format!("usage-runtime-ui-{}", uuid::Uuid::new_v4()));
+        let mut app = app();
+        app.home_activity_root = root.clone();
+        app.home_sessions
+            .refresh(vec![session("account-a", "ProjectA", 1)]);
+        let selected = app.home_sessions.selected_session().unwrap().key();
+        let handle = Handle::current();
+        app.refresh_seconds = 0;
+        app.maybe_refresh_home_activity(&handle);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while app.home_activity_pending {
+                app.drain_events();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!root.exists());
+        assert_eq!(app.overview_generation, 0);
+        assert!(app.home_activity.is_empty());
+        let generation = app.home_activity_generation;
+        app.maybe_refresh_home_activity(&handle);
+        assert_eq!(app.home_activity_generation, generation);
+        let activity = crate::runs::SessionRuntime {
+            runs: vec![crate::runs::SessionRun {
+                run_id: "internal-id".into(),
+                process: crate::runs::RunState::Running,
+                activity: crate::runs::SessionActivity::Working,
+                model: None,
+            }],
+        };
+        app.tx
+            .send(AppEvent::HomeActivityLoaded {
+                generation,
+                result: Ok(HashMap::from([(selected.clone(), activity.clone())])),
+            })
+            .unwrap();
+        assert!(app.drain_events().0);
+        app.tx
+            .send(AppEvent::HomeActivityLoaded {
+                generation,
+                result: Ok(HashMap::from([(selected.clone(), activity)])),
+            })
+            .unwrap();
+        assert!(
+            !app.drain_events().0,
+            "identical local status invalidated the UI"
+        );
+        app.home_activity_generation += 1;
+        app.tx
+            .send(AppEvent::HomeActivityLoaded {
+                generation,
+                result: Err("old error".into()),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(!app.home_activity.is_empty());
+        app.tx
+            .send(AppEvent::HomeActivityLoaded {
+                generation: app.home_activity_generation,
+                result: Err("运行状态读取失败".into()),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(app.home_activity.is_empty());
+        assert!(app.home_activity_error.is_some());
+        assert_eq!(
+            app.home_sessions.selected_session().unwrap().key(),
+            selected
+        );
     }
 
     #[tokio::test]

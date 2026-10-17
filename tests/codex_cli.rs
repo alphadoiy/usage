@@ -3,6 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
+include!("support/run_lifecycle.rs");
+include!("support/local_bark.rs");
+
 struct Fixture {
     path: PathBuf,
 }
@@ -247,6 +250,14 @@ fn bark_is_injected_per_managed_run_without_changing_byok_or_oauth_homes() {
                 .find(|arg| arg.starts_with("hooks.PermissionRequest="))
                 .unwrap();
             let parsed: toml::Value = toml::from_str(hook).unwrap();
+            assert_eq!(
+                parsed["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"].as_integer(),
+                Some(8)
+            );
+            assert_eq!(
+                parsed["hooks"]["PermissionRequest"][0]["hooks"][0]["async"].as_bool(),
+                Some(true)
+            );
             let callback = parsed["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap();

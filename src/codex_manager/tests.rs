@@ -41,7 +41,7 @@ fn overview_read_only_discovery_does_not_create_or_migrate_store() {
     assert!(Manager::open_read_only(missing.clone()).unwrap().is_none());
     assert!(!missing.exists());
     let manager = f.manager();
-    manager.conn.execute_batch("DROP TABLE run_contexts;
+    manager.conn.execute_batch("DROP TABLE run_contexts; DROP TABLE run_events; DROP TABLE run_sessions;
         INSERT INTO profiles(id,name,revision) VALUES('legacy','Legacy',1);
         INSERT INTO revisions VALUES('legacy',1,'','unused','2026-10-16T00:00:00Z');
         INSERT INTO runs VALUES('legacy-run','legacy',1,'/legacy','2026-10-16T00:00:00Z',NULL,NULL,NULL);").unwrap();
@@ -52,6 +52,7 @@ fn overview_read_only_discovery_does_not_create_or_migrate_store() {
     assert_eq!(runs.len(), 1);
     assert!(runs[0].context.is_none());
     assert!(runs[0].process_identity.is_none());
+    assert!(runs[0].sessions.is_empty());
     assert!(reader.conn.execute("DELETE FROM runs", []).is_err());
     assert_eq!(
         manager
@@ -1100,6 +1101,48 @@ fn oauth_configuration_revisions_retain_one_live_credential_file() {
             0o700
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn nonblocking_oauth_handle_retains_shared_lease_until_process_is_reaped() {
+    use crate::agents::RunningAgent;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let source = oauth_source(&f, "workspace-a", "fixture-refresh-a");
+    let profile = manager.import_oauth(None, None, &source, None).unwrap();
+    let binary = f.path.join("oauth codex");
+    std::fs::write(
+        &binary,
+        r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 'codex-cli 0.163.0'; exit 0; fi
+if [ "$1" = --help ]; then echo '--profile --no-daemon'; exit 0; fi
+for value; do done_file="$value"; done
+while [ ! -f "$done_file" ]; do sleep 0.01; done
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let done = f.path.join("done");
+    let mut handle = manager
+        .start_recorded_with_config(
+            &profile.id,
+            &f.path,
+            None,
+            None,
+            &binary,
+            &[done.to_string_lossy().into_owned()],
+            None,
+        )
+        .unwrap();
+    assert!(handle.try_wait().unwrap().is_none());
+    assert!(manager.oauth_lease(&profile.id).is_err());
+    assert!(manager.import_oauth(None, None, &source, None).is_err());
+    std::fs::write(done, "").unwrap();
+    assert!(handle.wait().unwrap().status.success());
+    assert!(manager.oauth_lease(&profile.id).is_ok());
 }
 
 #[test]

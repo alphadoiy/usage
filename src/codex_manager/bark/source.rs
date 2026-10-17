@@ -9,7 +9,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Origin {
+pub(crate) enum Origin {
     User,
     Internal,
     Untracked,
@@ -36,7 +36,7 @@ impl Origin {
     }
 }
 
-pub(super) fn classify(home: Option<&Path>, thread: &str) -> Origin {
+pub(crate) fn classify(home: Option<&Path>, thread: &str) -> Origin {
     let Some(home) = home else {
         lookup("context", "home_missing");
         return Origin::Unknown;

@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use crate::registry::{FactoryRegistry, RegistryError};
 use crate::sessions::{SessionRecord, SessionSource};
+mod process;
+pub use process::{ProcessHandle, RunningAgent};
 
 /// Metadata needed to group, color, and resume one session provider.
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +122,7 @@ pub struct SpawnRequest {
     pub usage_config: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 pub struct SpawnOutcome {
     pub status: ExitStatus,
     /// Local, unmanaged launches do not claim a persisted managed run binding.
@@ -128,6 +131,14 @@ pub struct SpawnOutcome {
 
 pub trait Launcher: Send + Sync {
     fn spawn(&self, request: &SpawnRequest) -> Result<SpawnOutcome, String>;
+
+    /// Additive capability: legacy/custom launchers may remain foreground-only.
+    fn start(&self, _request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String> {
+        Err("此 Agent 不支持非阻塞启动".into())
+    }
+    fn supports_start(&self) -> bool {
+        false
+    }
 
     /// Exporting a launch into another terminal is a separate capability.
     /// Adapters must explicitly preserve their own credential/configuration binding.
@@ -178,6 +189,9 @@ impl AgentAdapter for LocalAgent {
 }
 
 impl Launcher for LocalAgent {
+    fn supports_start(&self) -> bool {
+        true
+    }
     fn resume_shell_command(&self, session: &crate::sessions::Session) -> Result<String, String> {
         match &self.context {
             AgentContext::ManagedCodex {
@@ -193,6 +207,9 @@ impl Launcher for LocalAgent {
         }
     }
     fn spawn(&self, request: &SpawnRequest) -> Result<SpawnOutcome, String> {
+        self.start(request)?.wait()
+    }
+    fn start(&self, request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String> {
         match &self.context {
             AgentContext::ManagedCodex {
                 root,
@@ -200,7 +217,7 @@ impl Launcher for LocalAgent {
                 revision,
             } => crate::codex_manager::Manager::open(root.clone())
                 .and_then(|mut manager| {
-                    manager.run_recorded_with_config(
+                    manager.start_recorded_with_config(
                         account,
                         &request.cwd,
                         *revision,
@@ -210,22 +227,24 @@ impl Launcher for LocalAgent {
                         request.usage_config.as_deref(),
                     )
                 })
-                .map(|(status, run)| SpawnOutcome {
-                    status,
-                    run: Some(run),
-                })
+                .map(|handle| Box::new(handle) as Box<dyn RunningAgent>)
                 .map_err(|error| error.to_string()),
             AgentContext::Local { home } => {
                 if self.kind == AgentKind::CODEX
                     && let Some((account, revision)) = crate::codex_manager::binding_for_home(home)
                         .map_err(|error| error.to_string())?
                 {
-                    return crate::hub::spawn_managed_codex(
+                    return crate::hub::start_managed_codex(
                         &crate::codex_manager::default_root(),
                         &account,
                         Some(revision),
                         request,
                     );
+                }
+                if self.kind == AgentKind::CODEX {
+                    return crate::codex_manager::start_local_codex(home, request)
+                        .map(|handle| Box::new(handle) as Box<dyn RunningAgent>)
+                        .map_err(|error| error.to_string());
                 }
                 let mut command = Command::new(&request.program);
                 if let Some(id) = &request.resume {
@@ -236,13 +255,13 @@ impl Launcher for LocalAgent {
                         .args(self.kind.command().split_whitespace().skip(1))
                         .arg(id);
                 }
-                command
+                let child = command
                     .args(&request.args)
                     .current_dir(&request.cwd)
                     .env(self.kind.home_env(), home)
-                    .status()
-                    .map(|status| SpawnOutcome { status, run: None })
-                    .map_err(|error| format!("无法运行 {}：{error}", self.kind.name()))
+                    .spawn()
+                    .map_err(|error| format!("无法运行 {}：{error}", self.kind.name()))?;
+                Ok(Box::new(ProcessHandle::new(child, None, None)))
             }
         }
     }

@@ -5,6 +5,94 @@ use sha2::{Digest, Sha256};
 use crate::resources::ResourceBinding;
 use crate::resources::connections::ConnectionConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivity {
+    Idle,
+    Working,
+    Interrupted,
+    Ended,
+}
+impl SessionActivity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "等待输入",
+            Self::Working => "执行中",
+            Self::Interrupted => "已中断",
+            Self::Ended => "会话已关闭",
+        }
+    }
+}
+
+/// Confirmed by a session event, never inferred from a shared Home or project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSession {
+    pub id: String,
+    pub cwd: std::path::PathBuf,
+    pub activity: SessionActivity,
+    pub turn_id: Option<String>,
+    pub model: Option<String>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunEvent {
+    pub sequence: i64,
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub model: Option<String>,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRun {
+    pub run_id: String,
+    pub process: RunState,
+    pub activity: SessionActivity,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionRuntime {
+    pub runs: Vec<SessionRun>,
+}
+impl SessionRuntime {
+    pub fn label(&self) -> String {
+        let active: Vec<_> = self
+            .runs
+            .iter()
+            .filter(|run| run.process == RunState::Running)
+            .collect();
+        match active.as_slice() {
+            [run] => run.activity.label().into(),
+            [] => self.runs.first().map_or(String::new(), |run| {
+                match run.process {
+                    RunState::Completed => "进程已退出",
+                    RunState::Failed => "异常结束",
+                    RunState::Stopped => "已停止",
+                    _ => "运行状态待确认",
+                }
+                .into()
+            }),
+            runs => {
+                let activity = runs
+                    .iter()
+                    .max_by_key(|run| match run.activity {
+                        SessionActivity::Working => 4,
+                        SessionActivity::Idle => 3,
+                        SessionActivity::Interrupted => 2,
+                        SessionActivity::Ended => 1,
+                    })
+                    .unwrap()
+                    .activity;
+                format!("{} 个运行实例 · {}", runs.len(), activity.label())
+            }
+        }
+    }
+}
+
 /// OS process identity, kept private to the run store rather than displayed in the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
@@ -28,6 +116,7 @@ mod process_tests {
             pid: Some(pid),
             exit_code: None,
             context: None,
+            sessions: Vec::new(),
             process_identity: ProcessIdentity::capture(pid),
         }
     }

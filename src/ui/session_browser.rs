@@ -331,7 +331,7 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         ])
         .areas(lists_area)
     };
-    render_projects(project_area, buf, browser);
+    render_projects(project_area, buf, browser, true);
     render_sessions(session_area, buf, browser);
     if preview_height > 0 {
         render_preview(preview_area, buf, browser);
@@ -348,10 +348,10 @@ pub(super) fn render_compact(
     if area.width >= 48 {
         let [projects, sessions] =
             Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(area);
-        render_projects(projects, buf, browser);
+        render_projects(projects, buf, browser, false);
         render_session_list(sessions, buf, browser, Some(label));
     } else if browser.focus() == Focus::Projects {
-        render_projects(area, buf, browser);
+        render_projects(area, buf, browser, false);
     } else {
         render_session_list(area, buf, browser, Some(label));
     }
@@ -436,7 +436,7 @@ fn preview_text(value: &str, width: usize) -> String {
     short
 }
 
-fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
+fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser, show_usage: bool) {
     let active = browser.focus == Focus::Projects;
     let block = Block::bordered()
         .title(format!(" 项目 · {} ", browser.project_count()))
@@ -457,13 +457,17 @@ fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
                 || project.cwd.to_string_lossy().into_owned(),
                 |name| name.to_string_lossy().into_owned(),
             );
+            let mut title = format!("{}  ({})", clean(&name), project.sessions.len());
+            if show_usage
+                && project
+                    .sessions
+                    .iter()
+                    .any(|&i| browser.usage_for(&browser.sessions[i]).is_some())
+            {
+                title.push_str(&format!(" · {}", compact(project.tokens.total())));
+            }
             ListItem::new(vec![
-                Line::from(format!(
-                    "{}  ({}) · {}",
-                    clean(&name),
-                    project.sessions.len(),
-                    compact(project.tokens.total())
-                )),
+                Line::from(title),
                 Line::from(clean(&project.cwd.to_string_lossy())).dim(),
             ])
         })

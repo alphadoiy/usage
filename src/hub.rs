@@ -85,6 +85,7 @@ pub struct Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     pub spawn: bool,
+    pub start: bool,
     pub sessions: bool,
     pub resources: bool,
 }
@@ -114,6 +115,10 @@ impl Provider {
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
             spawn: self.agent.launcher().is_some(),
+            start: self
+                .agent
+                .launcher()
+                .is_some_and(|launcher| launcher.supports_start()),
             sessions: self.agent.session_source().is_some(),
             resources: !self.resources.is_empty(),
         }
@@ -126,6 +131,18 @@ impl Provider {
             .ok_or(CapabilityError::Unsupported("spawn"))?
             .spawn(request)
             .map_err(CapabilityError::Failed)
+    }
+
+    pub fn start(
+        &self,
+        request: &SpawnRequest,
+    ) -> Result<Box<dyn crate::agents::RunningAgent>, CapabilityError> {
+        let launcher = self
+            .agent
+            .launcher()
+            .filter(|launcher| launcher.supports_start())
+            .ok_or(CapabilityError::Unsupported("start"))?;
+        launcher.start(request).map_err(CapabilityError::Failed)
     }
 
     /// Query services concurrently, preserve configured order, and bound arbitrary adapters.
@@ -185,6 +202,15 @@ pub fn spawn_managed_codex(
     revision: Option<i64>,
     request: &SpawnRequest,
 ) -> Result<SpawnOutcome, String> {
+    start_managed_codex(root, account, revision, request)?.wait()
+}
+
+pub fn start_managed_codex(
+    root: &std::path::Path,
+    account: &str,
+    revision: Option<i64>,
+    request: &SpawnRequest,
+) -> Result<Box<dyn crate::agents::RunningAgent>, String> {
     let provider = Hub::default()
         .provider(ProviderDefinition {
             id: account.into(),
@@ -197,7 +223,7 @@ pub fn spawn_managed_codex(
             resources: Vec::new(),
         })
         .map_err(|error| error.to_string())?;
-    provider.spawn(request).map_err(|error| error.to_string())
+    provider.start(request).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -210,6 +236,43 @@ mod tests {
     use async_trait::async_trait;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn local_agent_exposes_nonblocking_handle_without_inventing_a_managed_run() {
+        let root =
+            std::env::temp_dir().join(format!("usage-local-handle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let provider = Hub::default()
+            .provider(ProviderDefinition {
+                id: "local".into(),
+                agent: "claude".into(),
+                context: AgentContext::Local { home: root.clone() },
+                resources: Vec::new(),
+            })
+            .unwrap();
+        assert!(provider.capabilities().start);
+        let mut handle = provider
+            .start(&SpawnRequest {
+                cwd: root.clone(),
+                program: "/bin/sh".into(),
+                resume: None,
+                usage_config: None,
+                args: vec![
+                    "-c".into(),
+                    "while [ ! -f \"$CLAUDE_CONFIG_DIR/release\" ]; do sleep 0.01; done; exit 7"
+                        .into(),
+                ],
+            })
+            .unwrap();
+        assert!(handle.record().is_none());
+        assert!(handle.try_wait().unwrap().is_none());
+        std::fs::write(root.join("release"), "").unwrap();
+        assert_eq!(handle.wait().unwrap().status.code(), Some(7));
+        assert!(handle.wait().unwrap().run.is_none());
+        handle.terminate().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     struct CatalogAgent;
     impl AgentAdapter for CatalogAgent {
@@ -332,6 +395,7 @@ mod tests {
             provider.capabilities(),
             Capabilities {
                 spawn: false,
+                start: false,
                 sessions: true,
                 resources: true
             }

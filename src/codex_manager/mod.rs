@@ -5,7 +5,10 @@ pub mod cli;
 pub mod config;
 mod effective;
 mod launcher;
+mod local;
+pub use local::{local_resume_shell_command, start_local_codex};
 pub mod oauth;
+pub mod runtime;
 mod secrets;
 
 use crate::logging;
@@ -158,6 +161,7 @@ pub struct RunRecord {
     pub exit_code: Option<i32>,
     /// Absent for records written before launch identity capture was introduced.
     pub context: Option<crate::runs::RunContext>,
+    pub sessions: Vec<crate::runs::RunSession>,
     #[serde(skip_serializing)]
     pub process_identity: Option<crate::runs::ProcessIdentity>,
 }
@@ -187,6 +191,7 @@ impl RunRecord {
             exit_code: row.get(7)?,
             process_identity: capture.as_ref().and_then(|capture| capture.process.clone()),
             context: capture.map(|capture| capture.context),
+            sessions: Vec::new(),
         })
     }
 }
@@ -304,9 +309,11 @@ impl Manager {
         let sql = format!("SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,{column} FROM runs r {join}
             ORDER BY r.finished_at IS NOT NULL,r.started_at DESC,r.id DESC LIMIT ?1");
         let mut query = self.conn.prepare(&sql)?;
-        Ok(query
+        let mut runs = query
             .query_map([limit.min(1000) as i64], RunRecord::from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        runtime::load_sessions(&self.conn, &mut runs)?;
+        Ok(runs)
     }
 
     pub fn open_default() -> Result<Self> {
@@ -345,7 +352,18 @@ impl Manager {
                 identity_key TEXT UNIQUE NOT NULL, identity_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS run_contexts (
                 run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
-                context_json TEXT NOT NULL);")?;
+                context_json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS run_events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL, session_id TEXT, turn_id TEXT, model TEXT,
+                observed_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS run_events_run ON run_events(run_id, sequence);
+            CREATE TABLE IF NOT EXISTS run_sessions (
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL, cwd TEXT NOT NULL, activity TEXT NOT NULL,
+                turn_id TEXT, model TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+                PRIMARY KEY(run_id, session_id));")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -827,7 +845,37 @@ impl Manager {
         args: &[String],
         usage_config: Option<&Path>,
     ) -> Result<(ExitStatus, RunRecord)> {
-        logging::operation("codex.run", |op| {
+        use crate::agents::RunningAgent;
+        let mut handle = self.start_recorded_with_config(
+            selector,
+            cwd,
+            revision,
+            resume,
+            program,
+            args,
+            usage_config,
+        )?;
+        let outcome = handle.wait().map_err(Error::message)?;
+        Ok((
+            outcome.status,
+            outcome
+                .run
+                .ok_or_else(|| Error::message("启动记录不存在"))?,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_recorded_with_config(
+        &mut self,
+        selector: &str,
+        cwd: &Path,
+        revision: Option<i64>,
+        resume: Option<&str>,
+        program: &Path,
+        args: &[String],
+        usage_config: Option<&Path>,
+    ) -> Result<crate::agents::ProcessHandle> {
+        logging::operation("codex.run_start", |op| {
             // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
             let report = op.step("source_sync", || self.sync(false))?;
             if !report.skipped.is_empty()
@@ -967,6 +1015,17 @@ impl Manager {
                     &saved.config,
                 )
             })?;
+            op.step("runtime_events_inject", || {
+                runtime::inject(
+                    &mut command,
+                    &self.root,
+                    &home,
+                    &run_id,
+                    &saved.config,
+                    String::from_utf8_lossy(&help.stdout)
+                        .contains("--dangerously-bypass-hook-trust"),
+                )
+            })?;
             if let Some(id) = resume {
                 command.args(["resume", id]);
             }
@@ -978,7 +1037,7 @@ impl Manager {
             let mut child = op.step("child_spawn", || command.spawn())?;
             tracing::info!(event = "child_spawned", child_pid = child.id());
             op.begin("run_record");
-            let recorded = (|| -> Result<()> {
+            let recorded = (|| -> Result<RunRecord> {
                 capture.process = crate::runs::ProcessIdentity::capture(child.id());
                 let capture = serde_json::to_string(&capture)
                     .map_err(|_| Error::message("运行身份无法序列化"))?;
@@ -989,45 +1048,34 @@ impl Manager {
                     "INSERT INTO run_contexts(run_id,context_json) VALUES (?1,?2)",
                     params![run_id, capture],
                 )?;
+                runtime::record_started(&tx, &run_id)?;
                 tx.commit()?;
-                Ok(())
+                self.run_record(&run_id)?
+                    .ok_or_else(|| Error::message("启动记录不存在"))
             })();
-            if let Err(error) = recorded {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-            let status = op.step("child_wait", || child.wait())?;
-            if status.success() {
-                tracing::info!(
-                    event = "child_exited",
-                    exit_code = status.code(),
-                    successful = true
-                );
-            } else {
-                tracing::warn!(
-                    event = "child_exited",
-                    exit_code = status.code(),
-                    successful = false
-                );
-            }
-            op.begin("run_finish_record");
-            self.conn.execute(
-                "UPDATE runs SET finished_at=?1,exit_code=?2 WHERE id=?3",
-                params![now(), status.code(), run_id],
-            )?;
-            if profile.auth_mode == AuthMode::Oauth {
-                op.step("auth_permissions", || {
-                    oauth::restrict_auth_permissions(&home)
-                })?;
-            }
-            if !status.success() {
-                op.fail("child_exit");
-            }
-            let run = self
-                .run_record(&run_id)?
-                .ok_or_else(|| Error::message("启动记录不存在"))?;
-            Ok((status, run))
+            let run = match recorded {
+                Ok(run) => run,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            };
+            let root = self.root.clone();
+            let span = op.span();
+            let finish = Box::new(move |status: ExitStatus| {
+                // Keep the OAuth lease owned by this process handle until exit.
+                let _lease = &_oauth_lease;
+                span.in_scope(|| {
+                    runtime::finish_run(&root, &home, &run_id, profile.auth_mode, status)
+                })
+                .map_err(|error| error.to_string())
+            });
+            Ok(crate::agents::ProcessHandle::new(
+                child,
+                Some(run),
+                Some(finish),
+            ))
         })
     }
 
@@ -1038,18 +1086,22 @@ impl Manager {
              LEFT JOIN run_contexts c ON c.run_id=r.id
              WHERE (?1 IS NULL OR r.profile_id=?1) ORDER BY r.started_at DESC,r.id DESC",
         )?;
-        let records = query
+        let mut records = query
             .query_map([profile_id], RunRecord::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        runtime::load_sessions(&self.conn, &mut records)?;
         Ok(records)
     }
 
     pub fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
-        Ok(self.conn.query_row(
+        let record = self.conn.query_row(
             "SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,c.context_json FROM runs r
              LEFT JOIN run_contexts c ON c.run_id=r.id WHERE r.id=?1",
             [id], RunRecord::from_row,
-        ).optional()?)
+        ).optional()?;
+        let mut records: Vec<_> = record.into_iter().collect();
+        runtime::load_sessions(&self.conn, &mut records)?;
+        Ok(records.pop())
     }
 
     pub fn resources_for_run(
@@ -1352,6 +1404,10 @@ pub fn launch_shell_command(
     if let Some(id) = session {
         args.extend(["--resume".into(), id.into()]);
     }
+    Ok(usage_shell_command(&args))
+}
+
+fn usage_shell_command(args: &[String]) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         let mut command = format!(
@@ -1365,18 +1421,18 @@ pub fn launch_shell_command(
                 .collect::<Vec<_>>()
                 .join(" "),
         );
-        Ok(command)
+        command
     }
     #[cfg(target_os = "windows")]
     {
-        Ok(format!(
+        format!(
             "$env:USAGE_CODEX_DIR={}; & {}",
             shell_quote(&default_root().to_string_lossy()),
             args.iter()
                 .map(|s| shell_quote(s))
                 .collect::<Vec<_>>()
                 .join(" ")
-        ))
+        )
     }
 }
 #[cfg(not(target_os = "windows"))]

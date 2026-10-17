@@ -1,6 +1,32 @@
 //! Native process boundaries: argument policy and the lifetime of inherited run leases.
 use super::{AuthMode, Error, Result};
 
+/// Serialize integers directly. Going through serde_json::Value would turn
+/// arbitrary-precision JSON numbers into private map wrappers in TOML.
+pub(super) fn command_hook(command: &str, timeout: u64, background: bool) -> Result<toml::Value> {
+    #[derive(serde::Serialize)]
+    struct Handler<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        command: &'a str,
+        timeout: u64,
+        r#async: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct Group<'a> {
+        hooks: [Handler<'a>; 1],
+    }
+    toml::Value::try_from(Group {
+        hooks: [Handler {
+            kind: "command",
+            command,
+            timeout,
+            r#async: background,
+        }],
+    })
+    .map_err(|_| Error::message("无法创建生命周期 hook"))
+}
+
 pub(super) fn validate_run_args(args: &[String], mode: AuthMode) -> Result<()> {
     let mut args = args.iter();
     let mut options = true;

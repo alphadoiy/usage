@@ -13,7 +13,7 @@ use super::{Error, Result};
 use crate::logging;
 mod content;
 mod presence;
-mod source;
+pub(super) mod source;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -234,10 +234,10 @@ pub(super) fn inject(
     account: &str,
     run_id: &str,
     saved_config: &str,
-) -> Result<()> {
+) -> Result<bool> {
     command.env_remove(CONTEXT_ENV);
     let Some(settings) = read_settings(root)?.filter(|s| s.enabled) else {
-        return Ok(());
+        return Ok(false);
     };
     let executable = std::env::current_exe()?;
     let config: toml::Value =
@@ -278,10 +278,7 @@ pub(super) fn inject(
             "{} codex notify --event approval",
             super::shell_quote(&executable.to_string_lossy())
         );
-        let groups = toml::Value::try_from(vec![json!({"hooks":[{
-            "type":"command", "command":callback, "async":true, "timeout":8
-        }]})])
-        .map_err(|_| Error::message("无法创建审批通知 hook"))?;
+        let groups = toml::Value::Array(vec![super::launcher::command_hook(&callback, 8, true)?]);
         command.args(["-c", &format!("hooks.PermissionRequest={groups}")]);
     }
     tracing::info!(
@@ -289,7 +286,7 @@ pub(super) fn inject(
         completion = settings.completion,
         approval = settings.approval
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Callback errors never interfere with Codex or decide a permission request.

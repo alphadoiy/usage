@@ -10,6 +10,8 @@
 
 第四阶段已接入[首页中枢](home-overview.md)：默认展示 Provider 名称／类型／用量与余额／模型、官方状态列表、项目与会话快速恢复三个看板。Provider 目录独立于运行和账单查询，不在首页堆叠运行记录和启动信息。
 
+第五阶段已接入[运行生命周期与会话关联](run-lifecycle.md)：内置 Agent 提供非阻塞运行句柄，托管 Codex 通过经过核验的生命周期 hooks 建立 Run 与 Session 的关系；首页独立更新会话活动状态。恢复会话的运行关联与 API 资源身份证明分开处理。
+
 Usage 的 Provider 是一个配置实例，由 Agent 和零个或多个资源服务组成。类型注册一次，账号作为工厂参数传入；同一 Provider 可以重复启动进程。
 
 ```mermaid
@@ -33,7 +35,7 @@ flowchart TD
 - `agents::AgentRegistry`：登记 Codex、Claude、Grok。Agent 提供可选的 `Launcher` 和 `SessionSource`；自定义 Agent 可以声明自己的会话 ID 校验，不必使用 UUID。
 - `resources::ResourceRegistry`：登记 ChatGPT、Claude、Grok 官方订阅读取器，以及 New API 令牌/账号和 OpenAI 费用读取器。`ResourceSnapshot` 声明权限范围，区分配额窗口、余额、带时间范围的费用、支出和原始额度；余额保留十进制文本和币种，原始额度不自动转换成美元。
 - `hub::Hub`：通过 `ProviderDefinition` 创建配置实例，提供 `spawn`、`resources`、`sessions`。不支持的能力返回 `CapabilityError::Unsupported`；缺少凭据、凭据失效和网络失败由资源状态分别表达。
-- Codex CLI、账号 TUI、托管会话恢复经过 Hub 进入 Agent 启动适配器。现有 Manager 继续负责同步、密钥注入、OAuth 租约、Bark 注入和运行记录，避免复制这些逻辑。
+- Codex CLI、账号 TUI、托管会话恢复经过 Hub 进入 Agent 启动适配器。`Provider::start` 返回 `RunningAgent`，原 `spawn` 保留等待行为。Manager 负责同步、密钥注入、OAuth 租约、Bark／事件注入和运行记录，句柄负责进程退出后的记录与回收。
 - 首页通过 `provider_catalog::CatalogService` 只读发现托管账号和显式推理连接，并以固定推理凭据获取模型列表；用量与余额通过独立资源计划读取，配置关联无需 Run。跟随 CC Switch 的账号可读取其已启用的内置用量参数。结果按刷新代次、Provider 与资源身份路由。`OverviewService` 保留运行和类型化资源核对读模型，首页不再调用它。
 - 原用量工厂通过资源适配器的 `legacy_usage` 能力继续支持现有 CLI、JSON、TUI 和主动重置；新余额服务只实现 `ResourceReader` 即可，不需要伪造百分比。
 - 内置会话目录使用 Agent 注册表创建对应 Home 的读取器，并在 Session 上保留该 Agent；当前终端恢复委托其 Launcher。复制命令与 Ghostty 分屏使用 Launcher 显式提供的命令导出能力，不支持时返回错误。原 `SessionRegistry::register` 仍支持仅有 loader 的旧来源。
@@ -61,11 +63,11 @@ flowchart TD
 
 当前阶段完成注册表、能力接口和现有调用路径迁移。以下功能尚未实现，不能仅凭模型已经支持余额就视为已接入：
 
-1. 将运行到会话的绑定扩展为 Agent 事件。`resources --run` 要求启动时端点、凭据核对；`profile_ids` 仍只是显式关系，不宣称远端成员关系已验证。
-2. 扩展更多服务协议与凭据引用来源；目前支持的 New API 和 OpenAI Costs 只使用独立环境变量凭据，不读取托管 Codex 私有密钥，也不猜测站点协议。
+1. 将目前托管 Codex 的会话事件能力扩展到其他 Agent。`resources --run` 仍要求端点、凭据核对；会话事件不作为远端账号成员关系的证明。
+2. 扩展更多服务协议与凭据引用来源。独立资源使用环境变量；首页也支持明确跟随 CC Switch 的已保存账号和对应查询参数，不猜测未知站点协议。
 3. 将订阅卡片与旧 CLI 消费者迁入类型化资源展示后，再移除 `legacy_usage` 兼容能力。独立资源 CLI 已直接使用 `ResourceSnapshot`；首页在 Provider 下展示类型化资源与模型。
 4. 通过 Agent 事件补全原生 profile、项目层、会话恢复及交互内切换等配置来源。当前支持保存的 BYOK 配置及模型／TOML 参数覆盖；未支持的来源拒绝推断关联，`RunRecord.revision` 始终记录保存版本。
-5. 完善实时进程事件、非阻塞运行句柄和运行到会话的事件绑定。运行读模型已支持以 PID + 启动指纹核对存活，首页不展示运行状态。当前 `Launcher::spawn` 保持原有前台启动并等待退出的行为；多个调用可在不同线程或终端并行。会话扫描结果是 Home 的目录，不是某次 Run 的会话集合。
+5. 扩展跨客户端的实时事件及更完整的 Agent 活动状态。现有 `start` 句柄和托管事件已能确认运行与会话关系，但 Home 扫描本身仍不是某次 Run 的会话集合；缺失事件的旧实例不回填归属。
 6. 将历史读取、数据目录发现、统一缓存调度等剩余职责迁入对应能力和应用服务。
 
 扩展的集成测试使用自定义 Agent、非 UUID 会话和只提供余额的资源适配器，验证无需修改内置分派。真实子进程测试并行启动同一账号的两个配置版本，验证独立运行 ID 和版本记录。已有 Bark/OAuth 回归继续覆盖原启动保证。

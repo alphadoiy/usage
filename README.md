@@ -125,6 +125,8 @@ grok = ""
 
 首页 Provider 定时在后台更新用量与余额，刷新期间保留现有内容；连接未变化时复用模型列表。首次加载或推理连接变化后查询模型，按 `r` 可强制重新查询。返回首页、左右切换 Provider 或上下滚动不会重复请求未变化的模型列表。余额查询失败后显示本次错误，避免继续把旧金额当作当前余额。
 
+首页项目标题只显示名称与会话数量，不显示未加载的 Token 统计。托管 Codex 可通过生命周期 hooks 确认每次运行对应的会话，并在会话旁展示执行／等待输入等状态；首次使用需在 Codex `/hooks` 中信任 Usage 回调。活动状态在本机后台更新，不额外查询模型或余额。`usage codex runs --json` 查看确认过的会话，`usage codex run-events <运行UUID> --json` 查看不含对话内容的事件，详见[运行生命周期](docs/run-lifecycle.md)。
+
 首页官方 API 看板以状态符号和文字独立列出 OpenAI、Claude、xAI/Grok。绿色表示官方正常，黄色表示降级，蓝色表示维护，红色表示故障；按 Enter 查看事件与最近查询历史。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
 
 数据直接来自 [OpenAI 官方 JSON](https://status.openai.com/api/v2/summary.json)（另读 `api/v2/incidents.json` 过滤已解决事件）、[Claude 官方 JSON](https://status.claude.com/api/v2/summary.json) 和 [xAI 官方 RSS](https://status.x.ai/feed.xml)。Grok 显示「未报告故障」表示 RSS 内没有未解决事件，不代表主动探测成功；OpenAI / Claude 是供应商整体状态，可能涉及你未使用的产品，也不保证单个账户的可用性。完整受影响组件和故障事件可用 `usage status` 或 `usage status --json` 查看；此命令不读取用量配置或登录文件，默认查询三个来源，`--providers` 支持 `openai` / `codex`、`claude` / `anthropic`、`grok` / `xai`。查询失败退出码为 1；供应商报告故障但查询成功时为 0。
@@ -206,15 +208,15 @@ usage codex bark logs --run <运行UUID> # 只查看某个启动实例
 
 也可通过 `configure --url-env BARK_URL` 从指定环境变量读取 URL。`configure --no-approval` 只提醒本轮完成，`--no-completion` 只提醒权限审批请求。Bark 配置在管理数据目录的 `bark.json` 中，权限 `600`、明文存储；通过 `USAGE_CODEX_DIR` 可以分别管理不同通知设置。账号导出和 CC Switch 同步不携带 Bark 配置。
 
-开启后，`usage` 仅向它启动的 Codex 子进程传入临时 `-c notify=...` 和 `-c hooks.PermissionRequest=...`，并通过子进程环境传递本次运行上下文。CLI、账号管理页、Ghostty 分屏和托管会话恢复共用这个入口。不会将通知回调写进默认 `~/.codex`、托管账号配置或项目配置；直接运行 `codex`，即使使用相同托管 `CODEX_HOME`，也不会获得 `usage` 的 Bark 通知。账号原有的 `notify` 回调仍会收到原完成事件，已有 hook 来源保留。
+开启后，`usage` 仅向它启动的 Codex 子进程传入临时 `-c notify=...` 和 `-c hooks.PermissionRequest=...`，并通过子进程环境传递本次运行上下文。CLI、账号管理页，以及首页和 F3 会话页在当前终端、Ghostty 或复制命令中恢复的 Codex 会话都使用通知入口。默认 Home 和其他未托管 Home 通过 `usage codex resume-local` 包装恢复，保留原来的 Home、认证环境和账号文件，不导入托管账号。不会将通知回调写进默认 `~/.codex`、托管账号配置或项目配置；直接运行 `codex`，即使使用相同托管 `CODEX_HOME`，也不会获得 `usage` 的 Bark 通知。账号原有的 `notify` 回调仍会收到原完成事件，已有 hook 来源保留。
 
 完成提醒表示**本轮回答结束**，不保证整个需求已经实现。审批提醒表示**出现权限审批请求**，其他审批机制可能随后处理请求；通知 hook 不会批准或拒绝操作。审批使用异步 hook，需要支持生命周期 hooks 的新版 CLI（已用 0.162.1 验证）；首次在 Codex 中打开 `/hooks`，审阅并信任 `usage` 的 PermissionRequest hook。账号和配置版本的运行目录不同，可能需要分别信任；可执行文件路径或 hook 定义变化后需要重新审阅。遵循已有的 hooks 开关和管理员策略，不自动绕过信任检查。CLI 保存的合法 hook 信任状态可以保留，账号配置版本仍不变。等待普通问题回答、额度耗尽、网络卡住暂不单独检测。
 
 自动通知仅在 **Mac 锁屏或所有在线显示器熄屏** 时发送，没有“始终通知”选项。解锁且亮屏时直接丢弃事件，不在之后锁屏时补发；读取不到状态时也不发送。判断通过本机 Core Graphics 完成，不截屏、不读取屏幕内容。多显示器中任一显示器亮着且未锁屏时不通知。当前状态可用 `bark status` 检查；`bark test` 是显式测试，会直接发送，方便在电脑前验证通知通道。这项自动状态检测目前仅支持 macOS。
 
-完成通知标题包含项目名和“本轮完成”，正文摘录最后一条助手回复（合并空白，最多 400 个字符）并附账号名；没有回复时明确提示返回电脑查看。审批通知显示项目名、工具名和申请理由（若回调提供 `tool_input.justification`），提醒返回电脑处理。通知不展示会话 ID，也不额外读取用户提示词、原始命令或完整项目路径；回复摘录本身可能包含助手提到的代码、路径等内容。完成通知只针对用户会话：只读核验托管 `CODEX_HOME` 的会话索引，必要时读取对应记录文件的首行元数据，排除标题生成等临时线程及子代理；无法核验来源时也跳过（包括不保存记录的 `--ephemeral` 会话）。审批通知保持独立。每次启动有独立分组；每次收到支持的事件后立即检查来源、屏幕状态和通知开关，符合条件就发送，不做时间窗口合并或事件去重。发送使用 JSON POST、5 秒超时，推送失败不阻止 Codex；后续回调仍可尝试推送，不做后台自动重试。
+完成通知标题包含项目名和“本轮完成”，正文摘录最后一条助手回复（合并空白，最多 400 个字符）并附账号名；没有回复时明确提示返回电脑查看。审批通知显示项目名、工具名和申请理由（若回调提供 `tool_input.justification`），提醒返回电脑处理。通知不展示会话 ID，也不额外读取用户提示词、原始命令或完整项目路径；回复摘录本身可能包含助手提到的代码、路径等内容。完成通知只针对用户会话：只读核验该进程实际 `CODEX_HOME` 的会话索引，必要时读取对应记录文件的首行元数据，排除标题生成等临时线程及子代理；无法核验来源时也跳过（包括不保存记录的 `--ephemeral` 会话）。审批通知保持独立。每次启动有独立分组；每次收到支持的事件后立即检查来源、屏幕状态和通知开关，符合条件就发送，不做时间窗口合并或事件去重。发送使用 JSON POST、5 秒超时，推送失败不阻止 Codex；后续回调仍可尝试推送，不做后台自动重试。
 
-Bark 使用现有的结构化日志和轮转规则。默认日志记录原始 `thread_id` / `turn_id`、回调类型、客户端、账号、项目名、工具和子代理标识；回调进程的 PID 和进程标识由日志 span 提供。同时记录完成回复摘录（最多 200 字符）与准备发送的通知预览（最多 300 字符）。来源核验会记录查询的数据库版本、索引或记录文件的查询结果、原始 `thread_source` / `session_source`、具体失败原因；无持久记录只标记为 `untracked`，不会断言它一定是标题线程。还记录锁屏与熄屏状态、忽略原因、HTTP 状态、Bark 结果码、请求耗时及失败阶段。不额外记录配置中的设备密钥、推送 URL、完整事件 payload、用户提示词或原始工具命令。`bark logs` 按时间汇总各通知进程，可用 `--run` 筛选启动实例；通用 `usage logs --operation <运行UUID>` 也能关联该实例的通知回调。`run_id` 对应原启动记录，每次回调的 `operation_id` 关联接收、核验和发送过程，原始线程和轮次 ID 可与 Codex 原生日志直接对照。保留 `event_id` 指纹以对照历史记录，并区分同一线程和轮次中不同的审批事件，不用于去重；不再重复记录 `thread_key` 或 `has_turn_id`。`USAGE_LOG=off` 时不记录。
+Bark 使用现有的结构化日志和轮转规则。默认日志记录原始 `thread_id` / `turn_id`、回调类型、客户端、账号、项目名、工具和子代理标识；回调进程的 PID 和进程标识由日志 span 提供。同时记录完成回复摘录（最多 200 字符）与准备发送的通知预览（最多 300 字符）。来源核验会记录查询的数据库版本、索引或记录文件的查询结果、原始 `thread_source` / `session_source`、具体失败原因；无持久记录只标记为 `untracked`，不会断言它一定是标题线程。还记录锁屏与熄屏状态、忽略原因、HTTP 状态、Bark 结果码、请求耗时及失败阶段。不额外记录配置中的设备密钥、推送 URL、完整事件 payload、用户提示词或原始工具命令。`bark logs` 按时间汇总各通知进程，可用 `--run` 筛选启动实例；通用 `usage logs --operation <运行UUID>` 也能关联该实例的通知回调。`run_id` 对应启动操作；未托管 Home 的恢复不创建托管运行记录，启动日志 `bark_local_launch` 记录是否注入、子进程 PID、Home、项目目录和会话，便于区分未注入与回调被过滤。每次回调的 `operation_id` 关联接收、核验和发送过程，原始线程和轮次 ID 可与 Codex 原生日志直接对照。保留 `event_id` 指纹以对照历史记录，并区分同一线程和轮次中不同的审批事件，不用于去重；不再重复记录 `thread_key` 或 `has_turn_id`。`USAGE_LOG=off` 时不记录。
 
 在 iPhone 的 Watch App 中打开 Bark 的通知镜像；手机锁屏、手表佩戴且解锁时，通常由 Watch 提醒。专注模式会影响通知，Mac 需要保持唤醒、联网。详见 [Apple Watch 通知规则](https://support.apple.com/zh-cn/108369)、[Codex 单次配置覆盖及 notify](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)、[hooks 信任说明](https://learn.chatgpt.com/docs/hooks)。
 
