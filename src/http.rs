@@ -42,10 +42,35 @@ pub struct ReqwestClient {
 
 impl ReqwestClient {
     pub fn new() -> Self {
+        Self::build(reqwest::redirect::Policy::default())
+    }
+
+    pub fn without_redirects() -> Self {
+        Self::build(reqwest::redirect::Policy::none())
+    }
+
+    pub fn same_origin_redirects() -> Self {
+        Self::build(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many same-origin redirects")
+            } else if attempt.previous().first().is_some_and(|first| {
+                first.origin() == attempt.url().origin()
+                    && attempt.url().username().is_empty()
+                    && attempt.url().password().is_none()
+            }) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+    }
+
+    fn build(redirects: reqwest::redirect::Policy) -> Self {
         let client = reqwest::Client::builder()
+            .redirect(redirects)
             .timeout(Duration::from_secs(15))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("HTTP client configuration is valid");
         Self { client }
     }
 }
@@ -164,5 +189,101 @@ impl HttpClient for FakeHttp {
             }
         }
         Err(TransportError(format!("no fake route for {url}")))
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    fn server(
+        count: usize,
+        location: Option<String>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let until = std::time::Instant::now() + Duration::from_secs(3);
+            while requests.len() < count && std::time::Instant::now() < until {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut data = Vec::new();
+                let mut buffer = [0; 4096];
+                while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buffer).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buffer[..n]);
+                }
+                requests.push(String::from_utf8(data).unwrap());
+                if requests.len() == 1
+                    && let Some(location) = &location
+                {
+                    write!(stream,"HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .unwrap();
+                }
+            }
+            requests
+        });
+        (base, handle)
+    }
+    #[tokio::test]
+    async fn provider_queries_follow_same_origin_canonical_routes_but_stop_before_other_origins() {
+        let (base, handle) = server(2, Some("/canonical/api/usage/token".into()));
+        let client = ReqwestClient::same_origin_redirects();
+        let result = client
+            .request(
+                "GET",
+                &format!("{base}/api/usage/token"),
+                &[("Authorization", "Bearer synthetic-key".into())],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200);
+        let requests = handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with("GET /canonical/api/usage/token "));
+        assert!(requests.iter().all(|r| {
+            r.to_ascii_lowercase()
+                .contains("authorization: bearer synthetic-key")
+        }));
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let (base, handle) = server(
+            1,
+            Some(format!(
+                "http://{}/do-not-send-key",
+                other.local_addr().unwrap()
+            )),
+        );
+        let result = client
+            .request(
+                "GET",
+                &base,
+                &[("x-api-key", "synthetic-anthropic-key".into())],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, 301);
+        assert_eq!(handle.join().unwrap().len(), 1);
+        assert!(
+            matches!(other.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock)
+        );
     }
 }

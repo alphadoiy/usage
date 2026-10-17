@@ -1,6 +1,6 @@
 # 运行配置与资源关联
 
-启动路径和资源查询路径通过启动时保存的 `RunContext` 连接。此功能目前针对 Usage 托管的 Codex BYOK 启动；首页仍未迁移。
+启动路径和资源查询路径通过启动时保存的 `RunContext` 连接。此功能目前针对 Usage 托管的 Codex BYOK 启动；关联结果通过 `usage resources --run` 查询；[首页中枢](home-overview.md)的 Provider 目录与运行关联查询分离。
 
 ## 配置和使用
 

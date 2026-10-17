@@ -153,12 +153,14 @@ fn quota_metrics(
         return Err(invalid());
     }
     let mut metrics = vec![ResourceMetric::Allowance {
-        remaining: (!unlimited).then(|| remaining.normalize().to_string()),
+        // Match CC Switch: the returned remainder and the token's quota cap are
+        // independent. Relay implementations may return a wallet value here.
+        remaining: Some(remaining.normalize().to_string()),
         used: Some(used.normalize().to_string()),
         unit: "new_api_quota".into(),
         unlimited,
     }];
-    if !unlimited && let (Some(ratio), Some(currency)) = (ratio, currency) {
+    if let (Some(ratio), Some(currency)) = (ratio, currency) {
         let amount = remaining
             .checked_div(Decimal::from_str_exact(ratio).map_err(|_| invalid())?)
             .ok_or_else(invalid)?;

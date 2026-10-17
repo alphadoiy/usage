@@ -2,11 +2,13 @@
 
 第一阶段的初始评估见 [全项目消融评估](provider-stage1-ablation.md)。其中四个失败契约已修复并纳入正式回归，当前行为与验证见 [优化记录](provider-stage1-optimization.md)。
 
-第二阶段已接入资源连接配置、New API 和 OpenAI 费用查询及 CLI 消费者，详见 [资源连接](resource-connections.md)。首页与运行状态的整合仍待迁移。
+第二阶段已接入资源连接配置、New API 和 OpenAI 费用查询及 CLI 消费者，详见 [资源连接](resource-connections.md)。首页的 Provider 目录与运行资源核对分开读取。
 
 第三阶段已接入启动侧配置解析、运行资源关联快照与 `resources --run` 校验查询，详见 [运行资源关联](run-resource-binding.md)。原生 profile、项目配置层、OAuth 与会话恢复目前明确标记未解析。
 
 第三阶段的测试覆盖与结构评估见 [运行资源关联消融](provider-stage3-ablation.md)。实验发现的嵌套命令门控缺口已修复，并补充常规回归、合并上下文读取、延迟构造资源服务，详见 [修复记录](provider-stage3-optimization.md)。
+
+第四阶段已接入[首页中枢](home-overview.md)：默认展示 Provider 名称／类型／用量与余额／模型、官方状态列表、项目与会话快速恢复三个看板。Provider 目录独立于运行和账单查询，不在首页堆叠运行记录和启动信息。
 
 Usage 的 Provider 是一个配置实例，由 Agent 和零个或多个资源服务组成。类型注册一次，账号作为工厂参数传入；同一 Provider 可以重复启动进程。
 
@@ -32,6 +34,7 @@ flowchart TD
 - `resources::ResourceRegistry`：登记 ChatGPT、Claude、Grok 官方订阅读取器，以及 New API 令牌/账号和 OpenAI 费用读取器。`ResourceSnapshot` 声明权限范围，区分配额窗口、余额、带时间范围的费用、支出和原始额度；余额保留十进制文本和币种，原始额度不自动转换成美元。
 - `hub::Hub`：通过 `ProviderDefinition` 创建配置实例，提供 `spawn`、`resources`、`sessions`。不支持的能力返回 `CapabilityError::Unsupported`；缺少凭据、凭据失效和网络失败由资源状态分别表达。
 - Codex CLI、账号 TUI、托管会话恢复经过 Hub 进入 Agent 启动适配器。现有 Manager 继续负责同步、密钥注入、OAuth 租约、Bark 注入和运行记录，避免复制这些逻辑。
+- 首页通过 `provider_catalog::CatalogService` 只读发现托管账号和显式推理连接，并以固定推理凭据获取模型列表；用量与余额通过独立资源计划读取，配置关联无需 Run。跟随 CC Switch 的账号可读取其已启用的内置用量参数。结果按刷新代次、Provider 与资源身份路由。`OverviewService` 保留运行和类型化资源核对读模型，首页不再调用它。
 - 原用量工厂通过资源适配器的 `legacy_usage` 能力继续支持现有 CLI、JSON、TUI 和主动重置；新余额服务只实现 `ResourceReader` 即可，不需要伪造百分比。
 - 内置会话目录使用 Agent 注册表创建对应 Home 的读取器，并在 Session 上保留该 Agent；当前终端恢复委托其 Launcher。复制命令与 Ghostty 分屏使用 Launcher 显式提供的命令导出能力，不支持时返回错误。原 `SessionRegistry::register` 仍支持仅有 loader 的旧来源。
 - `Provider::sessions()` 从实例的 AgentContext 解析 Home，并将 Provider ID 作为会话实例身份，调用方不能替换为其他账号目录。
@@ -58,11 +61,11 @@ flowchart TD
 
 当前阶段完成注册表、能力接口和现有调用路径迁移。以下功能尚未实现，不能仅凭模型已经支持余额就视为已接入：
 
-1. 将已有运行资源关联接入首页。当前 `profile_ids` 仍仅为显式关联；需要 `inference` 配置并通过启动时端点、凭据核对，才能使用 `resources --run`。账号／项目关系来自显式配置，不宣称远端成员关系已验证。
+1. 将运行到会话的绑定扩展为 Agent 事件。`resources --run` 要求启动时端点、凭据核对；`profile_ids` 仍只是显式关系，不宣称远端成员关系已验证。
 2. 扩展更多服务协议与凭据引用来源；目前支持的 New API 和 OpenAI Costs 只使用独立环境变量凭据，不读取托管 Codex 私有密钥，也不猜测站点协议。
-3. 将首页从原 `UsageSnapshot` 切换到 Provider/Run 和 `ResourceSnapshot`，再移除旧界面的兼容能力。现有额度首页不会自动展示 BYOK 余额。
+3. 将订阅卡片与旧 CLI 消费者迁入类型化资源展示后，再移除 `legacy_usage` 兼容能力。独立资源 CLI 已直接使用 `ResourceSnapshot`；首页在 Provider 下展示类型化资源与模型。
 4. 通过 Agent 事件补全原生 profile、项目层、会话恢复及交互内切换等配置来源。当前支持保存的 BYOK 配置及模型／TOML 参数覆盖；未支持的来源拒绝推断关联，`RunRecord.revision` 始终记录保存版本。
-5. 完善进程存活核对、非阻塞运行句柄和运行到会话的事件绑定。当前 `Launcher::spawn` 保持原有前台启动并等待退出的行为；多个调用可在不同线程或终端并行。会话扫描结果是 Home 的目录，不是某次 Run 的会话集合。
+5. 完善实时进程事件、非阻塞运行句柄和运行到会话的事件绑定。运行读模型已支持以 PID + 启动指纹核对存活，首页不展示运行状态。当前 `Launcher::spawn` 保持原有前台启动并等待退出的行为；多个调用可在不同线程或终端并行。会话扫描结果是 Home 的目录，不是某次 Run 的会话集合。
 6. 将历史读取、数据目录发现、统一缓存调度等剩余职责迁入对应能力和应用服务。
 
 扩展的集成测试使用自定义 Agent、非 UUID 会话和只提供余额的资源适配器，验证无需修改内置分派。真实子进程测试并行启动同一账号的两个配置版本，验证独立运行 ID 和版本记录。已有 Bark/OAuth 回归继续覆盖原启动保证。

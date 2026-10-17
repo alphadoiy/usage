@@ -193,15 +193,18 @@ fn write_cache(path: &Path, cache: &CacheFile) -> io::Result<()> {
         return Ok(());
     };
     fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!("statusline-{}.tmp", std::process::id()));
+    let temporary = parent.join(format!(
+        "statusline-{}-{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     let bytes = serde_json::to_vec(cache).map_err(io::Error::other)?;
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .mode(0o600)
             .open(&temporary)?;

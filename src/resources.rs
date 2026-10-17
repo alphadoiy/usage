@@ -5,6 +5,8 @@ mod api;
 pub mod connections;
 mod new_api;
 mod openai_costs;
+mod provider_usage;
+pub(crate) use provider_usage::balance_endpoint;
 
 use std::sync::Arc;
 
@@ -254,6 +256,7 @@ pub fn builtin_registry() -> ResourceRegistry {
     api::register::<new_api::Token>(&mut registry);
     api::register::<new_api::Account>(&mut registry);
     api::register::<openai_costs::Costs>(&mut registry);
+    provider_usage::register(&mut registry);
     registry
 }
 
@@ -314,6 +317,16 @@ pub(crate) async fn collect_with_deadline(
     readers: &[Arc<dyn ResourceReader>],
     timeout: std::time::Duration,
 ) -> Vec<ResourceSnapshot> {
+    collect_with_updates(readers, timeout, |_, _| {}).await
+}
+
+/// Publish completed queries immediately while retaining configuration order in the result.
+/// Dropping this future cancels the entire query set, including slow readers.
+pub(crate) async fn collect_with_updates(
+    readers: &[Arc<dyn ResourceReader>],
+    timeout: std::time::Duration,
+    mut update: impl FnMut(usize, &ResourceSnapshot),
+) -> Vec<ResourceSnapshot> {
     let mut tasks = tokio::task::JoinSet::new();
     let mut indices = std::collections::HashMap::new();
     for (index, reader) in readers.iter().enumerate() {
@@ -344,6 +357,7 @@ pub(crate) async fn collect_with_deadline(
                     message: Some(message.into()),
                 }
             });
+        update(index, &snapshot);
         snapshots.push((index, snapshot));
     }
     snapshots.sort_by_key(|(index, _)| *index);
@@ -356,6 +370,92 @@ pub(crate) async fn collect_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PendingReader {
+        binding: ResourceBinding,
+        pending: bool,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct Cancelled(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ResourceReader for PendingReader {
+        fn service(&self) -> &str {
+            "synthetic"
+        }
+        fn binding(&self) -> &ResourceBinding {
+            &self.binding
+        }
+        async fn read(&self) -> ResourceSnapshot {
+            let _cancel = Cancelled(self.cancelled.clone());
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            ResourceSnapshot {
+                binding: self.binding.clone(),
+                service: self.service().into(),
+                scope: ResourceScope::Account,
+                state: ResourceState::Ready,
+                metrics: Vec::new(),
+                queried_at: None,
+                message: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_queries_deliver_fast_result_and_cancel_slow_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let readers: Vec<Arc<dyn ResourceReader>> = [true, false]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pending)| {
+                Arc::new(PendingReader {
+                    binding: ResourceBinding {
+                        account: format!("account-{index}"),
+                        revision: String::new(),
+                    },
+                    pending,
+                    cancelled: if pending {
+                        cancelled.clone()
+                    } else {
+                        Arc::new(AtomicBool::new(false))
+                    },
+                }) as Arc<dyn ResourceReader>
+            })
+            .collect();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            collect_with_updates(&readers, Duration::from_secs(30), |index, _| {
+                tx.send(index).unwrap();
+            })
+            .await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn registered_subscription_reports_missing_configuration_as_resource_state() {

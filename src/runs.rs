@@ -5,6 +5,166 @@ use sha2::{Digest, Sha256};
 use crate::resources::ResourceBinding;
 use crate::resources::connections::ConnectionConfig;
 
+/// OS process identity, kept private to the run store rather than displayed in the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessIdentity {
+    pid: u32,
+    started: String,
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use crate::codex_manager::RunRecord;
+
+    fn run(pid: u32) -> RunRecord {
+        RunRecord {
+            id: "synthetic-run".into(),
+            profile_id: "synthetic-profile".into(),
+            revision: 1,
+            cwd: "/synthetic-project".into(),
+            started_at: "2026-10-16T00:00:00Z".into(),
+            finished_at: None,
+            pid: Some(pid),
+            exit_code: None,
+            context: None,
+            process_identity: ProcessIdentity::capture(pid),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_liveness_requires_matching_start_fingerprint() {
+        let mut record = run(std::process::id());
+        assert!(record.process_identity.is_some());
+        assert_eq!(RunState::observe(&record), RunState::Running);
+        record
+            .process_identity
+            .as_mut()
+            .unwrap()
+            .started
+            .push_str("-different");
+        assert_eq!(RunState::observe(&record), RunState::Stopped, "reused PID");
+        record.process_identity = None;
+        assert_eq!(RunState::observe(&record), RunState::Unknown, "old record");
+        record.pid = None;
+        assert_eq!(RunState::observe(&record), RunState::Unknown);
+        record.finished_at = Some("2026-10-16T01:00:00Z".into());
+        record.exit_code = Some(0);
+        assert_eq!(RunState::observe(&record), RunState::Completed);
+        record.exit_code = Some(1);
+        assert_eq!(RunState::observe(&record), RunState::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_child_without_finish_record_is_stopped() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let record = run(child.id());
+        child.wait().unwrap();
+        assert_eq!(RunState::observe(&record), RunState::Stopped);
+    }
+}
+
+impl ProcessIdentity {
+    pub(crate) fn capture(pid: u32) -> Option<Self> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+            // SAFETY: proc_pidinfo receives a valid, correctly sized writable buffer.
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid as i32,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if read == size {
+                // SAFETY: the OS initialized the complete buffer above.
+                let info = unsafe { info.assume_init() };
+                return Some(Self {
+                    pid,
+                    started: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+                });
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, fields) = stat.rsplit_once(')')?;
+            let start = fields.split_whitespace().nth(19)?;
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            return Some(Self {
+                pid,
+                started: format!("{}:{start}", boot.trim()),
+            });
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+    Unknown,
+}
+
+impl RunState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "运行中",
+            Self::Completed => "已完成",
+            Self::Failed => "异常结束",
+            Self::Stopped => "已停止 · 缺少结束记录",
+            Self::Unknown => "状态待确认",
+        }
+    }
+
+    pub fn observe(run: &crate::codex_manager::RunRecord) -> Self {
+        if run.finished_at.is_some() {
+            return if run.exit_code == Some(0) {
+                Self::Completed
+            } else {
+                Self::Failed
+            };
+        }
+        let Some(pid) = run.pid.filter(|pid| *pid > 0 && *pid <= i32::MAX as u32) else {
+            return Self::Unknown;
+        };
+        if let Some(current) = ProcessIdentity::capture(pid) {
+            return match &run.process_identity {
+                Some(expected) if *expected == current => Self::Running,
+                Some(_) => Self::Stopped,
+                None => Self::Unknown,
+            };
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only checks existence/permissions; it sends no signal.
+            if unsafe { libc::kill(pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return Self::Stopped;
+            }
+        }
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityState {
@@ -58,6 +218,8 @@ pub struct RunContext {
 pub(crate) struct CapturedContext {
     pub context: RunContext,
     proofs: Vec<Option<CredentialProof>>,
+    #[serde(default)]
+    pub(crate) process: Option<ProcessIdentity>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,6 +277,7 @@ impl CapturedContext {
                 resources_error: None,
             },
             proofs: Vec::new(),
+            process: None,
         };
         let configs = match configs {
             Ok(configs) => configs,

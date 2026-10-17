@@ -166,6 +166,14 @@ impl ResourceService {
         &self,
         config: &ConnectionConfig,
     ) -> Result<Arc<dyn ResourceReader>, RegistryError> {
+        self.prepare_with_credentials(config, self.credentials.clone())
+    }
+
+    pub fn prepare_with_credentials(
+        &self,
+        config: &ConnectionConfig,
+        credentials: Arc<CredentialResolver>,
+    ) -> Result<Arc<dyn ResourceReader>, RegistryError> {
         config.validate()?;
         let context = ResourceContext {
             binding: config.binding(),
@@ -174,7 +182,7 @@ impl ResourceService {
                 credential_ref: format!("env:{}", config.credential_env),
                 options: config.options.clone(),
                 http: self.http.clone(),
-                credentials: self.credentials.clone(),
+                credentials,
                 now: self.now.clone(),
             }),
         };
@@ -272,7 +280,16 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
         for metric in &snapshot.metrics {
             lines.push(match metric {
                 ResourceMetric::Balance { remaining } => {
-                    format!("  余额 {} {}", remaining.amount, remaining.currency)
+                    format!(
+                        "  余额 {} {}{}",
+                        remaining.amount,
+                        remaining.currency,
+                        if snapshot.service == "new_api_token" {
+                            "（接口返回）"
+                        } else {
+                            ""
+                        }
+                    )
                 }
                 ResourceMetric::Cost {
                     used,
@@ -295,7 +312,10 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
                     unit,
                     used.as_deref().unwrap_or("未知"),
                     if *unlimited {
-                        "令牌额度不限量（不代表账号余额无限）".into()
+                        match remaining {
+                            Some(value) => format!("剩余 {value} · 令牌不限额"),
+                            None => "令牌额度不限量（不代表账号余额无限）".into(),
+                        }
                     } else {
                         format!("剩余 {}", remaining.as_deref().unwrap_or("未知"))
                     }

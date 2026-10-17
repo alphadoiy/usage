@@ -158,10 +158,24 @@ pub struct RunRecord {
     pub exit_code: Option<i32>,
     /// Absent for records written before launch identity capture was introduced.
     pub context: Option<crate::runs::RunContext>,
+    #[serde(skip_serializing)]
+    pub process_identity: Option<crate::runs::ProcessIdentity>,
 }
 
 impl RunRecord {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let capture = row
+            .get::<_, Option<String>>(8)?
+            .map(|text| {
+                serde_json::from_str::<crate::runs::CapturedContext>(&text).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?;
         Ok(Self {
             id: row.get(0)?,
             profile_id: row.get(1)?,
@@ -171,20 +185,8 @@ impl RunRecord {
             finished_at: row.get(5)?,
             pid: row.get(6)?,
             exit_code: row.get(7)?,
-            context: row
-                .get::<_, Option<String>>(8)?
-                .map(|text| {
-                    serde_json::from_str::<crate::runs::CapturedContext>(&text)
-                        .map(|capture| capture.context)
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                8,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })
-                })
-                .transpose()?,
+            process_identity: capture.as_ref().and_then(|capture| capture.process.clone()),
+            context: capture.map(|capture| capture.context),
         })
     }
 }
@@ -273,6 +275,40 @@ pub struct Manager {
 }
 
 impl Manager {
+    /// Dashboard discovery never creates, migrates, or changes permissions on a store.
+    pub fn open_read_only(root: PathBuf) -> Result<Option<Self>> {
+        let path = root.join("manager.sqlite3");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(500))?;
+        Ok(Some(Self { root, conn }))
+    }
+
+    /// Keep all pages bounded; unfinished records precede completed history.
+    pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
+        let has_contexts: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_contexts')",
+            [],
+            |row| row.get(0),
+        )?;
+        let (column, join) = if has_contexts {
+            (
+                "c.context_json",
+                "LEFT JOIN run_contexts c ON c.run_id=r.id",
+            )
+        } else {
+            ("NULL", "")
+        };
+        let sql = format!("SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,{column} FROM runs r {join}
+            ORDER BY r.finished_at IS NOT NULL,r.started_at DESC,r.id DESC LIMIT ?1");
+        let mut query = self.conn.prepare(&sql)?;
+        Ok(query
+            .query_map([limit.min(1000) as i64], RunRecord::from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn open_default() -> Result<Self> {
         Self::open(default_root())
     }
@@ -362,6 +398,28 @@ impl Manager {
             )
             .optional()?
             .ok_or_else(|| Error::message("找不到保存的配置版本"))
+    }
+
+    pub(crate) fn usage_source(&self, id: &str) -> Result<Option<(PathBuf, String)>> {
+        Ok(self.conn.query_row(
+            "SELECT source_path,source_provider FROM profiles WHERE id=?1 AND source_path IS NOT NULL AND source_provider IS NOT NULL AND source_revision=revision AND follow=1",
+            [id], |row| Ok((PathBuf::from(row.get::<_,String>(0)?),row.get(1)?)),
+        ).optional()?)
+    }
+
+    /// Prepare a read-only model query using this exact saved account revision.
+    pub(crate) fn model_catalog_query(
+        &self,
+        profile: &Profile,
+    ) -> Result<crate::provider_catalog::ModelQuery> {
+        if profile.auth_mode != AuthMode::Byok {
+            return Err(Error::message("OAuth 订阅未接入模型列表接口"));
+        }
+        let saved = self.revision(&profile.id, profile.revision)?;
+        let (base, _) = config::summary(&saved.config)?;
+        let key = secrets::get(&self.root, &saved.secret_ref)?;
+        crate::provider_catalog::ModelQuery::new(profile.id.clone(), &base, key)
+            .map_err(Error::message)
     }
 
     pub fn add(&mut self, name: &str, text: &str, key: &str) -> Result<Profile> {
@@ -873,7 +931,7 @@ impl Manager {
                 command.arg("--no-daemon");
             }
             let run_id = op.id().to_owned();
-            let capture = op.step("run_identity_capture", || {
+            let mut capture = op.step("run_identity_capture", || {
                 let environment = |name: &str| std::env::var(name).ok();
                 let effective = effective::resolve(&saved.config, profile.auth_mode, &cwd, resume.is_some(), args, key.as_deref(), &environment);
                 if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
@@ -897,7 +955,7 @@ impl Manager {
                     tracing::info!(event="run_resource_link", connection_id=link.binding.account,
                         service=link.service, revision=link.binding.revision, state=?link.state);
                 }
-                serde_json::to_string(&captured).map_err(|_| Error::message("运行身份无法序列化"))
+                Ok::<_, Error>(captured)
             })?;
             op.step("notification_inject", || {
                 bark::inject(
@@ -921,6 +979,9 @@ impl Manager {
             tracing::info!(event = "child_spawned", child_pid = child.id());
             op.begin("run_record");
             let recorded = (|| -> Result<()> {
+                capture.process = crate::runs::ProcessIdentity::capture(child.id());
+                let capture = serde_json::to_string(&capture)
+                    .map_err(|_| Error::message("运行身份无法序列化"))?;
                 let tx = self.conn.transaction()?;
                 tx.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
                     params![run_id,profile.id,revision,cwd.to_string_lossy(),now(),child.id()])?;
@@ -997,6 +1058,16 @@ impl Manager {
         configs: &[crate::resources::connections::ConnectionConfig],
         ids: &[String],
     ) -> Result<crate::runs::PinnedResources> {
+        self.resources_for_run_with(id, configs, ids, &|name| std::env::var(name).ok())
+    }
+
+    pub(crate) fn resources_for_run_with(
+        &self,
+        id: &str,
+        configs: &[crate::resources::connections::ConnectionConfig],
+        ids: &[String],
+        credentials: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<crate::runs::PinnedResources> {
         let (profile_id, text): (String, Option<String>) = self
             .conn
             .query_row(
@@ -1012,9 +1083,7 @@ impl Manager {
         )
         .map_err(|_| Error::message("运行身份记录无法解析"))?;
         captured
-            .select(id, &profile_id, configs, ids, &|name| {
-                std::env::var(name).ok()
-            })
+            .select(id, &profile_id, configs, ids, credentials)
             .map_err(Error::message)
     }
 

@@ -35,6 +35,38 @@ fn native(url: &str, model: &str) -> String {
 }
 
 #[test]
+fn overview_read_only_discovery_does_not_create_or_migrate_store() {
+    let f = Fixture::new();
+    let missing = f.path.join("missing");
+    assert!(Manager::open_read_only(missing.clone()).unwrap().is_none());
+    assert!(!missing.exists());
+    let manager = f.manager();
+    manager.conn.execute_batch("DROP TABLE run_contexts;
+        INSERT INTO profiles(id,name,revision) VALUES('legacy','Legacy',1);
+        INSERT INTO revisions VALUES('legacy',1,'','unused','2026-10-16T00:00:00Z');
+        INSERT INTO runs VALUES('legacy-run','legacy',1,'/legacy','2026-10-16T00:00:00Z',NULL,NULL,NULL);").unwrap();
+    let reader = Manager::open_read_only(manager.root().to_owned())
+        .unwrap()
+        .unwrap();
+    let runs = reader.recent_runs(10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].context.is_none());
+    assert!(runs[0].process_identity.is_none());
+    assert!(reader.conn.execute("DELETE FROM runs", []).is_err());
+    assert_eq!(
+        manager
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='run_contexts'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly() {
     let f = Fixture::new();
     fs::create_dir(f.path.join(".git")).unwrap();
@@ -829,6 +861,17 @@ sleep 0.3
     for thread in threads {
         assert!(thread.join().unwrap().success());
     }
+    let runs = m.recent_runs(10).unwrap();
+    assert_eq!(runs.len(), 2);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert!(runs.iter().all(|run| run.process_identity.is_some()));
+    assert!(
+        runs.iter()
+            .all(|run| crate::runs::RunState::observe(run) == crate::runs::RunState::Completed)
+    );
+    let public = serde_json::to_string(&runs).unwrap();
+    assert!(!public.contains("process_identity"));
+    assert!(!public.contains("proofs"));
     let ac = fs::read_to_string(f.path.join("a")).unwrap();
     let bc = fs::read_to_string(f.path.join("b")).unwrap();
     assert_ne!(ac.lines().next(), bc.lines().next());

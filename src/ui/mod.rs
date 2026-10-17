@@ -3,9 +3,12 @@
 mod app;
 mod codex;
 mod history;
+mod home;
 mod menu;
+mod overview;
 mod session_browser;
-mod widgets;
+/// Reusable subscription quota widgets; the home Provider board uses the model catalog.
+pub mod widgets;
 
 pub use app::{run, run_history, run_history_with_query, run_with_sessions};
 pub use codex::run as run_codex;

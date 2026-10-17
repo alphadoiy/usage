@@ -1,4 +1,4 @@
-//! Shared navigation menu for the quota, history, session, and account pages.
+//! Shared navigation menu for the home, history, session, and account pages.
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Action {
-    Quotas,
+    Home,
     History,
     Sessions,
     Codex,
@@ -17,7 +17,7 @@ pub(super) enum Action {
 impl Action {
     fn title(self) -> &'static str {
         match self {
-            Self::Quotas => "F1  官方额度",
+            Self::Home => "F1  运行与资源首页",
             Self::History => "F2  Token 历史",
             Self::Sessions => "F3  会话浏览",
             Self::Codex => "F4  Codex 账号管理",
@@ -27,7 +27,7 @@ impl Action {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Quotas => "查看 Claude Code、Codex 和 Grok 的官方已用额度",
+            Self::Home => "查看托管 Agent 运行、共享余额与费用，以及官方订阅额度",
             Self::History => "查看本地 Token 贡献图、项目和模型统计",
             Self::Sessions => "浏览项目会话，并在终端或分屏中恢复",
             Self::Codex => "保存 BYOK/OAuth 账号、导入或同步 CC Switch、多账号多开",
@@ -49,16 +49,14 @@ pub(super) struct Menu {
 }
 
 impl Menu {
-    pub(super) fn new(current: Action, quotas_available: bool) -> Self {
-        let mut actions = vec![
+    pub(super) fn new(current: Action) -> Self {
+        let actions = vec![
+            Action::Home,
             Action::History,
             Action::Sessions,
             Action::Codex,
             Action::Quit,
         ];
-        if quotas_available {
-            actions.insert(0, Action::Quotas);
-        }
         let selected = actions.iter().position(|a| *a == current).unwrap_or(0);
         Self { actions, selected }
     }
@@ -83,7 +81,7 @@ impl Menu {
                 Command::Stay
             }
             KeyCode::Enter => Command::Activate(self.actions[self.selected]),
-            KeyCode::F(1) | KeyCode::Char('1') => self.activate(Action::Quotas),
+            KeyCode::F(1) | KeyCode::Char('1') => self.activate(Action::Home),
             KeyCode::F(2) | KeyCode::Char('2') => self.activate(Action::History),
             KeyCode::F(3) | KeyCode::Char('3') => self.activate(Action::Sessions),
             KeyCode::F(4) | KeyCode::Char('4') => self.activate(Action::Codex),
@@ -155,7 +153,7 @@ mod tests {
 
     #[test]
     fn keyboard_selection_and_shortcut_open_the_same_account_page() {
-        let mut menu = Menu::new(Action::Quotas, true);
+        let mut menu = Menu::new(Action::Home);
         for _ in 0..3 {
             assert_eq!(menu.key(KeyCode::Down), Command::Stay);
         }
@@ -169,19 +167,23 @@ mod tests {
     }
 
     #[test]
-    fn standalone_history_menu_skips_unavailable_quotas() {
-        let mut menu = Menu::new(Action::History, false);
+    fn standalone_history_can_open_home_without_subscription_providers() {
+        let mut menu = Menu::new(Action::History);
         assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::History));
-        assert_eq!(menu.key(KeyCode::F(1)), Command::Stay);
+        assert_eq!(menu.key(KeyCode::F(1)), Command::Activate(Action::Home));
+        menu.key(KeyCode::Up);
+        assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::Home));
         menu.key(KeyCode::Up);
         assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::Quit));
+        menu.key(KeyCode::Down);
+        assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::Home));
         menu.key(KeyCode::Down);
         assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::History));
     }
 
     #[test]
     fn account_management_is_visible_on_wide_and_narrow_menus() {
-        let menu = Menu::new(Action::Codex, true);
+        let menu = Menu::new(Action::Codex);
         for width in [32, 80] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
             terminal.draw(|frame| menu.render(frame)).unwrap();

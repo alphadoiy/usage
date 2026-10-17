@@ -138,6 +138,12 @@ impl ApiClient {
             target = %self.binding.cache_key(self.service), http_status = response.status);
         match response.status {
             200..=299 => {}
+            300..=399 => {
+                return Err(QueryFailure(
+                    ResourceState::NeedsConfiguration,
+                    "资源接口跳转异常，请核对 base_url；不会跨来源转发查询凭据",
+                ));
+            }
             401 | 403 => {
                 return Err(QueryFailure(
                     ResourceState::AuthenticationFailed,

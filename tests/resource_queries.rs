@@ -93,7 +93,7 @@ async fn queries_isolate_two_connections_and_keep_large_raw_quotas_exact() {
     );
     assert_eq!(
         encoded[1]["snapshot"]["metrics"][0]["remaining"],
-        Value::Null
+        "9007199254740993"
     );
     assert!(
         encoded[1]["snapshot"]["metrics"][0]["unlimited"]
@@ -104,7 +104,7 @@ async fn queries_isolate_two_connections_and_keep_large_raw_quotas_exact() {
     assert!(!text.contains("private-value"));
     assert!(!text.contains("FIXTURE_KEY"));
     assert!(!text.contains("relay.example"));
-    assert!(render_text(&reports).contains("不代表账号余额无限"));
+    assert!(render_text(&reports).contains("剩余 9007199254740993 · 令牌不限额"));
 }
 
 #[tokio::test]
@@ -170,20 +170,51 @@ async fn refuses_mismatched_accounts_expired_tokens_and_invented_balances() {
                 .contains("synthetic-private-credential")
         );
     }
-    let http = Arc::new(FakeHttp::new());
-    http.route("https://relay.example", response(200, &token(true)));
-    let reports = service(http)
-        .query(&[config(
-            "new_api_token",
-            json!({"quota_per_unit":"500000","currency":"USD"}),
-        )])
-        .await
-        .unwrap();
-    assert_eq!(
-        reports[0].snapshot.metrics.len(),
-        1,
-        "unlimited token has no finite wallet balance"
-    );
+}
+
+#[tokio::test]
+async fn unlimited_token_preserves_returned_balance_and_explicit_ccswitch_conversion() {
+    for (available, amount) in [
+        ("2500000", "5"),
+        ("0", "0"),
+        ("-100000", "-0.2"),
+        ("9007199254740993", "18014398509.481986"),
+    ] {
+        let http = Arc::new(FakeHttp::new());
+        let body = format!(
+            r#"{{"code":true,"data":{{"object":"token_usage","total_used":1000000,"total_available":{available},"unlimited_quota":true}}}}"#
+        );
+        http.route("https://relay.example", response(200, &body));
+        let reports = service(http)
+            .query(&[config(
+                "new_api_token",
+                json!({"quota_per_unit":"500000","currency":"USD"}),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(reports[0].snapshot.state, ResourceState::Ready);
+        assert_eq!(reports[0].snapshot.scope, ResourceScope::Token);
+        assert_eq!(
+            reports[0].snapshot.metrics,
+            vec![
+                ResourceMetric::Allowance {
+                    remaining: Some(available.into()),
+                    used: Some("1000000".into()),
+                    unit: "new_api_quota".into(),
+                    unlimited: true,
+                },
+                ResourceMetric::Balance {
+                    remaining: usage::resources::Money {
+                        amount: amount.into(),
+                        currency: "USD".into(),
+                    },
+                },
+            ]
+        );
+        let text = render_text(&reports);
+        assert!(text.contains(&format!("余额 {amount} USD（接口返回）")));
+        assert!(text.contains(&format!("剩余 {available} · 令牌不限额")));
+    }
 }
 
 #[tokio::test]

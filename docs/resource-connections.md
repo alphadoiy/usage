@@ -1,6 +1,6 @@
 # 资源连接：余额、额度与费用
 
-资源连接与 Agent 类型分开配置。当前已接入 `new_api_token`、`new_api_account` 和 `openai_costs`，通过 `usage resources` 使用；原 TUI 首页尚未迁移到这些快照。
+资源连接与 Agent 类型分开配置。当前已接入 New API、Sub2API、六种官方余额服务和 OpenAI 费用查询，通过 `usage resources` 使用；配置了 `profile_ids` 或独立 `inference` 的资源也可在[首页中枢](home-overview.md)对应 Provider 下展示，无需先启动 Agent。
 
 ## 配置和查询
 
@@ -34,7 +34,7 @@ usage --config /path/to/config.toml resources --json
 
 返回码：全部成功或未配置连接为 0，至少一个资源查询失败为 1，配置、选择或工厂错误为 2。不同资源并发查询，输出保持配置顺序；某个资源失败不丢弃其他资源的结果。
 
-`base_url` 是该查询协议的基础 URL，支持站点的部署子路径。New API 使用站点根路径，例如 `https://relay.example/panel`，不要填写推理端点 `/v1`。OpenAI 官方费用使用 `https://api.openai.com/v1`。不尝试根据推理端点自动识别服务或轮询其他接口。URL 需为 HTTPS，本机回环 HTTP 可用于本地服务和测试；不接受 URL 中的凭据、查询参数和片段。
+`base_url` 是该查询协议的基础 URL，支持站点的部署子路径。New API 使用站点根路径，例如 `https://relay.example/panel`，不要填写推理端点 `/v1`。OpenAI 官方费用使用 `https://api.openai.com/v1`；Sub2API 和新增官方余额服务使用站点根地址，原生路径由适配器追加。不尝试根据推理端点自动识别服务或轮询其他接口。URL 需为 HTTPS，本机回环 HTTP 可用于本地服务和测试；不接受 URL 中的凭据、查询参数和片段。
 
 ## 服务及权限范围
 
@@ -42,6 +42,12 @@ usage --config /path/to/config.toml resources --json
 | --- | --- | --- |
 | `new_api_token` | `GET api/usage/token` | 推理 API token，返回该令牌自身的额度；不限量不代表账号余额无限 |
 | `new_api_account` | `GET api/user/self` | 站点账号的管理访问凭据，另需 `options.user_id`；发送 `New-Api-User` 并核对返回的账号 ID |
+| `sub2api_usage` | `GET v1/usage` | 推理 Key，展示当前 Key 可见余额、限额与不限量状态 |
+| `deepseek_balance` | `GET user/balance` | 推理 Key，按响应中的币种展示账号余额 |
+| `stepfun_balance` | `GET v1/accounts` | 推理 Key，CNY 余额 |
+| `siliconflow_balance` / `siliconflow_en_balance` | `GET v1/user/info` | 推理 Key，中站 CNY／国际站 USD |
+| `openrouter_balance` | `GET api/v1/credits` | 可查询 credits 的 Key，购买额度减已用额度，USD；不会把 `/key` 的花费上限当余额 |
+| `novita_balance` | `GET v3/user/balance` | 推理 Key，接口金额单位为万分之一 USD，显式按此协议换算 |
 | `openai_costs` | `GET organization/costs` | OpenAI Admin API Key，查询组织费用；可显式筛选项目或 API Key ID |
 
 New API 默认输出原始 `new_api_quota` 单位，不把它当作模型 token 数或美元余额。若已确认该站点的换算设置，可显式提供比例和币种：
@@ -56,7 +62,7 @@ credential_env = "RELAY_ACCOUNT_ACCESS_TOKEN"
 options = { user_id = 42, quota_per_unit = "500000", currency = "USD" }
 ```
 
-这里的 `500000` 只是显式配置示例，不是程序假设的全局换算比例。`quota_per_unit` 是每一货币单位对应的原始额度，必须为正十进制字符串，并同时填写三位大写币种代码。换算后仍保留原始额度。令牌不限量时不生成有限的金额余额；过期令牌返回认证失败，不能用其额度表示可用状态。
+这里的 `500000` 只是显式配置示例，不是程序假设的全局换算比例。`quota_per_unit` 是每一货币单位对应的原始额度，必须为正十进制字符串，并同时填写三位大写币种代码。换算后仍保留原始额度。令牌不限量时同样保留接口返回的 `total_available` 并进行显式换算，与 CC Switch 保持一致；金额标注“接口返回”，不限额状态单独显示，不据此推断账号钱包范围。过期令牌返回认证失败，不能用其额度表示可用状态。
 
 OpenAI 官方费用配置：
 

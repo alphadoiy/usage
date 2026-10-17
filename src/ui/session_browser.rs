@@ -338,6 +338,25 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     }
 }
 
+/// Home keeps the same selection model and launch identity, without the full preview.
+pub(super) fn render_compact(
+    area: Rect,
+    buf: &mut Buffer,
+    browser: &SessionBrowser,
+    label: &dyn Fn(&Session) -> String,
+) {
+    if area.width >= 48 {
+        let [projects, sessions] =
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(area);
+        render_projects(projects, buf, browser);
+        render_session_list(sessions, buf, browser, Some(label));
+    } else if browser.focus() == Focus::Projects {
+        render_projects(area, buf, browser);
+    } else {
+        render_session_list(area, buf, browser, Some(label));
+    }
+}
+
 fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     let Some(session) = browser.selected_session() else {
         return;
@@ -461,6 +480,15 @@ fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
 }
 
 fn render_sessions(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
+    render_session_list(area, buf, browser, None);
+}
+
+fn render_session_list(
+    area: Rect,
+    buf: &mut Buffer,
+    browser: &SessionBrowser,
+    compact_label: Option<&dyn Fn(&Session) -> String>,
+) {
     let active = browser.focus == Focus::Sessions;
     let title = browser.selected_project().map_or_else(
         || "会话".to_string(),
@@ -512,25 +540,37 @@ fn render_sessions(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
                         .to_string()
                 })
                 .unwrap_or_default();
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!("{time}  "), Style::new().fg(DIM)),
-                Span::styled(
-                    browser.usage_for(session).map_or_else(
-                        || "—  ".into(),
-                        |u| format!("{}  ", compact(u.tokens.total())),
-                    ),
-                    Style::new().fg(BLUE),
-                ),
-                Span::raw(format!(
-                    "{}{}",
-                    if session.instance != session.provider.id() {
-                        format!("[{}] ", clean(&session.instance))
-                    } else {
-                        String::new()
-                    },
+            if let Some(label) = compact_label {
+                let title = if session.title.trim() == session.id {
+                    "未命名会话".into()
+                } else {
                     clean(&session.title)
-                )),
-            ])));
+                };
+                items.push(ListItem::new(vec![
+                    Line::from(title),
+                    Line::from(format!("{} · {time}", clean(&label(session)))).dim(),
+                ]));
+            } else {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(format!("{time}  "), Style::new().fg(DIM)),
+                    Span::styled(
+                        browser.usage_for(session).map_or_else(
+                            || "—  ".into(),
+                            |u| format!("{}  ", compact(u.tokens.total())),
+                        ),
+                        Style::new().fg(BLUE),
+                    ),
+                    Span::raw(format!(
+                        "{}{}",
+                        if session.instance != session.provider.id() {
+                            format!("[{}] ", clean(&session.instance))
+                        } else {
+                            String::new()
+                        },
+                        clean(&session.title)
+                    )),
+                ])));
+            }
             session_index += 1;
         }
         offset += count;

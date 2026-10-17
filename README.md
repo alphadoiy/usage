@@ -1,8 +1,10 @@
 # usage
 
-在终端里查看 Claude Code、Codex 和 Grok 的官方已用额度。百分比是已经用掉的比例。
+在终端里查看托管 Codex 运行、BYOK 余额与费用，以及 Claude Code、Codex 和 Grok 的官方订阅额度。额度百分比是已经用掉的比例。
 
-界面用 [ratatui](https://ratatui.rs/) 绘制，单次只显示一种用量图：
+首页默认显示三个看板：Provider（名称、类型、用量／余额、支持的模型）、官方 API 厂商状态列表、项目与会话快速恢复。宽屏上方并排显示 Provider 和状态，下方显示项目与会话；窄屏上下排列。
+
+界面用 [ratatui](https://ratatui.rs/) 绘制，订阅额度卡片单次使用一种用量图：
 
 - Braille 点阵：额度窗口之间留一行，依次显示名称、彩色点阵进度条、百分比和重置倒计时
 - `Canvas` 上的 `Circle` 和 `Line`：用量圆环
@@ -77,7 +79,7 @@ usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
 
-`usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)；当前这些资源通过 CLI 查询，首页迁移尚未完成。
+`usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)。首页的 Provider 看板展示名称、类型、用量／余额和接口模型列表；查询服务通过 `profile_ids` 或独立推理连接关联，也可复用正在跟随的 CC Switch 账号中已启用的内置查询配置。运行诊断继续使用 CLI。模型查询与首页操作见[首页中枢](docs/home-overview.md)。
 
 托管运行可以保存启动侧解析的模型、端点与资源关联，通过 `usage codex runs --json` 查看。`resources --run` 会核对启动时的连接版本和凭据，配置方法与解析边界见[运行资源关联](docs/run-resource-binding.md)。
 
@@ -95,9 +97,15 @@ TUI 按键：
 | `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
 | `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
-| `m` / `F10` | 打开功能菜单，选择额度、历史、会话或 Codex 账号管理；`m` 用于额度主页 |
+| `m` / `F10` | 打开功能菜单，选择首页、历史、会话或 Codex 账号管理；`m` 用于首页 |
 | `F4` | 管理 Codex BYOK/OAuth 账号配置、导入 CC Switch、打开独立实例 |
-| `j` / `k` | 滚动 |
+| `Tab` / `Shift+Tab` | 切换首页三个看板 |
+| `j` / `k` / `↑` / `↓` | Provider 看板滚动当前 Provider 的信息；其他看板选择厂商／项目／会话 |
+| `←` / `→` | Provider 看板切换不同 Provider；项目与会话看板内切换列表 |
+| `Enter` | Provider 看板展开／收起模型；厂商看板查看事件与历史；项目看板进入列表并恢复会话 |
+| `Esc` | 收起 Provider 模型或从厂商详情返回列表 |
+| `/` / `c` | 在项目与会话看板搜索／清除搜索 |
+| `R` | 切换会话恢复方式：自动、Ghostty 分屏、当前终端 |
 | `q` | 退出 |
 
 没有配置文件也能直接运行。默认每 60 秒刷新一次，三个工具都查询，样式是 Braille 进度条。Claude 使用暖色、Codex 使用蓝色、Grok 使用黑白。Claude 和 Codex 的用量达到 70% 时变橙色、90% 时变红色；Grok 始终保持黑白。旧配置中的 `style = "both"` 读取时会转成进度条。
@@ -115,7 +123,9 @@ grok = ""
 
 令牌过期时，界面会提示重新登录对应的 CLI。网络抖动或查询超时时保留上一份成功结果。TUI 空闲时按秒更新倒计时，查询结果和按键变化会立即重画。TUI 和一次性查询对单个工具最多等待 20 秒；Keychain 读取最多等待 10 秒。独立状态栏对单个工具最多等待 4 秒。
 
-首页用量卡片底部同步展示官方服务状态：Codex 对应 OpenAI，Claude Code 对应 Claude，Grok 对应 xAI。绿色表示官方正常，橙色表示降级或维护，红色表示故障；有未解决事件时显示数量和第一条标题。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
+首页 Provider 定时在后台更新用量与余额，刷新期间保留现有内容；连接未变化时复用模型列表。首次加载或推理连接变化后查询模型，按 `r` 可强制重新查询。返回首页、左右切换 Provider 或上下滚动不会重复请求未变化的模型列表。余额查询失败后显示本次错误，避免继续把旧金额当作当前余额。
+
+首页官方 API 看板以状态符号和文字独立列出 OpenAI、Claude、xAI/Grok。绿色表示官方正常，黄色表示降级，蓝色表示维护，红色表示故障；按 Enter 查看事件与最近查询历史。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
 
 数据直接来自 [OpenAI 官方 JSON](https://status.openai.com/api/v2/summary.json)（另读 `api/v2/incidents.json` 过滤已解决事件）、[Claude 官方 JSON](https://status.claude.com/api/v2/summary.json) 和 [xAI 官方 RSS](https://status.x.ai/feed.xml)。Grok 显示「未报告故障」表示 RSS 内没有未解决事件，不代表主动探测成功；OpenAI / Claude 是供应商整体状态，可能涉及你未使用的产品，也不保证单个账户的可用性。完整受影响组件和故障事件可用 `usage status` 或 `usage status --json` 查看；此命令不读取用量配置或登录文件，默认查询三个来源，`--providers` 支持 `openai` / `codex`、`claude` / `anthropic`、`grok` / `xai`。查询失败退出码为 1；供应商报告故障但查询成功时为 0。
 
@@ -231,7 +241,7 @@ CC Switch 自动导入支持原生 Responses API 的 Codex BYOK 配置，导入�
 
 ## TUI 贡献看板
 
-使用 `F1` / `F2` / `F3` 切换额度、历史、会话。主面板按 `h`，或运行 `usage history` / `usage dashboard`，进入终端内的历史用量看板。布局按“年度概览 → 贡献图 → 选中日期与近期用量”排列：来源筛选放在顶部，摘要显示当前范围的 Token、活跃日和缓存读取占比。切换页面会保留当前日期、来源、日/月视图，以及会话选择和搜索。
+使用 `F1` / `F2` / `F3` 切换首页、历史、会话。主面板按 `h`，或运行 `usage history` / `usage dashboard`，进入终端内的历史用量看板。布局按“年度概览 → 贡献图 → 选中日期与近期用量”排列：来源筛选放在顶部，摘要显示当前范围的 Token、活跃日和缓存读取占比。切换页面会保留当前日期、来源、日/月视图，以及会话选择和搜索。
 
 贡献图参考 [hindsight](https://github.com/chaosprint/hindsight) 的前景色小方块样式，列间留空，星期只标周一/周三/周五。蓝色阶按当前年份、当前来源的活跃用量划分，使峰值很高时较小用量也容易区分；零用量显示灰色方块，未来日期留空。选中日期显示 `▣`，下方集中展示输入、输出、缓存和来源分布。窄终端只显示选中日期附近的周；宽终端将选中日期明细与近期列表并排。
 
@@ -246,7 +256,7 @@ CC Switch 自动导入支持原生 Responses API 的 Codex BYOK 配置，导入�
 | 键 | 作用 |
 | --- | --- |
 | `0` / `1` / `2` / `3` | 全部 / Codex / Claude / Grok（在本次 `--providers` 范围内） |
-| `F1` / `F2` / `F3` | 额度 / 历史 / 会话 |
+| `F1` / `F2` / `F3` | 首页 / 历史 / 会话 |
 | `Tab` | 轮换来源筛选 |
 | `v` | 全年 / 今天 / 近 7 天 / 近 30 天 / 本月 |
 | `f` / `M` / `i` | 搜索并选择项目 / 模型 / 实例 |
@@ -353,7 +363,7 @@ Codex 账号保存、CC Switch 导入/跟随同步、配置校验、OAuth 凭据
 
 ## 扩展
 
-Agent 和资源服务分别通过工厂注册表扩展，再由 `hub::Hub` 组合成配置实例。Agent 提供启动与会话能力，资源适配器提供额度、余额或支出快照。现有界面通过兼容层继续使用统一用量快照。完整结构和迁移边界见 [Provider 架构](docs/provider-architecture.md)。
+Agent 和资源服务分别通过工厂注册表扩展，再由 `hub::Hub` 组合成配置实例。Agent 提供启动与会话能力，资源适配器提供额度、余额或支出快照。首页通过独立应用服务读取 Provider 目录、模型列表与类型化用量／余额；运行与资源核对读模型、资源 CLI 和原有订阅查询保持独立。完整结构和迁移边界见 [Provider 架构](docs/provider-architecture.md)。
 
 新增 Agent 实现 `AgentAdapter`，注册到 `AgentRegistry`；新增资源服务实现 `ResourceReader`，注册到 `ResourceRegistry`。注册 ID 重复会返回错误，不再静默覆盖。
 
