@@ -275,26 +275,6 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<(), ConfigError>
         .map_err(|error| ConfigError(format!("无法写入配置: {error}")))
 }
 
-pub fn write_style(path: &Path, style: &str) -> Result<(), ConfigError> {
-    ensure_style(style)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| ConfigError(format!("无法创建配置目录: {error}")))?;
-    }
-    if !path.exists() {
-        return std::fs::write(path, default_toml(style))
-            .map_err(|error| ConfigError(format!("无法写入配置: {error}")));
-    }
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| ConfigError(format!("无法读取配置: {error}")))?;
-    let mut doc: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|error| ConfigError(format!("配置不是合法的 TOML: {error}")))?;
-    doc["style"] = toml_edit::value(style);
-    std::fs::write(path, doc.to_string())
-        .map_err(|error| ConfigError(format!("无法写入配置: {error}")))
-}
-
 pub fn with_overrides(
     mut config: AppConfig,
     style: Option<&str>,

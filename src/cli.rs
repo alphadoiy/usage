@@ -30,7 +30,7 @@ struct Cli {
     /// 配置文件路径。默认 ~/.config/usage/config.toml
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
-    /// bar (Braille 进度条)、ring (圆环) 或 statusline (圆点状态栏)
+    /// --once 文本样式：bar (Braille 进度条)、ring (圆环) 或 statusline (圆点状态栏)
     #[arg(long)]
     style: Option<String>,
     /// 逗号分隔的提供方，例如 claude,codex

@@ -6,6 +6,65 @@ use std::process::{Command, Output, Stdio};
 include!("support/run_lifecycle.rs");
 include!("support/local_bark.rs");
 
+#[cfg(unix)]
+#[test]
+fn managed_launch_avoids_redundant_store_open_and_still_records_exit() {
+    let f = Fixture::new();
+    let account = f.add();
+    let binary = f.binary();
+    let before: std::collections::HashSet<_> = f.log_files().into_iter().collect();
+    success(
+        f.command(&[
+            "run",
+            &account,
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .env("CAPTURE_FILE", f.path.join("capture"))
+        .output()
+        .unwrap(),
+    );
+    let opens = f
+        .log_files()
+        .into_iter()
+        .filter(|file| !before.contains(file))
+        .flat_map(|file| {
+            fs::read_to_string(file)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| {
+            row["fields"]["event"] == "operation_started"
+                && row["span"]["operation"] == "codex.manager_open"
+        })
+        .count();
+    assert!(
+        opens <= 2,
+        "launch and finalization opened the store {opens} times"
+    );
+    let runs: serde_json::Value = serde_json::from_str(&f.run(&["runs", "--json"])).unwrap();
+    assert_eq!(runs.as_array().unwrap().len(), 1);
+    assert_eq!(runs[0]["exit_code"], 0);
+    assert!(runs[0]["finished_at"].is_string());
+}
+
+#[test]
+fn rejected_split_does_not_initialize_account_store() {
+    let f = Fixture::new();
+    let output = f
+        .command(&["run", "missing", "--split"])
+        .env_remove("GHOSTTY_RESOURCES_DIR")
+        .env("TERM_PROGRAM", "usage-test")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!f.path.join("manager").exists());
+}
+
 struct Fixture {
     path: PathBuf,
 }

@@ -145,23 +145,12 @@ pub struct ModelQuery {
 }
 
 fn endpoint(base: &str) -> Result<reqwest::Url, &'static str> {
-    let mut url = reqwest::Url::parse(base).map_err(|_| "模型接口地址无效")?;
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err("模型接口地址需为无凭据和查询参数的 HTTPS 地址（本机回环可用 HTTP）");
-    }
+    let mut url = crate::http::validate_api_base_url(base).map_err(|error| match error {
+        crate::http::BaseUrlError::Invalid => "模型接口地址无效",
+        crate::http::BaseUrlError::Policy => {
+            "模型接口地址需为无凭据和查询参数的 HTTPS 地址（本机回环可用 HTTP）"
+        }
+    })?;
     let path = url.path().trim_end_matches('/');
     let path = if path.is_empty() {
         "/v1/models".into()

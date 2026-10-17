@@ -6,6 +6,33 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+pub(crate) enum BaseUrlError {
+    Invalid,
+    Policy,
+}
+
+/// Shared API address policy. Each protocol still owns its endpoint path.
+pub(crate) fn validate_api_base_url(value: &str) -> Result<reqwest::Url, BaseUrlError> {
+    let url = reqwest::Url::parse(value).map_err(|_| BaseUrlError::Invalid)?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(BaseUrlError::Policy);
+    }
+    Ok(url)
+}
+
 #[derive(Debug, Clone)]
 pub struct TransportError(pub String);
 

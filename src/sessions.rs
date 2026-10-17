@@ -779,7 +779,21 @@ fn validate_resume(session: &Session) -> Result<(), String> {
 /// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
 pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
     validate_resume(session)?;
-    if let Some(agent) = &session.agent {
+    let agent = match &session.agent {
+        Some(agent) => Some(Arc::clone(agent)),
+        None if session.provider == AgentKind::CODEX => Some(
+            crate::agents::builtin_registry()
+                .create(
+                    "codex",
+                    crate::agents::AgentContext::Local {
+                        home: session.home.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    if let Some(agent) = agent {
         let program = session
             .provider
             .command()
@@ -797,40 +811,6 @@ pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, 
                 usage_config: None,
             })
             .map(|outcome| outcome.status);
-    }
-    if session.provider == AgentKind::CODEX
-        && let Some((profile, revision)) =
-            crate::codex_manager::binding_for_home(&session.home).map_err(|e| e.to_string())?
-    {
-        return crate::hub::spawn_managed_codex(
-            &crate::codex_manager::default_root(),
-            &profile,
-            Some(revision),
-            &crate::agents::SpawnRequest {
-                cwd: session.cwd.clone(),
-                program: "codex".into(),
-                args: Vec::new(),
-                resume: Some(session.id.clone()),
-                usage_config: None,
-            },
-        )
-        .map(|outcome| outcome.status);
-    }
-    if session.provider == AgentKind::CODEX {
-        use crate::agents::RunningAgent;
-        return crate::codex_manager::start_local_codex(
-            &session.home,
-            &crate::agents::SpawnRequest {
-                cwd: session.cwd.clone(),
-                program: "codex".into(),
-                args: Vec::new(),
-                resume: Some(session.id.clone()),
-                usage_config: None,
-            },
-        )
-        .map_err(|error| error.to_string())?
-        .wait()
-        .map(|outcome| outcome.status);
     }
     let mut parts = session.provider.command().split_whitespace();
     let program = parts.next().ok_or("恢复命令为空")?;

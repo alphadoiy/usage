@@ -64,8 +64,8 @@ usage --json          # 查询一次，打印 JSON
 usage status          # 查询 OpenAI、Claude、Grok 官方服务状态，无需登录
 usage status --providers openai,claude --json
 usage statusline --providers claude  # 给 Claude Code 等 agent 输出轻量状态栏
-usage --style ring    # 本次只用圆环
-usage --style statusline  # 本次使用圆点状态栏视图
+usage --once --style ring    # 本次文本查询使用圆环
+usage --once --style statusline  # 本次文本查询使用圆点状态栏视图
 usage --providers claude,codex
 usage history         # TUI 贡献看板（也可用 usage dashboard）
 usage history --providers codex,claude --monthly
@@ -90,10 +90,6 @@ TUI 按键：
 | 键 | 作用 |
 | --- | --- |
 | `r` | 刷新 |
-| `1` | Braille 进度条 |
-| `2` | 圆环（Canvas） |
-| `3` | 圆点状态栏 |
-| `s` | 把当前样式写进配置 |
 | `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
 | `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
@@ -108,7 +104,7 @@ TUI 按键：
 | `R` | 切换会话恢复方式：自动、Ghostty 分屏、当前终端 |
 | `q` | 退出 |
 
-没有配置文件也能直接运行。默认每 60 秒刷新一次，三个工具都查询，样式是 Braille 进度条。Claude 使用暖色、Codex 使用蓝色、Grok 使用黑白。Claude 和 Codex 的用量达到 70% 时变橙色、90% 时变红色；Grok 始终保持黑白。旧配置中的 `style = "both"` 读取时会转成进度条。
+没有配置文件也能直接运行。默认首页展示 Provider、厂商状态、项目与会话三个看板，每 60 秒刷新一次。`style` 配置用于 `--once` 的文本用量查询，默认使用 Braille 进度条；首页不再提供无视觉效果的样式切换与保存快捷键。文本查询中，Claude 使用暖色、Codex 使用蓝色、Grok 使用黑白。Claude 和 Codex 的用量达到 70% 时变橙色、90% 时变红色；Grok 始终保持黑白。旧配置中的 `style = "both"` 读取时会转成进度条。
 
 ```toml
 style = "bar"
@@ -326,7 +322,7 @@ path = "~/.claude-work"
 
 ## 状态栏
 
-`usage --style statusline` 是面板中的圆点 UI，适用于所有已注册工具。按 `3` 可以直接切换，按 `s` 保存。例如 `5小时  ● ● ● ● ● ○ ○ ○  57%  ⟳ 2h0m`。
+`usage --once --style statusline` 使用圆点文本视图，适用于所有已注册工具。可在配置文件中设置 `style = "statusline"` 作为文本查询的默认样式。例如 `5小时  ● ● ● ● ● ○ ○ ○  57%  ⟳ 2h0m`。
 
 另有 `usage statusline` 命令输出形态，适合嵌入 Claude Code 的底部状态栏。它读取 Claude Code 传入的 JSON，显示模型、上下文占用、目录和 Git 分支；若 JSON 已带额度窗口，直接使用这些数字。否则通过本工具的 provider 查询，并在 `~/.cache/usage/statusline.json` 缓存 60 秒。缓存只包含用量快照，不包含登录令牌。
 
@@ -383,4 +379,4 @@ factory.register("gemini", |ctx| Box::new(GeminiProvider::new(ctx)))?;
 registry.register("spark", "另一种", render_spark);
 ```
 
-注册之后，`--style`、配置文件和 TUI 都能选到它。
+注册之后，`--once --style` 和配置文件都能选择这种文本用量视图。

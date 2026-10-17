@@ -1,4 +1,4 @@
-//! 终端用量查询。界面使用 ratatui 的 Canvas 与 Braille 点阵。
+//! Agent 与 Provider 中枢：账号、资源查询和会话管理。
 
 pub mod agents;
 pub mod alerts;
@@ -12,7 +12,6 @@ pub mod hub;
 pub mod labels;
 pub mod logging;
 pub mod model;
-pub mod overview;
 pub mod plain;
 pub mod provider_catalog;
 pub mod providers;

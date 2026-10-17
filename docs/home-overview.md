@@ -79,7 +79,7 @@ New API 的标准账号接口需要 `accessToken` 与 `userId`。令牌接口则
 
 手动刷新取消上一轮查询，定时刷新和返回首页复用进行中的查询；返回结果按刷新代次与 Provider 身份匹配，重复、未知或过期结果不会覆盖当前目录。模型缓存按 Provider、推理端点和凭据指纹匹配，资源内容按 Provider、资源绑定和服务匹配；指纹不含明文密钥。更新失败后展示本次错误并清除失败项目的旧值，不冒充本次成功。配置加载失败会清除旧目录。退出 Dashboard 时取消查询任务。目录发现使用后台阻塞任务，终端事件循环不等待网络或本地账号扫描。
 
-Provider 看板展示资源状态，但不展示运行、项目、会话和启动时间。运行诊断仍可通过 `usage codex runs --json` 查看；显式资源余额和费用也可通过 `usage resources`、`usage resources --run <UUID>` 查看，参见[运行资源关联](run-resource-binding.md)。原 `OverviewService` 保留运行及资源核对读模型，首页不再消费它。
+Provider 看板展示资源状态，但不展示运行、项目、会话和启动时间。运行诊断仍可通过 `usage codex runs --json` 查看；显式资源余额和费用也可通过 `usage resources`、`usage resources --run <UUID>` 查看，参见[运行资源关联](run-resource-binding.md)。没有消费者的旧 `OverviewService` 已移除；运行及资源核对继续使用上述 CLI 和底层 Manager／资源服务。
 
 `--once`、顶层 `--json`、statusline 和订阅提醒继续使用原有用量路径；F2 历史、F3 会话和 F4 账号管理保留。项目与会话看板仍可恢复原实例，不受 Provider 模型列表查询结果影响。
 

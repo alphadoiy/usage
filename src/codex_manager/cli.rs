@@ -279,6 +279,58 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
             .map_err(Error::message)?;
             return Ok(outcome.status.code().unwrap_or(1));
         }
+        CodexCommand::Run {
+            profile,
+            cwd,
+            revision,
+            resume,
+            binary,
+            split,
+            worktree,
+            mut args,
+        } => {
+            if worktree {
+                args.push("--worktree".into());
+            }
+            if split {
+                let mut command =
+                    super::launch_shell_command(&profile, &cwd, revision, resume.as_deref())?;
+                command = super::with_usage_config(command, usage_config.as_deref())?;
+                command.push_str(" --binary ");
+                command.push_str(&super::shell_quote(&binary.to_string_lossy()));
+                if !args.is_empty() {
+                    command.push_str(" -- ");
+                    command.push_str(
+                        &args
+                            .iter()
+                            .map(|s| super::shell_quote(s))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+                crate::sessions::command_in_ghostty(&cwd, &command).map_err(Error::message)?;
+            } else {
+                // Preserve the launcher parent when SIGINT reaches the whole foreground group.
+                #[cfg(unix)]
+                let _interrupts =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+                let outcome = crate::hub::spawn_managed_codex(
+                    &super::default_root(),
+                    &profile,
+                    revision,
+                    &crate::agents::SpawnRequest {
+                        cwd,
+                        program: binary,
+                        args,
+                        resume,
+                        usage_config,
+                    },
+                )
+                .map_err(Error::message)?;
+                return Ok(outcome.status.code().unwrap_or(130));
+            }
+            return Ok(0);
+        }
         CodexCommand::Event => {
             super::runtime::callback();
             return Ok(0);
@@ -298,7 +350,8 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
         CodexCommand::ResumeLocal { .. }
         | CodexCommand::Event
         | CodexCommand::Notify { .. }
-        | CodexCommand::Bark { .. } => {
+        | CodexCommand::Bark { .. }
+        | CodexCommand::Run { .. } => {
             unreachable!()
         }
         CodexCommand::RunEvents { run, limit, json } => {
@@ -565,57 +618,6 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                     "已开启跟随"
                 }
             );
-        }
-        CodexCommand::Run {
-            profile,
-            cwd,
-            revision,
-            resume,
-            binary,
-            split,
-            worktree,
-            mut args,
-        } => {
-            if worktree {
-                args.push("--worktree".into());
-            }
-            if split {
-                let mut command =
-                    super::launch_shell_command(&profile, &cwd, revision, resume.as_deref())?;
-                command = super::with_usage_config(command, usage_config.as_deref())?;
-                command.push_str(" --binary ");
-                command.push_str(&super::shell_quote(&binary.to_string_lossy()));
-                if !args.is_empty() {
-                    command.push_str(" -- ");
-                    command.push_str(
-                        &args
-                            .iter()
-                            .map(|s| super::shell_quote(s))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
-                }
-                crate::sessions::command_in_ghostty(&cwd, &command).map_err(Error::message)?;
-            } else {
-                // Preserve the launcher parent when SIGINT reaches the whole foreground group.
-                #[cfg(unix)]
-                let _interrupts =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-                let outcome = crate::hub::spawn_managed_codex(
-                    manager.root(),
-                    &profile,
-                    revision,
-                    &crate::agents::SpawnRequest {
-                        cwd,
-                        program: binary,
-                        args,
-                        resume,
-                        usage_config,
-                    },
-                )
-                .map_err(Error::message)?;
-                return Ok(outcome.status.code().unwrap_or(130));
-            }
         }
         CodexCommand::Test { profile, request } => {
             let p = manager.resolve(&profile)?;

@@ -36,7 +36,7 @@ flowchart TD
 - `resources::ResourceRegistry`：登记 ChatGPT、Claude、Grok 官方订阅读取器，以及 New API 令牌/账号和 OpenAI 费用读取器。`ResourceSnapshot` 声明权限范围，区分配额窗口、余额、带时间范围的费用、支出和原始额度；余额保留十进制文本和币种，原始额度不自动转换成美元。
 - `hub::Hub`：通过 `ProviderDefinition` 创建配置实例，提供 `spawn`、`resources`、`sessions`。不支持的能力返回 `CapabilityError::Unsupported`；缺少凭据、凭据失效和网络失败由资源状态分别表达。
 - Codex CLI、账号 TUI、托管会话恢复经过 Hub 进入 Agent 启动适配器。`Provider::start` 返回 `RunningAgent`，原 `spawn` 保留等待行为。Manager 负责同步、密钥注入、OAuth 租约、Bark／事件注入和运行记录，句柄负责进程退出后的记录与回收。
-- 首页通过 `provider_catalog::CatalogService` 只读发现托管账号和显式推理连接，并以固定推理凭据获取模型列表；用量与余额通过独立资源计划读取，配置关联无需 Run。跟随 CC Switch 的账号可读取其已启用的内置用量参数。结果按刷新代次、Provider 与资源身份路由。`OverviewService` 保留运行和类型化资源核对读模型，首页不再调用它。
+- 首页通过 `provider_catalog::CatalogService` 只读发现托管账号和显式推理连接，并以固定推理凭据获取模型列表；用量与余额通过独立资源计划读取，配置关联无需 Run。跟随 CC Switch 的账号可读取其已启用的内置用量参数。结果按刷新代次、Provider 与资源身份路由。已移除没有消费者的旧 `OverviewService`；运行诊断与资源核对继续通过 Manager、`runs` 和 `resources --run` 提供。
 - 原用量工厂通过资源适配器的 `legacy_usage` 能力继续支持现有 CLI、JSON、TUI 和主动重置；新余额服务只实现 `ResourceReader` 即可，不需要伪造百分比。
 - 内置会话目录使用 Agent 注册表创建对应 Home 的读取器，并在 Session 上保留该 Agent；当前终端恢复委托其 Launcher。复制命令与 Ghostty 分屏使用 Launcher 显式提供的命令导出能力，不支持时返回错误。原 `SessionRegistry::register` 仍支持仅有 loader 的旧来源。
 - `Provider::sessions()` 从实例的 AgentContext 解析 Home，并将 Provider ID 作为会话实例身份，调用方不能替换为其他账号目录。
@@ -71,3 +71,13 @@ flowchart TD
 6. 将历史读取、数据目录发现、统一缓存调度等剩余职责迁入对应能力和应用服务。
 
 扩展的集成测试使用自定义 Agent、非 UUID 会话和只提供余额的资源适配器，验证无需修改内置分派。真实子进程测试并行启动同一账号的两个配置版本，验证独立运行 ID 和版本记录。已有 Bark/OAuth 回归继续覆盖原启动保证。
+
+## 结构收敛（2026-10-18）
+
+移除首页迁移后没有消费者的旧 `overview` 模块及其专用测试。Provider 目录仍使用 `CatalogService`，运行记录与资源身份证明继续由 Manager 和 `runs` 处理。工厂、注册表、订阅兼容能力及来源／缓存隔离边界保持原职责。
+
+模型目录与 API 资源共用 HTTP 层的地址校验，各自保留端点路径规则及错误文案。没有附带 Agent 的旧 Codex Session 在恢复时补建内置 Agent，之后统一调用 Launcher；Home、账号版本、Bark 和自定义启动适配器仍由启动器处理。CLI 的 `run` 在打开 Manager 前分派，避免提前创建或重复初始化账号库；启动和退出记录保留各自所需的存储操作。
+
+首页移除遗留的额度样式状态、1/2/3/s 快捷键、保存函数和无用途的绘制转发。`style` 配置与 `--once --style` 文本输出继续可用。
+
+本轮验证：隔离账号目录后，298 项 Rust 回归通过（移除旧模块的 6 项专用测试，新增 2 项启动／分屏回归）；Clippy 全 target、格式和差异检查通过。公共消融执行器的 4 项 Python 测试覆盖环境隔离、嵌套测试计数、无效实验拒绝、日志保留及恢复输入核验。两份脚本的全部 35 个变体锚点通过；实际执行确认提前打开 Manager 会触发 2 项回归、取消事务会触发孤立运行记录回归，重复上下文读取对照仍通过。历史 JSON 报告保留原始结果。

@@ -13,27 +13,15 @@ pub(super) fn invalid() -> QueryFailure {
 }
 
 pub(super) fn validate_base_url(value: &str) -> Result<reqwest::Url, RegistryError> {
-    let mut url = reqwest::Url::parse(value)
-        .map_err(|_| RegistryError::Factory("资源 base_url 必须为绝对 HTTP(S) URL".into()))?;
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(RegistryError::Factory(
-            "资源 base_url 需使用 HTTPS（本机回环可用 HTTP），且不能包含凭据、查询参数或片段"
-                .into(),
-        ));
-    }
+    let mut url = crate::http::validate_api_base_url(value).map_err(|error| {
+        RegistryError::Factory(match error {
+            crate::http::BaseUrlError::Invalid => "资源 base_url 必须为绝对 HTTP(S) URL".into(),
+            crate::http::BaseUrlError::Policy => {
+                "资源 base_url 需使用 HTTPS（本机回环可用 HTTP），且不能包含凭据、查询参数或片段"
+                    .into()
+            }
+        })
+    })?;
     let path = format!("{}/", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url)

@@ -19,7 +19,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 use tokio::runtime::Handle;
 
-use crate::config::{AppConfig, ConfigError, home_dir, write_style};
+use crate::config::{AppConfig, home_dir};
 use crate::model::UsageSnapshot;
 use crate::providers::{
     ProviderError, QUERY_TIMEOUT, ResetPreview, UsageProvider, query_with_timeout,
@@ -30,7 +30,6 @@ use crate::ui::history::{self, HistoryPanel};
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{self, Focus, SessionBrowser};
 use crate::ui::widgets::accent;
-use crate::view::builtin_styles;
 
 struct RefreshEvent {
     generation: u64,
@@ -346,10 +345,6 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
                         KeyCode::Char('r') => app.refresh(&handle),
-                        KeyCode::Char('1') => app.set_style("bar"),
-                        KeyCode::Char('2') => app.set_style("ring"),
-                        KeyCode::Char('3') => app.set_style("statusline"),
-                        KeyCode::Char('s') => app.save_style(),
                         KeyCode::Char('x') => app.open_reset(&handle),
                         KeyCode::Char('p') => {
                             app.browser_filter = None;
@@ -462,7 +457,6 @@ struct Dashboard {
     resume_request: Option<sessions::Session>,
     providers: Vec<Arc<dyn UsageProvider>>,
     cards: Vec<CardSlot>,
-    style_name: String,
     refresh_seconds: u64,
     config_path: std::path::PathBuf,
     status: String,
@@ -568,7 +562,6 @@ impl Dashboard {
                 warning: None,
             })
             .collect();
-        let styles = builtin_styles();
         Self {
             home_activity: HashMap::new(),
             home_activity_error: None,
@@ -621,8 +614,7 @@ impl Dashboard {
             resume_request: None,
             providers,
             cards,
-            status: format!("百分比是已用额度 · {}", styles.label(&config.style)),
-            style_name: config.style,
+            status: "Provider · 厂商状态 · 项目会话".into(),
             refresh_seconds: config.refresh_seconds,
             config_path,
             generation: 0,
@@ -941,19 +933,6 @@ impl Dashboard {
                 self.launch_session(session, mode, false, handle);
             }
             _ => {}
-        }
-    }
-
-    fn set_style(&mut self, style_name: &str) {
-        self.style_name = style_name.to_string();
-        let label = builtin_styles().label(style_name);
-        self.status = format!("当前样式：{label}。按 s 写入配置");
-    }
-
-    fn save_style(&mut self) {
-        match write_style(&self.config_path, &self.style_name) {
-            Ok(()) => self.notice = Some(format!("已写入 {}", self.config_path.display())),
-            Err(ConfigError(message)) => self.notice = Some(message),
         }
     }
 
@@ -1777,8 +1756,7 @@ impl Dashboard {
                     .iter()
                     .filter(|card| card.warning.is_some())
                     .count();
-                let label = builtin_styles().label(&self.style_name);
-                self.status = format!("已更新 {ok}/{} 个工具 · {label}", self.cards.len());
+                self.status = format!("已更新 {ok}/{} 个订阅", self.cards.len());
                 if warned > 0 {
                     self.status.push_str(&format!(" · {warned} 个沿用上次结果"));
                 }
@@ -1863,7 +1841,7 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
             session_browser::render(body, frame.buffer_mut(), browser);
         }
     } else {
-        draw_cards(frame, body, app);
+        render_home(body, frame.buffer_mut(), app);
     }
     let footer_text = if app.history.is_some() {
         if frame.area().width >= 105 {
@@ -1967,10 +1945,6 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
     Paragraph::new(lines.join("\n"))
         .wrap(Wrap { trim: true })
         .render(inner, frame.buffer_mut());
-}
-
-fn draw_cards(frame: &mut Frame, area: Rect, app: &Dashboard) {
-    render_home(area, frame.buffer_mut(), app);
 }
 
 fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
@@ -2622,27 +2596,23 @@ mod tests {
         assert_eq!(app.pending, 0);
         assert!(!app.cards[0].snapshot.as_ref().unwrap().success);
         let time = app.service_statuses["claude"].fetched_at;
-        for style in ["bar", "ring", "statusline"] {
-            app.style_name = style.into();
-            for width in [28, 72, 110] {
-                let area = Rect::new(0, 0, width, 32);
-                let mut buffer = Buffer::empty(area);
-                render_home(area, &mut buffer, &app);
-                let text = buffer
-                    .content
-                    .iter()
-                    .map(|c| c.symbol())
-                    .collect::<String>();
-                let compact = text.split_whitespace().collect::<String>();
-                assert!(compact.contains("Claude·正常"), "{style} {width}: {text}");
-            }
+        for width in [28, 72, 110] {
+            let area = Rect::new(0, 0, width, 32);
+            let mut buffer = Buffer::empty(area);
+            render_home(area, &mut buffer, &app);
+            let text = buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            let compact = text.split_whitespace().collect::<String>();
+            assert!(compact.contains("Claude·正常"), "{width}: {text}");
         }
         app.service_http = Arc::new(crate::http::FakeHttp::new());
         app.refresh_service_statuses(&Handle::current());
         drain_until(&mut app, |a| a.service_pending == 0).await;
         assert_eq!(app.service_statuses["claude"].fetched_at, time);
         assert!(app.service_statuses["claude"].stale);
-        app.style_name = "bar".into();
         let area = Rect::new(0, 0, 72, 32);
         let mut buffer = Buffer::empty(area);
         render_home(area, &mut buffer, &app);
