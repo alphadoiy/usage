@@ -101,6 +101,7 @@ enum ResetStage {
 
 struct ResetFlow {
     provider_id: String,
+    provider: Arc<dyn UsageProvider>,
     target: String,
     provider_name: String,
     generation: u64,
@@ -1319,22 +1320,26 @@ impl Dashboard {
     }
 
     fn open_reset(&mut self, handle: &Handle) {
-        let Some(provider) = self
-            .providers
-            .iter()
-            .find(|provider| provider.reset().is_some())
+        let Some((_, selected)) =
+            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
         else {
-            self.notice = Some("当前没有支持主动重置的工具".into());
+            self.notice = Some("请先选择首页 Provider".into());
             return;
         };
-        let provider = Arc::clone(provider);
+        let Some(reset) = &selected.usage.reset else {
+            self.notice = Some(format!("{} 不支持主动重置", selected.name));
+            return;
+        };
+        let provider = reset.provider();
+        let provider_name = selected.name.clone();
         self.notice = None;
         self.reset_generation = self.reset_generation.wrapping_add(1);
         let generation = self.reset_generation;
         self.reset = Some(ResetFlow {
             provider_id: provider.id().into(),
             target: provider.cache_key(),
-            provider_name: provider.display_name().into(),
+            provider_name,
+            provider: provider.clone(),
             generation,
             stage: ResetStage::Loading,
         });
@@ -1370,16 +1375,7 @@ impl Dashboard {
         let Some(flow) = self.reset.as_mut() else {
             return;
         };
-        let Some(provider) = self
-            .providers
-            .iter()
-            .find(|provider| provider.cache_key() == flow.target)
-            .cloned()
-        else {
-            self.reset = None;
-            self.notice = Some("找不到主动重置工具".into());
-            return;
-        };
+        let provider = flow.provider.clone();
         let generation = flow.generation;
         flow.stage = ResetStage::Consuming;
         let tx = self.tx.clone();
@@ -1603,6 +1599,12 @@ impl Dashboard {
                         .is_some_and(|flow| flow.generation == generation)
                     {
                         changed = true;
+                        if let Ok(preview) = &result
+                            && let Some(flow) = &self.reset
+                            && let Some(catalog) = &mut self.overview
+                        {
+                            catalog.apply_reset_credits(&flow.target, preview.available);
+                        }
                         match result {
                             Ok(preview) if preview.available > 0 => {
                                 if let Some(flow) = &mut self.reset {
@@ -1865,7 +1867,7 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
             None if app.home_sessions.launching => " 正在恢复会话，请等待…",
             None => match app.home_focus {
                 super::home::Focus::Providers => {
-                    " Tab 看板  ←/→ 切换 Provider  ↑/↓ 滚动信息  Enter 展开/收起模型  r 刷新  F4 管理  q 退出"
+                    " Tab 看板  ←/→ Provider  ↑/↓ 滚动  Enter 模型  x 当前账号重置  r 刷新  F4 管理  q 退出"
                 }
                 super::home::Focus::Connections => {
                     if app.home_connections.is_details() {
@@ -2166,8 +2168,33 @@ mod tests {
             isolated_config(),
             "/tmp/usage-reset-test.toml".into(),
         );
+        app.overview = Some(reset_catalog(&app.providers));
         app.service_http = Arc::new(crate::http::FakeHttp::new());
         app
+    }
+
+    fn reset_catalog(providers: &[Arc<dyn UsageProvider>]) -> crate::provider_catalog::Catalog {
+        use crate::provider_catalog::{
+            Catalog, Models, Provider, ProviderKind, ProviderUsage, ResetHandle,
+        };
+        Catalog {
+            providers: providers
+                .iter()
+                .map(|provider| Provider {
+                    id: provider.cache_key(),
+                    name: provider.display_name().into(),
+                    agent: Some("Codex".into()),
+                    kind: ProviderKind::Subscription,
+                    configured_model: None,
+                    models: Models::Ready(Vec::new()),
+                    usage: ProviderUsage {
+                        reset: ResetHandle::new(provider.clone()),
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     async fn drain_until(
@@ -2454,7 +2481,7 @@ mod tests {
             vec![
                 Arc::new(ResetTestProvider {
                     target: "a",
-                    available: 2,
+                    available: 0,
                     consumed: first.clone(),
                 }),
                 Arc::new(ResetTestProvider {
@@ -2466,17 +2493,19 @@ mod tests {
             isolated_config(),
             "/tmp/usage-reset-accounts.toml".into(),
         );
-        app.reset = Some(ResetFlow {
-            provider_id: "codex".into(),
-            target: "b".into(),
-            provider_name: "Codex".into(),
-            generation: 0,
-            stage: ResetStage::Confirm(ResetPreview {
-                available: 2,
-                next_expires_at: None,
-                account_label: Some("b".into()),
-            }),
-        });
+        app.overview = Some(reset_catalog(&app.providers));
+        app.home_provider = Some("b".into());
+        app.open_reset(&Handle::current());
+        drain_until(&mut app, |app| {
+            app.reset
+                .as_ref()
+                .is_some_and(|flow| matches!(flow.stage, ResetStage::Confirm(_)))
+        })
+        .await;
+        assert_eq!(app.reset.as_ref().unwrap().target, "b");
+        // A selection change or legacy-list replacement cannot retarget an open confirmation.
+        app.home_provider = Some("a".into());
+        app.providers.clear();
         app.handle_reset_key(KeyCode::Char('y'), &Handle::current());
         drain_until(&mut app, |app| app.reset.is_none()).await;
         assert_eq!(first.load(Ordering::SeqCst), 0);
@@ -2494,10 +2523,91 @@ mod tests {
     }
 
     #[test]
+    fn reset_never_falls_back_to_default_when_home_provider_is_missing_or_unsupported() {
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let mut app = reset_dashboard(2, consumed.clone());
+        app.overview = None;
+        // No task is spawned on either rejection path.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        app.open_reset(runtime.handle());
+        assert!(app.reset.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("选择首页 Provider"));
+        let mut catalog = reset_catalog(&app.providers);
+        catalog.providers[0].usage.reset = None;
+        app.overview = Some(catalog);
+        app.open_reset(runtime.handle());
+        assert!(app.reset.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("不支持主动重置"));
+        assert_eq!(consumed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reset_preview_updates_only_its_provider_board_including_zero() {
+        use crate::provider_catalog::{QueryState, UsageSource};
+        use crate::resources::{
+            ResourceBinding, ResourceMetric, ResourceScope, ResourceSnapshot, ResourceState,
+        };
+        for (available, initial) in [(2, 0), (0, 2)] {
+            let mut app = reset_dashboard(available, Arc::new(AtomicUsize::new(0)));
+            let catalog = app.overview.as_mut().unwrap();
+            catalog.providers[0].usage.sources.push(UsageSource {
+                target: "codex".into(),
+                label: "官方订阅额度".into(),
+                service: "chatgpt_subscription".into(),
+                binding: ResourceBinding {
+                    account: "codex".into(),
+                    revision: "1".into(),
+                },
+                state: QueryState::Result(ResourceSnapshot {
+                    binding: ResourceBinding {
+                        account: "codex".into(),
+                        revision: "1".into(),
+                    },
+                    service: "chatgpt_subscription".into(),
+                    scope: ResourceScope::Account,
+                    state: ResourceState::Ready,
+                    metrics: vec![ResourceMetric::ResetCredits { available: initial }],
+                    queried_at: Some(Utc::now()),
+                    message: None,
+                }),
+            });
+            let mut other = catalog.providers[0].clone();
+            other.id = "other".into();
+            other.usage.sources[0].target = "other".into();
+            catalog.providers.push(other);
+            let text = |app: &Dashboard| {
+                crate::ui::overview::lines(app.overview.as_ref(), false, None, true, Some("codex"))
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            };
+            assert!(text(&app).contains(&format!("主动重置 {initial} 次")));
+            app.open_reset(&Handle::current());
+            drain_until(&mut app, |app| {
+                app.reset
+                    .as_ref()
+                    .is_none_or(|flow| matches!(flow.stage, ResetStage::Confirm(_)))
+            })
+            .await;
+            assert!(text(&app).contains(&format!("主动重置 {available} 次")));
+            let QueryState::Result(other) =
+                &app.overview.as_ref().unwrap().providers[1].usage.sources[0].state
+            else {
+                panic!("other provider lost its snapshot")
+            };
+            assert!(
+                matches!(other.metrics.as_slice(), [ResourceMetric::ResetCredits { available }] if *available == initial)
+            );
+        }
+    }
+
+    #[test]
     fn reset_confirmation_is_visible_over_dashboard() {
         let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
         app.reset = Some(ResetFlow {
             provider_id: "codex".into(),
+            provider: app.providers[0].clone(),
             target: "codex".into(),
             provider_name: "Codex".into(),
             generation: 1,
@@ -2566,6 +2676,7 @@ mod tests {
         let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
         app.reset = Some(ResetFlow {
             provider_id: "codex".into(),
+            provider: app.providers[0].clone(),
             target: "codex".into(),
             provider_name: "Codex".into(),
             generation: 1,
@@ -3252,6 +3363,7 @@ options={user_id=1}
                 state: QueryState::Loading,
             }],
             hint: None,
+            reset: None,
         };
         let mut app = dashboard();
         app.overview = Some(catalog);
@@ -3338,7 +3450,7 @@ options={user_id=1}
             agent: Some("Codex".into()),
             kind: ProviderKind::Subscription,
             configured_model: None,
-            models: Models::Unavailable("OAuth 订阅未接入模型列表接口".into()),
+            models: Models::Unavailable("OAuth 模型列表认证失败或权限不足".into()),
             usage: Default::default(),
         });
         app.overview = Some(catalog);

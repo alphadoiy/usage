@@ -64,6 +64,12 @@ pub(super) fn lines(
         lines.push(Line::from(format!("{}{}", clean(&provider.name), agent)).bold());
         lines.push(Line::from(format!("类型：{}", provider.kind.label())).dim());
         lines.extend(usage_lines(&provider.usage, expanded));
+        if provider.usage.reset.is_some() && !provider.usage.sources.iter().any(|source| {
+            matches!(&source.state, QueryState::Result(snapshot) if snapshot.metrics.iter().any(|metric|
+                matches!(metric, ResourceMetric::ResetCredits { .. })))
+        }) {
+            lines.push(Line::from("主动重置：次数未返回 · x 查询").dim());
+        }
         if let Some(model) = &provider.configured_model {
             lines.push(Line::from(format!("默认模型（配置）：{}", clean(model))).dim());
         }
@@ -132,6 +138,9 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                 }
                 for metric in &snapshot.metrics {
                     let text = match metric {
+                        ResourceMetric::ResetCredits { available } => {
+                            format!("主动重置 {available} 次 · x 查询／重置")
+                        }
                         ResourceMetric::Balance { remaining } => {
                             format!(
                                 "余额 {} {}{}",

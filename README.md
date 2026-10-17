@@ -79,7 +79,7 @@ usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
 
-`usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)。首页的 Provider 看板展示名称、类型、用量／余额和接口模型列表；查询服务通过 `profile_ids` 或独立推理连接关联，也可复用正在跟随的 CC Switch 账号中已启用的内置查询配置。运行诊断继续使用 CLI。模型查询与首页操作见[首页中枢](docs/home-overview.md)。
+`usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)。首页的 Provider 看板展示名称、类型、用量／余额和接口模型列表，托管 Codex OAuth 账号使用自身登录查询订阅模型；查询服务通过 `profile_ids` 或独立推理连接关联，也可复用正在跟随的 CC Switch 账号中已启用的内置查询配置。运行诊断继续使用 CLI。模型查询与首页操作见[首页中枢](docs/home-overview.md)。
 
 托管运行可以保存启动侧解析的模型、端点与资源关联，通过 `usage codex runs --json` 查看。`resources --run` 会核对启动时的连接版本和凭据，配置方法与解析边界见[运行资源关联](docs/run-resource-binding.md)。
 
@@ -90,7 +90,7 @@ TUI 按键：
 | 键 | 作用 |
 | --- | --- |
 | `r` | 刷新 |
-| `x` | 查看 Codex 可用的主动重置次数，确认后重置当前 5 小时额度 |
+| `x` | 查询首页当前 Provider 的主动重置次数，确认后重置其 5 小时额度 |
 | `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
 | `m` / `F10` | 打开功能菜单，选择首页、历史、会话或 Codex 账号管理；`m` 用于首页 |
@@ -129,7 +129,7 @@ grok = ""
 
 如需浏览更多 AI 服务，可参考 [aistatus.page](https://aistatus.page/)（OpenAI、Anthropic、Gemini、xAI、Cursor、Perplexity、Midjourney 的官方源聚合）或 [LLM Status](https://llm.status.compare/)；本程序直接读取上述官方源。
 
-Codex 的用量响应若提供主动重置次数，卡片会显示剩余次数。按 `x` 后会向 Codex 查询最新次数和最近到期时间；确认框显示当前账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。Claude Code 和 Grok 没有主动重置入口。
+Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板会显示剩余次数（包括 0）；未返回次数时提示按 `x` 查询，不把未知显示为 0。按 `x` 查询首页当前选中 Provider 的最新次数和最近到期时间，同时更新其已加载的看板次数。查询与确认都绑定该 Provider 的独立账号目录，不回退到默认登录或 Keychain。确认框显示 Provider 名称与账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消；打开确认后目标固定。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。BYOK、Claude Code 和 Grok 没有主动重置入口。
 
 按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 索引，无法打开时改读本机会话日志。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
@@ -166,7 +166,9 @@ BYOK 每次编辑或源配置更新生成新版本。不同账号、不同版本
 
 ### ChatGPT OAuth 账号
 
-在账号管理页按 `a`，选择「OAuth · 登录 ChatGPT」，填写名称，再选择浏览器登录或设备码登录。也可以选择「导入 OAuth」并指定官方 `auth.json` 或 Cockpit Tools 的单账号 JSON；界面只展示邮箱、套餐和账号 ID，预览后按 `Enter` 保存。列表显示账号的 OAuth / BYOK 类型及 OAuth 身份；按 `l` 重新登录，登录到另一个用户或工作区时会拒绝替换原账号。
+在账号管理页按 `a`，选择「OAuth · 登录 ChatGPT」，直接选择浏览器登录或设备码登录，授权成功后自动使用 OAuth 凭据中的邮箱作为账号名称。也可以选择「导入 OAuth」并指定官方 `auth.json` 或 Cockpit Tools 的单账号 JSON；界面只展示邮箱、套餐和账号 ID，预览后按 `Enter` 保存。列表显示账号的 OAuth / BYOK 类型及 OAuth 身份；按 `l` 重新登录，登录到另一个用户或工作区时会拒绝替换原账号。
+
+CLI 与账号管理页共用认证注册表和登录任务，显示准备、等待授权、保存及最终结果；原生 CLI 直接展示授权链接或设备码。授权过程中按 `Ctrl+C` 取消，CLI 退出码为 `130`，账号管理页返回列表。保存开始后等待提交结果，避免中途取消造成账号状态不明。准备阶段的 CLI 版本检查最多等待 10 秒，取消会在检查返回后生效。
 
 ```bash
 usage codex login personal

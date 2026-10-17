@@ -45,6 +45,7 @@ impl Identity {
 pub struct Auth {
     pub identity: Identity,
     bytes: Vec<u8>,
+    pub(super) access_token: String,
 }
 fn jwt_claims(token: &str) -> Value {
     token
@@ -151,7 +152,11 @@ fn parse_auth(bytes: &[u8]) -> Result<Auth> {
     let bytes = serde_json::to_vec_pretty(&json!({"auth_mode":"chatgpt", "OPENAI_API_KEY":null,
         "tokens":{"id_token":id_token,"access_token":access_token,"refresh_token":refresh_token,"account_id":identity.account_id},
         "last_refresh":last_refresh})).map_err(|_| Error::message("无法保存登录凭据"))?;
-    Ok(Auth { identity, bytes })
+    Ok(Auth {
+        identity,
+        bytes,
+        access_token,
+    })
 }
 
 pub fn read_auth(path: &Path) -> Result<Auth> {
@@ -275,6 +280,33 @@ struct Stage(PathBuf);
 impl Drop for Stage {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Own the login subprocess and, for task-based login, its private process group.
+struct LoginChild {
+    child: std::process::Child,
+    #[cfg(unix)]
+    grouped: bool,
+}
+impl LoginChild {
+    fn stop(&mut self) {
+        #[cfg(unix)]
+        if self.grouped {
+            // The child is unreaped and was spawned into this new process group.
+            unsafe {
+                libc::killpg(self.child.id() as i32, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl Drop for LoginChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.stop();
+        }
     }
 }
 
@@ -468,6 +500,30 @@ impl Manager {
         program: &Path,
         account: Option<&str>,
     ) -> Result<Profile> {
+        self.login_oauth_inner(name, text, device_auth, program, account, None)
+    }
+
+    pub(crate) fn login_oauth_controlled(
+        &mut self,
+        name: Option<&str>,
+        text: Option<&str>,
+        device_auth: bool,
+        program: &Path,
+        account: Option<&str>,
+        control: &crate::auth::AuthControl,
+    ) -> Result<Profile> {
+        self.login_oauth_inner(name, text, device_auth, program, account, Some(control))
+    }
+
+    fn login_oauth_inner(
+        &mut self,
+        name: Option<&str>,
+        text: Option<&str>,
+        device_auth: bool,
+        program: &Path,
+        account: Option<&str>,
+        control: Option<&crate::auth::AuthControl>,
+    ) -> Result<Profile> {
         logging::operation("codex.oauth_login", |op| {
             op.begin("input_validate");
             if let Some(name) = name {
@@ -475,6 +531,11 @@ impl Manager {
             }
             let config = normalize_config(text.unwrap_or(""))?;
             op.step("cli_version_detect", || verify_cli_version(program))?;
+            if let Some(control) = control {
+                control
+                    .checkpoint()
+                    .map_err(|error| Error::message(error.to_string()))?;
+            }
             // Check busy state before asking the user to sign in; reserve this account throughout login.
             let target = account.map(|s| self.resolve(s)).transpose()?;
             if target
@@ -505,19 +566,62 @@ impl Manager {
             if device_auth {
                 cmd.arg("--device-auth");
             }
+            #[cfg(unix)]
+            let grouped = {
+                use std::io::IsTerminal;
+                // An interactive child must remain in the foreground group to read the TTY.
+                control.is_some() && !std::io::stdin().is_terminal()
+            };
+            #[cfg(unix)]
+            if grouped {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
             op.begin("native_login");
-            let status = cmd.status().map_err(|_| {
-                Error::message("无法启动 Codex 登录；请安装 codex 或使用 --binary 指定路径")
-            })?;
+            if let Some(control) = control {
+                control
+                    .waiting()
+                    .map_err(|error| Error::message(error.to_string()))?;
+            }
+            let mut child = LoginChild {
+                child: cmd.spawn().map_err(|_| {
+                    Error::message("无法启动 Codex 登录；请安装 codex 或使用 --binary 指定路径")
+                })?,
+                #[cfg(unix)]
+                grouped,
+            };
+            let status = loop {
+                if control.is_some_and(|control| control.checkpoint().is_err()) {
+                    child.stop();
+                    tracing::info!(event = "login_cancelled");
+                    return Err(Error::message("登录已取消"));
+                }
+                if let Some(status) = child.child.try_wait()? {
+                    break status;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            };
             tracing::info!(
                 event = "login_child_exited",
                 successful = status.success(),
                 exit_code = status.code()
             );
             if !status.success() {
+                #[cfg(unix)]
+                if let Some(control) = control {
+                    use std::os::unix::process::ExitStatusExt;
+                    if status.signal() == Some(libc::SIGINT) {
+                        control.cancel();
+                    }
+                }
                 return Err(Error::message("Codex 登录未完成；已有账号及登录保持原样"));
             }
             let auth = op.step("auth_read", || read_auth(&stage.0.join("auth.json")))?;
+            if let Some(control) = control {
+                control
+                    .begin_save()
+                    .map_err(|error| Error::message(error.to_string()))?;
+            }
             op.step("account_save", || {
                 self.save_oauth(name, text, auth, account, lease)
             })

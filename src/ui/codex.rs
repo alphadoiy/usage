@@ -18,7 +18,6 @@ struct Form {
 }
 enum Prompt {
     AddType,
-    OAuthName(String),
     LoginMethod(String, Option<String>),
     AuthSource(String),
     AuthImport(PathBuf, oauth::Identity),
@@ -134,7 +133,7 @@ pub fn run_with_config(handle: Handle, usage_config: Option<PathBuf>) -> io::Res
                         KeyCode::Esc => {}
                         KeyCode::Char('b') | KeyCode::Char('1') => form = Some(byok_form()),
                         KeyCode::Char('o') | KeyCode::Char('2') => {
-                            prompt = Some(Prompt::OAuthName(String::new()))
+                            prompt = Some(Prompt::LoginMethod(String::new(), None))
                         }
                         KeyCode::Char('i') | KeyCode::Char('3') => {
                             prompt = Some(Prompt::AuthSource(
@@ -145,22 +144,6 @@ pub fn run_with_config(handle: Handle, usage_config: Option<PathBuf>) -> io::Res
                             ))
                         }
                         _ => prompt = Some(Prompt::AddType),
-                    },
-                    Prompt::OAuthName(mut name) => match key.code {
-                        KeyCode::Esc => {}
-                        KeyCode::Enter if !name.trim().is_empty() => {
-                            prompt = Some(Prompt::LoginMethod(name, None))
-                        }
-                        code => {
-                            if code == KeyCode::Char('u')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                name.clear();
-                            } else if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                                edit_input(&mut name, code);
-                            }
-                            prompt = Some(Prompt::OAuthName(name));
-                        }
                     },
                     Prompt::LoginMethod(name, account) => {
                         if [
@@ -177,17 +160,35 @@ pub fn run_with_config(handle: Handle, usage_config: Option<PathBuf>) -> io::Res
                             ratatui::restore();
                             let result = {
                                 let _runtime = handle.enter();
-                                #[cfg(unix)]
-                                let _interrupts = tokio::signal::unix::signal(
-                                    tokio::signal::unix::SignalKind::interrupt(),
-                                )?;
-                                manager.login_oauth(
-                                    Some(&name),
-                                    None,
-                                    device,
-                                    std::path::Path::new("codex"),
-                                    account.as_deref(),
-                                )
+                                let adapter = crate::hub::Hub::default().authentication(
+                                    crate::auth::AuthSpec {
+                                        service: "codex_oauth".into(),
+                                        context: crate::auth::AuthContext {
+                                            root: manager.root().into(),
+                                            account,
+                                        },
+                                    },
+                                );
+                                adapter
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|adapter| {
+                                        handle
+                                            .block_on(crate::auth::run_in_terminal(
+                                                adapter.as_ref(),
+                                                crate::auth::AuthRequest {
+                                                    name: (!name.trim().is_empty()).then_some(name),
+                                                    config: None,
+                                                    program: "codex".into(),
+                                                    method: if device {
+                                                        crate::auth::AuthMethod::DEVICE_CODE.id
+                                                    } else {
+                                                        crate::auth::AuthMethod::BROWSER.id
+                                                    }
+                                                    .into(),
+                                                },
+                                            ))
+                                            .map_err(|error| error.to_string())
+                                    })
                             };
                             terminal = ratatui::try_init().map_err(io::Error::other)?;
                             notice = result
@@ -608,8 +609,7 @@ fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
 fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
     let (title, text) = match prompt {
         Prompt::AddType => ("添加 Codex 账号", "1 / b  BYOK · API Key 和自定义 API\n\n2 / o  OAuth · 登录 ChatGPT\n\n3 / i  导入 OAuth · auth.json / Cockpit 单账号文件\n\nEsc 返回".into()),
-        Prompt::OAuthName(name) => ("OAuth 账号名称",format!("{name}\n\nEnter 选择登录方式 · Ctrl+U 清空 · Esc 取消")),
-        Prompt::LoginMethod(name,_) => ("ChatGPT 登录方式",format!("账号：{name}\n\n1 / b / Enter  浏览器登录\n2 / d  设备码登录（需账号启用设备授权）\n\n凭据保存在独立账号目录，Codex 自动刷新。\n同账号可多开，共用登录；运行中不能替换登录。\nEsc 取消")),
+        Prompt::LoginMethod(name,_) => ("ChatGPT 登录方式",format!("账号：{}\n\n1 / b / Enter  浏览器登录\n2 / d  设备码登录（需账号启用设备授权）\n\n凭据保存在独立账号目录，Codex 自动刷新。\n同账号可多开，共用登录；运行中不能替换登录。\n授权中 Ctrl+C 取消 · Esc 返回", if name.trim().is_empty() { "登录后自动读取邮箱" } else { name.as_str() })),
         Prompt::AuthSource(path) => ("OAuth 登录文件",format!("{path}\n\n支持官方 auth.json 或 Cockpit 单账号 JSON。\n只读来源，导入后独立保存。\nEnter 预览 · Ctrl+U 清空 · Esc 取消")),
         Prompt::AuthImport(_,identity) => ("OAuth 导入预览",format!("{}\n账号：{}\n\n包含可刷新登录凭据；本地文件权限 600。\n重复身份更新原账号，运行中不能更新。\nEnter 导入 · Esc 取消",identity.label(),identity.account_id)),
         Prompt::Source(path) => (

@@ -12,7 +12,7 @@
 
 第五阶段已接入[运行生命周期与会话关联](run-lifecycle.md)：内置 Agent 提供非阻塞运行句柄，托管 Codex 通过经过核验的生命周期 hooks 建立 Run 与 Session 的关系；首页独立更新会话活动状态。恢复会话的运行关联与 API 资源身份证明分开处理。
 
-Usage 的 Provider 是一个配置实例，由 Agent 和零个或多个资源服务组成。类型注册一次，账号作为工厂参数传入；同一 Provider 可以重复启动进程。
+Usage 的 Provider 是一个配置实例，由 Agent、零个或多个资源服务及可选的认证能力组成。类型注册一次，账号作为工厂参数传入；同一 Provider 可以重复启动进程。
 
 ```mermaid
 flowchart TD
@@ -20,6 +20,7 @@ flowchart TD
     Hub --> Provider[配置实例 Provider]
     Provider --> Agent[AgentAdapter]
     Provider --> Resources[ResourceReader 列表]
+    Provider --> Auth[可选 AuthAdapter]
     Agent --> Launcher
     Agent --> Sessions[SessionSource]
     Launcher --> Manager[Codex Manager / 本地命令]
@@ -27,6 +28,7 @@ flowchart TD
     Resources --> API[API 资源适配器扩展点]
     AgentRegistry[AgentRegistry 工厂] --> Agent
     ResourceRegistry[ResourceRegistry 工厂] --> Resources
+    AuthRegistry[AuthRegistry 工厂] --> Auth
 ```
 
 ## 当前已经接入的路径
@@ -34,7 +36,8 @@ flowchart TD
 - `registry::FactoryRegistry<C, T>`：显式注入的有序工厂表，拒绝空 ID、重复注册，未知类型返回已注册列表。没有全局单例或动态插件加载。
 - `agents::AgentRegistry`：登记 Codex、Claude、Grok。Agent 提供可选的 `Launcher` 和 `SessionSource`；自定义 Agent 可以声明自己的会话 ID 校验，不必使用 UUID。
 - `resources::ResourceRegistry`：登记 ChatGPT、Claude、Grok 官方订阅读取器，以及 New API 令牌/账号和 OpenAI 费用读取器。`ResourceSnapshot` 声明权限范围，区分配额窗口、余额、带时间范围的费用、支出和原始额度；余额保留十进制文本和币种，原始额度不自动转换成美元。
-- `hub::Hub`：通过 `ProviderDefinition` 创建配置实例，提供 `spawn`、`resources`、`sessions`。不支持的能力返回 `CapabilityError::Unsupported`；缺少凭据、凭据失效和网络失败由资源状态分别表达。
+- `auth::AuthRegistry`：登记认证服务工厂，首个后端为 `codex_oauth`，支持浏览器与设备码登录。方法 ID 由适配器提供，自定义后端可以注册自己的方法。`AuthSpec` 显式绑定数据目录及可选账号；工厂返回值必须与请求的服务和上下文一致。
+- `hub::Hub`：通过 `ProviderDefinition` 创建配置实例，提供 `spawn`、`resources`、`sessions` 和可选 `authentication`。不支持的能力返回 `CapabilityError::Unsupported`；缺少凭据、凭据失效和网络失败由资源状态分别表达。新账号可直接用 `Hub::authentication` 创建认证适配器，无需预先构造 Provider 或启动 Agent。
 - Codex CLI、账号 TUI、托管会话恢复经过 Hub 进入 Agent 启动适配器。`Provider::start` 返回 `RunningAgent`，原 `spawn` 保留等待行为。Manager 负责同步、密钥注入、OAuth 租约、Bark／事件注入和运行记录，句柄负责进程退出后的记录与回收。
 - 首页通过 `provider_catalog::CatalogService` 只读发现托管账号和显式推理连接，并以固定推理凭据获取模型列表；用量与余额通过独立资源计划读取，配置关联无需 Run。跟随 CC Switch 的账号可读取其已启用的内置用量参数。结果按刷新代次、Provider 与资源身份路由。已移除没有消费者的旧 `OverviewService`；运行诊断与资源核对继续通过 Manager、`runs` 和 `resources --run` 提供。
 - 原用量工厂通过资源适配器的 `legacy_usage` 能力继续支持现有 CLI、JSON、TUI 和主动重置；新余额服务只实现 `ResourceReader` 即可，不需要伪造百分比。
@@ -43,6 +46,16 @@ flowchart TD
 - `Provider::resources()` 与 `ResourceService` 共用资源层的并发收集和查询时间限制；单个任务 panic 或超时返回带原绑定的失败快照，其他结果继续返回并保持配置顺序。
 
 工厂构造不请求网络、读取密钥或启动进程。HTTP、时间、凭据解析器由上下文传入，API 服务使用 `ApiConnection`，凭据引用仅在查询时解析。
+
+## 认证任务
+
+CLI 和账号管理页通过同一个 `AuthAdapter` 创建 `AuthTask`，查询准备、等待、取消中、保存、成功、失败或已取消状态。任务拥有后台工作线程；取消采用协作检查，丢弃句柄只发出取消请求，不阻塞 UI。适配器必须在写入凭据前调用 `begin_save`，它与取消请求使用同一把锁：取消先到则拒绝写入，保存先到则取消返回 false，等待提交结果。
+
+Codex 适配器继续委托官方 CLI 完成授权和令牌刷新，复用 Manager 的账号租约、身份核对和暂存目录。CLI 和 TUI 在原生终端展示官方授权提示，同时显示任务阶段；`Ctrl+C` 等待登录进程回收和暂存目录清理。交互进程保留前台终端组，非交互登录进程单独分组以便取消时回收子进程。版本探测仍使用现有 10 秒超时，取消在探测返回后检查。
+
+认证请求不实现 Debug 或序列化，任务快照只包含操作 ID、阶段、账号标识及安全错误，不包含令牌、原生登录输出或授权链接。Codex 认证日志记录服务、登录方法和任务阶段，底层 OAuth 操作保留现有账号及步骤诊断。此阶段只内置 Codex OAuth；Claude、Grok 和其他认证协议需要另行实现适配器。文件导入仍走 Manager 的本地导入流程。
+
+本轮新增 6 项 Rust 回归，覆盖认证工厂与账号绑定、自定义登录方法、取消与保存的竞争边界、丢弃任务和异常处理，以及真实子进程取消和 CLI／TUI 的 PTY 登录流程。隔离账号目录后共 304 项 Rust 测试通过，另有 4 项公共消融执行器测试和 35 个变体锚点检查通过；Clippy 全 target、格式和差异检查通过。登录测试使用模拟 CLI 与合成凭据，不访问真实 OAuth 服务。
 
 ## 身份与实例
 

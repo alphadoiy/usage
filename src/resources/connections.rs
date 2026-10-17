@@ -323,6 +323,9 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
                 ResourceMetric::QuotaWindow {
                     name, used_percent, ..
                 } => format!("  {name} · 已用 {used_percent:.0}%"),
+                ResourceMetric::ResetCredits { available } => {
+                    format!("  主动重置 {available} 次")
+                }
                 ResourceMetric::Spending { used, currency, .. } => format!(
                     "  支出 {} {}",
                     used.map(|v| v.to_string()).unwrap_or_else(|| "未知".into()),

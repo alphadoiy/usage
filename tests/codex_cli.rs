@@ -791,6 +791,12 @@ def capture_record():
     tmp.write_text(json.dumps(record)); os.replace(tmp,path)
 if sys.argv[1]=='login':
     capture_record()
+    gate=os.getenv('LOGIN_GATE')
+    if gate:
+        deadline=time.monotonic()+10
+        while not Path(gate).exists():
+            if time.monotonic()>deadline: sys.exit(41)
+            time.sleep(0.01)
     if os.getenv('LOGIN_FAIL'): sys.exit(1)
     (home/'auth.json').write_bytes(Path(os.environ['SOURCE_AUTH']).read_bytes()); sys.exit(0)
 auth=json.loads((home/'auth.json').read_text())
@@ -828,6 +834,87 @@ fn oauth_id(f: &Fixture, source: &std::path::Path, name: &str) -> String {
         .as_str()
         .unwrap()
         .into()
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_terminal_login_and_cancel_restore_cli_and_tui() {
+    success(
+        Command::new("python3")
+            .arg("-c")
+            .arg(include_str!("support/oauth_terminal.py"))
+            .arg(env!("CARGO_BIN_EXE_usage"))
+            .output()
+            .unwrap(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oauth_login_cancellation_reaps_child_and_preserves_existing_credentials() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    let source = oauth_source(&f, "cancel-workspace");
+    let id = oauth_id(&f, &source, "Existing");
+    let home = f.path.join("manager/homes").join(&id).join("r1");
+    let before = fs::read(home.join("auth.json")).unwrap();
+    let binary = oauth_binary(&f);
+    for replacing in [false, true] {
+        let capture = f.path.join(format!("cancel-{replacing}.json"));
+        let mut command = f.command(&["login", "--binary", binary.to_str().unwrap()]);
+        if replacing {
+            command.args(["--account", &id]);
+        } else {
+            command.arg("Cancelled new account");
+        }
+        let child = command
+            .env("SOURCE_AUTH", &source)
+            .env("CAPTURE_FILE", &capture)
+            .env("LOGIN_GATE", f.path.join("release-login"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !capture.exists() {
+            assert!(Instant::now() < deadline, "synthetic login did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let login: serde_json::Value =
+            serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+        let native_pid = login["pid"].as_i64().unwrap() as libc::pid_t;
+        // Signal only this test's Usage process. It owns and cancels its separate login group.
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+            0
+        );
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(130),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("取消"));
+        assert_eq!(
+            unsafe { libc::kill(native_pid, 0) },
+            -1,
+            "native login must be reaped"
+        );
+        assert!(!PathBuf::from(login["home"].as_str().unwrap()).exists());
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), before);
+        let profiles: serde_json::Value =
+            serde_json::from_str(&f.run(&["list", "--json"])).unwrap();
+        assert_eq!(profiles.as_array().unwrap().len(), 1);
+        // Replacement leases are released after cancellation, permitting another import.
+        f.run(&[
+            "import-auth",
+            "--source",
+            source.to_str().unwrap(),
+            "--account",
+            &id,
+        ]);
+    }
 }
 
 #[cfg(unix)]

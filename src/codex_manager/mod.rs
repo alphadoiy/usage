@@ -430,8 +430,22 @@ impl Manager {
         &self,
         profile: &Profile,
     ) -> Result<crate::provider_catalog::ModelQuery> {
-        if profile.auth_mode != AuthMode::Byok {
-            return Err(Error::message("OAuth 订阅未接入模型列表接口"));
+        if profile.auth_mode == AuthMode::Oauth {
+            let home = self.home(&profile.id, profile.revision)?;
+            let auth = oauth::read_auth(&home.join("auth.json"))?;
+            if profile.oauth.as_ref().is_none_or(|identity| {
+                identity.account_id != auth.identity.account_id
+                    || identity.user_id != auth.identity.user_id
+            }) {
+                return Err(Error::message("OAuth 登录文件与账号身份不匹配；请重新登录"));
+            }
+            return crate::provider_catalog::ModelQuery::codex(
+                profile.id.clone(),
+                &home,
+                auth.access_token,
+                auth.identity.account_id,
+            )
+            .map_err(Error::message);
         }
         let saved = self.revision(&profile.id, profile.revision)?;
         let (base, _) = config::summary(&saved.config)?;
@@ -1261,7 +1275,7 @@ const CLEARED_AUTH_ENV: &[&str] = &[
     config::KEY_ENV,
     bark::CONTEXT_ENV,
 ];
-fn clear_auth_env(command: &mut Command) {
+pub(crate) fn clear_auth_env(command: &mut Command) {
     for key in CLEARED_AUTH_ENV {
         command.env_remove(key);
     }

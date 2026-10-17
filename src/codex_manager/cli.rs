@@ -255,6 +255,56 @@ fn fs_text(path: &Path) -> Result<String> {
 
 pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> Result<i32> {
     let command = match command {
+        CodexCommand::Login {
+            name,
+            account,
+            device_auth,
+            binary,
+            config: file,
+            model,
+        } => {
+            let text = file.as_deref().map(fs_text).transpose()?;
+            let text = if model.is_some() {
+                Some(oauth::patch_config(
+                    text.as_deref().unwrap_or(""),
+                    model.as_deref(),
+                    None,
+                )?)
+            } else {
+                text
+            };
+            let adapter = crate::hub::Hub::default()
+                .authentication(crate::auth::AuthSpec {
+                    service: "codex_oauth".into(),
+                    context: crate::auth::AuthContext {
+                        root: super::default_root(),
+                        account,
+                    },
+                })
+                .map_err(|error| Error::message(error.to_string()))?;
+            let result = crate::auth::run_in_terminal(
+                adapter.as_ref(),
+                crate::auth::AuthRequest {
+                    name,
+                    config: text,
+                    program: binary,
+                    method: if device_auth {
+                        crate::auth::AuthMethod::DEVICE_CODE.id
+                    } else {
+                        crate::auth::AuthMethod::BROWSER.id
+                    }
+                    .into(),
+                },
+            )
+            .await;
+            let p = match result {
+                Ok(account) => account,
+                Err(crate::auth::AuthError::Cancelled) => return Ok(130),
+                Err(error) => return Err(Error::message(error.to_string())),
+            };
+            println!("已保存 OAuth 账号：{}（{}）", p.name, p.id);
+            return Ok(0);
+        }
         CodexCommand::ResumeLocal {
             home,
             cwd,
@@ -351,7 +401,8 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
         | CodexCommand::Event
         | CodexCommand::Notify { .. }
         | CodexCommand::Bark { .. }
-        | CodexCommand::Run { .. } => {
+        | CodexCommand::Run { .. }
+        | CodexCommand::Login { .. } => {
             unreachable!()
         }
         CodexCommand::RunEvents { run, limit, json } => {
@@ -373,36 +424,6 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                     );
                 }
             }
-        }
-        CodexCommand::Login {
-            name,
-            account,
-            device_auth,
-            binary,
-            config: file,
-            model,
-        } => {
-            let text = file.as_deref().map(fs_text).transpose()?;
-            let text = if model.is_some() {
-                Some(oauth::patch_config(
-                    text.as_deref().unwrap_or(""),
-                    model.as_deref(),
-                    None,
-                )?)
-            } else {
-                text
-            };
-            #[cfg(unix)]
-            let _interrupts =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-            let p = manager.login_oauth(
-                name.as_deref(),
-                text.as_deref(),
-                device_auth,
-                &binary,
-                account.as_deref(),
-            )?;
-            println!("已保存 OAuth 账号：{}（{}）", p.name, p.id);
         }
         CodexCommand::ImportAuth {
             source,

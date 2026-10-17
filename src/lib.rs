@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod alerts;
+pub mod auth;
 pub mod cli;
 pub mod codex_manager;
 pub mod config;

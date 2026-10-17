@@ -28,9 +28,11 @@ Provider 目录读取 Usage 托管账号的当前保存版本，也包含 `[[res
 
 首页称其为“接口模型列表”：这表示当前凭据可见的模型，不保证每个模型都能用于 Codex、Responses 或其他特定 Agent。Provider 看板一次只展示当前 Provider。`←` / `→` 循环切换 Provider，`↑` / `↓` 或 `j` / `k` 仅滚动当前 Provider 的用量、余额与模型信息；标题固定显示当前名称和序号。默认预览前 3 个模型，显示剩余数量；按 `Enter` 展开／收起全部模型，`Esc` 从展开状态返回预览。切换 Provider 时回到顶部并收起模型；后台刷新按身份保留选择和滚动位置，当前 Provider 被移除时回到第一个。中文和长模型名称随宽度换行。
 
-配置中的默认模型单独标注为“默认模型（配置）”，不作为接口可用性证明。OAuth 订阅没有接入公开 API 模型列表；界面明确显示这一限制，不把 ChatGPT 登录令牌发送到 API Key 接口。接口不支持、认证失败、限流、网络错误、空列表分别表达，查询失败不会保留旧模型列表冒充本次成功。
+配置中的默认模型单独标注为“默认模型（配置）”，不作为接口可用性证明。Usage 托管的 Codex OAuth 账号参考 Magpie 的 `internal/provider/codex_models.go`，查询 `https://chatgpt.com/backend-api/codex/models?client_version=…`：使用该账号独立 Home 中的访问令牌和 `ChatGPT-Account-Id`，先核对保存的用户与工作区身份，过滤隐藏模型、去重并保留后端优先级顺序。模型随账号套餐和客户端版本变化，不维护固定的订阅模型名单，也不把 OAuth 令牌发送到 BYOK `/v1/models` 接口。此地址是 ChatGPT 的 Codex 后端协议，可能随客户端升级变化。
 
-托管账号查询固定使用该保存版本的推理密钥；独立连接只解析 `inference.credential_env`，不使用余额或组织管理凭据。密钥不进入目录快照、界面或错误文本；模型与用量查询最多跟随 5 次同源跳转，不跨来源转发查询凭据。首页继承启动时的环境变量，其他 shell 后来执行的 `export` 不会修改它。
+客户端版本取已安装 Codex CLI、同一账号 Home 的 `models_cache.json.client_version` 和兼容基线 `0.159.0` 中较新者。后台版本探测最多 2 秒，成功和失败均缓存 10 分钟；缓存文件只提供版本号，不读取其中的模型列表作为当前账号结果。每个账号独立查询，查询缓存身份包含端点、凭据、工作区和缓存版本。Usage 不在模型查询时刷新或写回 OAuth 令牌，登录失效时重新登录，或先由官方 CLI 刷新后按 `r` 重查。接口不支持、认证失败、限流、网络错误、空列表分别表达，查询失败不会保留旧模型列表冒充本次成功。
+
+托管 BYOK 账号查询固定使用该保存版本的推理密钥；独立连接只解析 `inference.credential_env`，不使用余额或组织管理凭据。密钥不进入目录快照、界面或错误文本；模型与用量查询最多跟随 5 次同源跳转，不跨来源转发查询凭据。首页继承启动时的环境变量，其他 shell 后来执行的 `export` 不会修改它。
 
 接口依据：[OpenAI List models](https://developers.openai.com/api/reference/resources/models/methods/list)、[New API 原生 OpenAI 格式](https://docs.newapi.ai/zh/docs/api/ai-model/models/list/listmodels)、[Anthropic List Models](https://platform.claude.com/docs/en/api/models/list)、[xAI Models](https://docs.x.ai/developers/rest-api-reference/inference/models)。
 
@@ -41,10 +43,12 @@ Provider 状态放在模型列表前，查询独立于模型列表，模型接�
 查询来源按以下顺序决定：
 
 1. Usage `[[resources]]` 中通过 `profile_ids` 关联到该托管账号的配置。没有启动记录也能查看；独立推理连接则展示自己的资源。共享的同一资源只查询一次，结果可显示在各关联 Provider 上。
-2. 托管 Codex OAuth 账号直接读取自己的 Home 和官方订阅额度接口；不读取默认账号或系统 Keychain。
+2. 托管 Codex OAuth 账号直接读取自己的 Home 和官方订阅额度接口；不读取默认账号或系统 Keychain。此订阅来源及其重置能力独立保留，显式关联的其他资源作为额外来源展示，不替换 OAuth 账号本身。
 3. 正在跟随 CC Switch、保存版本未被本地修改、推理端点与密钥仍匹配源 Provider 的账号，读取源数据库中已启用的用量配置。只读打开指定来源，停止跟随后不再读取；不导入或执行 JavaScript。
 
 支持 CC Switch 的 `newapi`、`sub2api`、`balance` 内置查询参数。旧版没有 `templateType` 的 `{{baseUrl}}/api/usage/token` 脚本也可识别。New API 账号模板使用 Access Token 与用户 ID；令牌模板使用推理 API Key。两种权限范围分别展示，令牌额度不限量不代表账号余额无限。
+
+OAuth 订阅响应中的主动重置次数作为 `reset_credits` 资源指标进入首页，保留真实的 0；未返回时显示“次数未返回 · x 查询”。`x` 只查询当前选中的 Provider，不搜索旧用量工具列表或默认账号。查询完成后更新该资源绑定的已加载次数；确认框固定持有同一账号的重置能力，按 `y` 提交，成功后刷新额度与次数。不支持重置的 Provider 明确提示不支持。
 
 旧版令牌脚本如果明确以同一个正数常量除 `total_used` / `total_available`，并声明固定三位币种，可复用这项显式换算，包括旧模板中只赋值一次的 `var unit = 500000` 形式。未知表达式、单位或复杂自定义脚本不推测换算。首页不显示原始额度，底层快照和资源 CLI 保留原始值供排查。不会把 500000 或 USD 作为所有站点的默认值。
 
@@ -88,3 +92,5 @@ Provider 看板展示资源状态，但不展示运行、项目、会话和启�
 使用临时账号数据库、合成凭据、FakeHttp 和 Ratatui Buffer 验证目录与查询隔离、无需运行记录、OAuth 凭据边界、完整分页、失败与取消、刷新代次以及宽窄屏滚动。未用真实 API Key 查询模型列表，也未安装本地 Homebrew 包。用当前已启用的 CC Switch 令牌用量配置做过只读接口验证：经过同源 301 跳转后返回成功；只记录状态、权限范围及不限量标志，未输出密钥或实际金额。
 
 本轮（2026-10-17）全量 293 项测试串行通过：244 项库测试、49 项集成测试。并发运行中原有 OAuth 文件锁测试曾偶发失败，单独复跑及全量串行复核通过。后台刷新使用延迟响应验证内容保留、自动刷新不增加模型请求、手动刷新重新查询、连接或凭据变化后缓存失效及失败后清除旧余额。令牌不限额时的余额换算覆盖正数、零、负数和大整数；CC Switch 配置导入、首页与 CLI 同时展示余额及不限额状态有回归测试。使用两个合成托管账号和本地模拟模型／额度接口，在 120×40 PTY 中检查单 Provider 展示、左右切换、Enter 展开模型、上下滚动、同源跳转后的余额更新及正常退出；6 次查询分别使用各账号的合成推理密钥，终端输出不含密钥。刷新重排时保留当前 Provider、移除当前 Provider 后回退及空列表行为另有回归测试。格式检查、Clippy（全部 target、警告视为错误）和 `git diff --check` 通过。
+
+2026-10-18 接入托管 Codex OAuth 模型查询。模型目录相关 15 项测试覆盖订阅响应解析、隐藏项与优先级、版本比较、账号身份核对、两账号查询及令牌轮换后的缓存失效。全量 307 项 Rust 测试串行通过，Clippy 全 target、格式与差异检查通过。本轮仅使用合成 OAuth 凭据和模拟接口，未发送真实订阅模型请求。

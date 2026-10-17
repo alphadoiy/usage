@@ -9,6 +9,23 @@ use crate::config::AppConfig;
 use crate::resources::connections::{ConnectionConfig, ResourceService};
 use crate::resources::{CredentialResolver, ResourceBinding, ResourceReader, ResourceSnapshot};
 
+/// Account-scoped reset capability. Holds a credential reader, never a captured token.
+#[derive(Clone)]
+pub struct ResetHandle(Arc<dyn crate::providers::UsageProvider>);
+impl std::fmt::Debug for ResetHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResetHandle").finish_non_exhaustive()
+    }
+}
+impl ResetHandle {
+    pub(crate) fn new(provider: Arc<dyn crate::providers::UsageProvider>) -> Option<Self> {
+        provider.reset().is_some().then_some(Self(provider))
+    }
+    pub(crate) fn provider(&self) -> Arc<dyn crate::providers::UsageProvider> {
+        self.0.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum QueryState {
     Loading,
@@ -27,9 +44,27 @@ pub struct UsageSource {
 pub struct ProviderUsage {
     pub sources: Vec<UsageSource>,
     pub hint: Option<String>,
+    pub reset: Option<ResetHandle>,
 }
 
 impl Catalog {
+    pub(crate) fn apply_reset_credits(&mut self, target: &str, available: u32) {
+        for source in self.providers.iter_mut().flat_map(|p| &mut p.usage.sources) {
+            if source.target == target
+                && let QueryState::Result(snapshot) = &mut source.state
+            {
+                snapshot.metrics.retain(|metric| {
+                    !matches!(
+                        metric,
+                        crate::resources::ResourceMetric::ResetCredits { .. }
+                    )
+                });
+                snapshot
+                    .metrics
+                    .push(crate::resources::ResourceMetric::ResetCredits { available });
+            }
+        }
+    }
     pub fn apply_resource(&mut self, target: &str, snapshot: ResourceSnapshot) -> bool {
         let refreshing = self.refreshing_resources.remove(target);
         let mut applied = false;
@@ -93,14 +128,6 @@ impl CatalogService {
         profile: &Profile,
         config: &AppConfig,
     ) {
-        // Explicit Usage configuration wins over imported CC Switch parameters.
-        if config
-            .resources
-            .iter()
-            .any(|c| c.profile_ids.contains(&profile.id))
-        {
-            return;
-        }
         if profile.auth_mode == AuthMode::Oauth {
             let result = manager
                 .home(&profile.id, profile.revision)
@@ -144,17 +171,33 @@ impl CatalogService {
                     Err(e) => QueryState::Unavailable(e.clone()),
                 },
             };
+            let reset = result.as_ref().ok().and_then(|reader| {
+                reader.legacy_usage()?.reset()?;
+                ResetHandle::new(Arc::new(crate::resources::LegacyUsageAdapter::new(
+                    reader.clone(),
+                )))
+            });
             if let Ok(reader) = result {
                 plan.resources.push(reader);
             }
-            plan.catalog
+            let usage = &mut plan
+                .catalog
                 .providers
                 .iter_mut()
                 .find(|p| p.id == profile.id)
                 .unwrap()
-                .usage
-                .sources
-                .push(source);
+                .usage;
+            usage.reset = reset;
+            usage.sources.push(source);
+            return;
+        }
+        // Explicit Usage configuration wins over imported CC Switch parameters.
+        // OAuth's own subscription/reset capability remains independent of extra billing sources.
+        if config
+            .resources
+            .iter()
+            .any(|c| c.profile_ids.contains(&profile.id))
+        {
             return;
         }
         let result = (|| {

@@ -1,10 +1,11 @@
 //! Provider inventory with independent model, quota and balance capabilities.
+mod codex;
 mod usage;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-pub use usage::{ProviderUsage, QueryState, UsageSource};
+pub use usage::{ProviderUsage, QueryState, ResetHandle, UsageSource};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -130,10 +131,10 @@ impl Plan {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
 enum Protocol {
     OpenAi,
     Anthropic,
+    Codex(codex::AccountModels),
 }
 
 // Credentials only live in query plans; never Debug/Serialize them or put them in UI state.
@@ -167,6 +168,12 @@ impl ModelQuery {
         hash.update(self.url.as_str());
         hash.update([0]);
         hash.update(&self.key);
+        if let Protocol::Codex(account) = &self.protocol {
+            hash.update([0]);
+            hash.update(&account.account_id);
+            hash.update([0]);
+            hash.update(account.cached_version.to_string());
+        }
         format!("{:x}", hash.finalize())
     }
 
@@ -198,6 +205,9 @@ impl ModelQuery {
     }
 
     async fn fetch(&self, http: &dyn HttpClient) -> Result<Vec<String>, &'static str> {
+        if let Protocol::Codex(account) = &self.protocol {
+            return account.fetch(http, &self.key).await;
+        }
         #[derive(Deserialize)]
         struct Model {
             id: String,
@@ -209,33 +219,21 @@ impl ModelQuery {
             has_more: bool,
             last_id: Option<String>,
         }
-        let headers = match self.protocol {
+        let headers = match &self.protocol {
             Protocol::OpenAi => vec![("Authorization", format!("Bearer {}", self.key))],
             Protocol::Anthropic => vec![
                 ("x-api-key", self.key.clone()),
                 ("anthropic-version", "2023-06-01".into()),
             ],
+            Protocol::Codex(_) => unreachable!(),
         };
         let mut url = self.url.clone();
         let mut models = BTreeSet::new();
         let mut cursors = BTreeSet::new();
         for _ in 0..20 {
-            let response = http
-                .request("GET", url.as_str(), &headers, None)
-                .await
-                .map_err(|_| "模型列表网络请求失败")?;
-            match response.status {
-                200 => {}
-                401 | 403 => return Err("模型列表认证失败或权限不足"),
-                404 | 405 | 501 => return Err("此端点未提供模型列表接口"),
-                429 => return Err("模型列表查询受到限流"),
-                _ => return Err("模型列表接口暂不可用"),
-            }
-            if response.body.len() > 2 * 1024 * 1024 {
-                return Err("模型列表响应过大");
-            }
+            let body = model_response(http, &url, &headers, 2 * 1024 * 1024).await?;
             let page: Response =
-                serde_json::from_slice(&response.body).map_err(|_| "模型列表响应格式无效")?;
+                serde_json::from_slice(&body).map_err(|_| "模型列表响应格式无效")?;
             for model in page.data {
                 if model.id.is_empty()
                     || model.id.len() > 256
@@ -263,6 +261,29 @@ impl ModelQuery {
         }
         Err("模型列表分页超过上限")
     }
+}
+
+async fn model_response(
+    http: &dyn HttpClient,
+    url: &reqwest::Url,
+    headers: &[(&str, String)],
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let response = http
+        .request("GET", url.as_str(), headers, None)
+        .await
+        .map_err(|_| "模型列表网络请求失败")?;
+    match response.status {
+        200 => {}
+        401 | 403 => return Err("模型列表认证失败或权限不足"),
+        404 | 405 | 501 => return Err("此端点未提供模型列表接口"),
+        429 => return Err("模型列表查询受到限流"),
+        _ => return Err("模型列表接口暂不可用"),
+    }
+    if response.body.len() > limit {
+        return Err("模型列表响应过大");
+    }
+    Ok(response.body)
 }
 
 fn kind(base: &str) -> ProviderKind {
@@ -317,13 +338,13 @@ impl CatalogService {
             Manager::open_read_only(self.root.clone()).map_err(|_| "读取 Provider 账号库失败")?
         {
             for profile in manager.list().map_err(|_| "读取 Provider 配置失败")? {
-                let query = if profile.auth_mode == AuthMode::Byok {
-                    manager
-                        .model_catalog_query(&profile)
-                        .map_err(|_| "无法读取此 Provider 的模型查询凭据".to_owned())
-                } else {
-                    Err("OAuth 订阅未接入模型列表接口".into())
-                };
+                let query = manager.model_catalog_query(&profile).map_err(|_| {
+                    if profile.auth_mode == AuthMode::Oauth {
+                        "无法读取此 OAuth 账号的模型查询凭据，请重新登录".to_owned()
+                    } else {
+                        "无法读取此 Provider 的模型查询凭据".to_owned()
+                    }
+                });
                 let models = match query {
                     Ok(query) => {
                         plan.queries.push(query);
@@ -777,43 +798,281 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn oauth_inventory_never_queries_api_models_with_chatgpt_tokens() {
+    fn oauth_profile(
+        manager: &mut Manager,
+        root: &std::path::Path,
+        workspace: &str,
+        version: &str,
+    ) -> (crate::codex_manager::Profile, PathBuf, String) {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims = json!({"sub":"fixture-user","email":"fixture@example.test",
+            "https://api.openai.com/auth":{"chatgpt_account_id":workspace,"chatgpt_user_id":"fixture-user","chatgpt_plan_type":"plus"}});
+        let jwt = format!("e30.{}.fixture", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        let source = root.join(format!("{workspace}.json"));
+        std::fs::write(
+            &source,
+            json!({"auth_mode":"chatgpt","tokens":{"id_token":jwt,
+            "access_token":jwt,"refresh_token":"synthetic-refresh","account_id":workspace},
+            "last_refresh":"2026-10-17T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        let profile = manager
+            .import_oauth(Some(workspace), None, &source, None)
+            .unwrap();
+        let home = manager.home(&profile.id, profile.revision).unwrap();
+        std::fs::write(
+            home.join("models_cache.json"),
+            json!({"client_version":version}).to_string(),
+        )
+        .unwrap();
+        (profile, home, jwt)
+    }
+
+    #[tokio::test]
+    async fn oauth_reset_uses_selected_account_even_with_explicit_billing_resources() {
         let f = Fixture::new();
         let mut manager = Manager::open(f.0.clone()).unwrap();
-        let claims = json!({"sub":"fixture-user","email":"fixture@example.test","https://api.openai.com/auth":{"chatgpt_account_id":"fixture-workspace","chatgpt_user_id":"fixture-user","chatgpt_plan_type":"plus"}});
-        let jwt = format!("e30.{}.fixture", URL_SAFE_NO_PAD.encode(claims.to_string()));
-        let source = f.0.join("oauth-source.json");
-        std::fs::write(&source,json!({"auth_mode":"chatgpt","tokens":{"id_token":jwt,"access_token":jwt,"refresh_token":"synthetic-refresh","account_id":"fixture-workspace"},"last_refresh":"2026-10-17T00:00:00Z"}).to_string()).unwrap();
-        manager
-            .import_oauth(Some("Personal"), None, &source, None)
-            .unwrap();
+        let (first, _, first_token) = oauth_profile(&mut manager, &f.0, "reset-first", "999.0.0");
+        let (second, _, second_token) =
+            oauth_profile(&mut manager, &f.0, "reset-second", "999.0.0");
         let http = Arc::new(FakeHttp::new());
-        http.route("https://chatgpt.com/backend-api/wham/usage",response(200,r#"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#));
+        let reset_url = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+        http.route(reset_url, response(200, r#"{"available_count":2}"#));
+        http.route(format!("{reset_url}/consume"), response(200, "{}"));
+        let mut config = config();
+        config.resources[0].profile_ids = vec![second.id.clone()];
         let plan = CatalogService::new(
             f.0.clone(),
             http.clone(),
-            Arc::new(|_| panic!("OAuth tried API credentials")),
+            Arc::new(|_| Ok("synthetic-billing-token".into())),
         )
-        .load(&AppConfig::default())
+        .load(&config)
         .unwrap();
-        assert!(plan.queries.is_empty());
+        assert!(http.calls.lock().unwrap().is_empty());
+        for id in [&first.id, &second.id] {
+            assert!(
+                plan.catalog
+                    .providers
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .unwrap()
+                    .usage
+                    .reset
+                    .is_some()
+            );
+        }
+        let selected = plan
+            .catalog
+            .providers
+            .iter()
+            .find(|p| p.id == second.id)
+            .unwrap();
+        assert_eq!(
+            selected.usage.sources.len(),
+            2,
+            "billing must not remove subscription/reset"
+        );
+        let provider = selected.usage.reset.as_ref().unwrap().provider();
+        let reset = provider.reset().unwrap();
+        assert_eq!(
+            reset
+                .preview_reset()
+                .await
+                .unwrap()
+                .account_label
+                .as_deref(),
+            Some("reset-second")
+        );
+        reset.consume_reset().await.unwrap();
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "preview, pre-submit check and one consume");
+        assert_eq!(calls.iter().filter(|call| call.method == "POST").count(), 1);
+        for call in calls.iter() {
+            assert!(
+                call.headers
+                    .contains(&("Authorization".into(), format!("Bearer {second_token}")))
+            );
+            assert!(call.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("chatgpt-account-id") && value == "reset-second"
+            }));
+            assert!(
+                !call
+                    .headers
+                    .iter()
+                    .any(|(_, value)| value.contains(&first_token)
+                        || value.contains("synthetic-billing-token"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_inventory_never_queries_api_models_with_chatgpt_tokens() {
+        let f = Fixture::new();
+        let mut manager = Manager::open(f.0.clone()).unwrap();
+        let (_, home, jwt) = oauth_profile(&mut manager, &f.0, "fixture-workspace", "999.0.0");
+        let http = Arc::new(FakeHttp::new());
+        http.route("https://chatgpt.com/backend-api/codex/models?client_version=999.0.0", response(200, r#"{"models":[{"slug":"plan-model","visibility":"list"},{"slug":"internal","visibility":"hide"}]}"#));
+        http.route("https://chatgpt.com/backend-api/wham/usage",response(200,r#"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000}}}"#));
+        let service = CatalogService::new(
+            f.0.clone(),
+            http.clone(),
+            Arc::new(|_| panic!("OAuth tried API credentials")),
+        );
+        let mut plan = service.load(&AppConfig::default()).unwrap();
+        assert_eq!(plan.queries.len(), 1);
         assert!(http.calls.lock().unwrap().is_empty());
         assert_eq!(plan.catalog.providers[0].kind, ProviderKind::Subscription);
-        assert!(
-            matches!(&plan.catalog.providers[0].models,Models::Unavailable(reason) if reason.contains("OAuth"))
+        collect_models(
+            http.clone(),
+            std::mem::take(&mut plan.queries),
+            |id, models| {
+                assert!(plan.catalog.apply_models(&id, models));
+            },
+        )
+        .await;
+        assert_eq!(
+            plan.catalog.providers[0].models,
+            Models::Ready(vec!["plan-model".into()])
         );
         assert_eq!(plan.resources.len(), 1);
         let usage = plan.resources[0].read().await;
         assert_eq!(usage.state, crate::resources::ResourceState::Ready);
         assert!(usage.metrics.iter().any(|m|matches!(m,crate::resources::ResourceMetric::QuotaWindow{used_percent,..} if *used_percent==25.0)));
         let calls = http.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].url,
+            "https://chatgpt.com/backend-api/codex/models?client_version=999.0.0"
+        );
+        assert!(
+            calls[0]
+                .headers
+                .contains(&("Authorization".into(), format!("Bearer {jwt}")))
+        );
+        assert!(
+            calls[0]
+                .headers
+                .contains(&("version".into(), "999.0.0".into()))
+        );
         assert!(
             calls[0]
                 .headers
                 .contains(&("ChatGPT-Account-Id".into(), "fixture-workspace".into()))
+        );
+        drop(calls);
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("auth.json")).unwrap()).unwrap();
+        auth["tokens"]["account_id"] = json!("different-workspace");
+        std::fs::write(home.join("auth.json"), auth.to_string()).unwrap();
+        let rejected = service.load(&AppConfig::default()).unwrap();
+        assert!(rejected.queries.is_empty());
+        assert!(
+            matches!(&rejected.catalog.providers[0].models, Models::Unavailable(message) if message.contains("重新登录"))
+        );
+        assert_eq!(http.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oauth_models_and_cache_refresh_follow_each_account_and_rotated_token() {
+        let f = Fixture::new();
+        let mut manager = Manager::open(f.0.clone()).unwrap();
+        let (a, a_home, a_token) = oauth_profile(&mut manager, &f.0, "workspace-a", "999.0.1");
+        let (b, _, b_token) = oauth_profile(&mut manager, &f.0, "workspace-b", "999.0.2");
+        let http = Arc::new(FakeHttp::new());
+        for (version, model) in [("999.0.1", "a-plan-model"), ("999.0.2", "b-plan-model")] {
+            http.route(
+                format!("https://chatgpt.com/backend-api/codex/models?client_version={version}"),
+                response(200, &json!({"models":[{"slug":model}]}).to_string()),
+            );
+        }
+        let service = CatalogService::new(
+            f.0.clone(),
+            http.clone(),
+            Arc::new(|_| panic!("OAuth used API credentials")),
+        );
+        let mut plan = service.load(&AppConfig::default()).unwrap();
+        collect_models(
+            http.clone(),
+            std::mem::take(&mut plan.queries),
+            |id, models| {
+                assert!(plan.catalog.apply_models(&id, models));
+            },
+        )
+        .await;
+        for (profile, model, token, workspace) in [
+            (&a, "a-plan-model", a_token, "workspace-a"),
+            (&b, "b-plan-model", b_token, "workspace-b"),
+        ] {
+            assert_eq!(
+                plan.catalog
+                    .providers
+                    .iter()
+                    .find(|p| p.id == profile.id)
+                    .unwrap()
+                    .models,
+                Models::Ready(vec![model.into()])
+            );
+            let calls = http.calls.lock().unwrap();
+            let call = calls
+                .iter()
+                .find(|c| {
+                    c.headers
+                        .contains(&("ChatGPT-Account-Id".into(), workspace.into()))
+                })
+                .unwrap();
+            assert!(
+                call.headers
+                    .contains(&("Authorization".into(), format!("Bearer {token}")))
+            );
+            assert!(
+                call.url
+                    .starts_with("https://chatgpt.com/backend-api/codex/models?")
+            );
+        }
+        let mut stable = service.load(&AppConfig::default()).unwrap();
+        stable.reuse(&plan.catalog, false);
+        assert!(stable.queries.is_empty());
+        assert_eq!(http.calls.lock().unwrap().len(), 2);
+
+        let auth_path = a_home.join("auth.json");
+        let mut auth: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&auth_path).unwrap()).unwrap();
+        auth["tokens"]["access_token"] = json!("rotated-access-token");
+        std::fs::write(auth_path, auth.to_string()).unwrap();
+        let mut changed = service.load(&AppConfig::default()).unwrap();
+        changed.reuse(&plan.catalog, false);
+        assert_eq!(changed.queries.len(), 1);
+        assert_eq!(changed.queries[0].id, a.id);
+        collect_models(
+            http.clone(),
+            std::mem::take(&mut changed.queries),
+            |id, models| {
+                assert!(changed.catalog.apply_models(&id, models));
+            },
+        )
+        .await;
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls[2]
+                .headers
+                .contains(&("Authorization".into(), "Bearer rotated-access-token".into()))
+        );
+        assert!(
+            calls[2]
+                .headers
+                .contains(&("ChatGPT-Account-Id".into(), "workspace-a".into()))
+        );
+        assert_eq!(
+            changed
+                .catalog
+                .providers
+                .iter()
+                .find(|p| p.id == b.id)
+                .unwrap()
+                .models,
+            Models::Ready(vec!["b-plan-model".into()])
         );
     }
 

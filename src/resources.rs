@@ -59,6 +59,9 @@ pub struct Money {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceMetric {
+    ResetCredits {
+        available: u32,
+    },
     QuotaWindow {
         name: String,
         used_percent: f64,
@@ -201,6 +204,9 @@ impl ResourceReader for SubscriptionResource {
                 resets_at: tier.resets_at,
             })
             .collect();
+        if let Some(available) = snapshot.reset_credits_available {
+            metrics.push(ResourceMetric::ResetCredits { available });
+        }
         if let Some(extra) = snapshot.extra_usage.filter(|extra| extra.is_enabled) {
             metrics.push(ResourceMetric::Spending {
                 used: extra.used_credits,
@@ -370,6 +376,50 @@ pub(crate) async fn collect_with_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn subscription_preserves_known_reset_credits_and_does_not_invent_zero() {
+        for count in [Some(0), Some(3), None] {
+            let http = Arc::new(crate::http::FakeHttp::new());
+            let mut body = serde_json::json!({"rate_limit":{"primary_window":{
+                "used_percent":25,"limit_window_seconds":18000}}});
+            if let Some(available) = count {
+                body["rate_limit_reset_credits"] = serde_json::json!({"available_count":available});
+            }
+            http.route(
+                "https://chatgpt.com/backend-api/wham/usage",
+                Ok(crate::http::HttpResponse {
+                    status: 200,
+                    headers: Default::default(),
+                    body: serde_json::to_vec(&body).unwrap(),
+                }),
+            );
+            let credentials = serde_json::json!({"auth_mode":"chatgpt","tokens":{
+                "access_token":"synthetic-token","account_id":"synthetic-account"}})
+            .to_string();
+            let context = Arc::new(ProviderContext {
+                claude_dir: "/nonexistent".into(),
+                codex_dir: "/nonexistent".into(),
+                grok_dir: "/nonexistent".into(),
+                http,
+                keychain: Arc::new(move |_, _| Some(credentials.clone())),
+                now: Arc::new(|| DateTime::UNIX_EPOCH),
+            });
+            let reader = builtin_registry()
+                .create(
+                    "chatgpt_subscription",
+                    local_context("chatgpt_subscription", &context.codex_dir, context.clone()),
+                )
+                .unwrap();
+            let snapshot = reader.read().await;
+            assert_eq!(snapshot.state, ResourceState::Ready);
+            let actual = snapshot.metrics.iter().find_map(|metric| match metric {
+                ResourceMetric::ResetCredits { available } => Some(*available),
+                _ => None,
+            });
+            assert_eq!(actual, count);
+        }
+    }
 
     struct PendingReader {
         binding: ResourceBinding,

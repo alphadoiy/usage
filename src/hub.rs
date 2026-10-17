@@ -18,11 +18,13 @@ pub struct ProviderDefinition {
     pub agent: String,
     pub context: AgentContext,
     pub resources: Vec<ResourceSpec>,
+    pub auth: Option<crate::auth::AuthSpec>,
 }
 
 pub struct Hub {
     pub agents: AgentRegistry,
     pub resources: ResourceRegistry,
+    pub auth: crate::auth::AuthRegistry,
 }
 
 impl Default for Hub {
@@ -30,11 +32,19 @@ impl Default for Hub {
         Self {
             agents: crate::agents::builtin_registry(),
             resources: crate::resources::builtin_registry(),
+            auth: crate::auth::builtin_registry(),
         }
     }
 }
 
 impl Hub {
+    /// New-account login need not construct an Agent or have an existing Provider ID.
+    pub fn authentication(
+        &self,
+        spec: crate::auth::AuthSpec,
+    ) -> Result<Arc<dyn crate::auth::AuthAdapter>, RegistryError> {
+        crate::auth::create(&self.auth, spec)
+    }
     /// Factories construct adapters only; no process, network or store is opened here.
     pub fn provider(&self, definition: ProviderDefinition) -> Result<Provider, RegistryError> {
         if definition.id.trim().is_empty() {
@@ -71,6 +81,10 @@ impl Hub {
             context: definition.context,
             agent,
             resources,
+            auth: definition
+                .auth
+                .map(|spec| self.authentication(spec))
+                .transpose()?,
         })
     }
 }
@@ -80,6 +94,7 @@ pub struct Provider {
     context: AgentContext,
     agent: Arc<dyn AgentAdapter>,
     resources: Vec<Arc<dyn ResourceReader>>,
+    auth: Option<Arc<dyn crate::auth::AuthAdapter>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +103,7 @@ pub struct Capabilities {
     pub start: bool,
     pub sessions: bool,
     pub resources: bool,
+    pub auth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +137,14 @@ impl Provider {
                 .is_some_and(|launcher| launcher.supports_start()),
             sessions: self.agent.session_source().is_some(),
             resources: !self.resources.is_empty(),
+            auth: self.auth.is_some(),
         }
+    }
+
+    pub fn authentication(&self) -> Result<&dyn crate::auth::AuthAdapter, CapabilityError> {
+        self.auth
+            .as_deref()
+            .ok_or(CapabilityError::Unsupported("authentication"))
     }
 
     /// Each call produces a separate launch; the adapter is reusable, not a process singleton.
@@ -221,6 +244,7 @@ pub fn start_managed_codex(
                 revision,
             },
             resources: Vec::new(),
+            auth: None,
         })
         .map_err(|error| error.to_string())?;
     provider.start(request).map_err(|error| error.to_string())
@@ -249,6 +273,7 @@ mod tests {
                 agent: "claude".into(),
                 context: AgentContext::Local { home: root.clone() },
                 resources: Vec::new(),
+                auth: None,
             })
             .unwrap();
         assert!(provider.capabilities().start);
@@ -355,6 +380,7 @@ mod tests {
         let mut hub = Hub {
             agents: AgentRegistry::new(),
             resources: ResourceRegistry::new(),
+            auth: crate::auth::AuthRegistry::new(),
         };
         hub.agents
             .register("custom", |_| {
@@ -378,6 +404,7 @@ mod tests {
                 id: "work".into(),
                 agent: "custom".into(),
                 context: AgentContext::Local { home: home.clone() },
+                auth: None,
                 resources: vec![
                     ResourceSpec {
                         service: "balance_api".into(),
@@ -397,7 +424,8 @@ mod tests {
                 spawn: false,
                 start: false,
                 sessions: true,
-                resources: true
+                resources: true,
+                auth: false,
             }
         );
         let request = SpawnRequest {
@@ -454,6 +482,7 @@ mod tests {
                     home: PathBuf::new(),
                 },
                 resources: Vec::new(),
+                auth: None,
             })
             .unwrap();
         assert!(matches!(
@@ -515,6 +544,7 @@ mod regression_tests {
                 home: "/nonexistent".into(),
             },
             agent,
+            auth: None,
             resources: [false, true]
                 .into_iter()
                 .map(|panic| {
