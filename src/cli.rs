@@ -51,6 +51,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 安装和使用 OpenCode Provider 插件
+    Plugins {
+        #[command(subcommand)]
+        command: crate::plugins::PluginCommand,
+    },
     /// 本地 HTTP/SSE 请求观测网关
     Gateway {
         #[command(subcommand)]
@@ -194,6 +199,7 @@ pub async fn run() -> i32 {
         };
     }
     let command = match &cli.command {
+        Some(Command::Plugins { .. }) => "plugins",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Resources { .. }) => "resources",
         Some(Command::Status { .. }) => "status",
@@ -256,6 +262,9 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         .interactive()
         .then(crate::app_runtime::AppRuntime::start);
     match cli.command {
+        Some(Command::Plugins { command }) => {
+            crate::plugins::dispatch(command).await.map_err(CliError)
+        }
         Some(Command::Gateway { command }) => {
             crate::gateway::execute(command).await.map_err(CliError)?;
             Ok(0)

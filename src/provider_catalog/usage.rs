@@ -245,41 +245,59 @@ impl CatalogService {
     }
 }
 
+pub(super) fn attach_reader(
+    plan: &mut Plan,
+    id: &str,
+    label: String,
+    reader: Arc<dyn ResourceReader>,
+) {
+    let binding = reader.binding().clone();
+    let service = reader.service().to_owned();
+    let target = binding.cache_key(&service);
+    if !plan
+        .resources
+        .iter()
+        .any(|r| r.binding().cache_key(r.service()) == target)
+    {
+        plan.resources.push(reader);
+    }
+    if let Some(provider) = plan.catalog.providers.iter_mut().find(|p| p.id == id) {
+        provider.usage.sources.push(UsageSource {
+            target,
+            label,
+            service,
+            binding,
+            state: QueryState::Loading,
+        });
+    }
+}
 fn attach(
     plan: &mut Plan,
     id: &str,
     config: &ConnectionConfig,
     reader: Result<Arc<dyn ResourceReader>, String>,
 ) {
-    let binding = config.binding();
-    let target = binding.cache_key(&config.service);
-    let state = match reader {
-        Ok(reader) => {
-            if !plan
-                .resources
-                .iter()
-                .any(|r| r.binding().cache_key(r.service()) == target)
-            {
-                plan.resources.push(reader);
-            }
-            QueryState::Loading
+    let label = config.label.clone().unwrap_or_else(|| config.id.clone());
+    match reader {
+        Ok(reader) => attach_reader(plan, id, label, reader),
+        Err(message) => {
+            let binding = config.binding();
+            plan.catalog
+                .providers
+                .iter_mut()
+                .find(|p| p.id == id)
+                .unwrap()
+                .usage
+                .sources
+                .push(UsageSource {
+                    target: binding.cache_key(&config.service),
+                    label,
+                    service: config.service.clone(),
+                    binding,
+                    state: QueryState::Unavailable(message),
+                });
         }
-        Err(message) => QueryState::Unavailable(message),
-    };
-    plan.catalog
-        .providers
-        .iter_mut()
-        .find(|p| p.id == id)
-        .unwrap()
-        .usage
-        .sources
-        .push(UsageSource {
-            target,
-            label: config.label.clone().unwrap_or_else(|| config.id.clone()),
-            service: config.service.clone(),
-            binding,
-            state,
-        });
+    }
 }
 
 fn imported_connection(

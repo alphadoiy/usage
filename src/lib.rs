@@ -17,6 +17,7 @@ pub mod logging;
 pub mod model;
 pub mod performance;
 pub mod plain;
+pub mod plugins;
 pub mod provider_catalog;
 pub mod providers;
 pub mod registry;

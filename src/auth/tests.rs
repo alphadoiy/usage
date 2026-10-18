@@ -17,10 +17,13 @@ impl AuthAdapter for CustomAuth {
         &self.context
     }
     fn methods(&self) -> &[AuthMethod] {
-        &[AuthMethod {
-            id: "company_sso",
-            label: "企业登录",
-        }]
+        {
+            static METHODS: [AuthMethod; 1] = [AuthMethod {
+                id: std::borrow::Cow::Borrowed("company_sso"),
+                label: std::borrow::Cow::Borrowed("企业登录"),
+            }];
+            &METHODS
+        }
     }
     fn start(&self, _: AuthRequest) -> Result<AuthTask, AuthError> {
         self.starts.fetch_add(1, Ordering::SeqCst);

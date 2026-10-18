@@ -31,6 +31,7 @@ struct StateFile {
 pub(crate) enum RouteAuth {
     ApiKey { key: String },
     NativeOauth { account_id: String },
+    Plugin { account: String },
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Registration {
@@ -48,6 +49,10 @@ pub(crate) struct Registration {
 impl Registration {
     fn valid_auth(&self) -> bool {
         match &self.auth {
+            RouteAuth::Plugin { account } => {
+                crate::plugins::endpoint_account(&self.upstream).as_deref()
+                    == Some(account.as_str())
+            }
             RouteAuth::ApiKey { key } => {
                 !key.is_empty()
                     && axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_ok()
@@ -80,6 +85,14 @@ impl Registration {
         headers: &axum::http::HeaderMap,
     ) -> Option<(&'a str, axum::http::HeaderValue)> {
         match &self.auth {
+            RouteAuth::Plugin { .. } => (headers.get("authorization")?.to_str().ok()?
+                == format!("Bearer {}", self.token))
+            .then(|| {
+                (
+                    path,
+                    axum::http::HeaderValue::from_static("Bearer usage-plugin"),
+                )
+            }),
             RouteAuth::ApiKey { key } => {
                 if headers.get("authorization")?.to_str().ok()? != format!("Bearer {}", self.token)
                 {
@@ -180,7 +193,7 @@ fn private_file(path: &Path) -> Result<File, String> {
     }
     Ok(file)
 }
-const PROTOCOL_VERSION: u32 = 8;
+const PROTOCOL_VERSION: u32 = 9;
 const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -341,7 +354,9 @@ pub(crate) fn attach(
                     base: url(
                         &state,
                         &match registration.auth {
-                            RouteAuth::ApiKey { .. } => format!("/r/{route}"),
+                            RouteAuth::ApiKey { .. } | RouteAuth::Plugin { .. } => {
+                                format!("/r/{route}")
+                            }
                             RouteAuth::NativeOauth { .. } => {
                                 format!("/r/{route}/{}/backend-api/codex", registration.token)
                             }
@@ -397,4 +412,14 @@ pub async fn execute(command: GatewayCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+pub(crate) fn plugin_control() -> Result<(String, String), String> {
+    let directory = directory(&crate::codex_manager::default_root());
+    private_dir(&directory)?;
+    let lock = private_file(&directory.join("start.lock"))?;
+    FileExt::lock_exclusive(&lock).map_err(|_| "插件网关启动锁失败")?;
+    let client = control_client()?;
+    let state = ensure(&directory, &client, Instant::now() + Duration::from_secs(5))?;
+    Ok((url(&state, "/_usage/plugins/call"), state.token))
 }

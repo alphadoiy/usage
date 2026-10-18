@@ -389,3 +389,5 @@ registry.register("spark", "另一种", render_spark);
 ```
 
 注册之后，`--once --style` 和配置文件都能选择这种文本用量视图。
+
+Provider 插件接入（WorkBuddy / WorkBuddy AI）：见 [插件文档](docs/plugins.md)。

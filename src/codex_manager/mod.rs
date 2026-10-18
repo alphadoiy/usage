@@ -950,6 +950,28 @@ impl Manager {
                 }
                 None
             };
+            let plugin_base = if profile.auth_mode == AuthMode::Byok {
+                Some(config::summary(&saved.config)?.0)
+            } else {
+                None
+            };
+            let plugin_account = plugin_base
+                .as_deref()
+                .and_then(crate::plugins::endpoint_account);
+            if let Some(id) = &plugin_account {
+                let plugin_store = crate::plugins::store::Store::new(crate::plugins::store::root());
+                let account = plugin_store.account(id).map_err(Error::message)?;
+                plugin_store
+                    .plugin(&account.plugin)
+                    .map_err(Error::message)?;
+                let expected = plugin_store.inference_key(id).map_err(Error::message)?;
+                if key.as_deref() != Some(expected.as_str()) {
+                    return Err(Error::message("插件账号与启动凭据不匹配"));
+                }
+                if !crate::gateway::enabled() {
+                    return Err(Error::message("插件推理依赖本地网关，请启用 USAGE_GATEWAY"));
+                }
+            }
             op.begin("cwd_validate");
             let cwd = cwd
                 .canonicalize()
@@ -1023,11 +1045,15 @@ impl Manager {
                 if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
                     command.env(env, key);
                 }
+                // A plugin resume pins its transport explicitly, while its resource identity
+                // remains unresolved until an Agent event confirms the session configuration.
+                let resume_transport=if plugin_account.is_some()&&resume.is_some(){Some(effective::resolve(&saved.config,profile.auth_mode,&cwd,false,args,key.as_deref(),&environment))}else{None};
+                let route_effective=resume_transport.as_ref().unwrap_or(&effective);
                 if crate::gateway::enabled() {
                     let reason=if profile.auth_mode==AuthMode::Oauth {
                         effective::oauth_gateway_reason(&saved.config,&cwd,resume.is_some(),args)
-                    } else if effective.gateway_supported {None}
-                    else {Some(effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
+                    } else if route_effective.gateway_supported {None}
+                    else {Some(route_effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
                     if reason.is_none() {
                         let prepared = (|| -> Result<crate::gateway::Attachment> {
                             let binding = self.performance_binding(&profile, revision)?;
@@ -1036,9 +1062,12 @@ impl Manager {
                                     account_id:profile.oauth.as_ref().expect("verified OAuth identity").account_id.clone()
                                 })
                             } else {
-                                (effective.identity.endpoint.as_deref().expect("resolved endpoint"),
-                                 effective.identity.model_provider.as_deref().expect("resolved provider"),
-                                 crate::gateway::RouteAuth::ApiKey {key:effective.key.clone().expect("resolved credential")})
+                                (route_effective.identity.endpoint.as_deref().expect("resolved endpoint"),
+                                 route_effective.identity.model_provider.as_deref().expect("resolved provider"),
+                                 if let Some(id)=&plugin_account {
+                                     if route_effective.identity.endpoint.as_deref()!=plugin_base.as_deref() || route_effective.key!=key {return Err(Error::message("插件启动配置被覆盖，无法确认账号关联"));}
+                                     crate::gateway::RouteAuth::Plugin {account:id.clone()}
+                                 } else {crate::gateway::RouteAuth::ApiKey {key:route_effective.key.clone().expect("resolved credential")}})
                             };
                             let attached=crate::gateway::attach(&self.root,&run_id,&binding,upstream,provider,auth).map_err(Error::message)?;
                             #[cfg(unix)]
@@ -1051,9 +1080,10 @@ impl Manager {
                                 if profile.auth_mode==AuthMode::Oauth {
                                     command.args(["-c",&format!("openai_base_url={base}")]);
                                 } else {
-                                    command.env(effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
-                                    let provider=toml::Value::String(effective.identity.model_provider.clone().expect("resolved provider"));
+                                    command.env(route_effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
+                                    let provider=toml::Value::String(route_effective.identity.model_provider.clone().expect("resolved provider"));
                                     command.args(["-c",&format!("model_providers.{provider}.base_url={base}")]);
+                                    if plugin_account.is_some(){command.args(["-c",&format!("model_provider={provider}")]);}
                                 }
                                 for variable in ["NO_PROXY", "no_proxy"] {
                                     let mut bypass = std::env::var(variable).unwrap_or_default();
@@ -1065,10 +1095,12 @@ impl Manager {
                                 gateway = Some(attached);
                             }
                             Err(error) => {
+                                if plugin_account.is_some(){return Err(error);}
                                 tracing::warn!(event="gateway_fallback", run_id, provider_id=profile.id, reason=%error, action="direct_launch");
                             }
                         }
                     } else {
+                        if plugin_account.is_some(){return Err(Error::message("插件会话的启动配置无法确认，请移除冲突覆盖参数"));}
                         tracing::info!(event="gateway_skipped", run_id, reason);
                     }
                 }

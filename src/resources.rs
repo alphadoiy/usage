@@ -149,6 +149,10 @@ pub struct ApiConnection {
 
 #[derive(Clone)]
 pub enum ResourceConnection {
+    Plugin {
+        root: std::path::PathBuf,
+        account: String,
+    },
     LocalSubscription(Arc<ProviderContext>),
     Api(ApiConnection),
 }
@@ -263,6 +267,7 @@ pub fn builtin_registry() -> ResourceRegistry {
     api::register::<new_api::Account>(&mut registry);
     api::register::<openai_costs::Costs>(&mut registry);
     provider_usage::register(&mut registry);
+    crate::plugins::adapters::register(&mut registry);
     registry
 }
 

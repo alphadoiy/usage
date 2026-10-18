@@ -104,3 +104,12 @@ Codex 适配器继续委托官方 CLI 完成授权和令牌刷新，复用 Manag
 [模型指纹测试](fingerprint.md) 是独立的主动检测能力，不属于用量读取或用户 Agent 会话。CLI、应用内调度和首页通过同一个 `FingerprintService` 使用账号绑定、执行策略与报告存储；官方订阅适配器复用 Manager 的 OAuth 租约和身份校验，固定 gpt-6.1-sol，不注入交互会话 hooks。当前只有一种检测后端，使用具体适配器，未新增注册表。
 
 交互应用入口统一持有后台任务，最多并发两个账号；配置、采样及历史记录按账号隔离失败。首页的只读快照通过现有 AppEvent 和代次校验更新，历史缓存仅在报告或运行目录变更后重建。测试状态与官方服务健康状态分别建模。退出应用通过共享取消标记停止并回收采样进程，原始报告与启用配置继续保留，不安装系统任务。
+
+
+## Provider 插件宿主
+
+[Provider 插件](plugins.md) 由现有网关持有独立 Bun/Node 宿主。插件包、上游 Backend、账号和带 Agent 的 Provider 实例分开标识；WorkBuddy 与 WorkBuddy AI 来自同一插件的两个导出工厂。通用兼容层执行 OpenCode Provider v1 及用量/刷新扩展，不在 Rust 分派服务商接口。
+
+认证桥接根据能力快照注册 `AuthRegistry` 工厂；插件方法采用动态文本并复用 `AuthTask` 的保存边界。资源桥接使用 `ResourceRegistry` 的 `plugin_account` 工厂，首页模型查询独立执行并按包版本、配置 revision 和账号缓存。`RouteAuth::Plugin` 引用插件账号，Agent 只获得本次路由的能力令牌。Rust credential broker 统一保存 opaque auth，按账号串行刷新并用 generation 拒绝过期写入。
+
+原生 HTTP 转发和插件 fetch 共用运行租约、观测及索引。Responses 到 Chat 的转换独立于服务商插件；不支持的协议或工具明确失败。明确绑定的插件恢复通过临时 CLI 配置固定传输，原资源身份仍保持未解析。构造工厂不加载 JS、不读凭据或请求网络；能力发现和插件调用发生在后台服务边界。

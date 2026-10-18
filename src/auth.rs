@@ -17,19 +17,19 @@ pub struct AuthSpec {
     pub context: AuthContext,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthMethod {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: std::borrow::Cow<'static, str>,
+    pub label: std::borrow::Cow<'static, str>,
 }
 impl AuthMethod {
     pub const BROWSER: Self = Self {
-        id: "browser",
-        label: "浏览器登录",
+        id: std::borrow::Cow::Borrowed("browser"),
+        label: std::borrow::Cow::Borrowed("浏览器登录"),
     };
     pub const DEVICE_CODE: Self = Self {
-        id: "device_code",
-        label: "设备码登录",
+        id: std::borrow::Cow::Borrowed("device_code"),
+        label: std::borrow::Cow::Borrowed("设备码登录"),
     };
 }
 
@@ -64,7 +64,7 @@ impl AuthPhase {
     pub fn label(self) -> &'static str {
         match self {
             Self::Preparing => "正在准备登录…",
-            Self::Waiting => "等待官方 CLI 完成授权 · Ctrl+C 取消",
+            Self::Waiting => "等待完成授权 · Ctrl+C 取消",
             Self::Cancelling => "正在取消登录…",
             Self::Saving => "正在保存账号…",
             Self::Done => "登录已保存",
@@ -253,7 +253,10 @@ impl AuthAdapter for CodexOAuth {
         &self.0
     }
     fn methods(&self) -> &[AuthMethod] {
-        &[AuthMethod::BROWSER, AuthMethod::DEVICE_CODE]
+        {
+            static METHODS: [AuthMethod; 2] = [AuthMethod::BROWSER, AuthMethod::DEVICE_CODE];
+            &METHODS
+        }
     }
     fn start(&self, request: AuthRequest) -> Result<AuthTask, AuthError> {
         if !self

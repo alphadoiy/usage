@@ -32,6 +32,7 @@ struct Shared {
     idle_timeout: Duration,
     records: mpsc::Sender<recording::Sample>,
     sources: Arc<recording::Sources>,
+    plugins: crate::plugins::Runtime,
 }
 /// An empty service can retire only after a full idle interval; live routes reset it.
 struct Idle {
@@ -421,27 +422,56 @@ async fn forward(
         .as_ref()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
-    let response = match tokio::time::timeout(
-        state.idle_timeout,
-        state
-            .client
-            .request(method, upstream)
-            .headers(headers)
-            .body(body)
-            .send(),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) => {
-            capture.outcome = "upstream_error";
-            capture.status = 502;
-            return error(StatusCode::BAD_GATEWAY, "Upstream connection failed");
+    let response = if let RouteAuth::Plugin { account } = &route.registration.auth {
+        if path == "models" {
+            match state
+                .plugins
+                .call(serde_json::json!({"operation":"models","account":account}))
+                .await
+            {
+                Ok(models) => {
+                    axum::Json(serde_json::json!({"object":"list","data":models})).into_response()
+                }
+                Err(_) => error(StatusCode::BAD_GATEWAY, "Plugin model discovery failed"),
+            }
+        } else if inference {
+            state.plugins.inference(account,if path=="responses"{"responses"}else{"chat"},request_json.clone().unwrap_or_default(),serde_json::json!({"session":capture.session,"run":route.registration.run,"request":capture.id})).await
+        } else {
+            error(
+                StatusCode::NOT_IMPLEMENTED,
+                "Plugin backend does not support this endpoint",
+            )
         }
-        Err(_) => {
-            capture.outcome = "upstream_timeout";
-            capture.status = 504;
-            return error(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out");
+    } else {
+        match tokio::time::timeout(
+            state.idle_timeout,
+            state
+                .client
+                .request(method, upstream)
+                .headers(headers)
+                .body(body)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let mut result = Response::new(Body::from_stream(response.bytes_stream()));
+                *result.status_mut() = status;
+                *result.headers_mut() = headers;
+                result
+            }
+            Ok(Err(_)) => {
+                capture.outcome = "upstream_error";
+                capture.status = 502;
+                return error(StatusCode::BAD_GATEWAY, "Upstream connection failed");
+            }
+            Err(_) => {
+                capture.outcome = "upstream_timeout";
+                capture.status = 504;
+                return error(StatusCode::GATEWAY_TIMEOUT, "Upstream response timed out");
+            }
         }
     };
     capture.status = response.status().as_u16();
@@ -456,7 +486,7 @@ async fn forward(
             .and_then(|s| s.to_str().ok())
             .is_some_and(|s| s.starts_with("text/event-stream"));
     headers.remove("content-length");
-    let mut upstream = response.bytes_stream();
+    let mut upstream = response.into_body().into_data_stream();
     let stream = async_stream::stream! {
         let mut json = Vec::new();
         let mut large = false;
@@ -503,6 +533,42 @@ async fn forward(
     result
 }
 
+async fn plugin_call(
+    State(state): State<Arc<Shared>>,
+    headers: HeaderMap,
+    axum::Json(value): axum::Json<serde_json::Value>,
+) -> Response {
+    if !authorized(&headers, &state.token) {
+        return error(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    if state.stopping.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is stopping");
+    }
+    match state.plugins.call(value).await {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(reason) => {
+            tracing::warn!(event = "plugin_call_failed", reason);
+            error(
+                StatusCode::BAD_GATEWAY,
+                "Plugin operation failed; see Usage logs",
+            )
+        }
+    }
+}
+async fn plugin_credentials(
+    State(state): State<Arc<Shared>>,
+    RoutePath(plugin): RoutePath<String>,
+    headers: HeaderMap,
+    axum::Json(value): axum::Json<serde_json::Value>,
+) -> Response {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    state.plugins.credentials(&plugin, token, value).await
+}
+
 pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
     private_dir(&directory)?;
     let lock = private_file(&directory.join("service.lock"))?;
@@ -529,6 +595,7 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
         Arc::new(crate::performance::Service::from_environment()),
     ));
     let state = Arc::new(Shared {
+        plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), port),
         directory: directory.clone(),
         token: token.clone(),
         port,
@@ -546,6 +613,11 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
     let router = Router::new()
         .route("/_usage/status", get(status))
         .route("/_usage/routes", post(register))
+        .route("/_usage/plugins/call", post(plugin_call))
+        .route(
+            "/_usage/plugins/credentials/{plugin}",
+            post(plugin_credentials),
+        )
         .route("/r/{id}/{*path}", any(forward))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .with_state(state.clone());
@@ -587,7 +659,10 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
                 );
                 false
             });
-            let stopping = idle.should_stop(!routes.is_empty(), Instant::now());
+            let stopping = idle.should_stop(
+                !routes.is_empty() || monitor.plugins.has_work(Instant::now()).await,
+                Instant::now(),
+            );
             if stopping {
                 monitor.stopping.store(true, Ordering::Release);
             }
@@ -686,6 +761,7 @@ mod failure_tests {
         let (records, receiver) = mpsc::channel(8);
         let sources = Arc::new(recording::Sources::default());
         let state = Arc::new(Shared {
+            plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), 0),
             sources: sources.clone(),
             directory: PathBuf::new(),
             token: "admin".into(),
@@ -828,6 +904,7 @@ mod oauth_tests {
         let (records, mut receiver) = mpsc::channel(8);
         let sources = Arc::new(recording::Sources::default());
         let state = Arc::new(Shared {
+            plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), 0),
             sources: sources.clone(),
             directory: PathBuf::new(),
             token: "admin".into(),
@@ -903,5 +980,58 @@ mod oauth_tests {
             ["Bearer native-before", "Bearer native-after-refresh"]
         );
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod plugin_login_tests {
+    use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_manual_login_prevents_idle_shutdown() {
+        let root = std::env::temp_dir().join(format!("usage-login-idle-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let entry = root.join("fixture.mjs");
+        fs::write(
+            &entry,
+            include_str!("../plugins/fixture.mjs").replace("method: \"auto\"", "method: \"code\""),
+        )
+        .unwrap();
+        let store = crate::plugins::store::Store::new(root.join("plugins"));
+        store
+            .register(crate::plugins::store::Plugin {
+                id: "fixture".into(),
+                package: "local".into(),
+                version: "1".into(),
+                entry,
+                runtime: "node".into(),
+                enabled: true,
+                revision: 1,
+            })
+            .unwrap();
+        let runtime = crate::plugins::Runtime::new(store.root.clone(), 0);
+        let begin=runtime.call(serde_json::json!({"operation":"login.begin","plugin":"fixture","provider":"fixture","method":"0","inputs":{"uid":"pending"}})).await.unwrap();
+        assert_eq!(begin["method"], "code");
+        let start = Instant::now();
+        let mut idle = Idle::new(start);
+        let has_work = runtime.has_work(start + Duration::from_secs(61)).await;
+        let stops = idle.should_stop(has_work, start + Duration::from_secs(61));
+        runtime.call(serde_json::json!({"operation":"login.cancel","plugin":"fixture","provider":"fixture","session":begin["session"]})).await.unwrap();
+        assert!(
+            !runtime.has_work(Instant::now()).await,
+            "cancel releases the login lease"
+        );
+        runtime.call(serde_json::json!({"operation":"login.begin","plugin":"fixture","provider":"fixture","method":"0","inputs":{}})).await.unwrap();
+        assert!(
+            !runtime
+                .has_work(Instant::now() + Duration::from_secs(601))
+                .await,
+            "expired login cannot keep the gateway running"
+        );
+        drop(runtime);
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            !stops,
+            "a valid pending manual login must keep its callback host alive during the 10 minute login window"
+        );
     }
 }

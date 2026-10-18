@@ -28,7 +28,7 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 semver = "1"
 sha2 = "0.10"
 shlex = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util", "io-std", "process"] }
 toml = "0.8"
 toml_edit = "0.22"
 tracing = "0.1"

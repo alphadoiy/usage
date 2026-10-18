@@ -21,6 +21,7 @@ pub enum ProviderKind {
     OfficialApi,
     CompatibleApi,
     Subscription,
+    Plugin,
 }
 impl ProviderKind {
     pub fn label(self) -> &'static str {
@@ -28,6 +29,7 @@ impl ProviderKind {
             Self::OfficialApi => "官方 API · BYOK",
             Self::CompatibleApi => "兼容 API · BYOK",
             Self::Subscription => "官方订阅 · OAuth",
+            Self::Plugin => "插件提供方",
         }
     }
 }
@@ -136,6 +138,7 @@ enum Protocol {
     OpenAi,
     Anthropic,
     Codex(codex::AccountModels),
+    Plugin { root: PathBuf, account: String },
 }
 
 // Credentials only live in query plans; never Debug/Serialize them or put them in UI state.
@@ -169,6 +172,9 @@ impl ModelQuery {
         hash.update(self.url.as_str());
         hash.update([0]);
         hash.update(&self.key);
+        if let Protocol::Plugin { root, .. } = &self.protocol {
+            hash.update(root.as_os_str().as_encoded_bytes());
+        }
         if let Protocol::Codex(account) = &self.protocol {
             hash.update([0]);
             hash.update(&account.account_id);
@@ -206,6 +212,28 @@ impl ModelQuery {
     }
 
     async fn fetch(&self, http: &dyn HttpClient) -> Result<Vec<String>, &'static str> {
+        if let Protocol::Plugin { root, account } = &self.protocol {
+            let models = crate::plugins::call_at(
+                root,
+                serde_json::json!({"operation":"models","account":account}),
+            )
+            .await
+            .map_err(|_| "插件模型目录查询失败")?;
+            return models
+                .as_array()
+                .ok_or("插件模型目录格式无效")?
+                .iter()
+                .map(|m| {
+                    m["id"]
+                        .as_str()
+                        .filter(|s| {
+                            !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
+                        })
+                        .map(str::to_owned)
+                        .ok_or("插件模型 ID 无效")
+                })
+                .collect();
+        }
         if let Protocol::Codex(account) = &self.protocol {
             return account.fetch(http, &self.key).await;
         }
@@ -226,7 +254,7 @@ impl ModelQuery {
                 ("x-api-key", self.key.clone()),
                 ("anthropic-version", "2023-06-01".into()),
             ],
-            Protocol::Codex(_) => unreachable!(),
+            Protocol::Codex(_) | Protocol::Plugin { .. } => unreachable!(),
         };
         let mut url = self.url.clone();
         let mut models = BTreeSet::new();
@@ -306,6 +334,7 @@ pub struct CatalogService {
     root: PathBuf,
     pub(crate) http: Arc<dyn HttpClient>,
     credentials: Arc<CredentialResolver>,
+    plugins: crate::plugins::store::Store,
 }
 impl CatalogService {
     pub fn new(
@@ -317,7 +346,12 @@ impl CatalogService {
             root,
             http,
             credentials,
+            plugins: crate::plugins::store::Store::new(crate::plugins::store::root()),
         }
+    }
+    pub fn with_plugin_root(mut self, root: PathBuf) -> Self {
+        self.plugins = crate::plugins::store::Store::new(root);
+        self
     }
     pub fn from_environment() -> Self {
         Self::new(
@@ -335,25 +369,52 @@ impl CatalogService {
             queries: Vec::new(),
             resources: Vec::new(),
         };
+        let plugin_accounts = self.plugins.accounts().unwrap_or_default();
+        let plugins: HashMap<_, _> = self
+            .plugins
+            .plugins()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.enabled)
+            .map(|p| (p.id.clone(), p))
+            .collect();
+        let available_accounts: HashSet<_> = plugin_accounts
+            .iter()
+            .filter(|a| plugins.contains_key(&a.plugin))
+            .map(|a| a.id.as_str())
+            .collect();
+        let mut plugin_bindings: HashMap<String, Vec<String>> = HashMap::new();
         if let Some(manager) =
             Manager::open_read_only(self.root.clone()).map_err(|_| "读取 Provider 账号库失败")?
         {
             for profile in manager.list().map_err(|_| "读取 Provider 配置失败")? {
-                let query = manager.model_catalog_query(&profile).map_err(|_| {
-                    if profile.auth_mode == AuthMode::Oauth {
-                        "无法读取此 OAuth 账号的模型查询凭据，请重新登录".to_owned()
-                    } else {
-                        "无法读取此 Provider 的模型查询凭据".to_owned()
-                    }
-                });
-                let models = match query {
-                    Ok(query) => {
-                        plan.queries.push(query);
+                let plugin_account = crate::plugins::endpoint_account(&profile.base_url);
+                let models = if let Some(account) = &plugin_account {
+                    plugin_bindings
+                        .entry(account.clone())
+                        .or_default()
+                        .push(profile.id.clone());
+                    if available_accounts.contains(account.as_str()) {
                         Models::Loading
+                    } else {
+                        Models::Unavailable("插件账号不可用或插件已停用".into())
                     }
-                    Err(message) => Models::Unavailable(message),
+                } else {
+                    match manager.model_catalog_query(&profile) {
+                        Ok(query) => {
+                            plan.queries.push(query);
+                            Models::Loading
+                        }
+                        Err(_) => Models::Unavailable(if profile.auth_mode == AuthMode::Oauth {
+                            "无法读取此 OAuth 账号的模型查询凭据，请重新登录".into()
+                        } else {
+                            "无法读取此 Provider 的模型查询凭据".into()
+                        }),
+                    }
                 };
-                let provider_kind = if profile.auth_mode == AuthMode::Oauth {
+                let provider_kind = if plugin_account.is_some() {
+                    ProviderKind::Plugin
+                } else if profile.auth_mode == AuthMode::Oauth {
                     ProviderKind::Subscription
                 } else {
                     kind(&profile.base_url)
@@ -369,6 +430,81 @@ impl CatalogService {
                     performance: manager.performance_binding(&profile, profile.revision).ok(),
                 });
                 self.add_profile_usage(&mut plan, &manager, &profile, config);
+            }
+        }
+        let mut descriptors: HashMap<String, Option<serde_json::Value>> = HashMap::new();
+        for account in plugin_accounts {
+            let Some(plugin) = plugins.get(&account.plugin) else {
+                continue;
+            };
+            let endpoint = crate::plugins::account_endpoint(&account.id);
+            let existing = plugin_bindings.remove(&account.id).unwrap_or_default();
+            let descriptor = descriptors.entry(plugin.id.clone()).or_insert_with(|| {
+                crate::plugins::store::read::<serde_json::Value>(
+                    &self
+                        .plugins
+                        .root
+                        .join("descriptors")
+                        .join(format!("{}.json", plugin.id)),
+                )
+                .ok()
+                .filter(|d| d["revision"].as_u64() == Some(plugin.revision))
+            });
+            let supports_usage = descriptor
+                .as_ref()
+                .and_then(|d| {
+                    d["providers"]
+                        .as_array()?
+                        .iter()
+                        .find(|p| p["id"] == account.provider)
+                        .map(|p| p["capabilities"]["usage"] == true)
+                })
+                .unwrap_or(true);
+            let ids = if existing.is_empty() {
+                let id = format!("plugin:{}", account.id);
+                plan.catalog.providers.push(Provider {
+                    id: id.clone(),
+                    name: account.name.clone(),
+                    agent: None,
+                    kind: ProviderKind::Plugin,
+                    configured_model: None,
+                    models: Models::Loading,
+                    usage: ProviderUsage::default(),
+                    performance: None,
+                });
+                vec![id]
+            } else {
+                existing
+            };
+            for id in ids {
+                let query = ModelQuery {
+                    id: id.clone(),
+                    url: reqwest::Url::parse(&endpoint).expect("plugin endpoint"),
+                    key: format!(
+                        "{}:{}:{}:{}",
+                        plugin.id, plugin.version, plugin.revision, account.id
+                    ),
+                    protocol: Protocol::Plugin {
+                        root: self.plugins.root.clone(),
+                        account: account.id.clone(),
+                    },
+                };
+                if supports_usage {
+                    let reader = crate::plugins::adapters::resource(
+                        &self.plugins.root,
+                        &account,
+                        format!(
+                            "{}:{}:{}",
+                            plugin.version,
+                            plugin.revision,
+                            plugin.entry.display()
+                        ),
+                    );
+                    usage::attach_reader(&mut plan, &id, "插件订阅".into(), reader);
+                } else if let Some(p) = plan.catalog.providers.iter_mut().find(|p| p.id == id) {
+                    p.usage.hint = Some("此插件未提供用量查询".into());
+                }
+                plan.queries.push(query);
             }
         }
         for connection in &config.resources {
