@@ -36,6 +36,9 @@ pub struct ConnectionConfig {
 pub struct InferenceBinding {
     pub base_url: String,
     pub credential_env: String,
+    /// Explicit local log instance; never infer a Home from the API endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_instance: Option<String>,
 }
 impl ConnectionConfig {
     pub fn validate(&self) -> Result<(), RegistryError> {
@@ -65,6 +68,15 @@ impl ConnectionConfig {
         super::api::validate_base_url(&self.base_url)?;
         if let Some(inference) = &self.inference {
             super::api::validate_base_url(&inference.base_url)?;
+            if inference
+                .performance_instance
+                .as_deref()
+                .is_some_and(|id| !clean(id))
+            {
+                return Err(RegistryError::Factory(
+                    "performance_instance 必须为非空的实例 ID".into(),
+                ));
+            }
             if !valid_env_name(&inference.credential_env) {
                 return Err(RegistryError::Factory(
                     "inference.credential_env 必须为环境变量名称".into(),
@@ -79,13 +91,19 @@ impl ConnectionConfig {
         let canonical_base = super::api::validate_base_url(&self.base_url)
             .map(|url| url.to_string())
             .unwrap_or_else(|_| self.base_url.clone());
+        // Log-directory association does not change billing or inference identity.
+        let inference = self.inference.as_ref().map(|i| {
+            serde_json::json!({
+                "base_url": i.base_url, "credential_env": i.credential_env,
+            })
+        });
         let serialized = serde_json::to_vec(&serde_json::json!([
             self.service,
             canonical_base,
             self.credential_env,
             self.revision,
             self.options,
-            self.inference,
+            inference,
         ]))
         .expect("JSON values serialize");
         ResourceBinding {

@@ -104,6 +104,7 @@ pub struct Capabilities {
     pub sessions: bool,
     pub resources: bool,
     pub auth: bool,
+    pub performance: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +128,57 @@ impl Provider {
     pub fn id(&self) -> &str {
         &self.id
     }
+    /// Shared binding used by the homepage and library consumers; no credentials are read.
+    pub fn performance_binding(&self) -> Result<crate::performance::Binding, CapabilityError> {
+        let source = self
+            .agent
+            .request_source()
+            .ok_or(CapabilityError::Unsupported("performance"))?;
+        match &self.context {
+            AgentContext::Local { home } => Ok(crate::performance::local_binding(
+                &self.id,
+                self.agent.kind().id(),
+                home,
+                source,
+            )),
+            AgentContext::ManagedCodex {
+                root,
+                account,
+                revision,
+            } => {
+                let manager = crate::codex_manager::Manager::open_read_only(root.clone())
+                    .map_err(|_| CapabilityError::Failed("无法读取性能账号绑定".into()))?
+                    .ok_or_else(|| CapabilityError::Failed("账号库不存在".into()))?;
+                let profile = manager
+                    .resolve(account)
+                    .map_err(|_| CapabilityError::Failed("账号不存在".into()))?;
+                let mut binding = manager
+                    .performance_binding(&profile, revision.unwrap_or(profile.revision))
+                    .map_err(|_| CapabilityError::Failed("无法读取性能账号绑定".into()))?;
+                binding.provider = self.id.clone();
+                binding.source = source;
+                Ok(binding)
+            }
+        }
+    }
+
+    /// Local indexed query; run on a background worker, like session catalog loading.
+    pub fn performance(
+        &self,
+        service: &crate::performance::Service,
+        period: crate::performance::Period,
+    ) -> Result<crate::performance::Snapshot, CapabilityError> {
+        let binding = self.performance_binding()?;
+        service
+            .snapshot(
+                &binding,
+                period,
+                None,
+                0,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(CapabilityError::Failed)
+    }
 
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -138,6 +190,7 @@ impl Provider {
             sessions: self.agent.session_source().is_some(),
             resources: !self.resources.is_empty(),
             auth: self.auth.is_some(),
+            performance: self.agent.request_source().is_some(),
         }
     }
 
@@ -426,6 +479,7 @@ mod tests {
                 sessions: true,
                 resources: true,
                 auth: false,
+                performance: false,
             }
         );
         let request = SpawnRequest {

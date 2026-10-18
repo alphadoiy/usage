@@ -3,7 +3,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
@@ -457,23 +457,40 @@ struct DotBar {
     color: Color,
 }
 
+fn dot_cells(percent: f64, color: Color, dots: u16) -> impl Iterator<Item = (&'static str, Style)> {
+    let ratio = if percent.is_finite() {
+        (percent / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = (ratio * f64::from(dots)).round() as u16;
+    (0..dots).map(move |index| {
+        let active = index < filled;
+        (
+            if active { "●" } else { "○" },
+            Style::new().fg(if active { color } else { TRACK }),
+        )
+    })
+}
+
+/// Inline variant of the existing dot meter for scrollable provider information.
+pub(crate) fn quota_dots(provider_id: &str, used_percent: f64) -> Vec<Span<'static>> {
+    dot_cells(used_percent, meter_color(provider_id, used_percent), 8)
+        .flat_map(|(symbol, style)| [Span::styled(symbol, style), Span::raw(" ")])
+        .collect()
+}
+
 impl Widget for DotBar {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 {
             return;
         }
-        let dots = area.width / 2;
-        let ratio = if self.percent.is_finite() {
-            (self.percent / 100.0).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let filled = (ratio * f64::from(dots)).round() as u16;
-        for index in 0..dots {
-            let active = index < filled;
-            buf[(area.x + index * 2, area.y)]
-                .set_symbol(if active { "●" } else { "○" })
-                .set_style(Style::new().fg(if active { self.color } else { TRACK }));
+        for (index, (symbol, style)) in
+            dot_cells(self.percent, self.color, area.width / 2).enumerate()
+        {
+            buf[(area.x + index as u16 * 2, area.y)]
+                .set_symbol(symbol)
+                .set_style(style);
         }
     }
 }

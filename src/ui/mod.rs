@@ -6,6 +6,7 @@ mod history;
 mod home;
 mod menu;
 mod overview;
+mod performance;
 mod session_browser;
 /// Reusable subscription quota widgets; the home Provider board uses the model catalog.
 pub mod widgets;

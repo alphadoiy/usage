@@ -155,6 +155,9 @@ pub trait AgentAdapter: Send + Sync {
     fn session_source(&self) -> Option<SessionSource> {
         None
     }
+    fn request_source(&self) -> Option<crate::performance::RequestSource> {
+        None
+    }
 }
 
 impl std::fmt::Debug for dyn AgentAdapter {
@@ -176,6 +179,9 @@ struct LocalAgent {
 impl AgentAdapter for LocalAgent {
     fn kind(&self) -> AgentKind {
         self.kind
+    }
+    fn request_source(&self) -> Option<crate::performance::RequestSource> {
+        crate::performance::source(self.kind.id())
     }
     fn launcher(&self) -> Option<&dyn Launcher> {
         Some(self)

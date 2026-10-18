@@ -425,6 +425,28 @@ impl Manager {
         ).optional()?)
     }
 
+    /// Bind performance logs to this exact saved account revision without reading keys.
+    pub(crate) fn performance_binding(
+        &self,
+        profile: &Profile,
+        revision: i64,
+    ) -> Result<crate::performance::Binding> {
+        let saved = self.revision(&profile.id, revision)?;
+        let config: toml::Value =
+            toml::from_str(&saved.config).map_err(|_| Error::message("性能配置无效"))?;
+        Ok(crate::performance::Binding {
+            provider: profile.id.clone(),
+            source: crate::performance::source("codex").expect("Codex source"),
+            agent: "codex".into(),
+            home: self.home(&profile.id, revision)?,
+            revision: revision.to_string(),
+            expected_upstream: config
+                .get("model_provider")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
     /// Prepare a read-only model query using this exact saved account revision.
     pub(crate) fn model_catalog_query(
         &self,

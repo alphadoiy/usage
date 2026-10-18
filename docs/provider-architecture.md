@@ -23,6 +23,8 @@ flowchart TD
     Provider --> Auth[可选 AuthAdapter]
     Agent --> Launcher
     Agent --> Sessions[SessionSource]
+    Agent --> Performance[可选 RequestSource]
+    Performance --> Index[增量性能索引]
     Launcher --> Manager[Codex Manager / 本地命令]
     Resources --> Subscription[现有官方订阅适配器]
     Resources --> API[API 资源适配器扩展点]
@@ -44,6 +46,7 @@ flowchart TD
 - 内置会话目录使用 Agent 注册表创建对应 Home 的读取器，并在 Session 上保留该 Agent；当前终端恢复委托其 Launcher。复制命令与 Ghostty 分屏使用 Launcher 显式提供的命令导出能力，不支持时返回错误。原 `SessionRegistry::register` 仍支持仅有 loader 的旧来源。
 - `Provider::sessions()` 从实例的 AgentContext 解析 Home，并将 Provider ID 作为会话实例身份，调用方不能替换为其他账号目录。
 - `Provider::resources()` 与 `ResourceService` 共用资源层的并发收集和查询时间限制；单个任务 panic 或超时返回带原绑定的失败快照，其他结果继续返回并保持配置顺序。
+- `AgentAdapter::request_source()` 声明性能日志格式工厂；`Provider::performance_binding()` 解析实例 Home 与版本，`Provider::performance()` 读取独立索引。首页 Provider 按 `v` 打开模型性能弹窗，按需后台增量采集并分页读取；独立推理连接可显式配置日志实例。绑定、估算口径和读取预算见[Provider 性能](performance.md)。
 
 工厂构造不请求网络、读取密钥或启动进程。HTTP、时间、凭据解析器由上下文传入，API 服务使用 `ApiConnection`，凭据引用仅在查询时解析。
 

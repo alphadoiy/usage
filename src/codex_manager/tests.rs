@@ -263,6 +263,31 @@ fn revision_updates_do_not_rewrite_existing_home_or_credentials() {
         serde_json::from_slice(&fs::read(home1.join("usage-binding.json")).unwrap()).unwrap();
     assert_eq!(binding.revision, 1);
     assert_eq!(binding.profile_id, p.id);
+    let performance1 = m.performance_binding(&updated, 1).unwrap();
+    let performance2 = m.performance_binding(&updated, 2).unwrap();
+    assert_eq!(performance1.home, home1);
+    assert_eq!(performance2.home, home2);
+    assert_ne!(performance1.scope(), performance2.scope());
+    assert_eq!(performance1.revision, "1");
+    assert!(performance1.expected_upstream.is_some());
+    let provider = crate::hub::Hub::default()
+        .provider(crate::hub::ProviderDefinition {
+            id: "configured-provider".into(),
+            agent: "codex".into(),
+            context: crate::agents::AgentContext::ManagedCodex {
+                root: m.root().to_owned(),
+                account: p.id.clone(),
+                revision: Some(1),
+            },
+            resources: Vec::new(),
+            auth: None,
+        })
+        .unwrap();
+    let binding = provider.performance_binding().unwrap();
+    assert_eq!(binding.provider, "configured-provider");
+    assert_eq!(binding.home, home1);
+    assert_eq!(binding.scope(), performance1.scope());
+    assert!(provider.capabilities().performance);
 }
 
 #[test]

@@ -38,6 +38,16 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    HomePerformance {
+        generation: u64,
+        key: String,
+        result: Result<Option<crate::performance::Summary>, String>,
+    },
+    Performance {
+        generation: u64,
+        result: Result<crate::performance::Snapshot, String>,
+        loading: bool,
+    },
     HomeActivityLoaded {
         generation: u64,
         result: Result<HashMap<sessions::SessionKey, crate::runs::SessionRuntime>, String>,
@@ -248,6 +258,10 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     {
                         break Ok(());
                     }
+                    if app.handle_performance_key(key.code, &handle) {
+                        redraw.invalidate();
+                        continue;
+                    }
                     if app.handle_reset_key(key.code, &handle) {
                         redraw.invalidate();
                         continue;
@@ -411,6 +425,13 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    home_performance: HashMap<String, super::performance::CachedSummary>,
+    home_performance_task: Option<tokio::task::JoinHandle<()>>,
+    home_performance_pending: bool,
+    home_performance_generation: u64,
+    performance: Option<super::performance::Panel>,
+    performance_service: Arc<crate::performance::Service>,
+    performance_generation: u64,
     home_activity: HashMap<sessions::SessionKey, crate::runs::SessionRuntime>,
     home_activity_error: Option<String>,
     home_activity_task: Option<tokio::task::JoinHandle<()>>,
@@ -478,6 +499,9 @@ struct Dashboard {
 
 impl Drop for Dashboard {
     fn drop(&mut self) {
+        if let Some(task) = self.home_performance_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.home_activity_task.take() {
             task.abort();
         }
@@ -565,6 +589,13 @@ impl Dashboard {
             .collect();
         Self {
             home_activity: HashMap::new(),
+            home_performance: HashMap::new(),
+            home_performance_task: None,
+            home_performance_pending: false,
+            home_performance_generation: 0,
+            performance: None,
+            performance_service: Arc::new(crate::performance::Service::from_environment()),
+            performance_generation: 0,
             home_activity_error: None,
             home_activity_task: None,
             home_activity_pending: false,
@@ -1046,6 +1077,9 @@ impl Dashboard {
             return true;
         }
         match key {
+            KeyCode::Char('v') if self.home_focus == HomeFocus::Providers => {
+                self.open_performance(handle)
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.home_focus = self.home_focus.next(key == KeyCode::BackTab)
             }
@@ -1319,6 +1353,206 @@ impl Dashboard {
         }
     }
 
+    fn refresh_home_performance(&mut self, handle: &Handle) -> bool {
+        if self.home_performance_pending {
+            return false;
+        }
+        let Some(binding) =
+            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+                .and_then(|(_, p)| p.performance.clone())
+        else {
+            return false;
+        };
+        let key = binding.cache_key();
+        if self
+            .home_performance
+            .get(&key)
+            .is_some_and(|s| s.updated.elapsed() < super::performance::HOME_TTL)
+        {
+            return false;
+        }
+        self.home_performance_generation = self.home_performance_generation.wrapping_add(1);
+        let generation = self.home_performance_generation;
+        self.home_performance_pending = true;
+        let service = self.performance_service.clone();
+        let tx = self.tx.clone();
+        self.home_performance_task = Some(handle.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                service.summary(
+                    &binding,
+                    crate::performance::Period::Day,
+                    Utc::now().timestamp_millis(),
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err("性能摘要读取中断".into()));
+            let _ = tx.send(AppEvent::HomePerformance {
+                generation,
+                key,
+                result,
+            });
+        }));
+        true
+    }
+
+    fn open_performance(&mut self, handle: &Handle) {
+        let Some((_, provider)) =
+            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+        else {
+            self.notice = Some("请先选择首页 Provider".into());
+            return;
+        };
+        let Some(binding) = provider.performance.clone() else {
+            self.notice = Some("此 Provider 尚未绑定本地请求日志".into());
+            return;
+        };
+        self.performance = Some(super::performance::Panel::new(
+            binding,
+            provider.name.clone(),
+        ));
+        self.load_performance(handle, false);
+    }
+
+    fn handle_performance_key(&mut self, key: KeyCode, handle: &Handle) -> bool {
+        let Some(panel) = &mut self.performance else {
+            return false;
+        };
+        match panel.key(key) {
+            super::performance::Action::Close => self.performance = None,
+            super::performance::Action::Reload => self.load_performance(handle, false),
+            super::performance::Action::Rescan => self.load_performance(handle, true),
+            super::performance::Action::Stay => {}
+        }
+        true
+    }
+
+    fn load_performance(&mut self, handle: &Handle, rescan: bool) {
+        let Some(panel) = &mut self.performance else {
+            return;
+        };
+        panel.stop();
+        self.performance_generation = self.performance_generation.wrapping_add(1);
+        panel.generation = self.performance_generation;
+        panel.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        panel.loading = true;
+        let generation = panel.generation;
+        let binding = panel.binding.clone();
+        let period = panel.period;
+        let model = panel.detail.clone();
+        let page = panel.page;
+        let cancel = panel.cancel.clone();
+        let service = self.performance_service.clone();
+        let tx = self.tx.clone();
+        panel.task = Some(handle.spawn(async move {
+            let cached = {
+                let (service, binding, model, flag) = (
+                    service.clone(),
+                    binding.clone(),
+                    model.clone(),
+                    cancel.clone(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("已取消".into());
+                    }
+                    service.snapshot(
+                        &binding,
+                        period,
+                        model.as_deref(),
+                        page,
+                        Utc::now().timestamp_millis(),
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| Err("性能索引读取中断".into()))
+            };
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let _ = tx.send(AppEvent::Performance {
+                generation,
+                result: cached,
+                loading: true,
+            });
+            let source = binding.source;
+            if rescan {
+                service.rediscover(&binding);
+            }
+            let mut bytes = 0;
+            let mut files = 0;
+            let mut skipped = 0;
+            let mut reported = std::time::Instant::now();
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let (svc, scope, flag) = (service.clone(), binding.clone(), cancel.clone());
+                let batch = tokio::task::spawn_blocking(move || svc.refresh(&scope, source, &flag))
+                    .await
+                    .unwrap_or_else(|_| Err("性能采集任务中断".into()));
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        let _ = tx.send(AppEvent::Performance {
+                            generation,
+                            result: Err(error),
+                            loading: false,
+                        });
+                        return;
+                    }
+                };
+                bytes += batch.bytes;
+                files += batch.files;
+                skipped += batch.skipped;
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if !batch.more || reported.elapsed() >= Duration::from_millis(250) {
+                    let (svc, scope, model, flag) = (
+                        service.clone(),
+                        binding.clone(),
+                        model.clone(),
+                        cancel.clone(),
+                    );
+                    let mut result = tokio::task::spawn_blocking(move || {
+                        if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Err("已取消".into());
+                        }
+                        svc.snapshot(
+                            &scope,
+                            period,
+                            model.as_deref(),
+                            page,
+                            Utc::now().timestamp_millis(),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("性能统计任务中断".into()));
+                    if let Ok(snapshot) = &mut result {
+                        snapshot.read_bytes = bytes;
+                        snapshot.files_checked = files;
+                        snapshot.skipped_lines = skipped;
+                        snapshot.partial = batch.more;
+                    }
+                    let failed = result.is_err();
+                    let _ = tx.send(AppEvent::Performance {
+                        generation,
+                        result,
+                        loading: batch.more && !failed,
+                    });
+                    if failed {
+                        return;
+                    }
+                    reported = std::time::Instant::now();
+                }
+                if !batch.more {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }));
+    }
+
     fn open_reset(&mut self, handle: &Handle) {
         let Some((_, selected)) =
             super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
@@ -1389,6 +1623,13 @@ impl Dashboard {
     }
 
     fn maybe_auto_refresh(&mut self, handle: &Handle) -> bool {
+        if let Some(panel) = &self.performance {
+            if !panel.loading && panel.refreshed.elapsed() >= Duration::from_secs(5) {
+                self.load_performance(handle, false);
+                return true;
+            }
+            return false;
+        }
         if self.history.is_some() || self.browser.is_some() {
             if self.browser.as_ref().is_some_and(|b| b.launching) {
                 return false;
@@ -1405,19 +1646,20 @@ impl Dashboard {
             }
             return false;
         }
+        let summary_started = self.refresh_home_performance(handle);
         if self.refresh_seconds == 0
             || self.pending > 0
             || self.overview_loading
             || self.reset.is_some()
             || self.browser.is_some()
         {
-            return false;
+            return summary_started;
         }
         if self.last_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds) {
             self.refresh_background(handle);
             return true;
         }
-        false
+        summary_started
     }
 
     fn drain_events(&mut self) -> (bool, bool) {
@@ -1425,6 +1667,81 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::HomePerformance {
+                    generation,
+                    key,
+                    result,
+                } => {
+                    if generation == self.home_performance_generation {
+                        self.home_performance_pending = false;
+                        self.home_performance_task = None;
+                        if self.overview.as_ref().is_some_and(|c| {
+                            c.providers.iter().any(|p| {
+                                p.performance.as_ref().is_some_and(|b| b.cache_key() == key)
+                            })
+                        }) {
+                            self.home_performance.insert(
+                                key,
+                                super::performance::CachedSummary {
+                                    result,
+                                    updated: std::time::Instant::now(),
+                                },
+                            );
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
+                AppEvent::Performance {
+                    generation,
+                    result,
+                    loading,
+                } => {
+                    let mut home_update = None;
+                    if let Some(panel) = &mut self.performance
+                        && panel.generation == generation
+                    {
+                        panel.loading = loading;
+                        panel.refreshed = std::time::Instant::now();
+                        match result {
+                            Ok(snapshot) => {
+                                if !loading {
+                                    home_update = Some((
+                                        panel.binding.cache_key(),
+                                        (panel.period == crate::performance::Period::Day)
+                                            .then(|| snapshot.summary.clone()),
+                                    ));
+                                }
+                                panel.selected =
+                                    panel.selected.min(snapshot.models.len().saturating_sub(1));
+                                panel.snapshot = Some(snapshot);
+                                panel.error = None;
+                            }
+                            Err(error) => panel.error = Some(error),
+                        }
+                        changed = true;
+                    }
+                    if let Some((key, summary)) = home_update {
+                        self.home_performance_generation =
+                            self.home_performance_generation.wrapping_add(1);
+                        if let Some(task) = self.home_performance_task.take() {
+                            task.abort();
+                        }
+                        self.home_performance_pending = false;
+                        if let Some(summary) = summary {
+                            self.home_performance.insert(
+                                key,
+                                super::performance::CachedSummary {
+                                    result: Ok(Some(summary)),
+                                    updated: std::time::Instant::now(),
+                                },
+                            );
+                        } else {
+                            self.home_performance.remove(&key);
+                        }
+                    }
+                    continue;
+                }
                 AppEvent::HomeActivityLoaded { generation, result } => {
                     if generation == self.home_activity_generation {
                         self.home_activity_pending = false;
@@ -1867,7 +2184,7 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
             None if app.home_sessions.launching => " 正在恢复会话，请等待…",
             None => match app.home_focus {
                 super::home::Focus::Providers => {
-                    " Tab 看板  ←/→ Provider  ↑/↓ 滚动  Enter 模型  x 当前账号重置  r 刷新  F4 管理  q 退出"
+                    " Tab 看板  ←/→ Provider  ↑/↓ 滚动  Enter 模型  v 性能  x 重置  r 刷新  F4 管理  q 退出"
                 }
                 super::home::Focus::Connections => {
                     if app.home_connections.is_details() {
@@ -1890,6 +2207,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         )
         .render(footer, frame.buffer_mut());
     draw_reset_modal(frame, app);
+    if let Some(panel) = &app.performance {
+        super::performance::draw(frame, panel);
+    }
     if let Some(menu) = &app.menu {
         menu.render(frame);
     }
@@ -1950,6 +2270,9 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
 }
 
 fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
+    let summary = super::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
+        .and_then(|(_, p)| p.performance.as_ref())
+        .and_then(|b| app.home_performance.get(&b.cache_key()));
     super::overview::wrap(
         super::overview::lines(
             app.overview.as_ref(),
@@ -1957,6 +2280,7 @@ fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
             app.overview_error.as_deref(),
             app.home_models_expanded,
             app.home_provider.as_deref(),
+            summary,
         ),
         width,
     )
@@ -2187,6 +2511,7 @@ mod tests {
                     kind: ProviderKind::Subscription,
                     configured_model: None,
                     models: Models::Ready(Vec::new()),
+                    performance: None,
                     usage: ProviderUsage {
                         reset: ResetHandle::new(provider.clone()),
                         ..Default::default()
@@ -2576,11 +2901,18 @@ mod tests {
             other.usage.sources[0].target = "other".into();
             catalog.providers.push(other);
             let text = |app: &Dashboard| {
-                crate::ui::overview::lines(app.overview.as_ref(), false, None, true, Some("codex"))
-                    .iter()
-                    .flat_map(|line| &line.spans)
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
+                crate::ui::overview::lines(
+                    app.overview.as_ref(),
+                    false,
+                    None,
+                    true,
+                    Some("codex"),
+                    None,
+                )
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
             };
             assert!(text(&app).contains(&format!("主动重置 {initial} 次")));
             app.open_reset(&Handle::current());
@@ -3045,6 +3377,7 @@ mod overview_regression_tests {
                 configured_model: Some("default-model".into()),
                 models: Models::Loading,
                 usage: Default::default(),
+                performance: None,
             }],
             ..Default::default()
         }
@@ -3452,6 +3785,7 @@ options={user_id=1}
             configured_model: None,
             models: Models::Unavailable("OAuth 模型列表认证失败或权限不足".into()),
             usage: Default::default(),
+            performance: None,
         });
         app.overview = Some(catalog);
         assert!(!rendered(&app, 100, 30).contains("available-model-23"));
@@ -3787,6 +4121,7 @@ mod home_board_tests {
                 configured_model: None,
                 models: crate::provider_catalog::Models::Ready(Vec::new()),
                 usage: Default::default(),
+                performance: None,
             }],
             ..Default::default()
         });
@@ -3959,5 +4294,342 @@ mod home_board_tests {
         assert_eq!(app.home_sessions.focus(), Focus::Sessions);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod performance_regression_tests {
+    use super::*;
+    use crate::performance::{Binding, ModelStats, Snapshot};
+    use crate::provider_catalog::{Catalog, Models, Provider, ProviderKind};
+
+    #[tokio::test]
+    async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minutes() {
+        let root =
+            std::env::temp_dir().join(format!("usage-home-performance-{}", uuid::Uuid::new_v4()));
+        let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config"));
+        app.performance_service =
+            Arc::new(crate::performance::Service::at(root.join("index.sqlite3")));
+        let a = panel().binding.clone();
+        let mut b = a.clone();
+        b.provider = "provider-b".into();
+        b.home = root.join("other-home");
+        app.overview = Some(Catalog {
+            providers: [a.clone(), b.clone()]
+                .into_iter()
+                .map(|binding| Provider {
+                    id: binding.provider.clone(),
+                    name: binding.provider.clone(),
+                    agent: None,
+                    kind: ProviderKind::CompatibleApi,
+                    configured_model: None,
+                    models: Models::Ready(Vec::new()),
+                    usage: Default::default(),
+                    performance: Some(binding),
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let handle = Handle::current();
+        assert!(app.refresh_home_performance(&handle));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.home_performance_pending {
+                app.drain_events();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !root.exists(),
+            "homepage must not create an index or scan directories"
+        );
+        assert!(!app.refresh_home_performance(&handle));
+        app.home_performance.insert(
+            a.cache_key(),
+            super::super::performance::CachedSummary {
+                result: Ok(Some(crate::performance::Summary {
+                    calls: 100,
+                    mean_ttft_ms: Some(2000.0),
+                    timed_samples: 90,
+                    floor_tokens: 1000,
+                    floor_ms: 10000,
+                    floor_samples: 4,
+                    speed_tokens: 600,
+                    speed_ms: 10000,
+                    speed_samples: 80,
+                })),
+                updated: std::time::Instant::now(),
+            },
+        );
+        let text = |app: &Dashboard| {
+            home_lines(app, 100)
+                .iter()
+                .flat_map(|l| &l.spans)
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(&app).contains("2.00s（90 样本）"));
+        assert!(text(&app).contains("≥100.0 tok/s（4 样本）"));
+        assert!(text(&app).contains("60.0 tok/s"));
+        app.home_provider = Some(b.provider.clone());
+        assert!(!text(&app).contains("60.0 tok/s"));
+        app.home_performance.insert(
+            b.cache_key(),
+            super::super::performance::CachedSummary {
+                result: Ok(None),
+                updated: std::time::Instant::now(),
+            },
+        );
+        assert!(!app.refresh_home_performance(&handle));
+        app.home_provider = Some(a.provider.clone());
+        assert!(!app.refresh_home_performance(&handle));
+        app.home_performance
+            .get_mut(&a.cache_key())
+            .unwrap()
+            .updated -= Duration::from_secs(301);
+        assert!(app.refresh_home_performance(&handle));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.home_performance_pending {
+                app.drain_events();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let old = a.cache_key();
+        app.overview.as_mut().unwrap().providers[0]
+            .performance
+            .as_mut()
+            .unwrap()
+            .revision = "changed".into();
+        app.tx
+            .send(AppEvent::HomePerformance {
+                generation: app.home_performance_generation,
+                key: old.clone(),
+                result: Err("wrong revision".into()),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(app.home_performance.get(&old).unwrap().result.is_ok());
+        assert!(!text(&app).contains("wrong revision"));
+        assert!(
+            app.refresh_home_performance(&handle),
+            "new account revision cannot reuse cached averages"
+        );
+    }
+
+    async fn loaded(app: &mut Dashboard) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                app.drain_events();
+                let panel = app.performance.as_ref().unwrap();
+                if !panel.loading {
+                    assert!(panel.error.is_none(), "{:?}", panel.error);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("performance dialog never finished");
+    }
+
+    #[tokio::test]
+    async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_cancels() {
+        let root =
+            std::env::temp_dir().join(format!("usage-performance-ui-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let at = (Utc::now() - chrono::Duration::seconds(30)).to_rfc3339();
+        let end = (Utc::now() - chrono::Duration::seconds(20)).to_rfc3339();
+        let text = [
+            serde_json::json!({"timestamp":at,"type":"session_meta","payload":{"id":"fixture","model_provider":"relay"}}),
+            serde_json::json!({"timestamp":at,"type":"turn_context","payload":{"model":"fixture-model"}}),
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}),
+            serde_json::json!({"timestamp":end,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":500},"last_token_usage":{"output_tokens":500}}}}),
+            serde_json::json!({"timestamp":end,"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","duration_ms":10000,"time_to_first_token_ms":2000}}),
+        ].into_iter().map(|v| v.to_string()+"\n").collect::<String>();
+        std::fs::write(home.join("sessions/fixture.jsonl"), &text).unwrap();
+        let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config.toml"));
+        app.performance_service = Arc::new(crate::performance::Service::at(
+            root.join("index/performance.sqlite3"),
+        ));
+        let mut p = panel();
+        p.binding.home = home;
+        p.snapshot = None;
+        app.performance = Some(p);
+        let handle = Handle::current();
+        app.load_performance(&handle, false);
+        loaded(&mut app).await;
+        let data = app.performance.as_ref().unwrap().snapshot.as_ref().unwrap();
+        assert_eq!(data.models[0].model, "fixture-model");
+        assert_eq!(data.models[0].mean_ttft_ms, Some(2000.0));
+        assert_eq!(data.read_bytes, text.len() as u64);
+        let key = app.performance.as_ref().unwrap().binding.cache_key();
+        let mean = app
+            .home_performance
+            .get(&key)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!(mean.mean_ttft_ms, Some(2000.0));
+        app.handle_performance_key(KeyCode::Char('r'), &handle);
+        loaded(&mut app).await;
+        let data = app.performance.as_ref().unwrap().snapshot.as_ref().unwrap();
+        assert_eq!(data.read_bytes, 0);
+        assert_eq!(data.models[0].calls, 1);
+        let cancel = app.performance.as_ref().unwrap().cancel.clone();
+        app.handle_performance_key(KeyCode::Esc, &handle);
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.performance.is_none());
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn panel() -> super::super::performance::Panel {
+        let binding = Binding {
+            provider: "provider-a".into(),
+            source: crate::performance::source("codex").unwrap(),
+            agent: "codex".into(),
+            home: "/nonexistent/usage-performance-fixture".into(),
+            revision: "1".into(),
+            expected_upstream: Some("relay".into()),
+        };
+        let mut panel = super::super::performance::Panel::new(binding, "Work".into());
+        panel.generation = 7;
+        panel.loading = false;
+        panel.snapshot = Some(Snapshot {
+            models: vec![ModelStats {
+                model: "observed-model".into(),
+                calls: 8,
+                mean_ttft_ms: Some(2000.0),
+                timed_samples: 3,
+                floor_tokens: 1000,
+                floor_ms: 10000,
+                floor_samples: 2,
+                speed_tokens: 600,
+                speed_ms: 10000,
+                speed_samples: 4,
+            }],
+            ..Default::default()
+        });
+        panel
+    }
+    #[test]
+    fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut app = Dashboard::new(
+            Vec::new(),
+            AppConfig::default(),
+            "/nonexistent/perf-config".into(),
+        );
+        app.performance = Some(panel());
+        // x, Enter and navigation belong to the modal, never to resets or parent sessions.
+        assert!(app.handle_performance_key(KeyCode::Char('x'), runtime.handle()));
+        assert!(app.reset.is_none());
+        for width in [42, 100] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 28)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::super::performance::draw(frame, app.performance.as_ref().unwrap())
+                })
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            let compact = text.split_whitespace().collect::<String>().replace('│', "");
+            assert!(compact.contains("Work·性能"));
+            assert!(compact.contains("平均首字"));
+            assert!(compact.contains("速度下限"));
+            assert!(compact.contains("observed-model"));
+            assert!(compact.contains("60.0tok/s"), "width={width}: {compact}");
+        }
+        assert!(app.handle_performance_key(KeyCode::Esc, runtime.handle()));
+        assert!(app.performance.is_none());
+    }
+    #[test]
+    fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
+        let mut app = Dashboard::new(
+            Vec::new(),
+            AppConfig::default(),
+            "/nonexistent/perf-config".into(),
+        );
+        app.performance = Some(panel());
+        app.home_provider = Some("provider-b".into());
+        app.tx
+            .send(AppEvent::Performance {
+                generation: 6,
+                result: Err("stale".into()),
+                loading: false,
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(app.performance.as_ref().unwrap().error.is_none());
+        assert_eq!(
+            app.performance.as_ref().unwrap().binding.provider,
+            "provider-a"
+        );
+        app.tx
+            .send(AppEvent::Performance {
+                generation: 7,
+                result: Ok(Snapshot::default()),
+                loading: false,
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(
+            app.performance
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .models
+                .is_empty()
+        );
+        app.performance = None;
+        app.tx
+            .send(AppEvent::Performance {
+                generation: 7,
+                result: Err("closed".into()),
+                loading: false,
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(app.performance.is_none());
+    }
+    #[test]
+    fn an_unbound_provider_never_scans_default_agent_logs() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut app = Dashboard::new(
+            Vec::new(),
+            AppConfig::default(),
+            "/nonexistent/perf-config".into(),
+        );
+        app.overview = Some(Catalog {
+            providers: vec![Provider {
+                id: "api".into(),
+                name: "API".into(),
+                agent: None,
+                kind: ProviderKind::OfficialApi,
+                configured_model: None,
+                models: Models::Ready(Vec::new()),
+                usage: Default::default(),
+                performance: None,
+            }],
+            ..Default::default()
+        });
+        app.open_performance(runtime.handle());
+        assert!(app.performance.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("尚未绑定"));
     }
 }

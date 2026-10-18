@@ -342,6 +342,11 @@ fn load_codex_index(home: &Path) -> Result<Vec<SessionRecord>, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    // sqlite3 -json prints nothing (rather than []) when SELECT matches no rows.
+    // This is an authoritative empty index, not a parse failure or rollout fallback.
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
     let rows: Vec<CodexRow> =
         serde_json::from_slice(&output.stdout).map_err(|e| format!("索引格式不兼容：{e}"))?;
     Ok(rows
@@ -1185,6 +1190,53 @@ mod tests {
             records.iter().find(|s| s.id == fork).unwrap().title,
             "New direction"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn empty_codex_index_is_not_a_warning_or_a_reason_to_scan_stale_rollouts() {
+        let root = std::env::temp_dir().join(format!("usage-empty-index-{}", uuid::Uuid::new_v4()));
+        let home = root.join("codex");
+        let cwd = root.join("project");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, cwd TEXT, name TEXT, title TEXT, preview TEXT, recency_at_ms INTEGER, archived INTEGER, thread_source TEXT, source TEXT);").unwrap();
+        // A valid but stale rollout must not override a successful zero-row index.
+        fs::write(
+            home.join("sessions/stale.jsonl"),
+            serde_json::json!({
+                "type":"session_meta", "payload":{
+                    "id":"123e4567-e89b-12d3-a456-426614174000", "cwd":cwd, "thread_source":"user"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let homes = SessionHomes::new().with("codex", &home);
+        let catalog = load_all(&homes);
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        for (archived, thread_source, source, path) in [
+            (1, "user", "cli", cwd.to_string_lossy().as_ref()),
+            (0, "subagent", "cli", cwd.to_string_lossy().as_ref()),
+            (0, "user", "exec", cwd.to_string_lossy().as_ref()),
+            (0, "user", "cli", ""),
+        ] {
+            db.execute("INSERT INTO threads VALUES('123e4567-e89b-12d3-a456-426614174000',?1,'fixture','','',100,?2,?3,?4)",
+                rusqlite::params![path, archived, thread_source, source]).unwrap();
+        }
+        let catalog = load_all(&homes);
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        db.execute_batch("DROP TABLE threads;").unwrap();
+        assert!(
+            load_codex_index(&home)
+                .unwrap_err()
+                .contains("读取索引失败")
+        );
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 

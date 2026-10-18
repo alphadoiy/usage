@@ -48,6 +48,7 @@ pub struct Provider {
     pub configured_model: Option<String>,
     pub models: Models,
     pub usage: ProviderUsage,
+    pub performance: Option<crate::performance::Binding>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -365,6 +366,7 @@ impl CatalogService {
                     configured_model: Some(profile.model.clone()),
                     models,
                     usage: ProviderUsage::default(),
+                    performance: manager.performance_binding(&profile, profile.revision).ok(),
                 });
                 self.add_profile_usage(&mut plan, &manager, &profile, config);
             }
@@ -392,6 +394,32 @@ impl CatalogService {
                 }
                 Err(error) => Models::Unavailable(error.into()),
             };
+            let performance = inference
+                .performance_instance
+                .as_deref()
+                .map(|instance_id| {
+                    let instance = config
+                        .instances
+                        .iter()
+                        .find(|i| i.id == instance_id)
+                        .ok_or("性能日志实例不存在")?;
+                    let agent = crate::agents::builtin_registry()
+                        .create(
+                            &instance.provider,
+                            crate::agents::AgentContext::Local {
+                                home: instance.path.clone(),
+                            },
+                        )
+                        .map_err(|_| "性能日志 Agent 无效")?;
+                    let source = agent.request_source().ok_or("此 Agent 尚不支持性能日志")?;
+                    Ok::<_, &str>(crate::performance::local_binding(
+                        &id,
+                        agent.kind().id(),
+                        &instance.path,
+                        source,
+                    ))
+                })
+                .transpose()?;
             plan.catalog.providers.push(Provider {
                 id,
                 name: connection
@@ -403,6 +431,7 @@ impl CatalogService {
                 configured_model: None,
                 models,
                 usage: ProviderUsage::default(),
+                performance,
             });
         }
         self.add_configured_usage(&mut plan, config);
@@ -495,10 +524,51 @@ mod tests {
                 inference: Some(InferenceBinding {
                     base_url: "https://relay.invalid/proxy/v1".into(),
                     credential_env: "INFERENCE_ONLY".into(),
+                    performance_instance: None,
                 }),
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn performance_only_uses_an_explicit_instance_and_factory_source_without_creating_home() {
+        let f = Fixture::new();
+        let service = CatalogService::new(
+            f.0.join("accounts"),
+            Arc::new(FakeHttp::new()),
+            Arc::new(|_| Err("synthetic-unset".into())),
+        );
+        let mut config = config();
+        let unbound = service.load(&config).unwrap();
+        assert!(unbound.catalog.providers[0].performance.is_none());
+        let resource_identity = config.resources[0].binding();
+        config.instances.push(crate::config::DataInstance {
+            id: "work-claude".into(),
+            provider: "claude".into(),
+            path: f.0.join("claude-home"),
+        });
+        config.resources[0]
+            .inference
+            .as_mut()
+            .unwrap()
+            .performance_instance = Some("work-claude".into());
+        let plan = service.load(&config).unwrap();
+        assert_eq!(config.resources[0].binding(), resource_identity);
+        let binding = plan.catalog.providers[0].performance.as_ref().unwrap();
+        assert_eq!(binding.provider, "resource:relay");
+        assert_eq!(binding.source.id, "claude_log_v1");
+        assert_eq!(binding.home, f.0.join("claude-home"));
+        assert!(
+            !binding.home.exists(),
+            "binding factories must do no filesystem writes"
+        );
+        config.resources[0]
+            .inference
+            .as_mut()
+            .unwrap()
+            .performance_instance = Some("missing".into());
+        assert!(service.load(&config).is_err());
     }
 
     #[tokio::test]

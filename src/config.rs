@@ -396,6 +396,34 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
         instance.path = expand_user(instance.path.clone());
         ids.push(instance.id.clone());
     }
+    for resource in &config.resources {
+        if let Some(id) = resource
+            .inference
+            .as_ref()
+            .and_then(|i| i.performance_instance.as_ref())
+        {
+            let instance = config
+                .instances
+                .iter()
+                .find(|instance| &instance.id == id)
+                .ok_or_else(|| {
+                    ConfigError(
+                        "performance_instance 必须引用 [[instances]] 中的显式实例 ID".into(),
+                    )
+                })?;
+            let agent = crate::agents::builtin_registry()
+                .create(
+                    &instance.provider,
+                    crate::agents::AgentContext::Local {
+                        home: instance.path.clone(),
+                    },
+                )
+                .map_err(|_| ConfigError("性能日志实例的 Agent 无效".into()))?;
+            if agent.request_source().is_none() {
+                return Err(ConfigError("此实例的 Agent 尚不支持性能日志".into()));
+            }
+        }
+    }
     let instances = config.data_instances();
     for (i, instance) in instances.iter().enumerate() {
         if instances[..i].iter().any(|other| {
@@ -498,6 +526,42 @@ mod tests {
         let raw: RawConfig = toml::from_str("style = 'both'").unwrap();
         assert_eq!(parse_raw(raw).unwrap().style, "bar");
         assert!(with_overrides(AppConfig::default(), Some("both"), None, None).is_err());
+    }
+    #[test]
+    fn performance_binding_rejects_missing_or_unsupported_instances() {
+        let text = r#"
+[[instances]]
+id = "work-agent"
+provider = "claude"
+path = "/nonexistent/usage-performance-claude"
+[[resources]]
+id = "api"
+service = "new_api_token"
+base_url = "https://relay.invalid"
+credential_env = "RELAY_KEY"
+[resources.inference]
+base_url = "https://relay.invalid/v1"
+credential_env = "RELAY_KEY"
+performance_instance = "work-agent"
+"#;
+        assert!(parse_raw(toml::from_str(text).unwrap()).is_ok());
+        assert!(
+            parse_raw(
+                toml::from_str(&text.replace(
+                    "performance_instance = \"work-agent\"",
+                    "performance_instance = \"claude\""
+                ))
+                .unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_raw(
+                toml::from_str(&text.replace("provider = \"claude\"", "provider = \"grok\""))
+                    .unwrap()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn stage_two_config_is_optional_and_validates_instances_and_thresholds() {

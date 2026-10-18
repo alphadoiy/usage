@@ -1,0 +1,689 @@
+use super::*;
+use serde_json::json;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+
+struct Fixture {
+    root: PathBuf,
+    service: Service,
+    binding: Binding,
+}
+impl Fixture {
+    fn new(agent: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("usage-performance-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let binding = Binding {
+            provider: "work".into(),
+            source: source(agent).unwrap(),
+            agent: agent.into(),
+            home,
+            revision: "1".into(),
+            expected_upstream: None,
+        };
+        let service = Service::at(root.join("index/performance.sqlite3"));
+        Self {
+            root,
+            service,
+            binding,
+        }
+    }
+    fn file(&self, name: &str, text: &str) -> PathBuf {
+        let dir = self.binding.home.join(if self.binding.agent == "claude" {
+            "projects"
+        } else {
+            "sessions"
+        });
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    }
+    fn update(&self) -> Batch {
+        let mut all = Batch::default();
+        for _ in 0..1000 {
+            let batch = self
+                .service
+                .refresh(&self.binding, self.binding.source, &AtomicBool::new(false))
+                .unwrap();
+            all.bytes += batch.bytes;
+            all.files += batch.files;
+            all.skipped += batch.skipped;
+            if !batch.more {
+                return all;
+            }
+        }
+        panic!("bounded import did not converge")
+    }
+    fn snapshot(&self) -> Snapshot {
+        self.service
+            .snapshot(&self.binding, Period::Month, None, 0, at(30))
+            .unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+fn at(sec: u32) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&format!("2026-10-18T00:00:{sec:02}Z"))
+        .unwrap()
+        .timestamp_millis()
+}
+fn line(sec: u32, kind: &str, payload: serde_json::Value) -> String {
+    json!({"timestamp":format!("2026-10-18T00:00:{sec:02}Z"),"type":kind,"payload":payload})
+        .to_string()
+        + "\n"
+}
+fn codex_session(session: &str, model: &str) -> String {
+    line(
+        0,
+        "session_meta",
+        json!({"id":session,"model_provider":"relay"}),
+    ) + &line(0, "turn_context", json!({"model":model}))
+        + &line(
+            0,
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-a"}),
+        )
+        + &line(
+            10,
+            "event_msg",
+            json!({"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":500,"reasoning_output_tokens":200},"last_token_usage":{"output_tokens":500,"reasoning_output_tokens":200}}}),
+        )
+}
+fn complete() -> String {
+    line(
+        11,
+        "event_msg",
+        json!({"type":"task_complete","turn_id":"turn-a","duration_ms":10000,"time_to_first_token_ms":2000}),
+    )
+}
+
+#[test]
+fn codex_incremental_native_timing_restart_and_archive_copy_count_once() {
+    let f = Fixture::new("codex");
+    let path = f.file("a.jsonl", &codex_session("session-a", "observed-model"));
+    let first = f.update();
+    assert!(first.bytes > 0);
+    let before = f.snapshot();
+    assert_eq!(before.models[0].calls, 1);
+    assert_eq!(before.models[0].timed_samples, 0);
+    assert_eq!(f.update().bytes, 0, "unchanged logs must not be reread");
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(complete().as_bytes())
+        .unwrap();
+    let reopened = Service::at(f.root.join("index/performance.sqlite3"));
+    let batch = reopened
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(batch.bytes, complete().len() as u64);
+    let after = reopened
+        .snapshot(&f.binding, Period::Day, None, 0, at(30))
+        .unwrap();
+    let m = &after.models[0];
+    assert_eq!(m.model, "observed-model");
+    assert_eq!(m.calls, 1);
+    assert_eq!(m.mean_ttft_ms, Some(2000.0));
+    assert_eq!(m.timed_samples, 1);
+    assert!(
+        m.speed().is_none(),
+        "reasoning without first-text timing is not measured speed"
+    );
+    assert_eq!(
+        m.floor(),
+        Some(37.5),
+        "300 answer tokens over the 8-second post-first-token window"
+    );
+    let archived = f.binding.home.join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    fs::copy(&path, archived.join("copy.jsonl")).unwrap();
+    f.service.rediscover(&f.binding);
+    f.update();
+    assert_eq!(f.snapshot().models[0].calls, 1);
+}
+
+#[test]
+fn pending_lines_replacement_cancellation_and_large_lines_are_bounded() {
+    let f = Fixture::new("codex");
+    let data = codex_session("session-a", "model-a");
+    let path = f.file("a.jsonl", &data[..data.len() - 1]);
+    f.update();
+    assert!(f.snapshot().models.is_empty());
+    assert_eq!(f.update().bytes, 0);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    f.update();
+    assert_eq!(f.snapshot().models[0].calls, 1);
+    fs::write(&path, codex_session("session-b", "model-b")).unwrap();
+    f.update();
+    assert_eq!(
+        f.snapshot().models.len(),
+        2,
+        "replacement must reset parser state, retaining indexed history"
+    );
+    let huge = f.file(
+        "huge.jsonl",
+        &("x".repeat(5 * 1024 * 1024) + "\n" + &codex_session("session-c", "model-c")),
+    );
+    f.service.rediscover(&f.binding);
+    let batch = f
+        .service
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+        .unwrap();
+    assert!(batch.bytes <= 4 * 1024 * 1024);
+    assert!(batch.more);
+    let stopped = f
+        .service
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(true))
+        .unwrap();
+    assert_eq!(stopped.bytes, 0);
+    f.update();
+    assert!(f.snapshot().models.iter().any(|m| m.model == "model-c"));
+    fs::remove_file(huge).unwrap();
+    f.update();
+}
+
+#[test]
+fn provider_home_and_upstream_identity_are_isolated() {
+    let a = Fixture::new("codex");
+    let b = Fixture::new("codex");
+    a.file(
+        "a.jsonl",
+        &(codex_session("same-session", "model-a") + &complete()),
+    );
+    b.file(
+        "b.jsonl",
+        &(codex_session("same-session", "model-b") + &complete()),
+    );
+    a.update();
+    b.update();
+    assert_ne!(a.binding.scope(), b.binding.scope());
+    assert_eq!(a.snapshot().models[0].model, "model-a");
+    assert_eq!(b.snapshot().models[0].model, "model-b");
+    let mut wrong = a.binding.clone();
+    wrong.expected_upstream = Some("other-relay".into());
+    let result = a
+        .service
+        .snapshot(&wrong, Period::Day, None, 0, at(30))
+        .unwrap();
+    assert!(result.models.is_empty());
+    assert_eq!(result.unmatched, 1);
+    let mut right = a.binding.clone();
+    right.expected_upstream = Some("relay".into());
+    assert_eq!(
+        a.service
+            .snapshot(&right, Period::Day, None, 0, at(30))
+            .unwrap()
+            .models[0]
+            .calls,
+        1
+    );
+    let db = rusqlite::Connection::open(a.root.join("index/performance.sqlite3")).unwrap();
+    let cursor: String = db
+        .query_row("SELECT cursor FROM perf_files", [], |r| r.get(0))
+        .unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_str(&cursor).unwrap();
+    assert_eq!(
+        checkpoint["fingerprint"].as_array().unwrap().len(),
+        32,
+        "only a digest of log boundaries may be persisted"
+    );
+}
+
+#[test]
+fn multiple_calls_do_not_inherit_turn_first_token_and_bad_timings_are_unknown() {
+    let mut parser = (source("codex").unwrap().parser)(serde_json::Value::Null);
+    let mut calls = Vec::new();
+    for ln in codex_session("s", "m").lines() {
+        calls.extend(parser.feed(ln.as_bytes()).unwrap());
+    }
+    calls.extend(parser.feed(line(12,"event_msg",json!({"type":"token_count","info":{"total_token_usage":{"output_tokens":800},"last_token_usage":{"output_tokens":300}}})).as_bytes()).unwrap());
+    assert!(parser.feed(complete().as_bytes()).unwrap().is_empty());
+    assert!(calls.iter().all(|c| c.ttft_ms.is_none()));
+    let call = Observation {
+        output: 500,
+        duration_ms: Some(10),
+        ..Default::default()
+    };
+    assert!(call.speed().is_none());
+}
+
+#[test]
+fn claude_chunks_merge_without_inventing_first_token_timing() {
+    let f = Fixture::new("claude");
+    let user=json!({"type":"user","uuid":"user-a","parentUuid":null,"timestamp":"2026-10-18T00:00:00Z","message":{"content":"large user text is not retained"}}).to_string();
+    let first=json!({"type":"assistant","uuid":"part-a","parentUuid":"user-a","sessionId":"s","timestamp":"2026-10-18T00:00:05Z","apiBlockIndex":0,"thinkingDurationMs":2000,"message":{"id":"msg-a","model":"claude-model","content":[{"type":"thinking","thinking":"PRIVATE-THINKING"}],"usage":{"output_tokens":200}}}).to_string();
+    let last=json!({"type":"assistant","uuid":"part-b","parentUuid":"part-a","sessionId":"s","timestamp":"2026-10-18T00:00:10Z","apiBlockIndex":1,"message":{"id":"msg-a","model":"claude-model","content":[{"type":"text","text":"PRIVATE-ANSWER"}],"usage":{"output_tokens":600}}}).to_string();
+    f.file("a.jsonl", &(user + "\n" + &first + "\n" + &last + "\n"));
+    f.update();
+    let snapshot = f.snapshot();
+    let m = &snapshot.models[0];
+    assert_eq!(m.calls, 1);
+    assert!(m.mean_ttft_ms.is_none());
+    assert_eq!(m.timed_samples, 0);
+    assert!(m.speed().is_none());
+    assert!(
+        m.floor().is_none(),
+        "short local replies do not establish a whole-request floor"
+    );
+    let db = rusqlite::Connection::open(f.root.join("index/performance.sqlite3")).unwrap();
+    let state: String = db
+        .query_row("SELECT cursor FROM perf_files", [], |r| r.get(0))
+        .unwrap();
+    assert!(!state.contains("PRIVATE"));
+    assert!(!state.contains("large user text"));
+}
+
+#[test]
+fn means_and_request_pages_keep_generation_and_floor_samples_separate() {
+    let f = Fixture::new("codex");
+    let mut text = String::new();
+    for i in 0..45 {
+        text += &codex_session(&format!("s{i}"), "m");
+        text += &line(
+            11,
+            "event_msg",
+            json!({"type":"task_complete","turn_id":"turn-a","duration_ms":if i<25 {2000}else{10000},"time_to_first_token_ms":if i<25{1000}else{3000}}),
+        );
+    }
+    f.file("many.jsonl", &text);
+    f.update();
+    let data = f.snapshot();
+    assert_eq!(data.models[0].calls, 45);
+    assert!((data.models[0].mean_ttft_ms.unwrap() - (85_000 / 45) as f64).abs() < 0.001);
+    assert!(data.models[0].speed().is_none());
+    assert!((data.models[0].floor().unwrap() - 13_500_000.0 / 165_000.0).abs() < 0.001);
+    let mean = f
+        .service
+        .summary(&f.binding, Period::Day, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(mean.calls, 45);
+    assert_eq!(mean.timed_samples, 45);
+    assert!((mean.mean_ttft_ms.unwrap() - (85_000 / 45) as f64).abs() < 0.001);
+    assert!(mean.speed().is_none());
+    assert_eq!(mean.floor(), data.models[0].floor());
+    assert_eq!(mean.speed_samples, 0);
+    assert_eq!(mean.floor_samples, 45);
+    assert_eq!(data.summary.mean_ttft_ms, mean.mean_ttft_ms);
+    let mut wrong = f.binding.clone();
+    wrong.expected_upstream = Some("other".into());
+    let mean = f
+        .service
+        .summary(&wrong, Period::Day, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(mean.calls, 0);
+    assert!(mean.mean_ttft_ms.is_none());
+    assert!(mean.speed().is_none());
+    assert_eq!(data.recent.len(), 40);
+    let page = f
+        .service
+        .snapshot(&f.binding, Period::Day, Some("m"), 1, at(30))
+        .unwrap();
+    assert_eq!(page.recent.len(), 5);
+    assert!(
+        !page
+            .recent
+            .iter()
+            .any(|c| data.recent.iter().any(|a| a.id == c.id))
+    );
+}
+
+#[test]
+fn homepage_summary_does_not_create_index_or_discover_logs() {
+    let f = Fixture::new("codex");
+    f.file("unindexed.jsonl", &(codex_session("s", "m") + &complete()));
+    assert!(
+        f.service
+            .summary(&f.binding, Period::Day, at(30))
+            .unwrap()
+            .is_none()
+    );
+    assert!(!f.root.join("index").exists());
+    f.update();
+    let db = rusqlite::Connection::open(f.root.join("index/performance.sqlite3")).unwrap();
+    let before: (String, i64) = db
+        .query_row("SELECT cursor,checked FROM perf_files", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    f.file(
+        "not-discovered.jsonl",
+        &(codex_session("new", "new-model") + &complete()),
+    );
+    assert_eq!(
+        f.service
+            .summary(&f.binding, Period::Day, at(30))
+            .unwrap()
+            .unwrap()
+            .calls,
+        1
+    );
+    let after: (String, i64) = db
+        .query_row("SELECT cursor,checked FROM perf_files", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "homepage must not advance or discover cursors"
+    );
+}
+
+#[test]
+fn ten_thousand_requests_are_indexed_in_bounded_batches_and_idle_reads_no_body() {
+    let f = Fixture::new("codex");
+    let mut text = String::new();
+    for i in 0..10_000 {
+        text += &codex_session(&format!("session-{i}"), &format!("model-{}", i % 5));
+        text += &complete();
+    }
+    f.file("large.jsonl", &text);
+    let began = std::time::Instant::now();
+    let mut bytes = 0;
+    let mut batches = 0;
+    loop {
+        let batch = f
+            .service
+            .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+            .unwrap();
+        assert!(batch.bytes <= 4 * 1024 * 1024);
+        bytes += batch.bytes;
+        batches += 1;
+        if !batch.more {
+            break;
+        }
+        assert!(batches < 1000);
+    }
+    let import_ms = began.elapsed().as_millis();
+    let began = std::time::Instant::now();
+    let data = f.snapshot();
+    let query_ms = began.elapsed().as_millis();
+    assert_eq!(data.models.len(), 5);
+    assert_eq!(data.models.iter().map(|m| m.calls).sum::<u64>(), 10_000);
+    assert_eq!(
+        data.models.iter().map(|m| m.timed_samples).sum::<u64>(),
+        10_000
+    );
+    assert_eq!(data.recent.len(), 40);
+    assert_eq!(bytes, text.len() as u64);
+    assert!(batches > 1);
+    let idle = f.update();
+    assert_eq!(idle.bytes, 0);
+    eprintln!(
+        "performance fixture: {} bytes, {batches} batches, import {import_ms}ms, indexed query {query_ms}ms, unchanged body read {} bytes",
+        text.len(),
+        idle.bytes
+    );
+}
+
+#[test]
+fn inherited_fork_usage_and_missing_first_token_evidence_are_not_samples() {
+    let mut parser = (source("codex").unwrap().parser)(serde_json::Value::Null);
+    parser
+        .feed(
+            line(
+                20,
+                "session_meta",
+                json!({"id":"fork","forked_from_id":"parent","model_provider":"relay"}),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    parser
+        .feed(line(0, "turn_context", json!({"model":"m"})).as_bytes())
+        .unwrap();
+    let inherited = line(
+        10,
+        "event_msg",
+        json!({"type":"token_count","info":{"total_token_usage":{"output_tokens":500},"last_token_usage":{"output_tokens":500}}}),
+    );
+    assert!(parser.feed(inherited.as_bytes()).unwrap().is_empty());
+    let next = line(
+        25,
+        "event_msg",
+        json!({"type":"token_count","info":{"total_token_usage":{"output_tokens":800}}}),
+    );
+    let calls = parser.feed(next.as_bytes()).unwrap();
+    assert_eq!(calls[0].output, 300);
+    assert!(calls[0].ttft_ms.is_none());
+    let mut claude = (source("claude").unwrap().parser)(serde_json::Value::Null);
+    let event = json!({"type":"assistant","uuid":"part","parentUuid":null,"sessionId":"s","timestamp":"2026-10-18T00:00:05Z","message":{"id":"msg","model":"m","content":[{"type":"text","text":"not a first-token timestamp"}],"usage":{"output_tokens":500}}});
+    let calls = claude.feed(event.to_string().as_bytes()).unwrap();
+    assert!(calls[0].ttft_ms.is_none());
+    assert!(calls[0].duration_ms.is_none());
+    assert!(calls[0].speed().is_none());
+}
+
+#[test]
+fn claude_interleaved_messages_keep_their_start_and_missing_first_blocks_stay_unknown() {
+    let mut parser = (source("claude").unwrap().parser)(serde_json::Value::Null);
+    parser.feed(json!({"type":"user","uuid":"user","parentUuid":null,"timestamp":"2026-10-18T00:00:00Z"}).to_string().as_bytes()).unwrap();
+    let block = |sec: u32, id: &str, uuid: &str, parent: &str, index: u32, output: u64| {
+        json!({"type":"assistant","uuid":uuid,"parentUuid":parent,"sessionId":"s","timestamp":format!("2026-10-18T00:00:{sec:02}Z"),"apiBlockIndex":index,"message":{"id":id,"model":"m","content":[{"type":"text","text":"not retained"}],"usage":{"output_tokens":output}}}).to_string()
+    };
+    parser
+        .feed(block(2, "m1", "p1", "user", 0, 200).as_bytes())
+        .unwrap();
+    parser
+        .feed(block(4, "m2", "p2", "p1", 0, 300).as_bytes())
+        .unwrap();
+    // m1 returns after m2, including across a persisted checkpoint.
+    let mut parser = (source("claude").unwrap().parser)(parser.checkpoint());
+    let calls = parser
+        .feed(block(10, "m1", "p3", "p1", 1, 600).as_bytes())
+        .unwrap();
+    assert_eq!(calls[0].duration_ms, Some(10000));
+    let calls = parser
+        .feed(block(12, "m2", "p4", "p2", 1, 800).as_bytes())
+        .unwrap();
+    assert_eq!(
+        calls[0].duration_ms,
+        Some(10000),
+        "m2 began at p1, not the earlier user prompt"
+    );
+    let calls = parser
+        .feed(block(15, "incomplete", "p5", "p4", 2, 900).as_bytes())
+        .unwrap();
+    assert!(calls[0].duration_ms.is_none());
+    let calls = parser
+        .feed(block(20, "incomplete", "p6", "p5", 3, 1000).as_bytes())
+        .unwrap();
+    assert!(calls[0].speed().is_none());
+    let synthetic = block(21, "synthetic", "p7", "p6", 0, 0)
+        .replace("\"model\":\"m\"", "\"model\":\"<synthetic>\"");
+    assert!(parser.feed(synthetic.as_bytes()).unwrap().is_empty());
+}
+
+fn insert_timing(
+    f: &Fixture,
+    id: &str,
+    output: u64,
+    reasoning: u64,
+    ms: i64,
+    ttft: Option<i64>,
+    native: bool,
+) {
+    f.snapshot(); // Create the private test index, never a user database.
+    let db = rusqlite::Connection::open(f.root.join("index/performance.sqlite3")).unwrap();
+    db.execute("INSERT INTO perf_calls(scope,id,session,at,model,output,reasoning,duration,ttft,native) VALUES(?1,?2,'fixture',?3,?2,?4,?5,?6,?7,?8)",
+        rusqlite::params![f.binding.scope(), id, at(10), output, reasoning, ms, ttft, native]).unwrap();
+}
+
+#[test]
+fn magpie_codex_speed_and_floor_reference_cases_match_in_detail_and_aggregates() {
+    // Reference vectors: Magpie internal/usage/speed_count_test.go,
+    // TestCodexRowsTellAFloor and TestCodexTurnMeasuredOnlyOverASecondAndAHundredTokens.
+    let f = Fixture::new("codex");
+    let cases = [
+        (496, 224, 11055, 10228, None, None),
+        (1300, 200, 11500, 11000, None, Some((1300, 11500))),
+        (1200, 200, 12000, 2000, None, Some((1000, 10000))),
+        (260, 200, 5000, 2000, None, None),
+        (500, 0, 5000, 1000, Some((500, 4000)), None),
+        (500, 100, 2050, 2000, None, None),
+        (300, 300, 9000, 2000, None, None),
+        (1000, 1000, 9000, 2000, None, Some((1000, 9000))),
+        (1500, 600, 30000, 0, None, Some((1500, 30000))),
+        (800, 100, 20000, 0, None, None),
+        (380, 0, 7000, 6800, None, None),
+        (1200, 0, 10000, 9500, None, Some((1200, 10000))),
+        (60, 0, 3000, 1000, None, None),
+        (100, 0, 7800, 6800, Some((100, 1000)), None),
+        (99, 0, 7800, 6800, None, None),
+        (400, 0, 7799, 6800, None, None),
+        (1000, 0, 7799, 6800, None, Some((1000, 7799))),
+        // Wide upper speed cap, inclusive at exactly 10,000 tok/s.
+        (10000, 0, 2000, 1000, Some((10000, 1000)), None),
+        (20001, 0, 2000, 1000, None, None),
+    ];
+    let mut decode = (0, 0, 0);
+    let mut floor = (0, 0, 0);
+    for (i, (output, reasoning, ms, ttft, generation, lower)) in cases.into_iter().enumerate() {
+        let name = format!("case-{i}");
+        insert_timing(
+            &f,
+            &name,
+            output,
+            reasoning,
+            ms,
+            (ttft > 0).then_some(ttft),
+            ttft > 0,
+        );
+        let snapshot = f.snapshot();
+        let row = snapshot.recent.iter().find(|r| r.id == name).unwrap();
+        assert_eq!(row.speed(), generation, "generation: {name}");
+        assert_eq!(row.floor(), lower, "floor: {name}");
+        let stats = snapshot.models.iter().find(|m| m.model == name).unwrap();
+        assert_eq!(
+            stats.speed(),
+            generation.map(|(n, w)| n as f64 * 1000.0 / w as f64)
+        );
+        assert_eq!(
+            stats.floor(),
+            lower.map(|(n, w)| n as f64 * 1000.0 / w as f64)
+        );
+        if let Some((n, w)) = generation {
+            decode.0 += n;
+            decode.1 += w;
+            decode.2 += 1;
+        }
+        if let Some((n, w)) = lower {
+            floor.0 += n;
+            floor.1 += w;
+            floor.2 += 1;
+        }
+    }
+    let s = f
+        .service
+        .summary(&f.binding, Period::Day, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!((s.speed_tokens, s.speed_ms, s.speed_samples), decode);
+    assert_eq!((s.floor_tokens, s.floor_ms, s.floor_samples), floor);
+    assert_eq!(s.mean_ttft_ms, f.snapshot().summary.mean_ttft_ms);
+}
+
+#[test]
+fn magpie_claude_floor_and_legacy_inferred_ttft_are_handled_without_rebuilding_index() {
+    let f = Fixture::new("claude");
+    for (name, out, ms, first, native, generation, floor) in [
+        ("large", 2000, 20000, None, false, None, Some((2000, 20000))),
+        ("small", 815, 18000, None, false, None, None),
+        (
+            "minimum",
+            1000,
+            12000,
+            None,
+            false,
+            None,
+            Some((1000, 12000)),
+        ),
+        ("too-fast", 20001, 1000, None, false, None, None),
+        (
+            "legacy-inference",
+            1500,
+            10000,
+            Some(3000),
+            false,
+            None,
+            Some((1500, 10000)),
+        ),
+        // Magpie's general 100ms decode gate applies to non-Codex native timing.
+        ("timed", 380, 7000, Some(6800), true, Some((380, 200)), None),
+    ] {
+        insert_timing(&f, name, out, 0, ms, first, native);
+        let snapshot = f.snapshot();
+        let row = snapshot.recent.iter().find(|r| r.id == name).unwrap();
+        assert_eq!(row.speed(), generation, "{name}");
+        assert_eq!(row.floor(), floor, "{name}");
+        if !native {
+            assert!(row.ttft_ms.is_none());
+        }
+    }
+    let summary = f
+        .service
+        .summary(&f.binding, Period::Day, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.timed_samples, 1);
+    assert_eq!(summary.mean_ttft_ms, Some(6800.0));
+    assert_eq!(summary.speed(), Some(1900.0));
+    assert_eq!(summary.floor_samples, 3);
+    assert_eq!(summary.floor(), Some(4500.0 * 1000.0 / 42000.0));
+}
+
+#[test]
+fn delayed_codex_usage_excludes_tool_runtime_and_survives_checkpoint() {
+    let f = Fixture::new("codex");
+    let text = line(
+        0,
+        "session_meta",
+        json!({"id":"tool-session","model_provider":"relay"}),
+    ) + &line(0, "turn_context", json!({"model":"m","turn_id":"t"}))
+        + &line(0, "event_msg", json!({"type":"task_started","turn_id":"t"}))
+        + &line(5, "response_item", json!({"type":"function_call"}))
+        + &line(10, "response_item", json!({"type":"function_call_output"}));
+    let path = f.file("tool.jsonl", &text);
+    f.update();
+    // Resume the parser through its persisted checkpoint, after the tool completed.
+    OpenOptions::new().append(true).open(path).unwrap().write_all(line(11,"event_msg",json!({"type":"token_count","info":{"total_token_usage":{"output_tokens":1500},"last_token_usage":{"output_tokens":1500}}})).as_bytes()).unwrap();
+    f.update();
+    let s = f.snapshot();
+    assert_eq!(s.recent[0].duration_ms, Some(5000));
+    assert_eq!(s.recent[0].floor(), Some((1500, 5000)));
+    assert!(s.recent[0].speed().is_none());
+}
+
+#[test]
+fn old_cursor_is_reparsed_once_without_duplicating_requests_or_losing_deleted_history() {
+    let f = Fixture::new("codex");
+    let text = codex_session("s", "m") + &complete();
+    let file = f.file("old.jsonl", &text);
+    f.update();
+    insert_timing(&f, "deleted-log", 1000, 0, 5000, None, false);
+    let db = rusqlite::Connection::open(f.root.join("index/performance.sqlite3")).unwrap();
+    let state: String = db
+        .query_row("SELECT cursor FROM perf_files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    state.as_object_mut().unwrap().remove("format");
+    db.execute("UPDATE perf_files SET cursor=?1", [state.to_string()])
+        .unwrap();
+    assert_eq!(f.update().bytes, text.len() as u64);
+    assert_eq!(f.snapshot().summary.calls, 2);
+    assert_eq!(f.update().bytes, 0);
+    fs::remove_file(file).unwrap();
+    f.update();
+    assert_eq!(f.snapshot().summary.calls, 2);
+}

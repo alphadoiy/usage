@@ -1,6 +1,6 @@
 //! Compact provider inventory and shared terminal-safe text layout.
 use ratatui::style::{Color, Stylize};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 use crate::provider_catalog::{Catalog, Models, Provider, ProviderUsage, QueryState};
@@ -33,6 +33,7 @@ pub(super) fn lines(
     error: Option<&str>,
     expanded: bool,
     selected_id: Option<&str>,
+    performance: Option<&super::performance::CachedSummary>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(error) = error {
@@ -63,6 +64,9 @@ pub(super) fn lines(
             .map_or(String::new(), |agent| format!(" · {}", clean(agent)));
         lines.push(Line::from(format!("{}{}", clean(&provider.name), agent)).bold());
         lines.push(Line::from(format!("类型：{}", provider.kind.label())).dim());
+        if provider.performance.is_some() {
+            lines.extend(super::performance::summary_lines(performance));
+        }
         lines.extend(usage_lines(&provider.usage, expanded));
         if provider.usage.reset.is_some() && !provider.usage.sources.iter().any(|source| {
             matches!(&source.state, QueryState::Result(snapshot) if snapshot.metrics.iter().any(|metric|
@@ -120,7 +124,19 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
             },
             _ => "资源",
         };
-        lines.push(Line::from(format!("{} · {}", clean(&source.label), scope)).dim());
+        let imported = source.binding.account.starts_with("ccswitch:");
+        let title = if imported {
+            match scope {
+                "资源" => "用量查询".into(),
+                _ => format!("{scope}用量"),
+            }
+        } else {
+            format!("{} · {}", clean(&source.label), scope)
+        };
+        lines.push(Line::from(title).dim());
+        if imported && expanded {
+            lines.push(Line::from("  配置来源：CC Switch").dim());
+        }
         match &source.state {
             QueryState::Loading => lines.push(Line::from("  用量／余额：查询中…").dim()),
             QueryState::Unavailable(message) => lines
@@ -199,12 +215,24 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                                     )
                                 })
                                 .unwrap_or_default();
-                            format!(
-                                "{} · 剩余 {:.0}%{}",
-                                crate::labels::tier_label(name),
-                                (100.0 - used_percent).clamp(0.0, 100.0),
+                            let agent = match source.service.as_str() {
+                                "chatgpt_subscription" => "codex",
+                                "claude_subscription" => "claude",
+                                "grok_subscription" => "grok",
+                                _ => "",
+                            };
+                            let mut spans = vec![Span::raw(format!(
+                                "  {}  ",
+                                clean(&crate::labels::tier_label(name))
+                            ))];
+                            spans.extend(super::widgets::quota_dots(agent, *used_percent));
+                            spans.push(Span::raw(format!(
+                                " 已用 {}{}",
+                                crate::labels::fmt_percent(*used_percent),
                                 reset
-                            )
+                            )));
+                            lines.push(Line::from(spans));
+                            continue;
                         }
                         ResourceMetric::Cost {
                             used,
