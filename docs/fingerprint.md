@@ -21,6 +21,21 @@ usage codex fingerprint status <OAuth账号名称或ID> --json
 
 优先查找数据目录 `fingerprint/tools/node_modules/.bin/fpd`，其次使用 PATH 中的 `fpd`；也可为 `run` / `enable` 指定 `--fpd /绝对路径/fpd`。进程不继承 `API_KEY`、`BASE_URL`、`MODEL` 等推理连接覆盖值。BYOK 账号会在发出请求前拒绝。
 
+## 引擎版本提示
+
+Usage 打开期间在后台查询 npm 的 `lmfpd/latest` 公开元数据，与实际 fpd 安装目录的 `package.json` 版本按 SemVer 比较。成功结果缓存 6 小时，失败后 1 小时再试，并保留上次成功结果；请求最多等待 8 秒，独立于采样任务。查询不携带订阅凭据，不调用检测网站，也不自动安装或更新。关闭 Usage 后停止检查，不创建系统后台任务。
+
+发现更新后，首页订阅测试行提示“lmfpd 有更新”，按 Enter 查看当前版本、最新版本与上次成功检查时间；`fingerprint status` 的文本输出也展示已缓存的更新提示，JSON 报告格式保持不变。升级后提示自动消失。无法识别版本的自定义 fpd 包装脚本不猜测其版本。
+
+默认安装目录可用以下命令手动更新，将版本号替换为提示中的最新版本；自定义 `--fpd` 安装请更新对应位置：
+
+```sh
+npm install --prefix "$HOME/.local/share/usage/codex/fingerprint/tools" \
+  --ignore-scripts --no-audit --no-fund 'lmfpd@<最新版本>'
+```
+
+缓存位于 `<Usage账号数据根目录>/fingerprint/update.json`，删除后下次打开 Usage 会重新查询。
+
 ## 每小时任务
 
 ```sh

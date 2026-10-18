@@ -12,6 +12,7 @@ mod codex;
 pub(crate) mod runtime;
 mod service;
 mod store;
+mod update;
 pub(crate) use service::FingerprintService;
 #[cfg(test)]
 mod tests;
@@ -96,6 +97,7 @@ pub(crate) struct Snapshot {
     pub latest: Option<Report>,
     pub history: Vec<Report>,
     pub warnings: Vec<String>,
+    pub update_notice: Option<String>,
 }
 fn account(manager: &Manager, selector: &str) -> Result<super::Profile> {
     let profile = manager.resolve(selector)?;
@@ -168,6 +170,9 @@ pub async fn dispatch(command: FingerprintCommand) -> Result<i32> {
                     println!("尚无测试记录。");
                 }
                 if !json {
+                    if let Some(notice) = snapshot.update_notice {
+                        println!("{notice}");
+                    }
                     println!(
                         "定时任务：{}",
                         if snapshot.enabled {

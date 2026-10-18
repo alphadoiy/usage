@@ -13,11 +13,13 @@ use tokio::{runtime::Handle, task::JoinSet};
 pub(crate) struct Runtime {
     cancel: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+    update_task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         self.task.abort();
+        self.update_task.abort();
     }
 }
 impl Runtime {
@@ -27,6 +29,16 @@ impl Runtime {
     fn with_interval(handle: &Handle, service: Arc<FingerprintService>, poll: Duration) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
+        let updates = service.clone();
+        let update_task = handle.spawn(async move {
+            let http = crate::http::ReqwestClient::without_redirects();
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                updates.check_updates(&http).await;
+            }
+        });
         let task = handle.spawn(async move {
             let mut interval = tokio::time::interval(poll);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -61,7 +73,11 @@ impl Runtime {
                 }
             }
         });
-        Self { cancel, task }
+        Self {
+            cancel,
+            task,
+            update_task,
+        }
     }
 }
 

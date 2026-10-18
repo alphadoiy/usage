@@ -110,11 +110,11 @@ impl Store {
             return None;
         }
         let mut warnings = Vec::new();
-        let enabled = match self.settings(&profile.id) {
-            Ok(value) => value.is_some(),
+        let settings = match self.settings(&profile.id) {
+            Ok(value) => value,
             Err(_) => {
                 warnings.push("定时测试配置损坏，请重新启用".into());
-                false
+                None
             }
         };
         let latest = match self.latest(&profile.id) {
@@ -170,10 +170,11 @@ impl Store {
         Some(Snapshot {
             id: profile.id.clone(),
             name: profile.name.clone(),
-            enabled,
+            enabled: settings.is_some(),
             latest,
             history: cached.reports.clone(),
             warnings,
+            update_notice: update::notice(&self.root, settings.as_ref().map(|s| s.fpd.as_path())),
         })
     }
     pub fn retain_accounts(&self, ids: &std::collections::HashSet<String>) {

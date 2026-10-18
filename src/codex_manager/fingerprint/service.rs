@@ -66,6 +66,18 @@ impl FingerprintService {
             .filter_map(|p| self.store.snapshot(p))
             .collect())
     }
+    pub(super) async fn check_updates(&self, http: &dyn crate::http::HttpClient) {
+        let configured = self.jobs().unwrap_or_default().iter().any(|id| {
+            self.store
+                .settings(id)
+                .ok()
+                .flatten()
+                .is_some_and(|s| update::installed(&s.fpd).is_some())
+        });
+        if configured || update::installed(&update::default_fpd(&self.root)).is_some() {
+            update::check(&self.root, http, chrono::Utc::now().timestamp()).await;
+        }
+    }
     pub(super) fn jobs(&self) -> Result<Vec<String>> {
         if !self.root.join("fingerprint/accounts").is_dir() {
             return Ok(Vec::new());

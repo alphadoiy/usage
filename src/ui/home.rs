@@ -389,6 +389,10 @@ fn fingerprint_details(
         for warning in &snapshot.warnings {
             lines.push(Line::from(super::overview::clean(warning)).fg(Color::Yellow));
         }
+        if let Some(notice) = &snapshot.update_notice {
+            lines.push(Line::from(notice.clone()).fg(Color::Yellow));
+            lines.push(Line::from("手动更新当前 lmfpd 安装；更新命令见 docs/fingerprint.md").dim());
+        }
         lines.push(Line::from("最近 24 次测试 · 旧 → 新").bold());
         if snapshot.history.is_empty() {
             lines.push(Line::from("暂无完成记录").dim());
@@ -535,7 +539,11 @@ impl Connections {
             {
                 lines.push(Line::from(format!("    最近测试 {}", time(at))).dim());
             }
-            lines.push(Line::from("Enter 查看事件与历史").dim());
+            if self.fingerprints.iter().any(|s| s.update_notice.is_some()) {
+                lines.push(Line::from("▲ lmfpd 有更新 · Enter 查看版本").fg(Color::Yellow));
+            } else {
+                lines.push(Line::from("Enter 查看事件与历史").dim());
+            }
             lines.push(Line::from("厂商：官方状态页 · 订阅：本机测试").dim());
             lines
         } else {
@@ -707,6 +715,46 @@ mod fingerprint_tests {
     use super::*;
     use crate::codex_manager::fingerprint::{Report, ReportStatus, Snapshot};
     #[test]
+    fn engine_update_is_visible_without_claiming_damaged_records() {
+        let notice = "lmfpd 有更新：0.0.1 → 0.0.2";
+        let mut c = Connections::default();
+        c.set_fingerprints(Ok(vec![Snapshot {
+            name: "Official".into(),
+            update_notice: Some(notice.into()),
+            ..Default::default()
+        }]));
+        let area = Rect::new(0, 0, 72, 7);
+        let text = c
+            .lines(
+                area,
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("lmfpd 有更新"));
+        assert!(!text.contains("记录异常"));
+        c.selected = SOURCES.len();
+        c.open();
+        let text = c
+            .lines(
+                area,
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(notice));
+    }
+    #[test]
     fn local_test_row_details_and_history_do_not_claim_official_outage_or_identity() {
         let r = Report {
             model: "gpt-6.1-sol".into(),
@@ -724,6 +772,7 @@ mod fingerprint_tests {
         };
         let mut c = Connections::default();
         let snapshot = Snapshot {
+            update_notice: None,
             id: "official".into(),
             warnings: Vec::new(),
             name: "Official account".into(),
