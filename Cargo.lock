@@ -2948,6 +2948,8 @@ dependencies = [
  "clap",
  "fs2",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "quick-xml",
  "ratatui",

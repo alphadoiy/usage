@@ -1022,24 +1022,38 @@ impl Manager {
                 if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
                     command.env(env, key);
                 }
-                if profile.auth_mode == AuthMode::Byok && crate::gateway::enabled() {
-                    if effective.gateway_supported {
+                if crate::gateway::enabled() {
+                    let reason=if profile.auth_mode==AuthMode::Oauth {
+                        effective::oauth_gateway_reason(&saved.config,&cwd,resume.is_some(),args)
+                    } else if effective.gateway_supported {None}
+                    else {Some(effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
+                    if reason.is_none() {
                         let prepared = (|| -> Result<crate::gateway::Attachment> {
                             let binding = self.performance_binding(&profile, revision)?;
-                            let attached = crate::gateway::attach(&self.root, &run_id, &binding,
-                                effective.identity.endpoint.as_deref().expect("resolved endpoint"),
-                                effective.identity.model_provider.as_deref().expect("resolved provider"),
-                                effective.key.as_deref().expect("resolved credential")).map_err(Error::message)?;
+                            let (upstream,provider,auth)=if profile.auth_mode==AuthMode::Oauth {
+                                ("https://chatgpt.com/backend-api/codex","openai",crate::gateway::RouteAuth::NativeOauth {
+                                    account_id:profile.oauth.as_ref().expect("verified OAuth identity").account_id.clone()
+                                })
+                            } else {
+                                (effective.identity.endpoint.as_deref().expect("resolved endpoint"),
+                                 effective.identity.model_provider.as_deref().expect("resolved provider"),
+                                 crate::gateway::RouteAuth::ApiKey {key:effective.key.clone().expect("resolved credential")})
+                            };
+                            let attached=crate::gateway::attach(&self.root,&run_id,&binding,upstream,provider,auth).map_err(Error::message)?;
                             #[cfg(unix)]
                             launcher::inherit_run_lease(&mut command, &attached.lease)?;
                             Ok(attached)
                         })();
                         match prepared {
                             Ok(attached) => {
-                                command.env(effective.credential_env.as_deref().expect("resolved environment"), &attached.token);
-                                let provider = toml::Value::String(effective.identity.model_provider.clone().expect("resolved provider"));
-                                let base = toml::Value::String(attached.base.clone());
-                                command.args(["-c", &format!("model_providers.{provider}.base_url={base}")]);
+                                let base=toml::Value::String(attached.base.clone());
+                                if profile.auth_mode==AuthMode::Oauth {
+                                    command.args(["-c",&format!("openai_base_url={base}")]);
+                                } else {
+                                    command.env(effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
+                                    let provider=toml::Value::String(effective.identity.model_provider.clone().expect("resolved provider"));
+                                    command.args(["-c",&format!("model_providers.{provider}.base_url={base}")]);
+                                }
                                 for variable in ["NO_PROXY", "no_proxy"] {
                                     let mut bypass = std::env::var(variable).unwrap_or_default();
                                     if !bypass.is_empty() { bypass.push(','); }
@@ -1054,7 +1068,7 @@ impl Manager {
                             }
                         }
                     } else {
-                        tracing::info!(event="gateway_skipped", run_id, reason=effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"));
+                        tracing::info!(event="gateway_skipped", run_id, reason);
                     }
                 }
                 let path = usage_config.map(Path::to_path_buf).unwrap_or_else(crate::config::default_config_path);

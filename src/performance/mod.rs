@@ -187,6 +187,7 @@ pub struct Snapshot {
     pub files_checked: u64,
     pub skipped_lines: u64,
     pub partial: bool,
+    pub native_transport: bool,
 }
 
 pub(crate) fn local_binding(id: &str, agent: &str, home: &Path, source: RequestSource) -> Binding {

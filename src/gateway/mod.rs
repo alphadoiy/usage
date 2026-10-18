@@ -28,16 +28,82 @@ struct StateFile {
     token: String,
 }
 #[derive(Serialize, Deserialize)]
+pub(crate) enum RouteAuth {
+    ApiKey { key: String },
+    NativeOauth { account_id: String },
+}
+#[derive(Serialize, Deserialize)]
 pub(crate) struct Registration {
     pub run: String,
     pub scope: String,
     pub provider: String,
     pub upstream: String,
     pub model_provider: String,
-    pub key: String,
+    pub auth: RouteAuth,
     pub token: String,
     pub lease: PathBuf,
 }
+impl Registration {
+    fn valid_auth(&self) -> bool {
+        match &self.auth {
+            RouteAuth::ApiKey { key } => {
+                !key.is_empty()
+                    && axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_ok()
+            }
+            RouteAuth::NativeOauth { account_id } => {
+                let Ok(url) = crate::http::validate_api_base_url(&self.upstream) else {
+                    return false;
+                };
+                let loopback = url
+                    .host_str()
+                    .and_then(|host| {
+                        host.trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .ok()
+                    })
+                    .is_some_and(|ip| ip.is_loopback());
+                !account_id.is_empty()
+                    && account_id.len() <= 1024
+                    && !account_id.chars().any(char::is_control)
+                    && (self.upstream == "https://chatgpt.com/backend-api/codex"
+                        || loopback
+                        || url.host_str() == Some("localhost")
+                        || url.host_str() == Some("[::1]"))
+            }
+        }
+    }
+    fn request_auth<'a>(
+        &self,
+        path: &'a str,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<(&'a str, axum::http::HeaderValue)> {
+        match &self.auth {
+            RouteAuth::ApiKey { key } => {
+                if headers.get("authorization")?.to_str().ok()? != format!("Bearer {}", self.token)
+                {
+                    return None;
+                }
+                Some((
+                    path,
+                    axum::http::HeaderValue::from_str(&format!("Bearer {key}")).ok()?,
+                ))
+            }
+            RouteAuth::NativeOauth { account_id } => {
+                let path = path.strip_prefix(&format!("{}/backend-api/codex/", self.token))?;
+                if headers.get("chatgpt-account-id")?.to_str().ok()? != account_id {
+                    return None;
+                }
+                let bearer = headers.get("authorization")?;
+                let token = bearer.to_str().ok()?.strip_prefix("Bearer ")?;
+                if token.is_empty() || token.starts_with("sk-") || token == self.token {
+                    return None;
+                }
+                Some((path, bearer.clone()))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Record {
     pub id: String,
@@ -62,6 +128,8 @@ pub(crate) struct Record {
     pub status: u16,
     pub complete: bool,
     pub outcome: String,
+    #[serde(default)]
+    pub native_transport: bool,
 }
 
 pub(crate) fn enabled() -> bool {
@@ -106,7 +174,7 @@ fn private_file(path: &Path) -> Result<File, String> {
     }
     Ok(file)
 }
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -210,7 +278,7 @@ pub(crate) fn attach(
     binding: &crate::performance::Binding,
     upstream: &str,
     model_provider: &str,
-    key: &str,
+    auth: RouteAuth,
 ) -> Result<Attachment, String> {
     let directory = directory(root);
     let mut registration = Registration {
@@ -219,7 +287,7 @@ pub(crate) fn attach(
         provider: binding.provider.clone(),
         upstream: upstream.into(),
         model_provider: model_provider.into(),
-        key: key.into(),
+        auth,
         token: uuid::Uuid::new_v4().to_string(),
         lease: directory.join(format!("{run}.lease")),
     };
@@ -262,7 +330,15 @@ pub(crate) fn attach(
                 }
                 let (state, route) = registered.ok_or("观测网关暂不可用，请重试")?;
                 Ok(Attachment {
-                    base: url(&state, &format!("/r/{route}")),
+                    base: url(
+                        &state,
+                        &match registration.auth {
+                            RouteAuth::ApiKey { .. } => format!("/r/{route}"),
+                            RouteAuth::NativeOauth { .. } => {
+                                format!("/r/{route}/{}/backend-api/codex", registration.token)
+                            }
+                        },
+                    ),
                     token: registration.token.clone(),
                     lease,
                 })

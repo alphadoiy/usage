@@ -1058,6 +1058,36 @@ fn oauth_import_is_read_only_deduplicates_identity_and_isolates_workspaces() {
 }
 
 #[test]
+fn oauth_profile_allows_cli_onboarding_state_but_preserves_versioned_settings() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let source = oauth_source(&f, "workspace-a", "fixture-refresh");
+    let account = manager
+        .import_oauth(Some("Native state"), None, &source, None)
+        .unwrap();
+    let saved = manager.revision(&account.id, 1).unwrap().config;
+    let home = manager.materialize(&account.id, 1).unwrap();
+    let path = home.join("usage-r1.config.toml");
+    let runtime = format!("{saved}\n[tui]\nscreen_reader_detection_done = true\n");
+    fs::write(&path, &runtime).unwrap();
+    assert_eq!(manager.materialize(&account.id, 1).unwrap(), home);
+    assert_eq!(fs::read_to_string(&path).unwrap(), runtime);
+    assert_eq!(manager.revision(&account.id, 1).unwrap().config, saved);
+    for invalid in [
+        runtime.replace(
+            "screen_reader_detection_done = true",
+            "screen_reader_detection_done = 'yes'",
+        ),
+        runtime.replace("model_provider = \"openai\"", "model_provider = \"other\""),
+        format!("openai_base_url = 'https://other.example'\n{runtime}"),
+    ] {
+        fs::write(&path, &invalid).unwrap();
+        assert!(manager.materialize(&account.id, 1).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+    }
+}
+
+#[test]
 fn oauth_configuration_revisions_retain_one_live_credential_file() {
     let f = Fixture::new();
     let mut m = f.manager();

@@ -637,8 +637,10 @@ impl Manager {
             let profile = home.join(format!("usage-r{revision}.config.toml"));
             op.begin("runtime_config_validate");
             if profile.exists() {
-                if fs::read_to_string(&profile)? != saved.config {
-                    tracing::error!(event = "config_mismatch", reason = "oauth_profile_changed");
+                let runtime = fs::read_to_string(&profile)?;
+                if !super::config::matches_runtime_config(&runtime, &saved.config) {
+                    tracing::error!(event = "config_mismatch", reason = "oauth_profile_changed",
+                        changed_fields = ?super::config::runtime_differences(&runtime, &saved.config));
                     return Err(Error::message(
                         "OAuth 配置版本被手动修改；请通过编辑保存新版本",
                     ));

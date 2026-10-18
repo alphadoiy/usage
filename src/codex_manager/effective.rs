@@ -392,3 +392,114 @@ mod gateway_tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 }
+
+/// OAuth remains a native sign-in. Only the public built-in base override is injected.
+/// This eligibility check deliberately does not claim a billing/resource credential identity.
+pub(super) fn oauth_gateway_reason(
+    saved: &str,
+    cwd: &Path,
+    resume: bool,
+    args: &[String],
+) -> Option<&'static str> {
+    if resume {
+        return Some("恢复会话尚未确认实际配置");
+    }
+    for directory in cwd.ancestors() {
+        if directory.join(".codex/config.toml").exists() {
+            return Some("存在未解析的项目配置层");
+        }
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    let Ok(document) = toml::from_str::<toml::Value>(saved) else {
+        return Some("OAuth 配置无法解析");
+    };
+    if document.get("model_provider").and_then(toml::Value::as_str) != Some("openai")
+        || [
+            "profile",
+            "profiles",
+            "model_providers",
+            "openai_base_url",
+            "chatgpt_base_url",
+            "enforce_residency",
+        ]
+        .iter()
+        .any(|k| document.get(k).is_some())
+    {
+        return Some("OAuth 路由或配置层尚未解析");
+    }
+    if document
+        .get("features")
+        .and_then(|f| f.get("respect_system_proxy"))
+        .and_then(toml::Value::as_bool)
+        == Some(true)
+    {
+        return Some("原生系统代理路由尚未解析");
+    }
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model" | "-m" => {
+                if args.next().is_none() {
+                    return Some("模型选项缺少值");
+                }
+            }
+            "exec"
+            | "e"
+            | "--json"
+            | "--full-auto"
+            | "--skip-git-repo-check"
+            | "--no-alt-screen"
+            | "--no-daemon" => {}
+            "resume" | "fork" | "review" => return Some("此 OAuth 子命令保持原生路由"),
+            arg if arg.starts_with("--model=") => {}
+            arg if arg.starts_with('-') => return Some("存在尚未解析的 OAuth 启动选项"),
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod oauth_observation_tests {
+    use super::*;
+    #[test]
+    fn native_gateway_eligibility_keeps_auth_and_billing_resolution_separate() {
+        let path =
+            std::env::temp_dir().join(format!("usage-oauth-observation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        let config = "model_provider='openai'\nforced_login_method='chatgpt'\n";
+        assert!(oauth_gateway_reason(config, &path, false, &[]).is_none());
+        assert!(
+            oauth_gateway_reason(
+                config,
+                &path,
+                false,
+                &["exec".into(), "--json".into(), "hello".into()]
+            )
+            .is_none()
+        );
+        assert_eq!(
+            resolve(config, AuthMode::Oauth, &path, false, &[], None, &|_| None)
+                .identity
+                .state,
+            IdentityState::Unresolved
+        );
+        for (text, resume, args) in [
+            (config, true, vec![]),
+            (config, false, vec!["--enable".into(), "unknown".into()]),
+            (
+                "model_provider='openai'\nenforce_residency='us'",
+                false,
+                vec![],
+            ),
+        ] {
+            assert!(oauth_gateway_reason(text, &path, resume, &args).is_some());
+        }
+        std::fs::create_dir_all(path.join(".codex")).unwrap();
+        std::fs::write(path.join(".codex/config.toml"), "").unwrap();
+        assert!(oauth_gateway_reason(config, &path, false, &[]).is_some());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}

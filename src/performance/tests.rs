@@ -853,3 +853,63 @@ fn prepared_but_unused_gateway_does_not_hide_direct_cli_observations() {
         "a failed optional registration cannot suppress actual direct traffic"
     );
 }
+
+#[test]
+fn websocket_passthrough_uses_cli_source_for_the_whole_run_without_double_counting() {
+    let f = Fixture::new("codex");
+    let scope = f.binding.scope();
+    f.service
+        .register_gateway_run(&scope, "run", "owner")
+        .unwrap();
+    let db = f.service.open().unwrap();
+    db.execute("UPDATE perf_gateway_runs SET started=?1", [at(1)])
+        .unwrap();
+    super::store::save(
+        &db,
+        &scope,
+        &Observation {
+            id: "cli".into(),
+            session: "session".into(),
+            at: at(10),
+            model: "m".into(),
+            output: 200,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let record = crate::gateway::Record {
+        id: "http".into(),
+        run: "run".into(),
+        session: "session".into(),
+        at: at(10),
+        model: "m".into(),
+        output: Some(200),
+        complete: true,
+        ..Default::default()
+    };
+    f.service.record_gateway(&scope, "openai", &record).unwrap();
+    assert!(f.snapshot().recent[0].gateway);
+    f.service
+        .record_gateway(
+            &scope,
+            "openai",
+            &crate::gateway::Record {
+                run: "run".into(),
+                native_transport: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let snapshot = f.snapshot();
+    assert_eq!(snapshot.summary.calls, 1);
+    assert!(!snapshot.recent[0].gateway);
+    assert!(snapshot.native_transport);
+    assert_eq!(
+        f.service
+            .summary(&f.binding, Period::Month, at(30))
+            .unwrap()
+            .unwrap()
+            .calls,
+        1
+    );
+}

@@ -221,6 +221,9 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
         lines.push(format!("读取失败：{}", super::overview::clean(error)));
     }
     if let Some(snapshot) = &p.snapshot {
+        if snapshot.native_transport {
+            lines.push("WebSocket 请求沿用会话日志统计；未测得的 TPS 保持未知。".into());
+        }
         lines.push(format!(
             "本次读 {} KiB · 检查 {} 文件 · 未归属 {} · 跳过 {} 行{}",
             snapshot.read_bytes / 1024,
