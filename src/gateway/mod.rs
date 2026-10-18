@@ -174,7 +174,7 @@ fn private_file(path: &Path) -> Result<File, String> {
     }
     Ok(file)
 }
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
 

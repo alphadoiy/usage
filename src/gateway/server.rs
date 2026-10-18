@@ -1,10 +1,9 @@
 use super::*;
-mod websocket;
 use axum::{
     Router,
     body::{Body, to_bytes},
     extract::{Path as RoutePath, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -308,7 +307,14 @@ async fn forward(
     let mut headers = clean_headers(request.headers());
     headers.insert("authorization", authorization);
     if upgrading {
-        return websocket::forward(state, route, request, upstream, headers).await;
+        tracing::info!(
+            event = "gateway_transport_fallback",
+            run_id = route.registration.run,
+            from = "websocket",
+            to = "sse",
+            reason = "sse_default"
+        );
+        return error(StatusCode::UPGRADE_REQUIRED, "Use HTTP/SSE for Responses");
     }
     let session = ["session_id", "x-session-id"]
         .iter()
@@ -651,6 +657,27 @@ mod failure_tests {
             .unwrap()
     }
     #[tokio::test]
+    async fn websocket_upgrade_returns_426_without_contacting_upstream_or_recording_a_request() {
+        let (state, mut records, hits, task) = fixture("limit").await;
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .header("authorization", "Bearer local")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .body(Body::empty())
+            .unwrap();
+        let response = forward(
+            State(state),
+            RoutePath(("route".into(), "responses".into())),
+            request,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+        assert!(records.try_recv().is_err());
+        task.abort();
+    }
+    #[tokio::test]
     async fn rate_limit_is_forwarded_unchanged_without_gateway_retries() {
         let (state, mut records, hits, task) = fixture("limit").await;
         let response = forward(
@@ -769,6 +796,25 @@ mod oauth_tests {
             records,
         });
         for token in ["native-before", "native-after-refresh"] {
+            let handshake = axum::http::Request::builder()
+                .method("GET")
+                .header("authorization", format!("Bearer {token}"))
+                .header("chatgpt-account-id", "workspace")
+                .header("upgrade", "websocket")
+                .header("connection", "Upgrade")
+                .body(Body::empty())
+                .unwrap();
+            let response = forward(
+                State(state.clone()),
+                RoutePath((
+                    "route".into(),
+                    "capability/backend-api/codex/responses".into(),
+                )),
+                handshake,
+            )
+            .await;
+            assert_eq!(response.status(), 426);
+            assert!(receiver.try_recv().is_err());
             let request = axum::http::Request::builder()
                 .method("POST")
                 .header("authorization", format!("Bearer {token}"))
