@@ -1,4 +1,5 @@
 use super::*;
+mod recording;
 mod websocket;
 use axum::{
     Router,
@@ -18,6 +19,7 @@ use tokio::sync::{RwLock, mpsc};
 
 struct Route {
     registration: Registration,
+    source: Arc<recording::Source>,
     active: AtomicUsize,
 }
 struct Shared {
@@ -28,7 +30,8 @@ struct Shared {
     routes: RwLock<HashMap<String, Arc<Route>>>,
     client: reqwest::Client,
     idle_timeout: Duration,
-    records: mpsc::Sender<(String, String, Record)>,
+    records: mpsc::Sender<recording::Sample>,
+    sources: Arc<recording::Sources>,
 }
 /// An empty service can retire only after a full idle interval; live routes reset it.
 struct Idle {
@@ -94,6 +97,15 @@ async fn register(
     {
         return error(StatusCode::BAD_REQUEST, "Invalid route");
     }
+    let Some(source) = state
+        .sources
+        .reserve(&registration.scope, &registration.run)
+    else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Performance source backlog",
+        );
+    };
     let run = registration.run.clone();
     let scope = registration.scope.clone();
     let owner = state.directory.to_string_lossy().into_owned();
@@ -125,6 +137,7 @@ async fn register(
     routes.insert(
         id.clone(),
         Arc::new(Route {
+            source,
             registration,
             active: AtomicUsize::new(0),
         }),
@@ -166,7 +179,7 @@ struct Capture {
     transport: &'static str,
     connection_id: Option<String>,
     route: Arc<Route>,
-    records: mpsc::Sender<(String, String, Record)>,
+    records: mpsc::Sender<recording::Sample>,
     start: Instant,
     at: i64,
     id: String,
@@ -198,7 +211,7 @@ pub(super) fn header_session(headers: &HeaderMap) -> String {
 impl Capture {
     fn new(
         route: Arc<Route>,
-        records: mpsc::Sender<(String, String, Record)>,
+        records: mpsc::Sender<recording::Sample>,
         session: String,
         requested: String,
         transport: &'static str,
@@ -308,15 +321,17 @@ impl Drop for Capture {
         if self
             .records
             .try_send((
-                self.route.registration.scope.clone(),
+                self.route.source.clone(),
                 self.route.registration.model_provider.clone(),
                 record,
             ))
             .is_err()
         {
+            self.route.source.fallback();
             tracing::error!(
                 event = "gateway_record_dropped",
                 request_id = self.id,
+                run_id = self.route.registration.run,
                 reason = "writer_queue_full_or_closed"
             );
         }
@@ -506,21 +521,13 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
         .map_err(|_| "无法读取网关端口")?
         .port();
     let token = uuid::Uuid::new_v4().to_string();
-    let (records, mut receiver) = mpsc::channel::<(String, String, Record)>(256);
-    let writer = tokio::spawn(async move {
-        while let Some((scope, upstream, record)) = receiver.recv().await {
-            let request_id = record.id.clone();
-            let run_id = record.run.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                crate::performance::Service::from_environment()
-                    .record_gateway(&scope, &upstream, &record)
-            })
-            .await;
-            if !matches!(result, Ok(Ok(()))) {
-                tracing::error!(event = "gateway_record_failed", request_id, run_id);
-            }
-        }
-    });
+    let (records, receiver) = mpsc::channel::<recording::Sample>(256);
+    let sources = Arc::new(recording::Sources::default());
+    let writer = tokio::spawn(recording::write(
+        receiver,
+        sources.clone(),
+        Arc::new(crate::performance::Service::from_environment()),
+    ));
     let state = Arc::new(Shared {
         directory: directory.clone(),
         token: token.clone(),
@@ -528,6 +535,7 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
         stopping: AtomicBool::new(false),
         routes: RwLock::new(HashMap::new()),
         records,
+        sources,
         idle_timeout: Duration::from_secs(120),
         client: reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -631,7 +639,7 @@ mod failure_tests {
         mode: &'static str,
     ) -> (
         Arc<Shared>,
-        mpsc::Receiver<(String, String, Record)>,
+        mpsc::Receiver<recording::Sample>,
         Arc<AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
@@ -676,7 +684,9 @@ mod failure_tests {
             lease: PathBuf::new(),
         };
         let (records, receiver) = mpsc::channel(8);
+        let sources = Arc::new(recording::Sources::default());
         let state = Arc::new(Shared {
+            sources: sources.clone(),
             directory: PathBuf::new(),
             token: "admin".into(),
             port: 0,
@@ -684,6 +694,9 @@ mod failure_tests {
             routes: RwLock::new(HashMap::from([(
                 "route".into(),
                 Arc::new(Route {
+                    source: sources
+                        .reserve(&registration.scope, &registration.run)
+                        .unwrap(),
                     registration,
                     active: AtomicUsize::new(0),
                 }),
@@ -813,7 +826,9 @@ mod oauth_tests {
             axum::serve(listener, app).await.unwrap();
         });
         let (records, mut receiver) = mpsc::channel(8);
+        let sources = Arc::new(recording::Sources::default());
         let state = Arc::new(Shared {
+            sources: sources.clone(),
             directory: PathBuf::new(),
             token: "admin".into(),
             port: 0,
@@ -821,6 +836,7 @@ mod oauth_tests {
             routes: RwLock::new(HashMap::from([(
                 "route".into(),
                 Arc::new(Route {
+                    source: sources.reserve("scope", "run").unwrap(),
                     active: AtomicUsize::new(0),
                     registration: Registration {
                         observe_websocket: false,

@@ -206,22 +206,32 @@ impl Service {
         .map_err(|_| "无法补充网关会话")?;
         tx.commit().map_err(|_| "无法保存网关会话".into())
     }
+    pub(crate) fn mark_gateway_cli_sources(
+        &self,
+        sources: &[(String, String)],
+    ) -> Result<(), String> {
+        let mut db = self.open()?;
+        let tx = db.transaction().map_err(|_| "无法记录会话日志来源")?;
+        for (scope, run) in sources {
+            tx.execute(
+                "INSERT OR IGNORE INTO perf_gateway_native(scope,run) VALUES(?1,?2)",
+                params![scope, run],
+            )
+            .map_err(|_| "无法记录会话日志来源")?;
+        }
+        tx.commit().map_err(|_| "无法保存会话日志来源".into())
+    }
     pub(crate) fn record_gateway(
         &self,
         scope: &str,
         upstream: &str,
         record: &crate::gateway::Record,
     ) -> Result<(), String> {
+        if record.native_transport {
+            return self.mark_gateway_cli_sources(&[(scope.to_owned(), record.run.clone())]);
+        }
         let mut db = self.open()?;
         let tx = db.transaction().map_err(|_| "无法记录网关请求")?;
-        if record.native_transport {
-            tx.execute(
-                "INSERT OR IGNORE INTO perf_gateway_native(scope,run) VALUES(?1,?2)",
-                params![scope, record.run],
-            )
-            .map_err(|_| "无法记录原生传输来源")?;
-            return tx.commit().map_err(|_| "无法保存原生传输来源".into());
-        }
         let session = if record.session.is_empty() {
             // A launch may own several sessions: only infer when exactly one is known.
             tx.query_row("SELECT CASE WHEN COUNT(*)=1 THEN MIN(session) ELSE '' END FROM perf_gateway_sessions WHERE scope=?1 AND run=?2", params![scope,record.run], |r|r.get::<_,String>(0)).map_err(|_| "无法读取网关会话")?

@@ -23,7 +23,7 @@ impl Drop for Active {
 
 struct Tracker {
     route: Arc<Route>,
-    records: mpsc::Sender<(String, String, Record)>,
+    records: mpsc::Sender<recording::Sample>,
     session: String,
     connection: String,
     pending: HashMap<String, VecDeque<Capture>>,
@@ -49,29 +49,7 @@ impl Tracker {
             }
         }
         self.pending.clear();
-        let record = Record {
-            id: uuid::Uuid::new_v4().to_string(),
-            run: self.route.registration.run.clone(),
-            transport: "websocket".into(),
-            connection_id: Some(self.connection.clone()),
-            native_transport: true,
-            ..Default::default()
-        };
-        if self
-            .records
-            .try_send((
-                self.route.registration.scope.clone(),
-                self.route.registration.model_provider.clone(),
-                record,
-            ))
-            .is_err()
-        {
-            tracing::error!(
-                event = "gateway_record_dropped",
-                run_id = self.route.registration.run,
-                reason = "native_transport_queue_full"
-            );
-        }
+        self.route.source.fallback();
     }
     fn message(&mut self, client: bool, bytes: &[u8]) {
         if self.disabled {

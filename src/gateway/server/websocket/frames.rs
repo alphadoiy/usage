@@ -112,70 +112,59 @@ impl Frames {
     }
     pub fn feed(
         &mut self,
-        bytes: &[u8],
+        mut bytes: &[u8],
         client: bool,
         mut emit: impl FnMut(&[u8]),
     ) -> Option<&'static str> {
-        if self.buffer.len().saturating_add(bytes.len()) > MAX_MESSAGE + 14 {
-            return Some("websocket_message_limit");
-        }
-        self.buffer.extend_from_slice(bytes);
-        let mut consumed = 0;
         loop {
-            let bytes = &self.buffer[consumed..];
-            if bytes.len() < 2 {
-                break;
+            // Buffer only one frame at a time. A TCP read may contain the tail of
+            // a maximum-sized frame and any number of following valid frames.
+            if !self.fill(&mut bytes, 2) {
+                return None;
             }
-            let fin = bytes[0] & 0x80 != 0;
-            let opcode = bytes[0] & 0xf;
-            let compressed = bytes[0] & 0x40 != 0;
-            if bytes[0] & 0x30 != 0 || (compressed && (opcode != 1 || self.deflate.is_none())) {
-                return Some("websocket_extension_encoding");
+            let length_header = match self.buffer[1] & 0x7f {
+                126 => 4,
+                127 => 10,
+                _ => 2,
+            };
+            if !self.fill(&mut bytes, length_header) {
+                return None;
             }
-            let masked = bytes[1] & 0x80 != 0;
-            if masked != client {
-                return Some("websocket_invalid_masking");
-            }
-            let (length, mut header) = match bytes[1] & 0x7f {
-                126 => {
-                    if bytes.len() < 4 {
-                        break;
-                    }
-                    (u16::from_be_bytes([bytes[2], bytes[3]]) as u64, 4)
-                }
-                127 => {
-                    if bytes.len() < 10 {
-                        break;
-                    }
-                    (
-                        u64::from_be_bytes(bytes[2..10].try_into().expect("eight bytes")),
-                        10,
-                    )
-                }
-                n => (n as u64, 2),
+            let bytes_header = &self.buffer;
+            let length = match length_header {
+                4 => u16::from_be_bytes([bytes_header[2], bytes_header[3]]) as u64,
+                10 => u64::from_be_bytes(bytes_header[2..10].try_into().expect("eight bytes")),
+                _ => (bytes_header[1] & 0x7f) as u64,
             };
             if length > MAX_MESSAGE as u64 {
                 return Some("websocket_message_limit");
             }
+            let header = length_header + if bytes_header[1] & 0x80 != 0 { 4 } else { 0 };
+            if !self.fill(&mut bytes, header + length as usize) {
+                return None;
+            }
+            let frame = &self.buffer;
+            let fin = frame[0] & 0x80 != 0;
+            let opcode = frame[0] & 0xf;
+            let compressed = frame[0] & 0x40 != 0;
+            if frame[0] & 0x30 != 0 || (compressed && (opcode != 1 || self.deflate.is_none())) {
+                return Some("websocket_extension_encoding");
+            }
+            let masked = frame[1] & 0x80 != 0;
+            if masked != client {
+                return Some("websocket_invalid_masking");
+            }
             let mask = if masked {
-                if bytes.len() < header + 4 {
-                    break;
-                }
-                let mask: [u8; 4] = bytes[header..header + 4].try_into().expect("four bytes");
-                header += 4;
-                Some(mask)
+                Some(<[u8; 4]>::try_from(&frame[length_header..header]).expect("four bytes"))
             } else {
                 None
             };
-            if bytes.len() < header + length as usize {
-                break;
-            }
             if opcode >= 8 {
                 if !fin || length > 125 || !matches!(opcode, 8..=10) {
                     return Some("websocket_invalid_control_frame");
                 }
             } else {
-                let payload = &bytes[header..header + length as usize];
+                let payload = &frame[header..];
                 let decoded: Vec<u8> = payload
                     .iter()
                     .enumerate()
@@ -210,9 +199,16 @@ impl Frames {
                     _ => return Some("websocket_unsupported_message"),
                 }
             }
-            consumed += header + length as usize;
+            self.buffer.clear();
+            if bytes.is_empty() {
+                return None;
+            }
         }
-        self.buffer.drain(..consumed);
-        None
+    }
+    fn fill(&mut self, bytes: &mut &[u8], target: usize) -> bool {
+        let take = target.saturating_sub(self.buffer.len()).min(bytes.len());
+        self.buffer.extend_from_slice(&bytes[..take]);
+        *bytes = &bytes[take..];
+        self.buffer.len() >= target
     }
 }

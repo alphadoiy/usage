@@ -877,6 +877,19 @@ fn unobservable_websocket_uses_cli_source_for_the_whole_run_without_double_count
         },
     )
     .unwrap();
+    super::store::save(
+        &db,
+        &scope,
+        &Observation {
+            id: "cli-second".into(),
+            session: "session".into(),
+            at: at(11),
+            model: "m".into(),
+            output: 300,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let record = crate::gateway::Record {
         transport: "websocket".into(),
         id: "http".into(),
@@ -889,6 +902,7 @@ fn unobservable_websocket_uses_cli_source_for_the_whole_run_without_double_count
         ..Default::default()
     };
     f.service.record_gateway(&scope, "openai", &record).unwrap();
+    assert_eq!(f.snapshot().summary.calls, 1);
     assert!(f.snapshot().recent[0].gateway);
     assert!(!f.snapshot().native_transport);
     f.service
@@ -903,8 +917,8 @@ fn unobservable_websocket_uses_cli_source_for_the_whole_run_without_double_count
         )
         .unwrap();
     let snapshot = f.snapshot();
-    assert_eq!(snapshot.summary.calls, 1);
-    assert!(!snapshot.recent[0].gateway);
+    assert_eq!(snapshot.summary.calls, 2);
+    assert!(snapshot.recent.iter().all(|r| !r.gateway));
     assert!(snapshot.native_transport);
     assert_eq!(
         f.service
@@ -912,6 +926,6 @@ fn unobservable_websocket_uses_cli_source_for_the_whole_run_without_double_count
             .unwrap()
             .unwrap()
             .calls,
-        1
+        2
     );
 }

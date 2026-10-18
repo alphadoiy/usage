@@ -2,9 +2,12 @@ use super::*;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn tracker() -> (Tracker, mpsc::Receiver<(String, String, Record)>) {
+fn tracker() -> (Tracker, mpsc::Receiver<recording::Sample>) {
     let (records, receiver) = mpsc::channel(128);
     let route = Arc::new(Route {
+        source: recording::Sources::default()
+            .reserve("scope", "run")
+            .unwrap(),
         active: AtomicUsize::new(0),
         registration: Registration {
             observe_websocket: true,
@@ -196,8 +199,7 @@ fn ambiguous_attribution_and_limits_select_cli_source_instead_of_guessing() {
         }
         assert!(t.disabled);
         assert!(t.pending.is_empty());
-        let (_, _, r) = rx.try_recv().unwrap();
-        assert!(r.native_transport);
+        assert!(t.route.source.is_fallback());
         assert!(rx.try_recv().is_err());
     }
 }
@@ -367,6 +369,7 @@ async fn native_socket(compressed: bool) {
     let route = base_tracker.route.clone();
     let lease = route.clone();
     let state = Arc::new(Shared {
+        sources: Arc::new(recording::Sources::default()),
         directory: PathBuf::new(),
         token: "admin".into(),
         port: 0,
@@ -520,6 +523,7 @@ async fn websocket_refusal_preserves_status_body_and_retry_after_without_inferen
         axum::serve(listener, app).await.unwrap();
     });
     let state = Arc::new(Shared {
+        sources: Arc::new(recording::Sources::default()),
         directory: PathBuf::new(),
         token: "admin".into(),
         port: 0,
@@ -574,9 +578,7 @@ async fn unsupported_frame_bytes_still_reach_the_other_end_and_select_cli_statis
     let mut received = vec![0; bytes.len()];
     observed.read_exact(&mut received).await.unwrap();
     assert_eq!(received, bytes);
-    let (_, _, r) = rx.try_recv().unwrap();
-    assert!(r.native_transport);
-    assert!(r.decode.is_none());
+    assert!(observed.tracker.lock().unwrap().route.source.is_fallback());
     assert!(rx.try_recv().is_err());
     // A subsequent read is still forwarded after observation has been disabled.
     peer.write_all(b"more-opaque-bytes").await.unwrap();
@@ -680,5 +682,116 @@ fn multiplexed_requests_use_each_native_thread_identity_instead_of_the_socket_de
         finish(&mut t, lane, lane);
         let (_, _, r) = rx.try_recv().unwrap();
         assert_eq!(r.session, thread);
+    }
+}
+
+#[tokio::test]
+async fn full_sample_queue_cannot_drop_websocket_source_fallback() {
+    let (mut t, mut rx) = tracker();
+    let sources = Arc::new(recording::Sources::default());
+    Arc::get_mut(&mut t.route).unwrap().source = sources.reserve("scope", "run").unwrap();
+    // First persistable sample exists, then the bounded sample queue fills up.
+    client(&mut t, json!({"type":"response.create"}));
+    created(&mut t, "", "first");
+    finish(&mut t, "", "first");
+    while t.records.capacity() > 0 {
+        t.records
+            .try_send((
+                t.route.source.clone(),
+                "openai".into(),
+                Record {
+                    run: "run".into(),
+                    ..Default::default()
+                },
+            ))
+            .ok()
+            .unwrap();
+    }
+    t.fallback("unsupported_client_event");
+    assert!(t.route.source.is_fallback());
+    // The source selection is independent of both full and closed sample queues.
+    rx.close();
+    let root = std::env::temp_dir().join(format!("usage-ws-source-{}", uuid::Uuid::new_v4()));
+    let path = root.join("performance.sqlite3");
+    let service = Arc::new(crate::performance::Service::at(path.clone()));
+    drop(t);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recording::write(rx, sources, service),
+    )
+    .await
+    .unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM perf_gateway_native WHERE scope='scope' AND run='run'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn maximum_message_followed_by_terminal_frame_is_independent_of_tcp_chunking() {
+    const LIMIT: usize = 1024 * 1024;
+    let mut delta = br#"{"type":"response.output_text.delta","delta":""#.to_vec();
+    delta.resize(LIMIT - 2, b'x');
+    delta.extend_from_slice(b"\"}");
+    assert_eq!(delta.len(), LIMIT);
+    let large = frame(1, true, &delta, false);
+    let terminal = frame(
+        1,
+        true,
+        br#"{"type":"response.completed","response":{"id":"r","usage":{"output_tokens":200}}}"#,
+        false,
+    );
+    let mut wire = large.clone();
+    wire.extend_from_slice(&terminal);
+    // Separate packets, a coalesced tail + terminal, one read, and a split header.
+    for split in [large.len(), large.len() - 2, 0, 1] {
+        let (mut t, mut rx) = tracker();
+        client(&mut t, json!({"type":"response.create"}));
+        created(&mut t, "", "r");
+        let mut parser = frames::Frames::default();
+        for chunk in [&wire[..split], &wire[split..]] {
+            assert_eq!(parser.feed(chunk, false, |m| t.message(false, m)), None);
+        }
+        assert!(!t.route.source.is_fallback());
+        let (_, _, record) = rx.try_recv().unwrap();
+        assert!(record.complete);
+        assert_eq!(record.output, Some(200));
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn multiple_maximum_frames_and_fragmented_messages_remain_bounded_per_message() {
+    const LIMIT: usize = 1024 * 1024;
+    for masked in [false, true] {
+        let payload = vec![b'x'; LIMIT];
+        let mut wire = frame(1, true, &payload, masked);
+        wire.extend(frame(9, true, b"ping", masked));
+        wire.extend(frame(1, false, &payload[..LIMIT / 2], masked));
+        wire.extend(frame(0, true, &payload[LIMIT / 2..], masked));
+        let mut parser = frames::Frames::default();
+        let mut count = 0;
+        assert_eq!(
+            parser.feed(&wire, masked, |m| {
+                assert_eq!(m, payload);
+                count += 1;
+            }),
+            None
+        );
+        assert_eq!(count, 2);
+        let mut oversized = frame(1, false, &payload, masked);
+        oversized.extend(frame(0, true, b"x", masked));
+        assert_eq!(
+            parser.feed(&oversized, masked, |_| panic!("oversized message")),
+            Some("websocket_message_limit")
+        );
     }
 }
