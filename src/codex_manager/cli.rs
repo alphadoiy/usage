@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum CodexCommand {
+    /// GPT 官方订阅模型指纹测试与每小时调度
+    Fingerprint {
+        #[command(subcommand)]
+        command: super::fingerprint::FingerprintCommand,
+    },
     #[command(hide = true)]
     ResumeLocal {
         #[arg(long)]
@@ -186,6 +191,7 @@ impl CodexCommand {
     /// Fixed command names only; never format the enum (it contains user input).
     pub(crate) fn log_name(&self) -> &'static str {
         match self {
+            Self::Fingerprint { .. } => "codex.fingerprint",
             Self::ResumeLocal { .. } => "codex.resume_local",
             Self::Event => "codex.event",
             Self::RunEvents { .. } => "codex.run_events",
@@ -255,6 +261,9 @@ fn fs_text(path: &Path) -> Result<String> {
 
 pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> Result<i32> {
     let command = match command {
+        CodexCommand::Fingerprint { command } => {
+            return super::fingerprint::dispatch(command).await;
+        }
         CodexCommand::Login {
             name,
             account,
@@ -397,7 +406,8 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
     };
     let mut manager = Manager::open(super::default_root())?;
     match command {
-        CodexCommand::ResumeLocal { .. }
+        CodexCommand::Fingerprint { .. }
+        | CodexCommand::ResumeLocal { .. }
         | CodexCommand::Event
         | CodexCommand::Notify { .. }
         | CodexCommand::Bark { .. }

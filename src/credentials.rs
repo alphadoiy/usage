@@ -105,7 +105,19 @@ pub fn read_macos_keychain(service: &str, account: Option<&str>) -> Option<Strin
     if text.is_empty() { None } else { Some(text) }
 }
 
-pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+pub(crate) fn output_with_timeout(command: Command, timeout: Duration) -> Option<Output> {
+    output_with_cancel(command, timeout, &std::sync::atomic::AtomicBool::new(false))
+}
+
+pub(crate) fn output_with_cancel(
+    mut command: Command,
+    timeout: Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<Output> {
+    use std::sync::atomic::Ordering;
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
     let started = Instant::now();
@@ -153,7 +165,7 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
             .ok()?;
         let mut output = None;
         let status = loop {
-            if started.elapsed() >= timeout {
+            if started.elapsed() >= timeout || cancel.load(Ordering::Acquire) {
                 return None;
             }
             if output.is_none() {
@@ -168,12 +180,20 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
                 None => std::thread::sleep(Duration::from_millis(5)),
             }
         };
-        let stdout = output.or_else(|| {
-            receiver
-                .recv_timeout(timeout.saturating_sub(started.elapsed()))
-                .ok()
-                .flatten()
-        })?;
+        let stdout = if let Some(output) = output {
+            output
+        } else {
+            loop {
+                if started.elapsed() >= timeout || cancel.load(Ordering::Acquire) {
+                    return None;
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(Some(bytes)) => break bytes,
+                    Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        };
         Some(Output {
             status,
             stdout,

@@ -2,18 +2,18 @@
 use super::*;
 use serde_json::json;
 
-struct Fixture {
-    path: PathBuf,
+pub(super) struct Fixture {
+    pub(super) path: PathBuf,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = std::env::temp_dir().join(format!("usage-codex-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         Self {
             path: path.canonicalize().unwrap(),
         }
     }
-    fn manager(&self) -> Manager {
+    pub(super) fn manager(&self) -> Manager {
         Manager::open(self.path.join("manager")).unwrap()
     }
     fn source(&self) -> Connection {
@@ -30,7 +30,7 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.path);
     }
 }
-fn native(url: &str, model: &str) -> String {
+pub(super) fn native(url: &str, model: &str) -> String {
     config::new_config(url, model, Some("high")).unwrap()
 }
 
@@ -1004,7 +1004,7 @@ async fn http_200_with_wrong_protocol_does_not_pass_connection_test() {
     server.join().unwrap();
 }
 
-fn oauth_source(f: &Fixture, workspace: &str, refresh: &str) -> PathBuf {
+pub(super) fn oauth_source(f: &Fixture, workspace: &str, refresh: &str) -> PathBuf {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     let claims = json!({"sub":"fixture-user","email":"fixture@example.test",
         "https://api.openai.com/auth":{"chatgpt_account_id":workspace,"chatgpt_user_id":"fixture-user","chatgpt_plan_type":"plus"}});

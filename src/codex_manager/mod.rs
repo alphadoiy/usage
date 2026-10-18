@@ -4,6 +4,7 @@ pub mod ccswitch;
 pub mod cli;
 pub mod config;
 mod effective;
+pub mod fingerprint;
 mod launcher;
 mod local;
 pub use local::{local_resume_shell_command, start_local_codex};

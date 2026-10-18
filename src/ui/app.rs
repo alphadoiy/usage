@@ -38,6 +38,10 @@ struct RefreshEvent {
 }
 
 enum AppEvent {
+    FingerprintLoaded {
+        generation: u64,
+        result: Result<Vec<crate::codex_manager::fingerprint::Snapshot>, String>,
+    },
     HomePerformance {
         generation: u64,
         key: String,
@@ -211,6 +215,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     let mut redraw = RedrawSchedule::new();
     app.refresh(&handle);
     let result = loop {
+        app.maybe_refresh_fingerprint(&handle);
         let (received, reset_consumed) = app.drain_events();
         if !app.alerts_queue.is_empty() {
             let alerts = std::mem::take(&mut app.alerts_queue);
@@ -425,6 +430,10 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    fingerprint_service: Arc<crate::codex_manager::fingerprint::FingerprintService>,
+    fingerprint_task: Option<tokio::task::JoinHandle<()>>,
+    fingerprint_generation: u64,
+    fingerprint_last_poll: Option<std::time::Instant>,
     home_performance: HashMap<String, super::performance::CachedSummary>,
     home_performance_task: Option<tokio::task::JoinHandle<()>>,
     home_performance_pending: bool,
@@ -499,6 +508,9 @@ struct Dashboard {
 
 impl Drop for Dashboard {
     fn drop(&mut self) {
+        if let Some(task) = self.fingerprint_task.take() {
+            task.abort();
+        }
         if let Some(task) = self.home_performance_task.take() {
             task.abort();
         }
@@ -588,6 +600,12 @@ impl Dashboard {
             })
             .collect();
         Self {
+            fingerprint_service: Arc::new(
+                crate::codex_manager::fingerprint::FingerprintService::from_environment(),
+            ),
+            fingerprint_task: None,
+            fingerprint_generation: 0,
+            fingerprint_last_poll: None,
             home_activity: HashMap::new(),
             home_performance: HashMap::new(),
             home_performance_task: None,
@@ -966,6 +984,29 @@ impl Dashboard {
             }
             _ => {}
         }
+    }
+
+    fn maybe_refresh_fingerprint(&mut self, handle: &Handle) {
+        if self.history.is_some()
+            || self.browser.is_some()
+            || self.fingerprint_task.is_some()
+            || self
+                .fingerprint_last_poll
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.fingerprint_last_poll = Some(std::time::Instant::now());
+        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
+        let generation = self.fingerprint_generation;
+        let service = self.fingerprint_service.clone();
+        let tx = self.tx.clone();
+        self.fingerprint_task = Some(handle.spawn_blocking(move || {
+            let result = service
+                .snapshots()
+                .map_err(|_| "本机测试记录读取失败".to_owned());
+            let _ = tx.send(AppEvent::FingerprintLoaded { generation, result });
+        }));
     }
 
     fn maybe_refresh_home_activity(&mut self, handle: &Handle) {
@@ -1667,6 +1708,13 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::FingerprintLoaded { generation, result } => {
+                    if generation == self.fingerprint_generation {
+                        self.fingerprint_task = None;
+                        changed |= self.home_connections.set_fingerprints(result);
+                    }
+                    continue;
+                }
                 AppEvent::HomePerformance {
                     generation,
                     key,
@@ -2310,7 +2358,11 @@ fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     let inner = home::board(
         connections,
         buf,
-        "官方 API · 厂商状态",
+        if app.home_connections.has_fingerprints() {
+            "厂商状态 · 订阅测试"
+        } else {
+            "官方 API · 厂商状态"
+        },
         app.home_focus == HomeFocus::Connections,
     );
     app.home_connections.render(
@@ -4631,5 +4683,43 @@ mod performance_regression_tests {
         app.open_performance(runtime.handle());
         assert!(app.performance.is_none());
         assert!(app.notice.as_deref().unwrap().contains("尚未绑定"));
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_event_tests {
+    use super::*;
+    #[test]
+    fn fingerprint_updates_follow_dashboard_generation_and_isolate_read_errors() {
+        let mut app = Dashboard::new(
+            Vec::new(),
+            AppConfig::default(),
+            PathBuf::from("/tmp/config.toml"),
+        );
+        app.fingerprint_generation = 2;
+        app.tx
+            .send(AppEvent::FingerprintLoaded {
+                generation: 1,
+                result: Err("stale".into()),
+            })
+            .unwrap();
+        assert!(!app.drain_events().0);
+        assert!(!app.home_connections.has_fingerprints());
+        app.tx
+            .send(AppEvent::FingerprintLoaded {
+                generation: 2,
+                result: Err("current read failure".into()),
+            })
+            .unwrap();
+        assert!(app.drain_events().0);
+        assert!(app.home_connections.has_fingerprints());
+        app.tx
+            .send(AppEvent::FingerprintLoaded {
+                generation: 2,
+                result: Ok(Vec::new()),
+            })
+            .unwrap();
+        assert!(app.drain_events().0);
+        assert!(!app.home_connections.has_fingerprints());
     }
 }

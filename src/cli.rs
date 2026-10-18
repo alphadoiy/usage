@@ -154,6 +154,19 @@ enum Command {
     },
 }
 
+impl Cli {
+    fn interactive(&self) -> bool {
+        match &self.command {
+            None => !self.once && !self.json,
+            Some(Command::Codex { command: None }) => true,
+            Some(Command::History {
+                csv, once, json, ..
+            }) => !csv && !once && !json && !self.once && !self.json,
+            _ => false,
+        }
+    }
+}
+
 pub async fn run() -> i32 {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -239,6 +252,9 @@ pub async fn run() -> i32 {
 }
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
+    let _runtime = cli
+        .interactive()
+        .then(crate::app_runtime::AppRuntime::start);
     match cli.command {
         Some(Command::Gateway { command }) => {
             crate::gateway::execute(command).await.map_err(CliError)?;
@@ -938,5 +954,28 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].tool, "broken");
         assert!(snapshots[0].transient);
+    }
+}
+
+#[cfg(test)]
+mod app_runtime_tests {
+    use super::*;
+    #[test]
+    fn automatic_paid_checks_only_belong_to_interactive_invocations() {
+        for (args, expected) in [
+            (vec!["usage"], true),
+            (vec!["usage", "--once"], false),
+            (vec!["usage", "--json"], false),
+            (vec!["usage", "history"], true),
+            (vec!["usage", "history", "--once"], false),
+            (vec!["usage", "codex"], true),
+            (
+                vec!["usage", "codex", "fingerprint", "status", "account"],
+                false,
+            ),
+            (vec!["usage", "providers"], false),
+        ] {
+            assert_eq!(Cli::try_parse_from(args).unwrap().interactive(), expected);
+        }
     }
 }

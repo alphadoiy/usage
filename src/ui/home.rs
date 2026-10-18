@@ -300,14 +300,147 @@ fn detail_lines(
     super::overview::wrap(lines, area.width)
 }
 
+struct TestDisplay {
+    symbol: &'static str,
+    color: Color,
+    label: &'static str,
+    priority: u8,
+}
+fn fingerprint_display(report: Option<&crate::codex_manager::fingerprint::Report>) -> TestDisplay {
+    use crate::codex_manager::fingerprint::ReportStatus;
+    let (symbol, color, label, priority) = match report.map(|r| r.status) {
+        Some(ReportStatus::Completed) => ("●", Color::Green, "测试完成", 0),
+        Some(ReportStatus::Partial) => ("▲", Color::Yellow, "样本不完整", 3),
+        Some(ReportStatus::Running) => ("◆", Color::Cyan, "测试中", 1),
+        Some(ReportStatus::Interrupted) => ("○", Color::DarkGray, "已中断", 2),
+        Some(ReportStatus::Failed) if report.is_some_and(|r| r.http_status == Some(429)) => (
+            "▲",
+            Color::Yellow,
+            if report.is_some_and(|r| r.quota_resets_at.is_some()) {
+                "额度耗尽"
+            } else {
+                "限流"
+            },
+            3,
+        ),
+        Some(ReportStatus::Failed) => ("×", Color::Red, "测试失败", 4),
+        Some(ReportStatus::Unknown) => ("○", Color::DarkGray, "状态未知", 2),
+        None => ("○", Color::DarkGray, "等待测试", 2),
+    };
+    TestDisplay {
+        symbol,
+        color,
+        label,
+        priority,
+    }
+}
+fn fingerprint_details(
+    area: Rect,
+    snapshots: &[crate::codex_manager::fingerprint::Snapshot],
+    error: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from("GPT 官方订阅 · 本机指纹测试").bold(),
+        Line::from("仅 Usage 打开期间每小时测试 · 退出后停止").dim(),
+    ];
+    if let Some(error) = error {
+        lines.push(Line::from(error.to_owned()).fg(Color::Yellow));
+    }
+    for snapshot in snapshots {
+        let TestDisplay {
+            symbol,
+            color,
+            label,
+            ..
+        } = fingerprint_display(snapshot.latest.as_ref());
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(format!(
+                "{symbol} {} · {label}",
+                super::overview::clean(&snapshot.name)
+            ))
+            .fg(color)
+            .bold(),
+        );
+        lines.push(
+            Line::from(if snapshot.enabled {
+                "调度已启用 · gpt-6.1-sol · low · 3 条样本"
+            } else {
+                "调度已停用 · 以下为历史结果"
+            })
+            .dim(),
+        );
+        if let Some(report) = &snapshot.latest {
+            if let Some(at) = DateTime::from_timestamp(report.started_at, 0) {
+                lines.push(Line::from(format!(
+                    "最近测试：{} · {}/3 样本",
+                    time(at),
+                    report.accepted
+                )));
+            }
+            lines.push(Line::from(super::overview::clean(&report.message)));
+            if let Some(model) = &report.closest_candidate {
+                lines.push(Line::from(format!(
+                    "参考库最近候选：{}（非身份认证）",
+                    super::overview::clean(model)
+                )));
+            }
+        }
+        for warning in &snapshot.warnings {
+            lines.push(Line::from(super::overview::clean(warning)).fg(Color::Yellow));
+        }
+        lines.push(Line::from("最近 24 次测试 · 旧 → 新").bold());
+        if snapshot.history.is_empty() {
+            lines.push(Line::from("暂无完成记录").dim());
+        } else {
+            lines.push(Line::from(
+                snapshot
+                    .history
+                    .iter()
+                    .map(|r| {
+                        let TestDisplay { symbol, color, .. } = fingerprint_display(Some(r));
+                        Span::styled(symbol, Style::new().fg(color))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("● 完成  ◆ 测试中  ▲ 限流/部分结果  × 失败  ○ 未测试/中断").dim());
+    lines.push(Line::from("每个符号代表一次本机测试；采样消耗订阅额度。").dim());
+    lines.push(Line::from("指纹排名仅供参考，不代表官方服务健康度或模型身份认证。").dim());
+    super::overview::wrap(lines, area.width)
+}
+
 #[derive(Default)]
 pub(super) struct Connections {
+    fingerprints: Vec<crate::codex_manager::fingerprint::Snapshot>,
+    fingerprint_error: Option<String>,
     selected: usize,
     details: bool,
     scroll: u16,
 }
 
 impl Connections {
+    pub fn has_fingerprints(&self) -> bool {
+        !self.fingerprints.is_empty() || self.fingerprint_error.is_some()
+    }
+    pub fn set_fingerprints(
+        &mut self,
+        result: Result<Vec<crate::codex_manager::fingerprint::Snapshot>, String>,
+    ) -> bool {
+        let (snapshots, error) = match result {
+            Ok(s) => (s, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
+        let changed = self.fingerprints != snapshots || self.fingerprint_error != error;
+        self.fingerprints = snapshots;
+        self.fingerprint_error = error;
+        self.selected = self
+            .selected
+            .min(SOURCES.len() - usize::from(!self.has_fingerprints()));
+        changed
+    }
     pub fn is_details(&self) -> bool {
         self.details
     }
@@ -338,8 +471,10 @@ impl Connections {
                 .min(u16::MAX as usize) as i32;
             self.scroll = (i32::from(self.scroll) + i32::from(delta)).clamp(0, max) as u16;
         } else {
-            self.selected = (self.selected as i32 + i32::from(delta))
-                .clamp(0, SOURCES.len() as i32 - 1) as usize;
+            self.selected = (self.selected as i32 + i32::from(delta)).clamp(
+                0,
+                SOURCES.len() as i32 - 1 + i32::from(self.has_fingerprints()),
+            ) as usize;
         }
     }
 
@@ -352,8 +487,57 @@ impl Connections {
         active: bool,
     ) -> Vec<Line<'static>> {
         if self.details {
-            let source = SOURCES[self.selected];
-            detail_lines(area, source, statuses.get(source.id), history, pending)
+            if let Some(source) = SOURCES.get(self.selected).copied() {
+                detail_lines(area, source, statuses.get(source.id), history, pending)
+            } else {
+                fingerprint_details(area, &self.fingerprints, self.fingerprint_error.as_deref())
+            }
+        } else if self.has_fingerprints() {
+            let compact = Rect { height: 7, ..area };
+            let mut lines = list_lines(compact, statuses, pending, self.selected, active);
+            lines.truncate(SOURCES.len());
+            let report = self
+                .fingerprints
+                .iter()
+                .filter_map(|s| s.latest.as_ref())
+                .max_by_key(|r| fingerprint_display(Some(r)).priority);
+            let has_warning = self.fingerprints.iter().any(|s| !s.warnings.is_empty());
+            let TestDisplay {
+                symbol,
+                color,
+                label,
+                ..
+            } = if self.fingerprint_error.is_some() {
+                TestDisplay {
+                    symbol: "○",
+                    color: Color::DarkGray,
+                    label: "记录读取失败",
+                    priority: 2,
+                }
+            } else if has_warning {
+                TestDisplay {
+                    symbol: "▲",
+                    color: Color::Yellow,
+                    label: "部分记录异常",
+                    priority: 3,
+                }
+            } else {
+                fingerprint_display(report)
+            };
+            let prefix = if active && self.selected == SOURCES.len() {
+                "> "
+            } else {
+                "  "
+            };
+            lines.push(Line::from(format!("{prefix}{symbol} GPT 订阅测试 · {label}")).fg(color));
+            if area.height >= 8
+                && let Some(at) = report.and_then(|r| DateTime::from_timestamp(r.started_at, 0))
+            {
+                lines.push(Line::from(format!("    最近测试 {}", time(at))).dim());
+            }
+            lines.push(Line::from("Enter 查看事件与历史").dim());
+            lines.push(Line::from("厂商：官方状态页 · 订阅：本机测试").dim());
+            lines
         } else {
             list_lines(area, statuses, pending, self.selected, active)
         }
@@ -515,5 +699,100 @@ mod tests {
                 .iter()
                 .any(|line| line.to_string().contains("! Claude · 部分故障"))
         );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use crate::codex_manager::fingerprint::{Report, ReportStatus, Snapshot};
+    #[test]
+    fn local_test_row_details_and_history_do_not_claim_official_outage_or_identity() {
+        let r = Report {
+            model: "gpt-6.1-sol".into(),
+            channel: "codex-subscription".into(),
+            started_at: 1792308647,
+            finished_at: Some(1792308651),
+            status: ReportStatus::Failed,
+            directory: Default::default(),
+            accepted: 0,
+            reference_contains_model: false,
+            closest_candidate: None,
+            message: "官方订阅额度已用尽，预计 17:15 恢复".into(),
+            http_status: Some(429),
+            quota_resets_at: Some(1792314948),
+        };
+        let mut c = Connections::default();
+        let snapshot = Snapshot {
+            id: "official".into(),
+            warnings: Vec::new(),
+            name: "Official account".into(),
+            enabled: true,
+            latest: Some(r.clone()),
+            history: vec![r],
+        };
+        assert!(c.set_fingerprints(Ok(vec![snapshot])));
+        for width in [30, 72] {
+            let area = Rect::new(0, 0, width, 12);
+            let lines = c.lines(
+                area,
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            );
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("GPT 订阅测试 · 额度耗尽"));
+            assert!(text.contains("厂商：官方状态页 · 订阅：本机测试"));
+            assert!(!text.contains("严重故障"));
+            c.selected = SOURCES.len();
+            c.open();
+            let lines = c.lines(
+                area,
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            );
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(text.contains("最近 24 次测试"));
+            assert!(text.contains("▲"));
+            assert!(text.contains("17:15"));
+            assert!(text.contains("不代表官方服务健康度或模型身份认证"));
+            let mut buf = Buffer::empty(area);
+            c.render(
+                area,
+                &mut buf,
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            );
+            c.back();
+        }
+        c.set_fingerprints(Err("本机测试记录读取失败".into()));
+        let text = c
+            .lines(
+                Rect::new(0, 0, 72, 10),
+                &HashMap::new(),
+                &StatusHistory::default(),
+                false,
+                true,
+            )
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("○ GPT 订阅测试 · 记录读取失败"));
+        c.set_fingerprints(Ok(Vec::new()));
+        assert_eq!(c.selected, SOURCES.len() - 1);
     }
 }
