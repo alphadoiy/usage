@@ -23,6 +23,7 @@ impl Fixture {
             .env("USAGE_CONFIG", self.0.join("usage.toml"))
             .env("USAGE_LOG_DIR", self.0.join("logs"))
             .env("USAGE_LOG", "debug")
+            .env("USAGE_GATEWAY", "off")
             .env("FIXTURE_INFERENCE_A", "synthetic-inference-a")
             .env("FIXTURE_INFERENCE_B", "synthetic-inference-b")
             .env("FIXTURE_RESOURCE_A", "synthetic-query-a")

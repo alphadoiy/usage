@@ -1015,11 +1015,47 @@ impl Manager {
                 command.arg("--no-daemon");
             }
             let run_id = op.id().to_owned();
+            let mut gateway = None;
             let mut capture = op.step("run_identity_capture", || {
                 let environment = |name: &str| std::env::var(name).ok();
                 let effective = effective::resolve(&saved.config, profile.auth_mode, &cwd, resume.is_some(), args, key.as_deref(), &environment);
                 if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
                     command.env(env, key);
+                }
+                if profile.auth_mode == AuthMode::Byok && crate::gateway::enabled() {
+                    if effective.gateway_supported {
+                        let prepared = (|| -> Result<crate::gateway::Attachment> {
+                            let binding = self.performance_binding(&profile, revision)?;
+                            let attached = crate::gateway::attach(&self.root, &run_id, &binding,
+                                effective.identity.endpoint.as_deref().expect("resolved endpoint"),
+                                effective.identity.model_provider.as_deref().expect("resolved provider"),
+                                effective.key.as_deref().expect("resolved credential")).map_err(Error::message)?;
+                            #[cfg(unix)]
+                            launcher::inherit_run_lease(&mut command, &attached.lease)?;
+                            Ok(attached)
+                        })();
+                        match prepared {
+                            Ok(attached) => {
+                                command.env(effective.credential_env.as_deref().expect("resolved environment"), &attached.token);
+                                let provider = toml::Value::String(effective.identity.model_provider.clone().expect("resolved provider"));
+                                let base = toml::Value::String(attached.base.clone());
+                                command.args(["-c", &format!("model_providers.{provider}.base_url={base}")]);
+                                for variable in ["NO_PROXY", "no_proxy"] {
+                                    let mut bypass = std::env::var(variable).unwrap_or_default();
+                                    if !bypass.is_empty() { bypass.push(','); }
+                                    bypass.push_str("127.0.0.1,localhost,::1");
+                                    command.env(variable, bypass);
+                                }
+                                tracing::info!(event="gateway_injected", run_id, provider_id=profile.id);
+                                gateway = Some(attached);
+                            }
+                            Err(error) => {
+                                tracing::warn!(event="gateway_fallback", run_id, provider_id=profile.id, reason=%error, action="direct_launch");
+                            }
+                        }
+                    } else {
+                        tracing::info!(event="gateway_skipped", run_id, reason=effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"));
+                    }
                 }
                 let path = usage_config.map(Path::to_path_buf).unwrap_or_else(crate::config::default_config_path);
                 let config = crate::config::load_config(&path, usage_config.is_some());
@@ -1102,6 +1138,7 @@ impl Manager {
             let finish = Box::new(move |status: ExitStatus| {
                 // Keep the OAuth lease owned by this process handle until exit.
                 let _lease = &_oauth_lease;
+                let _gateway = &gateway;
                 span.in_scope(|| {
                     runtime::finish_run(&root, &home, &run_id, profile.auth_mode, status)
                 })

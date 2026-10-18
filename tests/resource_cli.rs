@@ -28,6 +28,7 @@ impl Fixture {
             .env("USAGE_CODEX_DIR", self.0.join("manager"))
             .env("USAGE_LOG_DIR", self.0.join("logs"))
             .env("USAGE_LOG", "debug")
+            .env("USAGE_GATEWAY", "off")
             .env_remove("USAGE_RESOURCE_FIXTURE_KEY");
         command
     }

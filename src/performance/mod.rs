@@ -1,4 +1,4 @@
-//! Request performance from explicitly bound local logs. No inference or credential requests.
+//! Unified performance queries over explicitly bound CLI logs and gateway observations.
 mod parser;
 mod store;
 #[cfg(test)]
@@ -69,11 +69,15 @@ pub struct Observation {
     pub model: String,
     pub upstream: Option<String>,
     pub output: u64,
+    #[serde(default)]
+    pub output_unknown: bool,
     pub reasoning: u64,
     pub duration_ms: Option<i64>,
     pub ttft_ms: Option<i64>,
     /// Native CLI timing, rather than inferred timestamps. Still not proxy observation.
     pub native_timing: bool,
+    #[serde(default)]
+    pub gateway: bool,
     /// Computed by the shared SQL policy when reading indexed rows, not stored in parser state.
     #[serde(skip)]
     pub generated: Option<RateSample>,

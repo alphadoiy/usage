@@ -687,3 +687,169 @@ fn old_cursor_is_reparsed_once_without_duplicating_requests_or_losing_deleted_hi
     f.update();
     assert_eq!(f.snapshot().summary.calls, 2);
 }
+
+#[test]
+fn gateway_supersedes_cli_only_inside_its_recorded_launch_and_keeps_other_sessions() {
+    let f = Fixture::new("codex");
+    let scope = f.binding.scope();
+    let run = "test-run";
+    f.service
+        .register_gateway_run(&scope, run, "owner")
+        .unwrap();
+    let db = f.service.open().unwrap();
+    db.execute(
+        "UPDATE perf_gateway_runs SET started=?1,ended=?2 WHERE run=?3",
+        rusqlite::params![at(5), at(15), run],
+    )
+    .unwrap();
+    for (id, session, sec) in [
+        ("original", "shared", 10),
+        ("resumed", "shared", 20),
+        ("independent", "other", 10),
+    ] {
+        super::store::save(
+            &db,
+            &scope,
+            &Observation {
+                id: id.into(),
+                session: session.into(),
+                at: at(sec),
+                model: "model".into(),
+                output: 200,
+                duration_ms: Some(2000),
+                ttft_ms: Some(500),
+                native_timing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    drop(db);
+    let record = crate::gateway::Record {
+        id: "gateway-request".into(),
+        run: run.into(),
+        session: "shared".into(),
+        at: at(10),
+        model: "model".into(),
+        requested_model: "model".into(),
+        response_id: Some("response".into()),
+        output: Some(300),
+        reasoning: 100,
+        duration: 1500,
+        ttft: Some(200),
+        decode: Some((200, 1000)),
+        status: 200,
+        complete: true,
+        outcome: "finished".into(),
+        ..Default::default()
+    };
+    f.service.record_gateway(&scope, "custom", &record).unwrap();
+    f.service.record_gateway(&scope, "custom", &record).unwrap();
+    let snapshot = f.snapshot();
+    assert_eq!(snapshot.summary.calls, 3);
+    assert_eq!(snapshot.summary.speed_samples, 3);
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .any(|r| r.gateway && r.speed() == Some((200, 1000)))
+    );
+    assert!(!snapshot.recent.iter().any(|r| r.id == "original"));
+    let summary = f
+        .service
+        .summary(&f.binding, Period::Month, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.calls, snapshot.summary.calls);
+    assert_eq!(summary.speed_tokens, snapshot.summary.speed_tokens);
+}
+
+#[test]
+fn gateway_without_session_is_unmatched_until_explicit_lifecycle_binding() {
+    let f = Fixture::new("codex");
+    let scope = f.binding.scope();
+    f.service
+        .register_gateway_run(&scope, "run", "owner")
+        .unwrap();
+    let record = crate::gateway::Record {
+        id: "unknown".into(),
+        run: "run".into(),
+        session: String::new(),
+        at: at(10),
+        model: "m".into(),
+        requested_model: "m".into(),
+        response_id: None,
+        output: None,
+        reasoning: 0,
+        duration: 1500,
+        ttft: None,
+        decode: None,
+        status: 502,
+        complete: false,
+        outcome: "upstream_error".into(),
+        ..Default::default()
+    };
+    f.service.record_gateway(&scope, "custom", &record).unwrap();
+    let before = f.snapshot();
+    assert_eq!(before.summary.calls, 0);
+    assert_eq!(before.unmatched, 1);
+    f.service.link_gateway_session("run", "session").unwrap();
+    let after = f.snapshot();
+    assert_eq!(after.summary.calls, 1);
+    assert_eq!(after.summary.speed_samples, 0);
+    assert!(after.recent[0].output_unknown);
+    assert_eq!(after.unmatched, 0);
+}
+
+#[test]
+fn recovering_one_gateway_does_not_close_other_manager_roots() {
+    let f = Fixture::new("codex");
+    let scope = f.binding.scope();
+    f.service
+        .register_gateway_run(&scope, "one", "root-one")
+        .unwrap();
+    f.service
+        .register_gateway_run(&scope, "two", "root-two")
+        .unwrap();
+    f.service.recover_gateway_runs("root-one").unwrap();
+    let db = f.service.open().unwrap();
+    let rows: Vec<(String, bool)> = db
+        .prepare("SELECT run,ended IS NOT NULL FROM perf_gateway_runs ORDER BY run")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec![("one".into(), true), ("two".into(), false)]);
+}
+
+#[test]
+fn prepared_but_unused_gateway_does_not_hide_direct_cli_observations() {
+    let f = Fixture::new("codex");
+    let scope = f.binding.scope();
+    f.service
+        .register_gateway_run(&scope, "unused", "owner")
+        .unwrap();
+    f.service.link_gateway_session("unused", "session").unwrap();
+    let db = f.service.open().unwrap();
+    db.execute("UPDATE perf_gateway_runs SET started=?1", [at(1)])
+        .unwrap();
+    super::store::save(
+        &db,
+        &scope,
+        &Observation {
+            id: "direct".into(),
+            session: "session".into(),
+            at: at(10),
+            model: "m".into(),
+            output: 200,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        f.snapshot().summary.calls,
+        1,
+        "a failed optional registration cannot suppress actual direct traffic"
+    );
+}

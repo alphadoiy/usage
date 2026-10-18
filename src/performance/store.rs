@@ -110,7 +110,7 @@ impl Service {
             .unwrap_or_else(|| crate::config::home_dir().join(".local/share"));
         Self::at(base.join("usage/performance.sqlite3"))
     }
-    fn open(&self) -> Result<Connection, String> {
+    pub(super) fn open(&self) -> Result<Connection, String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|_| "无法创建性能索引目录")?;
             #[cfg(unix)]
@@ -133,9 +133,102 @@ impl Service {
             CREATE TABLE IF NOT EXISTS perf_files(scope TEXT NOT NULL,path TEXT NOT NULL,cursor TEXT NOT NULL,checked INTEGER NOT NULL DEFAULT 0,mtime INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(scope,path));
             CREATE TABLE IF NOT EXISTS perf_calls(scope TEXT NOT NULL,id TEXT NOT NULL,session TEXT NOT NULL,turn TEXT,at INTEGER NOT NULL,model TEXT NOT NULL,upstream TEXT,output INTEGER NOT NULL,reasoning INTEGER NOT NULL,duration INTEGER,ttft INTEGER,native INTEGER NOT NULL, PRIMARY KEY(scope,id));
             CREATE INDEX IF NOT EXISTS perf_time ON perf_calls(scope,at,model);
+            CREATE TABLE IF NOT EXISTS perf_gateway_runs(scope TEXT NOT NULL,run TEXT NOT NULL,owner TEXT NOT NULL,started INTEGER NOT NULL,ended INTEGER,PRIMARY KEY(scope,run));
+            CREATE TABLE IF NOT EXISTS perf_gateway_sessions(scope TEXT NOT NULL,session TEXT NOT NULL,run TEXT NOT NULL,PRIMARY KEY(scope,session,run));
+            CREATE TABLE IF NOT EXISTS perf_gateway_calls(scope TEXT NOT NULL,id TEXT NOT NULL,run TEXT NOT NULL,session TEXT NOT NULL,at INTEGER NOT NULL,model TEXT NOT NULL,upstream TEXT,output INTEGER NOT NULL,usage_known INTEGER NOT NULL,reasoning INTEGER NOT NULL,duration INTEGER,ttft INTEGER,decode_out INTEGER,decode_ms INTEGER,status INTEGER NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(scope,id));
+            CREATE INDEX IF NOT EXISTS perf_gateway_run_id ON perf_gateway_runs(run);
+            CREATE INDEX IF NOT EXISTS perf_gateway_session_run ON perf_gateway_sessions(run,scope);
+            CREATE INDEX IF NOT EXISTS perf_gateway_call_run ON perf_gateway_calls(run,session);
+            CREATE INDEX IF NOT EXISTS perf_gateway_time ON perf_gateway_calls(scope,at,model);
             CREATE INDEX IF NOT EXISTS perf_files_round ON perf_files(scope,checked); CREATE INDEX IF NOT EXISTS perf_files_active ON perf_files(scope,mtime DESC);")
             .map_err(|_| "性能索引初始化失败")?;
         Ok(db)
+    }
+
+    pub(crate) fn register_gateway_run(
+        &self,
+        scope: &str,
+        run: &str,
+        owner: &str,
+    ) -> Result<(), String> {
+        self.open()?
+            .execute(
+                "INSERT OR IGNORE INTO perf_gateway_runs(scope,run,owner,started) VALUES(?1,?2,?3,?4)",
+                params![scope, run, owner, chrono::Utc::now().timestamp_millis()],
+            )
+            .map_err(|_| "无法绑定网关运行")?;
+        Ok(())
+    }
+    fn has_gateway_run(&self, run: &str) -> bool {
+        if !self.path.exists() {
+            return false;
+        }
+        let Ok(db) = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            return false;
+        };
+        let _ = db.busy_timeout(Duration::from_millis(100));
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM perf_gateway_runs WHERE run=?1)",
+            [run],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
+    }
+    pub(crate) fn finish_gateway_run(&self, run: &str) -> Result<(), String> {
+        if !self.has_gateway_run(run) {
+            return Ok(());
+        }
+        self.open()?
+            .execute(
+                "UPDATE perf_gateway_runs SET ended=?2 WHERE run=?1 AND ended IS NULL",
+                params![run, chrono::Utc::now().timestamp_millis()],
+            )
+            .map_err(|_| "无法结束网关采集范围")?;
+        Ok(())
+    }
+    pub(crate) fn recover_gateway_runs(&self, owner: &str) -> Result<(), String> {
+        self.open()?.execute("UPDATE perf_gateway_runs SET ended=COALESCE((SELECT MAX(at+duration) FROM perf_gateway_calls AS c WHERE c.scope=perf_gateway_runs.scope AND c.run=perf_gateway_runs.run),started) WHERE ended IS NULL AND owner=?1", [owner]).map_err(|_| "无法恢复网关采集范围")?;
+        Ok(())
+    }
+    pub(crate) fn link_gateway_session(&self, run: &str, session: &str) -> Result<(), String> {
+        if !self.has_gateway_run(run) {
+            return Ok(());
+        }
+        let mut db = self.open()?;
+        let tx = db.transaction().map_err(|_| "无法关联网关会话")?;
+        tx.execute("INSERT OR IGNORE INTO perf_gateway_sessions(scope,session,run) SELECT scope,?2,run FROM perf_gateway_runs WHERE run=?1", params![run,session]).map_err(|_| "无法关联网关会话")?;
+        tx.execute(
+            "UPDATE perf_gateway_calls SET session=?2 WHERE run=?1 AND session=''",
+            params![run, session],
+        )
+        .map_err(|_| "无法补充网关会话")?;
+        tx.commit().map_err(|_| "无法保存网关会话".into())
+    }
+    pub(crate) fn record_gateway(
+        &self,
+        scope: &str,
+        upstream: &str,
+        record: &crate::gateway::Record,
+    ) -> Result<(), String> {
+        let mut db = self.open()?;
+        let tx = db.transaction().map_err(|_| "无法记录网关请求")?;
+        let session = if record.session.is_empty() {
+            // A launch may own several sessions: only infer when exactly one is known.
+            tx.query_row("SELECT CASE WHEN COUNT(*)=1 THEN MIN(session) ELSE '' END FROM perf_gateway_sessions WHERE scope=?1 AND run=?2", params![scope,record.run], |r|r.get::<_,String>(0)).map_err(|_| "无法读取网关会话")?
+        } else {
+            record.session.clone()
+        };
+        if !session.is_empty() {
+            tx.execute(
+                "INSERT OR IGNORE INTO perf_gateway_sessions(scope,session,run) VALUES(?1,?2,?3)",
+                params![scope, session, record.run],
+            )
+            .map_err(|_| "无法保存网关会话")?;
+        }
+        tx.execute("INSERT OR IGNORE INTO perf_gateway_calls(scope,id,run,session,at,model,upstream,output,reasoning,duration,ttft,decode_out,decode_ms,status,metadata,usage_known) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![scope,record.id,record.run,session,record.at,record.model,upstream,record.output.unwrap_or(0).min(1_000_000_000),record.reasoning.min(record.output.unwrap_or(0)),record.duration,record.ttft,record.decode.map(|v|v.0),record.decode.map(|v|v.1),record.status,serde_json::to_string(record).map_err(|_| "网关指标编码失败")?,record.output.is_some()]).map_err(|_| "无法保存网关指标")?;
+        tx.commit().map_err(|_| "无法保存网关请求".into())
     }
 
     /// At most one bounded batch per service; never called on the terminal thread.
@@ -392,7 +485,7 @@ impl Service {
             ..Default::default()
         };
         let mut models = HashMap::new();
-        let measured = measured_calls(&binding.agent);
+        let measured = measured_calls(&binding.agent, has_gateway(&db));
         let sql = format!(
             "{measured} SELECT model,{TOTALS} FROM measured_calls GROUP BY model ORDER BY model LIMIT 501"
         );
@@ -421,9 +514,20 @@ impl Service {
         result.models.sort_by(|a, b| a.model.cmp(&b.model));
         result.models_truncated = result.models.len() > 500;
         result.models.truncate(500);
-        result.unmatched=db.query_row("SELECT COUNT(*) FROM perf_calls WHERE scope=?1 AND at>=?2 AND at<=?3 AND (model='' OR (?4 IS NOT NULL AND (upstream IS NULL OR upstream<>?4)))",params![scope,since,now,binding.expected_upstream],|r|r.get(0)).map_err(|_| "归属统计查询失败")?;
+        let unmatched = format!(
+            "WITH source_calls AS ({}) SELECT COUNT(*) FROM source_calls WHERE scope=?1 AND at>=?2 AND at<=?3 AND (model='' OR (?4 IS NOT NULL AND (upstream IS NULL OR upstream<>?4)))",
+            source_calls(true)
+        );
+        result.unmatched = db
+            .query_row(
+                &unmatched,
+                params![scope, since, now, binding.expected_upstream],
+                |r| r.get(0),
+            )
+            .map_err(|_| "归属统计查询失败")?;
+        result.unmatched+=db.query_row("SELECT COUNT(*) FROM perf_gateway_calls WHERE scope=?1 AND at>=?2 AND at<=?3 AND session=''",params![scope,since,now],|r|r.get::<_,u64>(0)).map_err(|_| "网关归属统计查询失败")?;
         let sql = format!(
-            "{measured} SELECT id,session,turn,at,model,upstream,output,reasoning,duration,first_ms,native,decode_out,decode_ms,floor_out,floor_ms FROM measured_calls WHERE (?5 IS NULL OR model=?5) ORDER BY at DESC,id LIMIT ?6 OFFSET ?7"
+            "{measured} SELECT id,session,turn,at,model,upstream,output,reasoning,duration,first_ms,native,decode_out,decode_ms,floor_out,floor_ms,output_unknown FROM measured_calls WHERE (?5 IS NULL OR model=?5) ORDER BY at DESC,id LIMIT ?6 OFFSET ?7"
         );
         let mut statement = db.prepare(&sql).map_err(|_| "请求明细查询失败")?;
         result.recent = statement
@@ -446,10 +550,12 @@ impl Service {
                         model: r.get(4)?,
                         upstream: r.get(5)?,
                         output: r.get(6)?,
+                        output_unknown: r.get(15)?,
                         reasoning: r.get(7)?,
                         duration_ms: r.get(8)?,
                         ttft_ms: r.get(9)?,
-                        native_timing: r.get(10)?,
+                        native_timing: r.get::<_, i64>(10)? == 1,
+                        gateway: r.get::<_, i64>(10)? == 2,
                         generated: rate_sample(r.get(11)?, r.get(12)?),
                         lower_bound: rate_sample(r.get(13)?, r.get(14)?),
                     })
@@ -462,22 +568,35 @@ impl Service {
     }
 }
 // Magpie usage/usage.go DecodeWindow and usage/ledger.go Row.Decode/Row.Floor,
-// specialized to session-log evidence: no first-text/stream-flow timing exists here.
+// CLI rules use session-log evidence; gateway rows carry bounded, directly observed decode evidence.
 // SQL keeps large histories aggregated without loading every request into memory.
 const TOTALS: &str = "COUNT(*),CAST(AVG(first_ms) AS INTEGER),COUNT(first_ms),COALESCE(SUM(decode_out),0),COALESCE(SUM(decode_ms),0),COUNT(decode_ms),COALESCE(SUM(floor_out),0),COALESCE(SUM(floor_ms),0),COUNT(floor_ms)";
-fn measured_calls(agent: &str) -> String {
+fn has_gateway(db: &Connection) -> bool {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='perf_gateway_calls')", [], |r|r.get(0)).unwrap_or(false)
+}
+fn source_calls(gateway: bool) -> &'static str {
+    if gateway {
+        "SELECT scope,id,session,turn,at,model,upstream,output,reasoning,duration,ttft,native,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls AS cli
+         WHERE NOT EXISTS(SELECT 1 FROM perf_gateway_sessions AS own JOIN perf_gateway_runs AS lifetime ON lifetime.scope=own.scope AND lifetime.run=own.run WHERE EXISTS(SELECT 1 FROM perf_gateway_calls AS observed WHERE observed.scope=lifetime.scope AND observed.run=lifetime.run) AND own.scope=cli.scope AND own.session=cli.session AND cli.at>=lifetime.started AND (lifetime.ended IS NULL OR cli.at<=lifetime.ended))
+         UNION ALL SELECT scope,id,session,NULL,at,model,upstream,output,reasoning,duration,ttft,2,decode_out,decode_ms,usage_known=0 FROM perf_gateway_calls WHERE session<>''"
+    } else {
+        "SELECT *,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls"
+    }
+}
+fn measured_calls(agent: &str, gateway: bool) -> String {
     let codex = i32::from(agent == "codex");
     let floors = i32::from(matches!(agent, "codex" | "claude" | "claude-desktop"));
-    format!("WITH base_calls AS (
-        SELECT *,CASE WHEN native=1 AND ttft>0 AND ttft<=duration THEN ttft END AS first_ms
-        FROM perf_calls WHERE {MATCHED}
+    let rows = source_calls(gateway);
+    format!("WITH source_calls AS ({rows}), base_calls AS (
+        SELECT *,CASE WHEN native IN (1,2) AND ttft>0 AND ttft<=duration THEN ttft END AS first_ms
+        FROM source_calls WHERE {MATCHED}
     ), windows AS (
         SELECT *,duration-first_ms AS window_ms,output-reasoning AS answer_tokens FROM base_calls
     ), eligible AS (
         SELECT *,
-            first_ms IS NOT NULL AND reasoning=0 AND output>0
+            (native=2 AND gw_tokens>0 AND gw_ms>=100) OR (native<>2 AND first_ms IS NOT NULL AND reasoning=0 AND output>0
                 AND window_ms>=100 AND output*1000<=10000*window_ms
-                AND ({codex}=0 OR (window_ms>=1000 AND output>=100)) AS decoded,
+                AND ({codex}=0 OR (window_ms>=1000 AND output>=100))) AS decoded,
             {codex}=1 AND first_ms IS NOT NULL AND reasoning>0
                 AND answer_tokens>=100 AND window_ms>=1000
                 AND answer_tokens*1000<=10000*window_ms AS answer_floor,
@@ -485,11 +604,11 @@ fn measured_calls(agent: &str) -> String {
         FROM windows
     ), measured_calls AS (
         SELECT *,
-            CASE WHEN decoded THEN output END AS decode_out,
-            CASE WHEN decoded THEN window_ms END AS decode_ms,
-            CASE WHEN {floors}=1 AND COALESCE(decoded,0)=0 THEN
+            CASE WHEN decoded THEN CASE WHEN native=2 THEN gw_tokens ELSE output END END AS decode_out,
+            CASE WHEN decoded THEN CASE WHEN native=2 THEN gw_ms ELSE window_ms END END AS decode_ms,
+            CASE WHEN native<>2 AND {floors}=1 AND COALESCE(decoded,0)=0 THEN
                 CASE WHEN answer_floor THEN answer_tokens WHEN whole_floor THEN output END END AS floor_out,
-            CASE WHEN {floors}=1 AND COALESCE(decoded,0)=0 THEN
+            CASE WHEN native<>2 AND {floors}=1 AND COALESCE(decoded,0)=0 THEN
                 CASE WHEN answer_floor THEN window_ms WHEN whole_floor THEN duration END END AS floor_ms
         FROM eligible
     )")
@@ -507,7 +626,7 @@ fn summary(
     period: Period,
     now: i64,
 ) -> Result<Summary, String> {
-    let measured = measured_calls(&binding.agent);
+    let measured = measured_calls(&binding.agent, has_gateway(db));
     let sql = format!("{measured} SELECT {TOTALS} FROM measured_calls");
     db.query_row(
         &sql,
@@ -533,7 +652,7 @@ fn summary(
     )
     .map_err(|_| "性能摘要查询失败".into())
 }
-fn save(db: &Connection, scope: &str, c: &Observation) -> Result<(), String> {
+pub(super) fn save(db: &Connection, scope: &str, c: &Observation) -> Result<(), String> {
     db.prepare_cached("INSERT INTO perf_calls(scope,id,session,turn,at,model,upstream,output,reasoning,duration,ttft,native) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
         ON CONFLICT(scope,id) DO UPDATE SET at=MAX(at,excluded.at),model=excluded.model,upstream=COALESCE(excluded.upstream,upstream),output=MAX(output,excluded.output),reasoning=MAX(reasoning,excluded.reasoning),duration=CASE WHEN excluded.native>=native THEN COALESCE(excluded.duration,duration) ELSE duration END,ttft=CASE WHEN excluded.native>=native THEN COALESCE(excluded.ttft,ttft) ELSE ttft END,native=MAX(native,excluded.native)").map_err(|_| "无法准备性能写入")?.execute(params![scope,c.id,c.session,c.turn,c.at,c.model,c.upstream,c.output,c.reasoning,c.duration_ms,c.ttft_ms,c.native_timing]).map_err(|_| "保存性能请求失败")?;
     Ok(())

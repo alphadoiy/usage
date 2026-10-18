@@ -8,6 +8,7 @@ pub(super) struct Resolution {
     pub identity: LaunchIdentity,
     pub key: Option<String>,
     pub credential_env: Option<String>,
+    pub gateway_supported: bool,
 }
 
 enum CommandPosition {
@@ -36,6 +37,7 @@ pub(super) fn resolve(
         reason: None,
     };
     let mut credential_env = None;
+    let mut gateway_supported = false;
     let resolved = (|| -> Result<Option<String>, &'static str> {
         if resume {
             return Err("会话恢复可能沿用会话内配置，尚未取得 Agent 确认");
@@ -257,6 +259,35 @@ pub(super) fn resolve(
         identity.model = Some(selected_model);
         identity.model_provider = Some(provider.into());
         identity.credential_source = Some(source.into());
+        gateway_supported = table
+            .get("wire_api")
+            .and_then(toml::Value::as_str)
+            .is_none_or(|api| matches!(api, "responses" | "chat"))
+            && table
+                .get("supports_websockets")
+                .and_then(toml::Value::as_bool)
+                != Some(true)
+            && !args.iter().any(|a| {
+                a == "--enable"
+                    || a.starts_with("--enable=")
+                    || a == "-c"
+                    || a == "--config"
+                    || a.starts_with("--config=")
+                    || (a.starts_with("-c") && !a.starts_with("--"))
+            })
+            && ![
+                "responses_websockets",
+                "responses_websockets_v2",
+                "respect_system_proxy",
+            ]
+            .iter()
+            .any(|key| {
+                document
+                    .get("features")
+                    .and_then(|f| f.get(key))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+            });
         credential_env = Some(env.into());
         Ok(Some(key))
     })();
@@ -267,6 +298,7 @@ pub(super) fn resolve(
                 identity,
                 key,
                 credential_env,
+                gateway_supported,
             }
         }
         Err(reason) => {
@@ -275,6 +307,7 @@ pub(super) fn resolve(
                 identity,
                 key: None,
                 credential_env: None,
+                gateway_supported: false,
             }
         }
     }
@@ -320,4 +353,42 @@ fn apply_override(document: &mut toml::Value, key: &str, raw: &str) -> Result<()
         .ok_or("配置覆盖路径不是表")?
         .insert(path[path.len() - 1].clone(), value);
     Ok(())
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    #[test]
+    fn observation_requires_resolved_byok_http_and_unambiguous_overrides() {
+        let path =
+            std::env::temp_dir().join(format!("usage-gateway-resolution-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.join(".git")).unwrap();
+        let config = config::new_config("https://upstream.invalid/v1", "m", None).unwrap();
+        let resolve = |text: &str, resume, args: &[String]| {
+            super::resolve(
+                text,
+                AuthMode::Byok,
+                &path,
+                resume,
+                args,
+                Some("synthetic"),
+                &|_| None,
+            )
+        };
+        assert!(resolve(&config, false, &[]).gateway_supported);
+        assert!(resolve(&config, false, &["--model".into(), "other".into()]).gateway_supported);
+        assert!(!resolve(&config, true, &[]).gateway_supported);
+        assert!(!resolve(&config, false, &["-c".into(), "model='other'".into()]).gateway_supported);
+        let mut websocket: toml::Value = toml::from_str(&config).unwrap();
+        websocket["model_providers"]["usage_byok"]
+            .as_table_mut()
+            .unwrap()
+            .insert("supports_websockets".into(), toml::Value::Boolean(true));
+        let websocket = toml::to_string(&websocket).unwrap();
+        assert!(!resolve(&websocket, false, &[]).gateway_supported);
+        std::fs::create_dir_all(path.join(".codex")).unwrap();
+        std::fs::write(path.join(".codex/config.toml"), "model='project'").unwrap();
+        assert!(!resolve(&config, false, &[]).gateway_supported);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }

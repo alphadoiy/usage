@@ -7,6 +7,7 @@ pub mod cli;
 pub mod codex_manager;
 pub mod config;
 pub mod credentials;
+pub mod gateway;
 pub mod history;
 pub mod http;
 pub mod hub;

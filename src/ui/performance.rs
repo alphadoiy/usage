@@ -207,7 +207,7 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
     let mut focus_line = 0;
     let mut lines = vec![
         format!(
-            "最近 {} 天 · {} · 仅本地日志",
+            "最近 {} 天 · {} · 网关与会话日志",
             p.period.days(),
             if p.loading {
                 "后台增量更新中"
@@ -215,7 +215,7 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
                 "已读取索引"
             }
         ),
-        "归属：绑定目录及日志提供方；首字取已有计时，生成速度与 ≥ 下限分开统计。".into(),
+        "网关请求优先；历史会话日志补充。生成速度与 ≥ 下限分开统计。".into(),
     ];
     if let Some(error) = &p.error {
         lines.push(format!("读取失败：{}", super::overview::clean(error)));
@@ -255,14 +255,20 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
                 let floor = rate(row.floor(), "≥");
                 lines.push(format!(
                     "{at} · 输出 {} · 首字 {}",
-                    row.output,
+                    if row.output_unknown {
+                        "未知".into()
+                    } else {
+                        row.output.to_string()
+                    },
                     ms(row.ttft_ms, false)
                 ));
                 lines.push(format!("  生成速度 {speed} · 速度下限 {floor}"));
                 lines.push(format!(
                     "  耗时 {} · {}",
-                    ms(row.duration_ms, !row.native_timing),
-                    if row.native_timing {
+                    ms(row.duration_ms, !row.native_timing && !row.gateway),
+                    if row.gateway {
+                        "网关 HTTP 观测"
+                    } else if row.native_timing {
                         "原生 CLI 计时"
                     } else {
                         "日志时间戳估算"

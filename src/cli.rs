@@ -51,6 +51,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 本地 HTTP/SSE 请求观测网关
+    Gateway {
+        #[command(subcommand)]
+        command: crate::gateway::GatewayCommand,
+    },
     /// 查询配置的 API 余额、原始额度与官方费用
     Resources {
         /// 资源连接 ID；省略时查询全部连接
@@ -176,6 +181,7 @@ pub async fn run() -> i32 {
         };
     }
     let command = match &cli.command {
+        Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Resources { .. }) => "resources",
         Some(Command::Status { .. }) => "status",
         Some(Command::Codex {
@@ -234,6 +240,10 @@ pub async fn run() -> i32 {
 
 async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
+        Some(Command::Gateway { command }) => {
+            crate::gateway::execute(command).await.map_err(CliError)?;
+            Ok(0)
+        }
         Some(Command::Resources {
             ids,
             profile,

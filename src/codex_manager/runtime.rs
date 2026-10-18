@@ -227,6 +227,18 @@ fn receive_inner(context: &Context, data: &Value) -> Result<()> {
     tx.execute("INSERT INTO run_events(run_id,kind,session_id,turn_id,model,observed_at) VALUES(?1,?2,?3,?4,?5,?6)",
         params![run.id,event,session,turn,model,time])?;
     tx.commit()?;
+    if event == "SessionStart"
+        && data["source"] != "compact"
+        && crate::performance::Service::from_environment()
+            .link_gateway_session(&run.id, session)
+            .is_err()
+    {
+        tracing::warn!(
+            event = "gateway_session_link_failed",
+            run_id = run.id,
+            session_id = session
+        );
+    }
     tracing::info!(
         event = "run_event_recorded",
         kind = event,
@@ -266,6 +278,12 @@ pub(super) fn finish_run(
         )?;
     }
     tx.commit()?;
+    if crate::performance::Service::from_environment()
+        .finish_gateway_run(run)
+        .is_err()
+    {
+        tracing::warn!(event = "gateway_run_finish_failed", run_id = run);
+    }
     if auth == AuthMode::Oauth {
         super::oauth::restrict_auth_permissions(home)?;
     }

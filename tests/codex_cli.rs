@@ -82,7 +82,8 @@ impl Fixture {
             .args(args)
             .env("USAGE_CODEX_DIR", self.path.join("manager"))
             .env("USAGE_LOG_DIR", self.path.join("logs"))
-            .env("USAGE_LOG", "debug");
+            .env("USAGE_LOG", "debug")
+            .env("USAGE_GATEWAY", "off");
         command
     }
     fn command(&self, args: &[&str]) -> Command {
