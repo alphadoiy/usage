@@ -1,4 +1,5 @@
 use super::*;
+mod websocket;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -112,6 +113,7 @@ async fn register(
         run_id = registration.run,
         provider_id = registration.provider,
         model_provider = registration.model_provider,
+        websocket_observation = registration.observe_websocket,
         upstream_host = reqwest::Url::parse(&registration.upstream)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned))
@@ -161,6 +163,8 @@ pub(super) fn clean_headers(headers: &HeaderMap) -> HeaderMap {
         .collect()
 }
 struct Capture {
+    transport: &'static str,
+    connection_id: Option<String>,
     route: Arc<Route>,
     records: mpsc::Sender<(String, String, Record)>,
     start: Instant,
@@ -173,6 +177,50 @@ struct Capture {
     outcome: &'static str,
     inference: bool,
 }
+pub(super) fn metadata_session(body: &serde_json::Value) -> Option<String> {
+    body.pointer("/client_metadata/thread_id").map(|id| {
+        id.as_str()
+            .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+            .unwrap_or_default()
+            .to_owned()
+    })
+}
+pub(super) fn header_session(headers: &HeaderMap) -> String {
+    // Current Codex's `session-id` is cache affinity, not necessarily thread identity.
+    ["thread-id", "thread_id", "session_id", "x-session-id"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|id| id.to_str().ok())
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+impl Capture {
+    fn new(
+        route: Arc<Route>,
+        records: mpsc::Sender<(String, String, Record)>,
+        session: String,
+        requested: String,
+        transport: &'static str,
+    ) -> Self {
+        route.active.fetch_add(1, Ordering::Relaxed);
+        Self {
+            route,
+            records,
+            start: Instant::now(),
+            at: chrono::Utc::now().timestamp_millis(),
+            id: uuid::Uuid::new_v4().to_string(),
+            session,
+            observer: metrics::Observer::new(requested.clone()),
+            requested,
+            status: 0,
+            outcome: "cancelled",
+            inference: true,
+            transport,
+            connection_id: None,
+        }
+    }
+}
 impl Drop for Capture {
     fn drop(&mut self) {
         self.route.active.fetch_sub(1, Ordering::Relaxed);
@@ -182,6 +230,8 @@ impl Drop for Capture {
         let duration = self.start.elapsed().as_millis().min(i64::MAX as u128) as i64;
         let successful = (200..300).contains(&self.status) && self.observer.complete;
         let record = Record {
+            transport: self.transport.into(),
+            connection_id: self.connection_id.clone(),
             id: self.id.clone(),
             run: self.route.registration.run.clone(),
             session: self.session.clone(),
@@ -231,6 +281,8 @@ impl Drop for Capture {
         };
         tracing::info!(
             event = "gateway_request_finished",
+            transport = record.transport,
+            connection_id = record.connection_id,
             request_id = record.id,
             run_id = record.run,
             provider_id = self.route.registration.provider,
@@ -307,6 +359,9 @@ async fn forward(
     let mut headers = clean_headers(request.headers());
     headers.insert("authorization", authorization);
     if upgrading {
+        if route.registration.observe_websocket {
+            return websocket::forward(state, route, request, upstream, headers).await;
+        }
         tracing::info!(
             event = "gateway_transport_fallback",
             run_id = route.registration.run,
@@ -316,18 +371,18 @@ async fn forward(
         );
         return error(StatusCode::UPGRADE_REQUIRED, "Use HTTP/SSE for Responses");
     }
-    let session = ["session_id", "x-session-id"]
-        .iter()
-        .find_map(|name| request.headers().get(*name).and_then(|v| v.to_str().ok()))
-        .filter(|s| uuid::Uuid::parse_str(s).is_ok())
-        .unwrap_or_default()
-        .to_owned();
+    let session = header_session(request.headers());
     let body = match to_bytes(request.into_body(), 32 * 1024 * 1024).await {
         Ok(body) => body,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "Request exceeds 32 MiB"),
     };
-    let model = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let request_json = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let session = request_json
+        .as_ref()
+        .and_then(metadata_session)
+        .unwrap_or(session);
+    let model = request_json
+        .as_ref()
         .and_then(|v| {
             v.get("model")
                 .and_then(|m| m.as_str())
@@ -335,22 +390,11 @@ async fn forward(
                 .map(str::to_owned)
         })
         .unwrap_or_default();
-    route.active.fetch_add(1, Ordering::Relaxed);
-    let mut capture = Capture {
-        route: route.clone(),
-        records: state.records.clone(),
-        start: Instant::now(),
-        at: chrono::Utc::now().timestamp_millis(),
-        id: uuid::Uuid::new_v4().to_string(),
-        session,
-        requested: model.clone(),
-        observer: metrics::Observer::new(model),
-        status: 0,
-        outcome: "cancelled",
-        inference,
-    };
+    let mut capture = Capture::new(route.clone(), state.records.clone(), session, model, "http");
+    capture.inference = inference;
     tracing::info!(
         event = "gateway_request_started",
+        transport = capture.transport,
         request_id = capture.id,
         run_id = route.registration.run,
         provider_id = route.registration.provider,
@@ -358,8 +402,8 @@ async fn forward(
         session_id = capture.session,
         endpoint = path
     );
-    let requested_stream = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
+    let requested_stream = request_json
+        .as_ref()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
     let response = match tokio::time::timeout(
@@ -619,6 +663,7 @@ mod failure_tests {
             axum::serve(listener, app).await.unwrap();
         });
         let registration = Registration {
+            observe_websocket: false,
             run: "run".into(),
             scope: "scope".into(),
             provider: "provider".into(),
@@ -778,6 +823,7 @@ mod oauth_tests {
                 Arc::new(Route {
                     active: AtomicUsize::new(0),
                     registration: Registration {
+                        observe_websocket: false,
                         run: "run".into(),
                         scope: "scope".into(),
                         provider: "provider".into(),

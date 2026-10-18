@@ -34,6 +34,8 @@ pub(crate) enum RouteAuth {
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Registration {
+    #[serde(default)]
+    pub observe_websocket: bool,
     pub run: String,
     pub scope: String,
     pub provider: String,
@@ -106,6 +108,10 @@ impl Registration {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Record {
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub connection_id: Option<String>,
     pub id: String,
     pub run: String,
     pub session: String,
@@ -174,7 +180,7 @@ fn private_file(path: &Path) -> Result<File, String> {
     }
     Ok(file)
 }
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 7;
 const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -282,6 +288,8 @@ pub(crate) fn attach(
 ) -> Result<Attachment, String> {
     let directory = directory(root);
     let mut registration = Registration {
+        observe_websocket: std::env::var("USAGE_GATEWAY_TRANSPORT")
+            .is_ok_and(|v| matches!(v.as_str(), "ws" | "websocket")),
         run: run.into(),
         scope: binding.scope(),
         provider: binding.provider.clone(),

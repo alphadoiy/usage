@@ -70,6 +70,7 @@ fn chat_usage_tokens_are_authoritative_and_completion_fixes_the_generation_windo
 #[test]
 fn native_oauth_route_keeps_rotated_bearer_and_rejects_cross_account_or_missing_capability() {
     let registration = Registration {
+        observe_websocket: false,
         run: "run".into(),
         scope: "scope".into(),
         provider: "account".into(),
@@ -117,5 +118,32 @@ fn native_oauth_route_keeps_rotated_bearer_and_rejects_cross_account_or_missing_
         !serde_json::to_string(&registration)
             .unwrap()
             .contains("access-after-refresh")
+    );
+}
+
+#[test]
+fn thread_identity_is_explicit_and_does_not_use_cache_affinity_as_a_session() {
+    let thread = "123e4567-e89b-12d3-a456-426614174001";
+    let affinity = "123e4567-e89b-12d3-a456-426614174002";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("session-id", affinity.parse().unwrap());
+    assert!(server::header_session(&headers).is_empty());
+    headers.insert("thread-id", thread.parse().unwrap());
+    assert_eq!(server::header_session(&headers), thread);
+    assert_eq!(
+        server::metadata_session(
+            &serde_json::json!({"client_metadata":{"thread_id":thread,"session_id":affinity}})
+        ),
+        Some(thread.into())
+    );
+    assert_eq!(
+        server::metadata_session(
+            &serde_json::json!({"client_metadata":{"thread_id":"invalid","session_id":affinity}})
+        ),
+        Some(String::new())
+    );
+    assert_eq!(
+        server::metadata_session(&serde_json::json!({"prompt_cache_key":affinity})),
+        None
     );
 }

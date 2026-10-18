@@ -855,7 +855,7 @@ fn prepared_but_unused_gateway_does_not_hide_direct_cli_observations() {
 }
 
 #[test]
-fn websocket_passthrough_uses_cli_source_for_the_whole_run_without_double_counting() {
+fn unobservable_websocket_uses_cli_source_for_the_whole_run_without_double_counting() {
     let f = Fixture::new("codex");
     let scope = f.binding.scope();
     f.service
@@ -878,6 +878,7 @@ fn websocket_passthrough_uses_cli_source_for_the_whole_run_without_double_counti
     )
     .unwrap();
     let record = crate::gateway::Record {
+        transport: "websocket".into(),
         id: "http".into(),
         run: "run".into(),
         session: "session".into(),
@@ -889,6 +890,7 @@ fn websocket_passthrough_uses_cli_source_for_the_whole_run_without_double_counti
     };
     f.service.record_gateway(&scope, "openai", &record).unwrap();
     assert!(f.snapshot().recent[0].gateway);
+    assert!(!f.snapshot().native_transport);
     f.service
         .record_gateway(
             &scope,

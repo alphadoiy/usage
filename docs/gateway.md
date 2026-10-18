@@ -1,6 +1,6 @@
 # 本地请求观测网关
 
-Usage 启动能够确认配置来源的托管 Codex BYOK / OAuth 新会话时，会按需启动本地网关。BYOK 使用临时注入的地址和本地路由令牌，网关再使用该次启动选定的真实端点与凭据转发请求；OAuth 保留内置 openai 提供方和 CLI 原生认证，每次请求透传当前令牌。账号配置、保存版本和原生用户配置不被改写，首页切换 Provider 不会改变已有路由。
+Usage 启动能够确认配置来源的托管 Codex BYOK / OAuth 新会话时，会按需启动本地网关。BYOK 使用临时注入的地址和本地路由令牌，网关再使用该次启动选定的真实端点与凭据转发请求；OAuth 保留内置 openai 提供方和 CLI 原生认证，透传 CLI 请求或握手中的当前令牌。账号配置、保存版本和原生用户配置不被改写，首页切换 Provider 不会改变已有路由。
 
 ```text
 Usage 启动 → 解析原始 Provider / 账号 / 版本 → 注册本次启动路由
@@ -30,7 +30,7 @@ USAGE_GATEWAY=off usage codex run <账号>
 - 托管 Codex BYOK 新会话，且原始推理端点、模型提供方、凭据引用可由现有启动解析器确认。
 - HTTP/SSE 的 Responses、Chat Completions 流量；实际 CLI 仍需支持其保存的协议。`models` 和 `responses/compact` 原样转发，不计入本期生成性能统计。
 - OAuth 新会话保留内置 `openai`，仅临时覆盖 `openai_base_url`。网关不获取、缓存或刷新 OAuth token，认证与刷新继续由 CLI 处理。
-- 恢复会话、本地未托管实例、项目 `.codex/config.toml`、原生 profile、显式 `-c` 覆盖、未知启动选项、BYOK 显式 WebSocket 或强制系统代理配置等继续使用原有调用路径。WebSocket 升级请求返回 426，引导 Codex 回退 HTTP/SSE。跳过时记录 `gateway_skipped` 及原因。保持原生认证，不修改保存的配置。
+- 恢复会话、本地未托管实例、项目 `.codex/config.toml`、原生 profile、显式 `-c` 覆盖、未知启动选项、BYOK 显式 WebSocket 或强制系统代理配置等继续使用原有调用路径。默认 WebSocket 升级请求返回 426，引导 Codex 回退 HTTP/SSE；单次启动可选择 WS 观测。跳过时记录 `gateway_skipped` 及原因。保持原生认证，不修改保存的配置。
 
 独立资源连接仍通过显式绑定的日志实例查询历史性能，不会因展示余额自动代理流量。
 
@@ -68,7 +68,7 @@ USAGE_GATEWAY=off usage codex run <账号>
 
 ## 性能与排查
 
-请求正文上限 32 MiB；按协议重建 HTTP 传输头，正文原样转发；不做模型映射、协议转换、自动重试或故障切换。WebSocket 升级返回 426，Codex 回退 HTTP/SSE；不建立 WebSocket 上游连接。连接超时 10 秒，等待上游响应头最多 120 秒；超过时返回 504。响应流连续无数据 120 秒后结束并记录 `stream_timeout`，未完成回复不生成成功性能样本。上游 429/5xx 状态、错误正文和 Retry-After 等端到端响应头直接转发，由 Agent 决定如何处理，网关不增加重试。大于 1 MiB 的单个 SSE 事件停止指标解析，仍继续转发；非流式 JSON 只在 1 MiB 内解析指标。压缩正文不会为采样而解压改写，可能无法提取指标。
+请求正文上限 32 MiB；按协议重建 HTTP 传输头，正文原样转发；不做模型映射、协议转换、自动重试或故障切换。默认 WebSocket 升级返回 426，Codex 回退 HTTP/SSE；显式选择 WS 时建立原始字节通道并被动观察消息。连接超时 10 秒，等待上游响应头最多 120 秒；超过时返回 504。响应流连续无数据 120 秒后结束并记录 `stream_timeout`，未完成回复不生成成功性能样本。上游 429/5xx 状态、错误正文和 Retry-After 等端到端响应头直接转发，由 Agent 决定如何处理，网关不增加重试。大于 1 MiB 的单个 SSE 事件停止指标解析，仍继续转发；非流式 JSON 只在 1 MiB 内解析指标。压缩正文不会为采样而解压改写，可能无法提取指标。
 
 每条流最多保存有限事件缓冲和 128 个流动采样点，不累计完整回复。指标通过 256 条有界队列后台写入 SQLite；采集或写入失败不阻塞回复，丢弃或失败会记录日志。服务最多保留 256 条活动路由。
 
@@ -94,7 +94,43 @@ OAuth 路由固定为官方 Codex 后端，或经过控制接口显式注册的�
 
 采用公开的 [`openai_base_url` 配置](https://learn.chatgpt.com/docs/config-file/config-reference) 保留内置提供方；[官方认证说明](https://learn.chatgpt.com/docs/auth)中的原生登录机制仍由 CLI 执行。具体后端路由及无 Content-Type 的 SSE 行为参考 Magpie 的 `internal/gateway/codex_backend.go`；模拟服务覆盖边界条件，真实服务验证记录见下文。采集值仍是客户端链路指标。
 
-新增验证覆盖 OAuth 跨工作区拒绝、连续请求使用刷新后的原生令牌、缺少 Content-Type 的 SSE、真实子进程临时参数与原始登录刷新保留、网关准备失败后原生直连，以及 WebSocket 426 后 HTTP/SSE 正常采集。恢复会话、WS 逐请求 TPS、更多 Agent 和复杂配置层仍属后续覆盖。
+新增验证覆盖 OAuth 跨工作区拒绝、连续请求使用刷新后的原生令牌、缺少 Content-Type 的 SSE、真实子进程临时参数与原始登录刷新保留、网关准备失败后原生直连，以及 WebSocket 426 后 HTTP/SSE 正常采集。恢复会话、更多 Agent 和复杂配置层仍属后续覆盖；WS 逐请求采集见下一节。
+
+### WebSocket 逐请求性能采集
+
+默认仍为 SSE。需要保留 CLI 原生 WebSocket 时，可对一次启动设置：
+
+```sh
+USAGE_GATEWAY_TRANSPORT=ws usage codex run <账号>
+```
+
+`websocket` 也是可用值。选择保存在本次注册路由中，同一服务内的其他启动保持自己的选择；不强制 CLI 使用 WS、不修改配置、不自动重放请求。未选择 WS 的握手仍返回 426。
+
+WS 握手、掩码、分帧、控制帧及协议扩展原样转发；被动解析文本消息，支持协商的 permessage-deflate（双向独立上下文、context takeover 与 no-context-takeover）、TCP 拆包、WS 续帧和穿插的 Ping/Pong。压缩只在观察副本中解码，不修改线上字节。每个 response.create 单独开始计时；按 stream_id 分流并按 response ID 验证归属，同一流按 FIFO 处理。握手耗时、请求间空闲和连接寿命不计入该次首字延迟。response.completed 立即保存指标，无需等连接关闭。generate=false 预热不计为生成请求。
+
+首字、Token usage、回答/推理窗口、缓冲过滤和 TPS 均复用 SSE 的 Observer，消息数或帧数不换算为 Token。未完成、取消、失败、429 和断线不生成成功速度样本。记录附带 transport=websocket 和独立 connection_id，关联请求、响应和启动；正文、请求 JSON 和凭据不落库。每个请求优先读取 client_metadata.thread_id，握手/HTTP 的 thread-id 或旧版 session_id、x-session-id 作为回退；不使用 prompt_cache_key 或当前 CLI 的 session-id（后者可代表缓存亲和性）推断线程。多路请求可携带不同的 thread_id。
+
+压缩载荷、续帧累计和解压后的单条观察消息各有 1 MiB 上限，每条连接最多观察 64 个待完成请求，并保留有限的已结束响应 ID。未支持的扩展、无效压缩、二进制消息、超限、steering 自动续接及无法可靠关联的事件只停用观测，继续原样转发，并记录 gateway_websocket_observation_fallback 及原因；该启动整体使用 CLI 统计，避免将部分 WS/HTTP 指标与 CLI 相加。旧版本的透传来源标记继续兼容。成功观测的 WS 请求与 SSE 一样进入性能摘要。
+
+自动化验证覆盖同连接多轮独立计时、并发流和同流排队、完成后不等断连、预热、重复终态 ID、错误/未完成/取消/断线、推理与 SSE 计算一致、掩码和长帧拆包、续帧与控制帧、超限/扩展回退、压缩上下文与解压膨胀限制、未知字节继续转发，以及真实本地套接字的鉴权、握手和原始字节一致性。上游握手 429 原样返回状态、正文和 Retry-After，不登记生成请求、不增加重试。
+
+首次手动复测曾因模型列表与 workspace discovery 超时、chatgpt.com TLS 连接失败而中止。网络恢复后继续实测，发现并补齐了真实 CLI 的 permessage-deflate 压缩观察，以及线程归属字段的兼容性。
+
+### 真实 WS 指标联调（2026-10-18）
+
+使用已保存的真实 OAuth、Codex CLI 0.163.0 和 gpt-6.1-sol，经正常 `usage codex run` 启动路径、设置 `USAGE_GATEWAY_TRANSPORT=ws`，在临时目录完成真实请求。证据已核对到性能库中的同一线程：
+
+- 实际协商 permessage-deflate，先预热再生成；最终仅记录 1 条生成请求，预热不重复计数。
+- 输出 243 Token、输入 17253 Token，均与 CLI 的 turn.completed usage 一致。
+- 网关记录首字 3167 ms、生成窗口 4973 ms，TPS 约 48.86，status=200、complete=true，且没有 CLI 来源回退标记。
+- 入库 session 与 CLI thread.started 的 thread_id 完全一致，修复前空归属的问题已在真实请求中消除。
+- 原有配置和登录文件均未改变；本次相关应用日志未发现 access token、refresh token 或 ID token。
+
+首次重试真实 WS 时发现压缩观察缺口；补齐后又通过入库核对发现线程归属缺口，随后增加相应用例并重新完成真实请求，以上数值取自最终线程归属正确的请求。当前 Codex 的 session-id 可以表示缓存亲和性，不能用作线程 ID，参见 [Codex 0.163 的实现](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/src/client.rs#L661)。
+
+随后移除 USAGE_GATEWAY_TRANSPORT 设置，用同一版本、同一 OAuth 复测默认路径：日志确认一次 426 后回退 HTTP/SSE，CLI 正常退出。数据库中的线程与 CLI 一致，输入 17255 Token、输出 243 Token，首字 3334 ms、生成窗口 3480 ms、TPS 约 69.83，status=200、complete=true。配置及登录文件未改变，相关应用日志未发现 OAuth 凭据。两次不同模式启动共享服务，但各自遵守路由中的传输选择。
+
+这些是单次链路样本，不作为 SSE 与 WS 的性能对比；真实长期多轮、休眠重连和令牌刷新未在此次验证覆盖。
 
 ### 真实 OAuth 联调（2026-10-18，切换默认 SSE 前）
 

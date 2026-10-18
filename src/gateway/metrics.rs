@@ -98,6 +98,9 @@ impl Observer {
             self.value(&value, 0, false);
         }
     }
+    pub fn websocket(&mut self, event: &Value, ms: i64) {
+        self.value(event, ms, true);
+    }
     fn value(&mut self, event: &Value, ms: i64, streamed: bool) {
         let response = event.get("response").unwrap_or(event);
         if let Some(model) = response

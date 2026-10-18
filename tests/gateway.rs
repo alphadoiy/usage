@@ -189,6 +189,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
             .env("USAGE_LOG_DIR", self.path.join("logs"))
             .env("USAGE_LOG", "debug")
             .env("USAGE_GATEWAY", "on")
+            .env_remove("USAGE_GATEWAY_TRANSPORT")
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .env("FIXTURE_ROOT", &self.path)
@@ -532,7 +533,7 @@ fn new_launch_restarts_crashed_gateway_without_replaying_old_requests() {
 #[test]
 fn oauth_launch_keeps_native_auth_refresh_and_falls_back_without_modifying_saved_config() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    for direct in [false, true] {
+    for (direct, websocket) in [(false, false), (false, true), (true, true)] {
         let f = Fixture::new();
         let claims = json!({"sub":"synthetic-user","email":"synthetic@example.test","https://api.openai.com/auth":{"chatgpt_account_id":"workspace","chatgpt_user_id":"synthetic-user"}});
         let token = format!(
@@ -598,6 +599,10 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 f.path.join("fake-codex").to_str().unwrap(),
             ])
             .env("FIXTURE_EXPECT_DIRECT", if direct { "1" } else { "0" })
+            .env(
+                "USAGE_GATEWAY_TRANSPORT",
+                if websocket { "ws" } else { "sse" },
+            )
             .output()
             .unwrap();
         assert!(
@@ -620,8 +625,17 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 .stdout,
             before
         );
+        let mut registered = false;
         for entry in fs::read_dir(f.path.join("logs")).unwrap() {
             let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+            for line in text.lines() {
+                if let Ok(event) = serde_json::from_str::<Value>(line)
+                    && event["fields"]["event"] == "gateway_route_registered"
+                {
+                    assert_eq!(event["fields"]["websocket_observation"], websocket);
+                    registered = true;
+                }
+            }
             for secret in [
                 "synthetic-access-before",
                 "synthetic-access-rotated",
@@ -630,5 +644,6 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 assert!(!text.contains(secret));
             }
         }
+        assert_eq!(registered, !direct);
     }
 }
