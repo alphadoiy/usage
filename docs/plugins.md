@@ -1,14 +1,14 @@
 # Provider 插件
 
-Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。首个接入包为 `@magpie-community/opencode-workbuddy-auth@0.1.24`，同时提供 `workbuddy` 与 `workbuddy-ai`。
+Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。内置接入包为 `@magpie-community/opencode-workbuddy-auth@0.1.24`（`workbuddy` / `workbuddy-ai`）和 `@magpie-community/opencode-trae-auth@0.2.17`（`trae-cn` / `trae-global`）。
 
 ## 安装和登录
 
-首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择 WorkBuddy。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
+首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy**、**Trae** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择 WorkBuddy 或 Trae。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
 
 接入步骤以紧凑的二级菜单覆盖在原页面上，标题展示当前层级，Esc 返回上一级。地区附账号说明，浏览器登录标为推荐；桌面登录仅支持未加密凭据，本机凭据加密或缺失时显示原因并禁用该选项。
 
-首次选择 WorkBuddy 会自动准备固定版本的底层组件；已有安装按包身份复用（支持自定义安装 ID），不会要求填写 npm 包名或版本，也不会覆盖同名的其他组件。首页按 WorkBuddy 展示账号和额度，类型为“订阅服务”。服务商名称、地区、类型与实现包的映射集中在 `provider_catalog::presets`，后续服务商复用同一接入流程。
+首次选择服务商会自动准备固定版本的底层组件；已有安装按包身份复用（支持自定义安装 ID），不会要求填写 npm 包名或版本，也不会覆盖同名的其他组件。首页按服务商及地区展示账号和额度，类型为“订阅服务”。服务商名称、地区、类型与实现包的映射集中在 `provider_catalog::presets`，后续服务商复用同一接入流程。
 
 通用安装与自定义插件账号入口保留在“高级 · 自定义接入”中；CLI 的 `plugins` 命令继续用于开发和排查。查询可按 Esc 返回；浏览器／验证码授权复用原有认证任务，Ctrl+C 取消。API Key 输入隐藏显示，账号名称默认读取授权结果。界面和 CLI 共用安装、认证与绑定实现。
 
@@ -28,7 +28,7 @@ usage plugins bind <账号ID> --name 'WorkBuddy Codex' --model <模型API-ID>
 usage codex run 'WorkBuddy Codex'
 ```
 
-登录默认选择插件第 0 个方法，方法及表单见 `providers`。支持浏览器自动完成、粘贴授权码与 API Key 方法；`--method <方法ID>` 选择方法，`--input key=value` 传递表单值，`--no-browser` 在终端显示授权地址而不自动打开浏览器。API Key 可用 `--key-stdin` 从标准输入读取，避免放入命令行参数。账号名称优先取插件授权结果，也可用 `--name` 指定。每次登录创建独立账号，现有账号凭据不会被静默覆盖。
+登录默认选择插件第 0 个方法，方法及表单见 `providers`。支持浏览器自动完成、粘贴授权码与 API Key 方法；`--method <方法ID>` 选择方法，`--input key=value` 传递表单值，`--no-browser` 在终端显示授权地址而不自动打开浏览器。API Key 可用 `--key-stdin` 从标准输入读取，避免放入命令行参数。账号名称优先取插件授权结果，也可用 `--name` 指定。登录完成授权并提交后，在同一插件安装与上游地区内按稳定 UID 及企业／区域身份检测重复；再次登录同一身份会复用原账号、保存新凭据并递增 generation，保留自定义名称、推理令牌和已有绑定。昵称不作为身份；缺少稳定 UID 的插件只复用完全相同的凭据记录。旧 generation 的迟到写入会被拒绝。已有重复记录不自动合并或删除。
 
 WorkBuddy 5.6+ 桌面凭据加密时请使用浏览器方法；宿主不解密桌面登录文件。Credits 保留原单位，不转换为美元；首页参照 Magpie 加千位分隔、最多显示两位小数，原始资源数据保留精度。插件未返回额度时展示不可用，绝不补成零。
 
@@ -43,6 +43,34 @@ WorkBuddy 0.1.24 未提供 `auth.checkin`，Usage 参照 Magpie 在插件宿主�
 自动回调登录允许没有浏览器地址：WorkBuddy 的桌面登录方式返回空 URL，Usage 直接执行其本地回调，不打开浏览器。浏览器和验证码登录仍校验非空地址，验证码方式缺少地址时拒绝继续。登录日志通过 `plugin_login_started` 的 `flow`（`local`／`browser`／`code`）、插件 ID、上游 ID 和方法 ID 区分来源；地址不合法时记录 `plugin_login_rejected`，不记录授权 URL、验证码或凭据。
 
 `bind` 创建普通托管 Codex 配置，实际订阅凭据留在插件账号库。首页展示模型、额度并复用项目与会话启动。新会话和明确绑定的恢复会话通过临时网关路由使用所选插件账号；恢复的 API 资源身份仍保持未解析，不借此推断远端账号归属。项目配置层、原生 profile 等无法确认的覆盖会阻止插件启动，避免误用其他账号。插件 Provider 必须使用网关，`USAGE_GATEWAY=off` 时明确失败。
+
+## Trae 国内版与国际版
+
+在添加 Provider 中选择 **Trae → 国内版 / 国际版 → 浏览器登录**。两个地区使用独立账号；授权页面回到插件在 `127.0.0.1` 临时端口监听的 `/authorize` 后自动完成，不需要粘贴令牌或填写账号名称。国际版 SG / US 路由由授权结果选择。插件本身仍标注实验性，服务商真实账号的模型权限与活动结果以接口为准。
+
+```sh
+usage plugins install @magpie-community/opencode-trae-auth@0.2.17 --id trae
+usage plugins providers trae
+usage plugins login trae trae-cn      # 国际版使用 trae-global
+usage plugins accounts
+usage plugins models <账号ID>
+usage plugins usage <账号ID>
+usage plugins bind <账号ID> --name 'Trae Codex' --model <模型API-ID>
+usage codex run 'Trae Codex'
+```
+
+模型列表、令牌刷新及请求签名由原版插件提供。国内版展示 Credits，国际版展示美元额度，二者不相互换算；无限额度明确标注“额度不限量”。国内版首页自动查询签到状态只访问 `/status`，不会调用领取 hook；按 `c` 再按 `y` 才调用原生 `auth.checkin`，由插件重新查询并领取。国际版虽然导出一个返回 inactive 的签到 hook，Usage 会根据地区能力声明隐藏该操作。按账号缓存与北京时间跨日失效复用现有机制。
+
+原版 npm 包的可重复兼容性检查（不使用真实账号，不打开浏览器，全部上游请求转向本地模拟服务）：
+
+```sh
+# npm pack --ignore-scripts @magpie-community/opencode-trae-auth@0.2.17
+# 将包解压到临时目录后，以原始入口运行：
+cargo build
+node tests/support/trae_plugin.mjs /临时目录/package/index.mjs target/debug/usage
+```
+
+此检查经过实际 Usage CLI、Rust 网关与 JS 宿主，覆盖国内版及国际版 SG/US 的浏览器回调、账号保存、动态模型目录、Credits / USD 额度、只读状态与确认签到、绑定 Agent 后的 Responses/SSE 转发。订阅凭据全部为合成数据；没有验证真实 Trae 账号或消耗真实额度。
 
 ## 能力与边界
 
@@ -92,7 +120,7 @@ test_root=$(mktemp -d)
 USAGE_CODEX_DIR="$test_root/codex" USAGE_PLUGIN_DIR="$test_root/plugins" \
   XDG_DATA_HOME="$test_root/data" USAGE_LOG=off \
   cargo test --all-targets -- --test-threads=1
-node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs
+node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -105,3 +133,5 @@ Rust 测试使用两个上游的合成插件、真实 Node 宿主、真实 Usage
 内置账号操作适配器的包名、上游、只读查询能力和日界时区集中在 `src/plugins/action_capabilities.json`，Rust Catalog 与 JS 宿主读取同一声明；原生插件 hooks 继续动态发现。添加内置适配器时登记声明并注册 JS 实现，Catalog 不添加服务商分支。能力声明随宿主内容哈希发布，旧能力快照不会覆盖当前内置声明。
 
 账号操作复用网关启动时的认证健康检查结果；缺少或不兼容的 `plugin_actions` 能力会在提交前明确拒绝，不重复查询状态。签到与主动重置共用 UI 确认状态转换，查询阶段允许取消，执行阶段禁止取消或重复确认；各自保留业务结果、账号隔离与刷新策略。签到 401 后的余额探测只有明确认证拒绝才显示登录过期，限流、服务故障或无效响应显示查询失败。
+
+添加 Provider 时，保存层在 SQLite 写事务内比较规范化后的完整配置与所用凭据；仅修改名称、TOML 注释或端点末尾斜线不能重复添加。相同插件账号绑定相同模型与配置也会提示已有 Provider。不同账号密钥、模型或其他配置可独立保存；管理页的“复制”是显式创建副本，不受添加去重限制。账号登录去重在插件 Store 文件锁内执行，两个并发登录不会同时创建同一身份。

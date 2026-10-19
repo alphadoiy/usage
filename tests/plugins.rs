@@ -380,3 +380,82 @@ fn checkin_reuses_health_capabilities_and_refuses_old_gateways_before_posting() 
         assert_eq!(*calls.lock().unwrap(), expected);
     }
 }
+
+#[test]
+fn repeated_plugin_login_and_provider_binding_do_not_create_duplicate_entries() {
+    let f = Fixture::new();
+    f.run(&[
+        "plugins",
+        "add",
+        "fixture",
+        f.path.join("fixture.mjs").to_str().unwrap(),
+        "--runtime",
+        "node",
+    ]);
+    let mut first = String::new();
+    for _ in 0..2 {
+        f.run(&[
+            "plugins",
+            "login",
+            "fixture",
+            "fixture",
+            "--input",
+            "uid=same-user",
+            "--no-browser",
+        ]);
+        let accounts = f.json(&["plugins", "accounts"]);
+        assert_eq!(accounts.as_array().unwrap().len(), 1);
+        let id = accounts[0]["id"].as_str().unwrap();
+        if first.is_empty() {
+            first = id.into();
+        } else {
+            assert_eq!(id, first);
+        }
+    }
+    f.run(&[
+        "plugins",
+        "bind",
+        &first,
+        "--name",
+        "Existing",
+        "--model",
+        "fixture-model",
+    ]);
+    let duplicate = f
+        .command(&[
+            "plugins",
+            "bind",
+            &first,
+            "--name",
+            "Renamed",
+            "--model",
+            "fixture-model",
+        ])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("Provider 配置已存在：Existing"));
+    assert_eq!(
+        f.json(&["codex", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    f.run(&[
+        "plugins",
+        "bind",
+        &first,
+        "--name",
+        "Another model",
+        "--model",
+        "another-model",
+    ]);
+    assert_eq!(
+        f.json(&["codex", "list", "--json"])
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}

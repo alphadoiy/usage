@@ -1091,6 +1091,11 @@ mod tests {
             )
         );
         assert!(matches!(entries.last().unwrap().0, Entry::Advanced));
+        assert!(
+            entries
+                .iter()
+                .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == "trae"))
+        );
         let rows: Vec<_> = entries.into_iter().map(|(_, row)| row).collect();
         for width in [40, 100] {
             for (selected, row) in rows.iter().enumerate() {

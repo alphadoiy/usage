@@ -3,7 +3,23 @@
     "package": "@magpie-community/opencode-workbuddy-auth",
     "provider": "workbuddy",
     "adapter": "workbuddy",
+    "checkin": true,
     "checkin_status": true,
     "day_offset_seconds": 28800
+  },
+  {
+    "package": "@magpie-community/opencode-trae-auth",
+    "provider": "trae-cn",
+    "adapter": "trae",
+    "checkin": true,
+    "checkin_status": true,
+    "day_offset_seconds": 28800
+  },
+  {
+    "package": "@magpie-community/opencode-trae-auth",
+    "provider": "trae-global",
+    "checkin": false,
+    "checkin_status": false,
+    "day_offset_seconds": 0
   }
 ]

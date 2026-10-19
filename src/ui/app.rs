@@ -2485,12 +2485,11 @@ fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     let [providers, connections, projects] = home::areas(area);
     let provider_title =
         super::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
-            .map(|(index, provider)| {
+            .map(|(index, _)| {
                 format!(
-                    "Provider · {} / {} · {}",
+                    "Provider · {} / {}",
                     index + 1,
                     app.overview.as_ref().unwrap().providers.len(),
-                    super::overview::clean(&provider.name)
                 )
             })
             .unwrap_or_else(|| "Provider".into());
@@ -4005,6 +4004,10 @@ options={user_id=1}
             performance: None,
         });
         app.overview = Some(catalog);
+        let initial = rendered(&app, 160, 40)
+            .split_whitespace()
+            .collect::<String>();
+        assert_eq!(initial.matches("工作Provider").count(), 1);
         assert!(!rendered(&app, 100, 30).contains("available-model-23"));
         assert!(
             rendered(&app, 100, 30)

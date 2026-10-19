@@ -3,6 +3,7 @@ pub(crate) mod adapters;
 pub mod auth;
 pub(crate) mod capabilities;
 mod cli;
+mod identity;
 mod runtime;
 mod service;
 pub mod store;
@@ -20,7 +21,9 @@ pub type Result<T> = std::result::Result<T, String>;
 pub(crate) const HOST: &str = include_str!("host.mjs");
 pub(crate) const ACTIONS: &str = include_str!("actions.mjs");
 pub(crate) const ACTION_CAPABILITIES: &str = include_str!("action_capabilities.json");
+pub(crate) const ACTION_SUPPORT: &str = include_str!("action_support.mjs");
 pub(crate) const WORKBUDDY_ACTIONS: &str = include_str!("workbuddy_actions.mjs");
+pub(crate) const TRAE_ACTIONS: &str = include_str!("trae_actions.mjs");
 pub(crate) const PROTOCOL: &str = include_str!("protocol.mjs");
 pub fn account_endpoint(id: &str) -> String {
     format!("https://usage-plugin.invalid/{id}/v1")

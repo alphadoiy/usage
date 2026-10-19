@@ -1,14 +1,19 @@
 // Optional account actions: native plugin hooks take precedence over registered host adapters.
 import * as workbuddy from './workbuddy_actions.mjs';
-const extensions = [workbuddy];
+import * as trae from './trae_actions.mjs';
+import { builtin } from './action_support.mjs';
+const extensions = [workbuddy, trae];
 const outcomes = new Set(['ready', 'claimed', 'done', 'ineligible', 'inactive', 'captcha', 'own-app', 'expired', 'failed']);
 export function supportsCheckin(packageName, hooks, provider) {
+  if (builtin(packageName, provider.id)?.checkin === false) return false;
   return typeof hooks.auth.checkin === 'function' || extensions.some((e) => e.supports(packageName, provider.id));
 }
 export function supportsCheckinStatus(packageName, hooks, provider) {
+  if (builtin(packageName, provider.id)?.checkin === false) return false;
   return typeof hooks.auth.checkinStatus === 'function' || extensions.some((e) => e.supportsStatus(packageName, provider.id));
 }
 export async function accountAction({ packageName, hooks, provider, getAuth, phase, signal }) {
+  if (!supportsCheckin(packageName, hooks, provider)) return { outcome: 'failed', reason: 'unsupported' };
   const deadline = AbortSignal.timeout(20000);
   signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
   let result;

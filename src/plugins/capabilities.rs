@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 struct Builtin {
     package: String,
     provider: String,
+    checkin: bool,
     checkin_status: bool,
     day_offset_seconds: i32,
 }
@@ -30,6 +31,10 @@ pub(crate) fn checkin(
         .and_then(|d| d["providers"].as_array())
         .and_then(|providers| providers.iter().find(|p| p["id"] == provider))
         .map(|p| &p["capabilities"]);
+    // Some plugins export an inactive check-in hook for a realm without the activity.
+    if builtin.is_some_and(|b| !b.checkin) {
+        return None;
+    }
     if builtin.is_none() && !native.is_some_and(|c| c["checkin"] == true) {
         return None;
     }
@@ -51,6 +56,18 @@ mod tests {
         assert_eq!(builtin.day_offset_seconds, 8 * 3600);
         assert!(checkin(package, "workbuddy-ai", None).is_none());
         assert!(checkin("unknown", "workbuddy", None).is_none());
+        let trae = checkin("@magpie-community/opencode-trae-auth", "trae-cn", None).unwrap();
+        assert!(trae.automatic_status);
+        assert_eq!(trae.day_offset_seconds, 8 * 3600);
+        let global = serde_json::json!({"providers":[{"id":"trae-global","capabilities":{"checkin":true,"checkin_status":true}}]});
+        assert!(
+            checkin(
+                "@magpie-community/opencode-trae-auth",
+                "trae-global",
+                Some(&global)
+            )
+            .is_none()
+        );
         for readonly in [false, true] {
             let descriptor = serde_json::json!({"providers":[
                 {"id":"native", "capabilities":{"checkin":true,"checkin_status":readonly}}

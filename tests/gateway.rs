@@ -229,6 +229,17 @@ with urllib.request.urlopen(request,timeout=5) as response:
     fn start(&self, name: &str, session: &str) -> std::process::Child {
         self.start_mode(name, session, "full")
     }
+    fn copy(&self, source: &str, name: &str) {
+        let output = self
+            .command(&["codex", "copy", source, name])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     fn start_mode(&self, name: &str, session: &str, mode: &str) -> std::process::Child {
         self.start_expect(name, session, mode, false)
     }
@@ -401,11 +412,12 @@ fn shared_gateway_survives_launcher_exit_isolates_credentials_and_populates_metr
 fn partial_stream_and_nonstream_json_do_not_invent_first_token_or_tps() {
     let f = Fixture::new();
     let upstream = Upstream::new();
+    f.add("one", upstream.port, "synthetic-key");
+    f.copy("one", "two");
     for (name, mode, session) in [
         ("one", "partial", "123e4567-e89b-12d3-a456-426614174001"),
         ("two", "json", "123e4567-e89b-12d3-a456-426614174002"),
     ] {
-        f.add(name, upstream.port, "synthetic-key");
         let mut child = f.start_mode(name, session, mode);
         f.wait(&format!("{name}.ready"));
         fs::write(f.path.join(format!("{name}.go")), "").unwrap();
@@ -491,7 +503,7 @@ fn new_launch_restarts_crashed_gateway_without_replaying_old_requests() {
     let f = Fixture::new();
     let upstream = Upstream::new();
     f.add("one", upstream.port, "synthetic-key");
-    f.add("two", upstream.port, "synthetic-key");
+    f.copy("one", "two");
     let mut one = f.start("one", "123e4567-e89b-12d3-a456-426614174001");
     f.wait("one.ready");
     let old = f.status();

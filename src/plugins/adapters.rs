@@ -84,6 +84,12 @@ impl Reader {
                     }
                 }
                 snapshot.message = v["plan"].as_str().map(str::to_owned);
+                if v["balance"] == "unlimited" {
+                    snapshot.message = Some(match snapshot.message {
+                        Some(plan) => format!("{plan} · 额度不限量"),
+                        None => "额度不限量".into(),
+                    });
+                }
             }
             _ => {
                 snapshot.state = ResourceState::TransientFailure;
@@ -180,5 +186,31 @@ mod tests {
             ResourceMetric::Allowance { remaining:Some(remaining),used:Some(used),unit,unlimited:false }
             if remaining == "1.000000000000001" && used == "0.100000000000001" && unit == "credits"
         )));
+    }
+
+    #[test]
+    fn trae_credit_dollar_and_unlimited_allowances_keep_their_meaning() {
+        for (unit, used, total, left) in [
+            ("credits", "125.25", "1000", "874.75"),
+            ("usd", "3.25", "20", "16.75"),
+        ] {
+            let snapshot = reader().snapshot(Ok(json!({"plan":"Pro","windows":[{
+                "name":"Allowance","used":25,"amount":used,"limit":total,"unit":unit,
+                "resetsAt":"2026-11-01T00:00:00Z"
+            }]})));
+            assert!(snapshot.metrics.iter().any(|metric| matches!(metric,
+                ResourceMetric::Allowance { remaining:Some(value),unit: actual,.. } if value == left && actual == unit
+            )));
+            assert!(snapshot.metrics.iter().any(|metric| matches!(
+                metric,
+                ResourceMetric::QuotaWindow {
+                    resets_at: Some(_),
+                    ..
+                }
+            )));
+        }
+        let unlimited = reader().snapshot(Ok(json!({"plan":"Credits", "balance":"unlimited"})));
+        assert_eq!(unlimited.message.as_deref(), Some("Credits · 额度不限量"));
+        assert!(unlimited.metrics.is_empty());
     }
 }

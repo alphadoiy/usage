@@ -12,7 +12,7 @@
 
 终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。Braille 进度条会随卡片宽度延伸；窄卡片会把额度信息和进度条分成两行，避免截断。
 
-官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。统一的 Provider 管理入口支持 BYOK、OAuth 和 WorkBuddy，可保存配置和登录、导入 CC Switch 供应商并配置 Agent 启动。
+官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。统一的 Provider 管理入口支持 BYOK、OAuth、WorkBuddy 和 Trae，可保存配置和登录、导入 CC Switch 供应商并配置 Agent 启动。
 
 | 工具 | 凭据 | 接口 |
 | --- | --- | --- |
@@ -144,7 +144,9 @@ Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板�
 
 ## Provider 管理与 Codex 多开
 
-运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
+运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
+
+添加时会检测相同配置与凭据，重复项提示使用已有 Provider；不同模型或配置可以分别保存，显式“复制”仍可创建独立副本。插件账号再次登录同一身份会更新原账号凭据并保留绑定，不按昵称合并不同账号。
 
 在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
 
@@ -390,4 +392,4 @@ registry.register("spark", "另一种", render_spark);
 
 注册之后，`--once --style` 和配置文件都能选择这种文本用量视图。
 
-Provider 插件接入（WorkBuddy / WorkBuddy AI）：见 [插件文档](docs/plugins.md)。
+Provider 插件接入（WorkBuddy / Trae 国内版与国际版）：见 [插件文档](docs/plugins.md)。

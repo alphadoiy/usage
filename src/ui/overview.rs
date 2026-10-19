@@ -52,19 +52,16 @@ pub(super) fn lines(
         }
         return lines;
     };
-    lines.push(
-        Line::from(format!(
-            "{} 个 Provider{}",
-            catalog.providers.len(),
-            if loading { " · 更新状态中" } else { "" }
-        ))
-        .dim(),
-    );
+    if loading {
+        lines.push(Line::from("更新状态中…").dim());
+    }
     if catalog.providers.is_empty() {
         lines.push(Line::from("尚无 Provider · a 添加服务商 · F4 添加账号").dim());
     }
     if let Some((_, provider)) = selected(Some(catalog), selected_id) {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         let agent = provider
             .agent
             .as_ref()

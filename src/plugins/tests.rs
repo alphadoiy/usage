@@ -477,11 +477,10 @@ async fn bound_plugin_accounts_share_resources_without_duplicate_provider_cards(
         None,
     )
     .unwrap();
-    for name in ["First", "Second"] {
-        manager
-            .add(name, &text, &h.store.inference_key(&account.id).unwrap())
-            .unwrap();
-    }
+    let first = manager
+        .add("First", &text, &h.store.inference_key(&account.id).unwrap())
+        .unwrap();
+    manager.copy(&first.id, "Second").unwrap();
     let http = std::sync::Arc::new(crate::http::FakeHttp::new());
     let service = CatalogService::new(
         root,
@@ -667,4 +666,151 @@ async fn known_workbuddy_checkin_is_discovered_locally_only_for_china() {
         }
     }
     assert!(http.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trae_catalog_projects_both_realms_and_only_china_has_account_actions() {
+    let h = harness().await;
+    let mut plugin = h.store.plugin("fixture").unwrap();
+    plugin.package = crate::provider_catalog::presets::TRAE.package.into();
+    h.store.register(plugin).unwrap();
+    for provider in ["trae-cn", "trae-global"] {
+        h.store
+            .create_account(
+                "fixture",
+                provider,
+                "Alice",
+                json!({"type":"api","key":"synthetic"}),
+            )
+            .unwrap();
+    }
+    let http = std::sync::Arc::new(crate::http::FakeHttp::new());
+    let service = crate::provider_catalog::CatalogService::new(
+        h.f.path.join("manager"),
+        http.clone(),
+        std::sync::Arc::new(|_| Err("unused".into())),
+    )
+    .with_plugin_root(h.store.root.clone());
+    let plan = service.load(&crate::config::AppConfig::default()).unwrap();
+    assert_eq!(plan.catalog.providers.len(), 2);
+    assert_eq!(plan.resources.len(), 2);
+    for provider in &plan.catalog.providers {
+        assert_eq!(
+            provider.kind,
+            crate::provider_catalog::ProviderKind::SubscriptionService
+        );
+        assert!(matches!(
+            provider.name.as_str(),
+            "Trae 国内版 · Alice" | "Trae 国际版 · Alice"
+        ));
+        assert_eq!(provider.usage.sources[0].label, "Trae 额度");
+        assert_eq!(
+            provider.operations.len(),
+            usize::from(provider.name.contains("国内版"))
+        );
+        if let Some(operation) = provider.operations.first() {
+            assert!(operation.0.automatic_status());
+        }
+    }
+    assert!(http.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn repeated_plugin_login_reuses_identity_and_rejects_late_credential_writes() {
+    let h = harness().await;
+    let original = json!({"type":"oauth","uid":"same-user","accountId":"Old nickname","access":"old-token","refresh":"old-refresh"});
+    let first = h
+        .store
+        .create_account("fixture", "trae-cn", "Custom name", original.clone())
+        .unwrap();
+    let key = h.store.inference_key(&first.id).unwrap();
+    let rotated = json!({"type":"oauth","uid":"same-user","accountId":"New nickname","access":"new-token","refresh":"new-refresh"});
+    let reused = h
+        .store
+        .create_account("fixture", "trae-cn", "New nickname", rotated.clone())
+        .unwrap();
+    assert_eq!(first.id, reused.id);
+    assert_eq!(reused.name, "Custom name");
+    assert_eq!(h.store.inference_key(&first.id).unwrap(), key);
+    assert_eq!(h.store.accounts().unwrap().len(), 1);
+    let credential = h.store.credential("fixture", &first.id).unwrap();
+    assert_eq!(credential["generation"], 2);
+    assert_eq!(credential["auth"], rotated);
+    assert!(
+        h.store
+            .update("fixture", &first.id, 1, original.clone())
+            .is_err()
+    );
+    for (provider, auth) in [
+        ("trae-global", original.clone()),
+        (
+            "trae-cn",
+            json!({"type":"oauth","uid":"other-user","accountId":"Old nickname","access":"old-token"}),
+        ),
+        (
+            "trae-cn",
+            json!({"type":"oauth","uid":"same-user","enterpriseId":"enterprise-a","access":"old-token"}),
+        ),
+        (
+            "trae-cn",
+            json!({"type":"oauth","uid":"same-user","region":"US","access":"old-token"}),
+        ),
+    ] {
+        let distinct = h
+            .store
+            .create_account("fixture", provider, "Same label", auth)
+            .unwrap();
+        assert_ne!(distinct.id, first.id);
+    }
+    assert_eq!(h.store.accounts().unwrap().len(), 5);
+    let anonymous = json!({"type":"api","key":"opaque-key"});
+    let a = h
+        .store
+        .create_account("fixture", "unknown", "Same label", anonymous.clone())
+        .unwrap();
+    let b = h
+        .store
+        .create_account("fixture", "unknown", "Another label", anonymous)
+        .unwrap();
+    assert_eq!(a.id, b.id);
+    let c = h
+        .store
+        .create_account(
+            "fixture",
+            "unknown",
+            "Same label",
+            json!({"type":"api","key":"different-key"}),
+        )
+        .unwrap();
+    assert_ne!(a.id, c.id);
+}
+
+#[tokio::test]
+async fn concurrent_plugin_logins_share_one_account_and_inference_capability() {
+    let h = harness().await;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|n| {
+            let store = h.store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .create_account(
+                        "fixture",
+                        "trae-cn",
+                        "Same user",
+                        json!({"type":"oauth","uid":"same-user","access":format!("token-{n}")}),
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let accounts: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(accounts[0].id, accounts[1].id);
+    assert_eq!(h.store.accounts().unwrap().len(), 1);
+    assert_eq!(
+        h.store.credential("fixture", &accounts[0].id).unwrap()["generation"],
+        2
+    );
 }

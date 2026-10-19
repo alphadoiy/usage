@@ -66,7 +66,34 @@ pub const WORKBUDDY: Preset = Preset {
         },
     ],
 };
-pub static PRESETS: &[Preset] = &[WORKBUDDY];
+pub const TRAE: Preset = Preset {
+    id: "trae",
+    name: "Trae",
+    package: "@magpie-community/opencode-trae-auth",
+    version: "0.2.17",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[
+        Variant {
+            id: "trae-cn",
+            name: "国内版",
+            description: "使用 trae.cn 账号；支持 Credits 额度与每日签到",
+            desktop_auth_file: None,
+        },
+        Variant {
+            id: "trae-global",
+            name: "国际版",
+            description: "使用 trae.ai 账号；查询美元额度，不提供每日签到",
+            desktop_auth_file: None,
+        },
+    ],
+    sign_in: &[SignIn {
+        id: "0",
+        name: "浏览器登录",
+        description: "在对应地区网站授权，本机回调自动完成登录",
+        source: SignInSource::Browser,
+    }],
+};
+pub static PRESETS: &[Preset] = &[WORKBUDDY, TRAE];
 
 pub fn for_package(package: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.package == package)
@@ -214,5 +241,28 @@ mod tests {
             "WorkBuddy 国际版 · Alice"
         );
         assert!(for_package("unrelated-package").is_none());
+    }
+
+    #[test]
+    fn trae_regions_have_independent_browser_signin_and_service_identity() {
+        let preset = for_package("@magpie-community/opencode-trae-auth").unwrap();
+        assert_eq!(preset.id, "trae");
+        assert_eq!(preset.version, "0.2.17");
+        for (id, name) in [("trae-cn", "国内版"), ("trae-global", "国际版")] {
+            assert_eq!(
+                preset.account_name(id, "Alice"),
+                format!("Trae {name} · Alice")
+            );
+            let method = preset
+                .sign_in_option(id, "0", std::path::Path::new("/unused"))
+                .unwrap();
+            assert!(method.available);
+            assert!(method.description.contains("回调"));
+            assert!(
+                preset
+                    .sign_in_option(id, "1", std::path::Path::new("/unused"))
+                    .is_none()
+            );
+        }
     }
 }

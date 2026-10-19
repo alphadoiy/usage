@@ -163,13 +163,33 @@ impl Store {
         if provider.is_empty() || provider.len() > 200 || name.chars().any(char::is_control) {
             return Err("插件账号信息无效".into());
         }
+        let _lock = self.locked()?;
+        if let Some(identity) = super::identity::key(&auth) {
+            for existing in self.accounts()? {
+                if existing.plugin != plugin || existing.provider != provider {
+                    continue;
+                }
+                let path = self.account_path(&existing.id)?;
+                let mut credential: Credential = read(&path)?;
+                if super::identity::key(&credential.auth).as_ref() != Some(&identity) {
+                    continue;
+                }
+                credential.generation = credential
+                    .generation
+                    .checked_add(1)
+                    .ok_or("插件凭据版本溢出")?;
+                credential.auth = auth;
+                save(&path, &credential)?;
+                tracing::info!(event="plugin_account_reused", plugin_id=plugin, backend=provider, account_id=%existing.id, generation=credential.generation);
+                return Ok(existing);
+            }
+        }
         let account = Account {
             id: uuid::Uuid::new_v4().to_string(),
             plugin: plugin.into(),
             provider: provider.into(),
             name: name.into(),
         };
-        let _lock = self.locked()?;
         save(
             &self.account_path(&account.id)?,
             &Credential {

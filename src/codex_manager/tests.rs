@@ -35,6 +35,79 @@ pub(super) fn native(url: &str, model: &str) -> String {
 }
 
 #[test]
+fn add_rejects_equivalent_provider_configs_but_keeps_distinct_keys_models_and_explicit_copies() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let text = native("https://example.com/v1", "model-a");
+    let first = manager.add("Existing", &text, "synthetic-key").unwrap();
+    for candidate in [
+        text.clone(),
+        format!("# another comment\n{text}"),
+        native("https://example.com/v1/", "model-a"),
+    ] {
+        let error = manager
+            .add("Another name", &candidate, "synthetic-key")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Provider 配置已存在：Existing"));
+        assert!(!error.contains("synthetic-key"));
+    }
+    assert_eq!(manager.list().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_dir(manager.root().join("keys")).unwrap().count(),
+        1
+    );
+    manager.add("Other key", &text, "different-key").unwrap();
+    manager
+        .add(
+            "Other model",
+            &native("https://example.com/v1", "model-b"),
+            "synthetic-key",
+        )
+        .unwrap();
+    manager
+        .add(
+            "Other effort",
+            &config::new_config("https://example.com/v1", "model-a", Some("low")).unwrap(),
+            "synthetic-key",
+        )
+        .unwrap();
+    manager.copy(&first.id, "Explicit copy").unwrap();
+    assert_eq!(manager.list().unwrap().len(), 5);
+    manager.remove(&first.id).unwrap();
+    let copy = manager.resolve("Explicit copy").unwrap();
+    manager.remove(&copy.id).unwrap();
+    manager.add("Restored", &text, "synthetic-key").unwrap();
+}
+
+#[test]
+fn simultaneous_provider_adds_cannot_save_duplicate_profiles_or_orphan_keys() {
+    let f = Fixture::new();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let workers: Vec<_> = (0..2)
+        .map(|n| {
+            let mut manager = f.manager();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                manager.add(
+                    &format!("Provider-{n}"),
+                    &native("https://example.com/v1", "model-a"),
+                    "synthetic-key",
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(f.manager().list().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_dir(f.path.join("manager/keys")).unwrap().count(),
+        1
+    );
+}
+
+#[test]
 fn overview_read_only_discovery_does_not_create_or_migrate_store() {
     let f = Fixture::new();
     let missing = f.path.join("missing");

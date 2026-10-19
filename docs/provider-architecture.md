@@ -108,7 +108,7 @@ Codex 适配器继续委托官方 CLI 完成授权和令牌刷新，复用 Manag
 
 ## Provider 插件宿主
 
-[Provider 插件](plugins.md) 由现有网关持有独立 Bun/Node 宿主。插件包、上游 Backend、账号和带 Agent 的 Provider 实例分开标识；WorkBuddy 与 WorkBuddy AI 来自同一插件的两个导出工厂。通用兼容层执行 OpenCode Provider v1 及用量/刷新扩展，不在 Rust 分派服务商接口。
+[Provider 插件](plugins.md) 由现有网关持有独立 Bun/Node 宿主。插件包、上游 Backend、账号和带 Agent 的 Provider 实例分开标识；WorkBuddy 与 WorkBuddy AI 来自同一插件的两个导出工厂；Trae CN 与 Trae Global 同样通过独立导出工厂接入。通用兼容层执行 OpenCode Provider v1 及用量/刷新扩展，不在 Rust 分派服务商接口。
 
 认证桥接根据能力快照注册 `AuthRegistry` 工厂；插件方法采用动态文本并复用 `AuthTask` 的保存边界。资源桥接使用 `ResourceRegistry` 的 `plugin_account` 工厂，首页模型查询独立执行并按包版本、配置 revision 和账号缓存。`RouteAuth::Plugin` 引用插件账号，Agent 只获得本次路由的能力令牌。Rust credential broker 统一保存 opaque auth，按账号串行刷新并用 generation 拒绝过期写入。
 

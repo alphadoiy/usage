@@ -3,6 +3,7 @@ pub mod bark;
 pub mod ccswitch;
 pub mod cli;
 pub mod config;
+mod duplicates;
 mod effective;
 pub mod fingerprint;
 mod launcher;
@@ -478,13 +479,30 @@ impl Manager {
     }
 
     pub fn add(&mut self, name: &str, text: &str, key: &str) -> Result<Profile> {
+        self.insert_profile(name, text, key, false)
+    }
+
+    fn insert_profile(
+        &mut self,
+        name: &str,
+        text: &str,
+        key: &str,
+        copying: bool,
+    ) -> Result<Profile> {
         logging::operation("codex.account_add", |op| {
             op.step("name_validate", || validate_name(name))?;
             let config = op.step("config_validate", || config::normalize(text))?;
             let id = uuid::Uuid::new_v4().to_string();
             op.account(&id, 1, "byok");
             op.begin("database_transaction");
-            let tx = self.conn.transaction()?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !copying {
+                op.step("duplicate_check", || {
+                    duplicates::reject(&tx, &self.root, &config, key)
+                })?;
+            }
             let secret_ref = op.step("credential_save", || secrets::put(&self.root, key))?;
             tx.execute(
                 "INSERT INTO profiles(id,name,revision) VALUES (?1,?2,1)",
@@ -576,7 +594,7 @@ impl Manager {
         }
         let revision = self.revision(&profile.id, profile.revision)?;
         let key = secrets::get(&self.root, &revision.secret_ref)?;
-        self.add(name, &revision.config, &key)
+        self.insert_profile(name, &revision.config, &key, true)
     }
 
     pub fn remove(&mut self, selector: &str) -> Result<()> {

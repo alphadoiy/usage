@@ -152,7 +152,7 @@ impl Runtime {
         let dir = self.store.root.join("host").join(format!(
             "{:x}",
             Sha256::digest(format!(
-                "{HOST}{PROTOCOL}{ACTIONS}{WORKBUDDY_ACTIONS}{ACTION_CAPABILITIES}"
+                "{HOST}{PROTOCOL}{ACTIONS}{WORKBUDDY_ACTIONS}{TRAE_ACTIONS}{ACTION_CAPABILITIES}{ACTION_SUPPORT}"
             ))
         ));
         fs::create_dir_all(&dir).map_err(|_| "无法创建插件宿主目录")?;
@@ -162,8 +162,10 @@ impl Runtime {
             .map_err(|_| "无法保存协议适配器")?;
         for (name, source) in [
             ("actions.mjs", ACTIONS),
+            ("action_support.mjs", ACTION_SUPPORT),
             ("action_capabilities.json", ACTION_CAPABILITIES),
             ("workbuddy_actions.mjs", WORKBUDDY_ACTIONS),
+            ("trae_actions.mjs", TRAE_ACTIONS),
         ] {
             crate::codex_manager::private_write(&dir.join(name), source.as_bytes())
                 .map_err(|_| "无法保存插件账号操作适配器")?;

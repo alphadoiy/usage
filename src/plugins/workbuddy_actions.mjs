@@ -1,36 +1,14 @@
 // WorkBuddy's host-side daily check-in, matching Magpie's fallback for this package.
 // Credentials remain inside the plugin's loader/fetch. Never read or print opaque auth here.
-import { readFileSync } from 'node:fs';
-const capabilities = JSON.parse(readFileSync(new URL('./action_capabilities.json', import.meta.url), 'utf8'));
-export function supports(packageName, provider) {
-  return capabilities.some((c) => c.adapter === 'workbuddy' && c.package === packageName && c.provider === provider);
-}
-export function supportsStatus(packageName, provider) {
-  return capabilities.some((c) => c.adapter === 'workbuddy' && c.package === packageName && c.provider === provider && c.checkin_status === true);
-}
+import { bodyOf, supportsAdapter, supportsAdapterStatus } from './action_support.mjs';
+export const supports = (packageName, provider) => supportsAdapter('workbuddy', packageName, provider);
+export const supportsStatus = (packageName, provider) => supportsAdapterStatus('workbuddy', packageName, provider);
 const failed = (reason) => ({ outcome: 'failed', reason });
 const count = (value) => {
   if (value === null || value === undefined || value === '') return undefined;
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 };
-async function bodyOf(response) {
-  let text = '';
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('invalid response');
-  const decoder = new TextDecoder();
-  let size = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > 65536) throw new Error('response too large');
-      text += decoder.decode(value, { stream: true });
-    }
-    return JSON.parse(text + decoder.decode());
-  } finally { await reader.cancel().catch(() => {}); }
-}
 export async function checkin({ hooks, provider, getAuth, phase, signal }) {
   try {
     const options = await hooks.auth.loader(getAuth, provider);
