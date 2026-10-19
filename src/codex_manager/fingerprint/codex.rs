@@ -1,5 +1,6 @@
 //! LMFPD adapter for the fixed official Codex subscription channel.
 use super::*;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -47,11 +48,12 @@ pub(super) fn failure_details(report: &mut Report) {
                         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
                     {
                         Some(time) => format!(
-                            "官方订阅额度已用尽（HTTP 429）；预计 {} 恢复。本轮不重试，下小时再检查。",
+                            "官方订阅额度已用尽（HTTP 429）；预计 {} 恢复。本轮不重试，按 5 小时间隔再检查。",
                             time.with_timezone(&chrono::Local)
                                 .format("%Y-%m-%d %H:%M:%S %Z")
                         ),
-                        None => "官方订阅额度已用尽（HTTP 429）；本轮不重试，下小时再检查。".into(),
+                        None => "官方订阅额度已用尽（HTTP 429）；本轮不重试，按 5 小时间隔再检查。"
+                            .into(),
                     };
                 } else {
                     report.message = format!(
@@ -109,29 +111,187 @@ pub(super) fn summarize(report: &mut Report, value: &Value) -> Result<()> {
     if value["schema"] != "fpd-detection-v1" || value["cancelled"] == true {
         return Err(Error::message("检测器未产生有效的离线报告"));
     }
-    let analysis = &value["analysis"];
-    let candidates = analysis["results"]
-        .as_array()
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::message("本轮有效样本不足，无法评分；原始记录已保留"))?;
-    report.accepted = analysis["used_outputs"].as_u64().unwrap_or(0) as usize;
-    report.reference_contains_model = candidates.iter().any(|v| v["model"] == MODEL);
-    report.closest_candidate = candidates[0]["model"].as_str().map(str::to_owned);
-    report.status = if report.accepted == 3 {
+    // `analysis` is only an alias for a single round. Never count that alias twice.
+    let analyses: Vec<_> = match value["rounds"].as_array().filter(|r| !r.is_empty()) {
+        Some(rounds) => rounds.iter().map(|r| &r["analysis"]).collect(),
+        None => vec![&value["analysis"]],
+    };
+    if analyses.len() > 3 {
+        return Err(Error::message("离线报告轮数超出本次三样本范围"));
+    }
+    let mut accepted = 0usize;
+    let mut ranked = 0;
+    let mut complete = 0;
+    let mut reference_contains_model = false;
+    let mut reference_label = None;
+    for analysis in &analyses {
+        let used = analysis["used_outputs"].as_u64().unwrap_or(0);
+        if used > 3 {
+            return Err(Error::message("离线报告样本计数无效"));
+        }
+        accepted += used as usize;
+        let Some(candidates) = analysis["results"].as_array().filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        ranked += 1;
+        if let Some(candidate) = candidates.iter().find(|v| {
+            reference::matches_target(
+                v["model"].as_str().unwrap_or_default(),
+                v["display_name"].as_str(),
+            )
+        }) {
+            reference_contains_model = true;
+            reference_label = candidate["display_name"]
+                .as_str()
+                .or_else(|| candidate["model"].as_str())
+                .map(str::to_owned);
+        }
+        if used == 3 && analysis["decision"] != "partial" && analysis["decision"] != "unscorable" {
+            complete += 1;
+        }
+    }
+    if accepted > 3 {
+        return Err(Error::message("离线报告重复或超出本次三样本范围"));
+    }
+    report.accepted = accepted;
+    report.scoring = Some(Scoring {
+        rounds: analyses.len(),
+        ranked_rounds: ranked,
+        complete_rounds: complete,
+    });
+    if ranked == 0 {
+        return Err(Error::message(
+            "采样已记录，但没有可用的离线评分；原始证据已保留",
+        ));
+    }
+    report.reference_contains_model = reference_contains_model;
+    report.reference_label = reference_label;
+    // Independent conditions do not have an aggregate winner or confidence.
+    report.closest_candidate = if analyses.len() == 1 {
+        analyses[0]["results"][0]["display_name"]
+            .as_str()
+            .or_else(|| analyses[0]["results"][0]["model"].as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    report.confidence = if analyses.len() == 1
+        && complete == 1
+        && analyses[0]["probability_status"] == "reference_calibrated"
+    {
+        analyses[0]["results"][0]["probability"]
+            .as_f64()
+            .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+    } else {
+        None
+    };
+    report.status = if accepted == 3 && complete == analyses.len() {
         ReportStatus::Completed
     } else {
         ReportStatus::Partial
     };
-    report.message = if report.reference_contains_model {
-        "候选与置信度仅是参考库内的相对排名，不是模型身份认证。"
-    } else {
-        "参考库尚未收录 gpt-6.1-sol；已保留样本和相近候选，不能据此判断换模。"
+    let mut message = format!(
+        "采样 {accepted}/3 成功；{ranked}/{} 轮已生成排名，{complete}/{} 轮满足三样本要求。",
+        analyses.len(),
+        analyses.len()
+    );
+    if complete < analyses.len() {
+        message.push_str("不足三条有效样本的轮次仅提供部分排名，不提供置信度。");
     }
-    .into();
+    if reference_contains_model {
+        if let Some(label) = &report.reference_label {
+            message.push_str(&format!("参考组：{label}。"));
+        }
+        message.push_str("候选与置信度仅是参考库内的相对排名，不是模型身份认证。");
+    } else {
+        message.push_str("参考库尚未收录 gpt-6.1-sol；已保留样本和相近候选，不能据此判断换模。");
+    }
+    report.message = message;
     Ok(())
 }
 
 pub(super) struct CodexSubscriptionDetector;
+// `sample` provides the subscription-only transport, but its reference batch
+// groups answers by nuisance condition. Normal detection scores three answers
+// together. Use the documented saved-round format and preserve completion proof.
+pub(super) fn detection_input(collection: &Value) -> Result<Value> {
+    let invalid = || Error::message("采样批次不是本次官方订阅的三条完整回答；原始样本已保留");
+    if collection["schema_version"] != 1
+        || collection["purpose"] != "reference"
+        || collection["model"]["id"] != MODEL
+    {
+        return Err(invalid());
+    }
+    let samples = collection["samples"]
+        .as_array()
+        .filter(|s| s.len() == 3)
+        .ok_or_else(invalid)?;
+    let mut ids = std::collections::HashSet::new();
+    let mut outputs = Vec::new();
+    let mut evidence = Vec::new();
+    for sample in samples {
+        let id = sample["challenge_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(invalid)?;
+        if !ids.insert(id)
+            || sample["completion"] != "complete"
+            || sample["response_model"] != MODEL
+        {
+            return Err(invalid());
+        }
+        let text = sample["text"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(invalid)?;
+        let expected = sample["expected_count"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or_else(invalid)?;
+        outputs.push(serde_json::json!({"text":text,"expected_count":expected}));
+        evidence.push(
+            serde_json::json!({"challenge_id":id,"condition":sample["condition"],
+            "completion":sample["completion"],"response_model":sample["response_model"]}),
+        );
+    }
+    Ok(
+        serde_json::json!({"source":{"path":"samples/result.json","channel":"codex-subscription","model":MODEL},
+        "rounds":[{"outputs":outputs,"samples":evidence}]}),
+    )
+}
+pub(super) fn score_saved(
+    path: &Path,
+    fpd: &Path,
+    output: &str,
+    cancel: &AtomicBool,
+) -> Result<Value> {
+    let mut bytes = Vec::new();
+    fs::File::open(path.join("samples/result.json"))?
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(Error::message("采样批次过大；原始证据已保留"));
+    }
+    let collection = serde_json::from_slice(&bytes).map_err(|_| Error::message("采样批次无效"))?;
+    let input = detection_input(&collection)?;
+    let input_path = path.join("detection-input.json");
+    store::save(&input_path, &input)?;
+    // Offline scoring has no subscription login available, and never calls sample.
+    let mut analyze = command(fpd, &path.join("offline-home"));
+    analyze
+        .args(["--input"])
+        .arg(&input_path)
+        .args(["--strict", "--json", "--no-update-check"]);
+    let scored = crate::credentials::output_with_cancel(analyze, Duration::from_secs(60), cancel)
+        .ok_or_else(|| Error::message("离线评分超时、被取消或子进程失败"))?;
+    if !scored.status.success() {
+        return Err(Error::message("指纹离线评分失败；原始样本已保留"));
+    }
+    let value: Value = serde_json::from_slice(&scored.stdout)
+        .map_err(|_| Error::message("检测器返回的 JSON 无效"))?;
+    private_write(&path.join(output), &scored.stdout)?;
+    Ok(value)
+}
 impl CodexSubscriptionDetector {
     pub fn detect(
         &self,
@@ -189,21 +349,6 @@ impl CodexSubscriptionDetector {
                 "官方订阅采样未完成；可能是登录失效、限流或网络错误。查看样本记录，必要时重新登录；本轮不重试。",
             ));
         }
-        let mut analyze = command(fpd, &home);
-        analyze
-            .args(["--input"])
-            .arg(collection.join("result.json"))
-            .args(["--json", "--no-update-check"]);
-        let scored =
-            crate::credentials::output_with_cancel(analyze, Duration::from_secs(60), cancel)
-                .ok_or_else(|| Error::message("离线评分超时、被取消或子进程失败"))?;
-        if !scored.status.success() {
-            return Err(Error::message("指纹离线评分失败；原始样本已保留"));
-        }
-        let value: Value = serde_json::from_slice(&scored.stdout)
-            .map_err(|_| Error::message("检测器返回的 JSON 无效"))?;
-
-        private_write(&path.join("detection.json"), &scored.stdout)?;
-        Ok(value)
+        score_saved(path, fpd, "detection.json", cancel)
     }
 }

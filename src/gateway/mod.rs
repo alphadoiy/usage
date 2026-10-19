@@ -218,24 +218,34 @@ fn read_state(path: &Path) -> Option<StateFile> {
 fn url(state: &StateFile, path: &str) -> String {
     format!("http://127.0.0.1:{}{path}", state.port)
 }
-fn health(client: &reqwest::blocking::Client, state: &StateFile) -> bool {
-    client
+struct ReadyGateway {
+    state: StateFile,
+    status: serde_json::Value,
+}
+fn health(client: &reqwest::blocking::Client, state: &StateFile) -> Option<serde_json::Value> {
+    let status: serde_json::Value = client
         .get(url(state, "/_usage/status"))
         .bearer_auth(&state.token)
         .send()
         .ok()
         .filter(|r| r.status().is_success())
-        .and_then(|r| r.json::<serde_json::Value>().ok())
-        .is_some_and(|v| v["service"] == "usage-gateway" && v["protocol"] == PROTOCOL_VERSION)
+        .and_then(|r| r.json().ok())?;
+    (status["service"] == "usage-gateway" && status["protocol"] == PROTOCOL_VERSION)
+        .then_some(status)
+}
+fn ready(client: &reqwest::blocking::Client, path: &Path) -> Option<ReadyGateway> {
+    let state = read_state(path)?;
+    let status = health(client, &state)?;
+    Some(ReadyGateway { state, status })
 }
 fn ensure(
     directory: &Path,
     client: &reqwest::blocking::Client,
     deadline: Instant,
-) -> Result<StateFile, String> {
+) -> Result<ReadyGateway, String> {
     let path = directory.join("state.json");
-    if let Some(state) = read_state(&path).filter(|s| health(client, s)) {
-        return Ok(state);
+    if let Some(gateway) = ready(client, &path) {
+        return Ok(gateway);
     }
     let service = private_file(&directory.join("service.lock"))?;
     service
@@ -269,14 +279,14 @@ fn ensure(
     }
     let mut child = command.spawn().map_err(|_| "无法启动观测网关")?;
     loop {
-        if let Some(state) = read_state(&path).filter(|s| health(client, s)) {
+        if let Some(gateway) = ready(client, &path) {
             // Reap only after natural exit, including when this launcher is killed.
             let _ = std::thread::Builder::new()
                 .name("usage-gateway-reap".into())
                 .spawn(move || {
                     let _ = child.wait();
                 });
-            return Ok(state);
+            return Ok(gateway);
         }
         if child.try_wait().map_err(|_| "无法检查网关进程")?.is_some() {
             return Err("观测网关启动失败，请查看 Usage 日志".into());
@@ -332,7 +342,7 @@ pub(crate) fn attach(
                     if Instant::now() >= deadline {
                         return Err("观测网关准备超时".into());
                     }
-                    let state = ensure(&directory, &client, deadline)?;
+                    let state = ensure(&directory, &client, deadline)?.state;
                     let response = client
                         .post(url(&state, "/_usage/routes"))
                         .bearer_auth(&state.token)
@@ -414,12 +424,21 @@ pub async fn execute(command: GatewayCommand) -> Result<(), String> {
     }
 }
 
-pub(crate) fn plugin_control() -> Result<(String, String), String> {
+pub(crate) struct PluginControl {
+    pub url: String,
+    pub token: String,
+    pub actions: bool,
+}
+pub(crate) fn plugin_control() -> Result<PluginControl, String> {
     let directory = directory(&crate::codex_manager::default_root());
     private_dir(&directory)?;
     let lock = private_file(&directory.join("start.lock"))?;
     FileExt::lock_exclusive(&lock).map_err(|_| "插件网关启动锁失败")?;
     let client = control_client()?;
-    let state = ensure(&directory, &client, Instant::now() + Duration::from_secs(5))?;
-    Ok((url(&state, "/_usage/plugins/call"), state.token))
+    let gateway = ensure(&directory, &client, Instant::now() + Duration::from_secs(5))?;
+    Ok(PluginControl {
+        url: url(&gateway.state, "/_usage/plugins/call"),
+        token: gateway.state.token,
+        actions: gateway.status["plugin_actions"] == 1,
+    })
 }

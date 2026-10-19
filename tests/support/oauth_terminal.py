@@ -62,15 +62,16 @@ def check_terminal(program, env, ui, cancel):
 
     try:
         if ui:
-            until("Codex")
-            os.write(fd, b"a")
-            until("添加 Codex 账号")
-            os.write(fd, b"o")
+            until("Provider 管理")
+            # Both manager entry points open the same service-first wizard.
+            os.write(fd, b"\x1b[15~" if cancel else b"a")
+            until("接入方式")
+            os.write(fd, b"ChatGPT\r")
             until("授权中Ctrl+C取消")
             os.write(fd, b"2")
         until("SYNTHETIC_LOGIN_READY")
         os.write(fd, b"\x03" if cancel else b"confirm\n")
-        until("登录已取消" if cancel else ("已保存 OAuth" if ui else "已保存 OAuth 账号"))
+        until("登录已取消" if cancel else ("已添加 Provider" if ui else "已保存 OAuth 账号"))
         if ui:
             # Wait for the second alternate-screen entry before sending the exit key.
             deadline = time.monotonic() + 5
@@ -78,6 +79,14 @@ def check_terminal(program, env, ui, cancel):
                 assert time.monotonic() < deadline, "TUI did not restore its screen"
                 if select.select([fd], [], [], 0.1)[0]:
                     data.extend(os.read(fd, 65536))
+            if cancel:
+                # Cancelling the shared wizard returns to its root menu; Esc closes it.
+                # Drain the redraw so Esc and q cannot be interpreted as one Alt chord.
+                os.write(fd, b"\x1b")
+                redraw_until = time.monotonic() + 0.2
+                while time.monotonic() < redraw_until:
+                    if select.select([fd], [], [], 0.02)[0]:
+                        data.extend(os.read(fd, 65536))
             os.write(fd, b"q")
         deadline = time.monotonic() + 5
         while True:

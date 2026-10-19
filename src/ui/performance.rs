@@ -33,22 +33,19 @@ pub(super) fn summary_lines(entry: Option<&CachedSummary>) -> Vec<ratatui::text:
         Ok(Some(s)) if s.calls == 0 => lines.push(Line::from("  暂无可用样本").dim()),
         Ok(Some(s)) => {
             lines.push(Line::from(format!(
-                "  {} 次请求 · 平均首字 {}（{} 样本）",
+                "  {} 次请求 · 平均首字 {}",
                 s.calls,
-                mean_ms(s.mean_ttft_ms),
-                s.timed_samples
+                mean_ms(s.mean_ttft_ms)
             )));
             lines.push(Line::from(format!(
-                "  生成速度 {}（{} 样本）",
+                "  生成速度 {}",
                 s.speed()
-                    .map_or_else(|| "—".into(), |v| format!("{v:.1} tok/s")),
-                s.speed_samples
+                    .map_or_else(|| "—".into(), |v| format!("{v:.1} tok/s"))
             )));
             lines.push(Line::from(format!(
-                "  速度下限 {}（{} 样本）",
+                "  速度下限 {}",
                 s.floor()
-                    .map_or_else(|| "—".into(), |v| format!("≥{v:.1} tok/s")),
-                s.floor_samples
+                    .map_or_else(|| "—".into(), |v| format!("≥{v:.1} tok/s"))
             )));
         }
     }

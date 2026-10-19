@@ -34,6 +34,7 @@ pub(crate) struct Runtime {
     hosts: Arc<Mutex<HostSlots>>,
     capabilities: Arc<Mutex<Capabilities>>,
     accounts: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    action_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     client: reqwest::Client,
     pub active: Arc<AtomicUsize>,
     broker: String,
@@ -95,6 +96,7 @@ impl Runtime {
             hosts: Default::default(),
             capabilities: Default::default(),
             accounts: Default::default(),
+            action_locks: Default::default(),
             active: Default::default(),
             logins: Default::default(),
             broker: format!("http://127.0.0.1:{port}/_usage/plugins/credentials"),
@@ -147,16 +149,25 @@ impl Runtime {
         {
             return Ok(host.clone());
         }
-        let dir = self
-            .store
-            .root
-            .join("host")
-            .join(format!("{:x}", Sha256::digest(format!("{HOST}{PROTOCOL}"))));
+        let dir = self.store.root.join("host").join(format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{HOST}{PROTOCOL}{ACTIONS}{WORKBUDDY_ACTIONS}{ACTION_CAPABILITIES}"
+            ))
+        ));
         fs::create_dir_all(&dir).map_err(|_| "无法创建插件宿主目录")?;
         crate::codex_manager::private_write(&dir.join("host.mjs"), HOST.as_bytes())
             .map_err(|_| "无法保存插件宿主")?;
         crate::codex_manager::private_write(&dir.join("protocol.mjs"), PROTOCOL.as_bytes())
             .map_err(|_| "无法保存协议适配器")?;
+        for (name, source) in [
+            ("actions.mjs", ACTIONS),
+            ("action_capabilities.json", ACTION_CAPABILITIES),
+            ("workbuddy_actions.mjs", WORKBUDDY_ACTIONS),
+        ] {
+            crate::codex_manager::private_write(&dir.join(name), source.as_bytes())
+                .map_err(|_| "无法保存插件账号操作适配器")?;
+        }
         let token = uuid::Uuid::new_v4().to_string();
         let mut command = Command::new(&plugin.runtime);
         crate::codex_manager::clear_auth_env(command.as_std_mut());
@@ -173,6 +184,7 @@ impl Runtime {
             .arg(&plugin.entry)
             .arg(format!("{}/{}", self.broker, id))
             .arg(&token)
+            .arg(&plugin.package)
             .current_dir(plugin.entry.parent().ok_or("插件入口无效")?)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
@@ -321,6 +333,22 @@ impl Runtime {
             self.prepare(&host, id, x["provider"].as_str().ok_or("缺少服务 ID")?)
                 .await?;
         }
+        // Serialize mutating actions across every CLI/TUI sharing this gateway/account.
+        let _action_lock = if operation == "action" && x["phase"] == "execute" {
+            let id = account.as_ref().ok_or("账号操作需要绑定账号")?;
+            Some(
+                self.action_locks
+                    .lock()
+                    .await
+                    .entry(id.into())
+                    .or_default()
+                    .clone()
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let response = self
             .client
             .post(format!("http://127.0.0.1:{}/call", host.port))
@@ -369,6 +397,46 @@ impl Runtime {
             return Err("插件 hook 执行失败；请确认运行时、登录及网络配置".into());
         }
         let mut result: Value = serde_json::from_slice(&bytes).map_err(|_| "插件响应无效")?;
+        if operation == "action" {
+            let outcome = result["outcome"]
+                .as_str()
+                .filter(|v| {
+                    [
+                        "ready",
+                        "claimed",
+                        "done",
+                        "ineligible",
+                        "inactive",
+                        "captcha",
+                        "own-app",
+                        "expired",
+                        "failed",
+                    ]
+                    .contains(v)
+                })
+                .unwrap_or("unknown");
+            let reason = result["reason"].as_str().filter(|v| {
+                [
+                    "unsupported",
+                    "invalid_response",
+                    "request_failed",
+                    "timeout",
+                ]
+                .contains(v)
+            });
+            tracing::info!(
+                event = "plugin_account_action_result",
+                plugin_id = plugin,
+                account_id = account,
+                backend = x["provider"].as_str(),
+                action = x["action"].as_str().filter(|v| *v == "checkin"),
+                phase = x["phase"]
+                    .as_str()
+                    .filter(|v| ["preview", "execute"].contains(v)),
+                outcome,
+                reason
+            );
+        }
         if operation == "providers" {
             let definition = self.store.plugin(&plugin)?;
             store::save(
@@ -403,7 +471,16 @@ impl Runtime {
                 result = result["result"].take();
             }
             if result["type"] != "success" {
-                return Err("插件登录失败".into());
+                let failure = auth::LoginFailure::from_result(&result);
+                tracing::warn!(
+                    event = "plugin_auth_failed",
+                    plugin_id = plugin,
+                    backend = x["provider"].as_str(),
+                    hook = operation,
+                    method_id = x["method"].as_str(),
+                    error_code = failure.code()
+                );
+                return Ok(serde_json::json!({"error":{"type":"plugin_auth","code":failure}}));
             }
             let auth = if result.get("refresh").is_some() {
                 result["type"] = "oauth".into();

@@ -12,7 +12,7 @@
 
 终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。Braille 进度条会随卡片宽度延伸；窄卡片会把额度信息和进度条分成两行，避免截断。
 
-官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。另有 Codex BYOK/OAuth 账号管理入口，可保存配置和登录、导入 CC Switch 供应商并启动多个账号。
+官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。统一的 Provider 管理入口支持 BYOK、OAuth 和 WorkBuddy，可保存配置和登录、导入 CC Switch 供应商并配置 Agent 启动。
 
 | 工具 | 凭据 | 接口 |
 | --- | --- | --- |
@@ -94,8 +94,8 @@ TUI 按键：
 | `v` | Provider 看板查看当前 Provider 的模型性能：平均首字、生成速度、速度下限与请求明细 |
 | `h` | 打开本地 Token 贡献看板 |
 | `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
-| `m` / `F10` | 打开功能菜单，选择首页、历史、会话或 Codex 账号管理；`m` 用于首页 |
-| `F4` | 管理 Codex BYOK/OAuth 账号配置、导入 CC Switch、打开独立实例 |
+| `m` / `F10` | 打开功能菜单，选择首页、历史、会话或 Provider 管理；`m` 用于首页 |
+| `F4` | 管理 Provider 账号及 Agent 配置、导入 CC Switch、打开独立实例 |
 | `Tab` / `Shift+Tab` | 切换首页三个看板 |
 | `j` / `k` / `↑` / `↓` | Provider 看板滚动当前 Provider 的信息；其他看板选择厂商／项目／会话 |
 | `←` / `→` | Provider 看板切换不同 Provider；项目与会话看板内切换列表 |
@@ -124,7 +124,7 @@ grok = ""
 
 首页 Provider 的性能摘要展示近 24 小时已索引请求的平均首字、生成速度与速度下限，分别标注样本数。托管 BYOK / OAuth 新会话可通过[本地观测网关](docs/gateway.md)自动采集 HTTP/SSE 请求；默认通过 426 引导 Codex 使用 HTTP/SSE；单次启动设置 `USAGE_GATEWAY_TRANSPORT=ws` 可保留 WS 并采集逐请求首字和 TPS。历史日志继续使用 Magpie 本地日志口径。摘要按绑定缓存 5 分钟，切换 Provider 复用缓存；首页仅查询已有索引，按 `v` 更新日志并查看模型详情。
 
-官方 OAuth 订阅支持[模型指纹测试](docs/fingerprint.md)：`usage codex fingerprint run <账号>` 采集固定 `gpt-6.1-sol` 的 3 条样本并本地评分，`enable <账号>` 在 Usage 打开期间每小时运行（退出即停止），`status <账号>` 查看结果，`disable <账号>` 停用。结果仅为参考库相对排名。
+官方 OAuth 订阅支持[模型指纹测试](docs/fingerprint.md)：`usage codex fingerprint run <账号>` 采集固定 `gpt-6.1-sol` 的 3 条样本并本地评分，`enable <账号>` 在 Usage 打开期间每 5 小时运行（退出即停止），`status <账号>` 查看结果，`disable <账号>` 停用。结果仅为参考库相对排名。
 
 Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时／7 天／30 天及分页明细。托管 Codex 使用绑定版本的网关记录及本地日志；独立 API Provider 可显式绑定日志实例。首字仅使用明确计时，生成速度排除首字等待，保守速度下限以 `≥` 单独展示；仅弹窗打开期间后台增量索引，文件未变化时不读正文。配置、口径与性能边界见[Provider 性能](docs/performance.md)。
 
@@ -142,9 +142,9 @@ Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板�
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
 
-## Codex 账号配置与多开（BYOK / OAuth）
+## Provider 管理与 Codex 多开
 
-运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Codex 账号管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 选择添加方式（BYOK / OAuth 登录 / 导入 OAuth），`l` 重新登录选中的 OAuth 账号，`e` 编辑常用字段，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
+运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
 
 在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
 

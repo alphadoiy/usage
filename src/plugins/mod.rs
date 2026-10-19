@@ -1,13 +1,16 @@
 //! Provider plugins: account-scoped host, OpenCode compatibility and existing capability bridges.
 pub(crate) mod adapters;
 pub mod auth;
+pub(crate) mod capabilities;
 mod cli;
 mod runtime;
+mod service;
 pub mod store;
 pub use cli::{PluginCommand, dispatch};
 pub(crate) use runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use service::{bind, ensure_preset, install};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -15,6 +18,9 @@ use std::{
 pub type Result<T> = std::result::Result<T, String>;
 
 pub(crate) const HOST: &str = include_str!("host.mjs");
+pub(crate) const ACTIONS: &str = include_str!("actions.mjs");
+pub(crate) const ACTION_CAPABILITIES: &str = include_str!("action_capabilities.json");
+pub(crate) const WORKBUDDY_ACTIONS: &str = include_str!("workbuddy_actions.mjs");
 pub(crate) const PROTOCOL: &str = include_str!("protocol.mjs");
 pub fn account_endpoint(id: &str) -> String {
     format!("https://usage-plugin.invalid/{id}/v1")
@@ -56,9 +62,12 @@ pub async fn call_at(root: &Path, mut value: Value) -> Result<Value> {
         .await
         .map_err(|_| "插件网关准备失败")??;
     let client = control_client()?;
+    if value["operation"] == "action" && !endpoint.actions {
+        return Err("当前运行的网关尚不支持账号操作；请在现有任务结束、网关空闲退出后重试".into());
+    }
     let response = client
-        .post(endpoint.0)
-        .bearer_auth(endpoint.1)
+        .post(endpoint.url)
+        .bearer_auth(endpoint.token)
         .json(&value)
         .timeout(std::time::Duration::from_secs(330))
         .send()
@@ -70,7 +79,16 @@ pub async fn call_at(root: &Path, mut value: Value) -> Result<Value> {
             response.status().as_u16()
         ));
     }
-    response.json().await.map_err(|_| "插件响应无效".into())
+    let result: Value = response.json().await.map_err(|_| "插件响应无效")?;
+    decode_control(result)
+}
+fn decode_control(result: Value) -> Result<Value> {
+    if result["error"]["type"] == "plugin_auth" {
+        let failure: auth::LoginFailure = serde_json::from_value(result["error"]["code"].clone())
+            .unwrap_or(auth::LoginFailure::Failed);
+        return Err(failure.message().into());
+    }
+    Ok(result)
 }
 #[cfg(test)]
 mod tests;

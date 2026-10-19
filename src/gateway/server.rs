@@ -69,7 +69,7 @@ async fn status(State(state): State<Arc<Shared>>, headers: HeaderMap) -> Respons
         return error(StatusCode::SERVICE_UNAVAILABLE, "Gateway is stopping");
     }
     let routes = state.routes.read().await;
-    axum::Json(serde_json::json!({"service":"usage-gateway","pid":std::process::id(),"port":state.port,"routes":routes.len(),"protocol":PROTOCOL_VERSION,"active_requests":routes.values().map(|r|r.active.load(Ordering::Relaxed)).sum::<usize>()})).into_response()
+    axum::Json(serde_json::json!({"service":"usage-gateway","pid":std::process::id(),"port":state.port,"routes":routes.len(),"protocol":PROTOCOL_VERSION,"plugin_actions":1,"active_requests":routes.values().map(|r|r.active.load(Ordering::Relaxed)).sum::<usize>()})).into_response()
 }
 async fn register(
     State(state): State<Arc<Shared>>,

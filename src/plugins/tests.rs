@@ -22,6 +22,39 @@ use axum::{
 };
 use serde_json::json;
 
+#[test]
+fn expected_auth_failures_are_actionable_without_exposing_plugin_prose() {
+    for (prose, code, expected) in [
+        (
+            "WorkBuddy desktop keeps its sign-in encrypted; private-sentinel",
+            "desktop_encrypted",
+            "已加密",
+        ),
+        (
+            "WorkBuddy AI desktop isn't signed in; private-sentinel",
+            "desktop_not_signed_in",
+            "尚未登录",
+        ),
+        (
+            "WorkBuddy sign-in timed out; private-sentinel",
+            "timed_out",
+            "已超时",
+        ),
+        ("unexpected private-sentinel", "failed", "插件登录失败"),
+    ] {
+        let failure = auth::LoginFailure::from_result(&json!({"error":prose}));
+        assert_eq!(failure.code(), code);
+        let value = json!({"error":{"type":"plugin_auth","code":failure}});
+        let message = decode_control(value).unwrap_err();
+        assert!(message.contains(expected));
+        assert!(!message.contains("private-sentinel"));
+    }
+    let unknown = decode_control(json!({"error":{"type":"plugin_auth","code":"private-sentinel"}}))
+        .unwrap_err();
+    assert!(unknown.contains("插件登录失败"));
+    assert!(!unknown.contains("private-sentinel"));
+}
+
 struct Harness {
     f: Fixture,
     store: store::Store,
@@ -456,6 +489,10 @@ async fn bound_plugin_accounts_share_resources_without_duplicate_provider_cards(
         std::sync::Arc::new(|_| Err("unused".into())),
     )
     .with_plugin_root(h.store.root.clone());
+    h.runtime
+        .call(json!({"operation":"providers","plugin":"fixture"}))
+        .await
+        .unwrap();
     let config = crate::config::AppConfig::default();
     let plan = service.load(&config).unwrap();
     assert_eq!(plan.catalog.providers.len(), 2);
@@ -475,6 +512,12 @@ async fn bound_plugin_accounts_share_resources_without_duplicate_provider_cards(
             .iter()
             .all(|p| p.kind == ProviderKind::Plugin && p.usage.sources.len() == 1)
     );
+    assert!(
+        plan.catalog
+            .providers
+            .iter()
+            .all(|p| p.operations.len() == 1)
+    );
     let mut plugin = h.store.plugin("fixture").unwrap();
     plugin.enabled = false;
     h.store.register(plugin).unwrap();
@@ -487,10 +530,141 @@ async fn bound_plugin_accounts_share_resources_without_duplicate_provider_cards(
             .iter()
             .all(|p| matches!(p.models, Models::Unavailable(_)))
     );
+    assert!(
+        disabled
+            .catalog
+            .providers
+            .iter()
+            .all(|p| p.operations.is_empty())
+    );
     assert!(disabled.queries.is_empty());
     assert!(disabled.resources.is_empty());
     assert!(
         http.calls.lock().unwrap().is_empty(),
         "reserved endpoints must never become external HTTP requests"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workbuddy_is_presented_as_a_service_independent_of_the_host_slot() {
+    use crate::provider_catalog::{CatalogService, ProviderKind};
+    let h = harness().await;
+    let mut plugin = h.store.plugin("fixture").unwrap();
+    plugin.package = crate::provider_catalog::presets::WORKBUDDY.package.into();
+    h.store.register(plugin).unwrap();
+    h.store
+        .create_account(
+            "fixture",
+            "workbuddy-ai",
+            "Alice",
+            json!({"type":"api","key":"synthetic"}),
+        )
+        .unwrap();
+    let service = CatalogService::new(
+        h.f.path.join("manager"),
+        std::sync::Arc::new(crate::http::FakeHttp::new()),
+        std::sync::Arc::new(|_| Err("unused".into())),
+    )
+    .with_plugin_root(h.store.root.clone());
+    let plan = service.load(&crate::config::AppConfig::default()).unwrap();
+    assert_eq!(plan.catalog.providers.len(), 1);
+    let provider = &plan.catalog.providers[0];
+    assert_eq!(provider.kind, ProviderKind::SubscriptionService);
+    assert_eq!(provider.kind.label(), "订阅服务");
+    assert_eq!(provider.name, "WorkBuddy 国际版 · Alice");
+    assert_eq!(provider.usage.sources[0].label, "WorkBuddy 额度");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_actions_are_explicit_serialized_isolated_and_do_not_block_inference_preparation() {
+    let h = harness().await;
+    let providers = h
+        .runtime
+        .call(json!({"operation":"providers","plugin":"fixture"}))
+        .await
+        .unwrap();
+    assert_eq!(providers[0]["capabilities"]["checkin"], true);
+    assert_eq!(providers[1]["capabilities"]["checkin"], false);
+    let account = |uid: &str| {
+        h.store.create_account("fixture","fixture",uid,json!({"type":"oauth","uid":uid,"access":format!("fresh-{uid}"),"expires":chrono::Utc::now().timestamp_millis()+3600000})).unwrap()
+    };
+    let a = account("action-a");
+    let b = account("action-b");
+    let preview = h
+        .runtime
+        .call(json!({"operation":"action","action":"checkin","phase":"preview","account":a.id}))
+        .await
+        .unwrap();
+    assert_eq!(preview["outcome"], "ready");
+    let first = h.runtime.clone();
+    let id = a.id.clone();
+    let first = tokio::spawn(async move {
+        first
+            .call(json!({"operation":"action","action":"checkin","phase":"execute","account":id}))
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let usage = h
+        .runtime
+        .call(json!({"operation":"usage","account":a.id}))
+        .await
+        .unwrap();
+    assert!(usage["windows"].is_array());
+    assert!(
+        !first.is_finished(),
+        "a slow action must not hold the inference credential coordinator"
+    );
+    let second = h
+        .runtime
+        .call(json!({"operation":"action","action":"checkin","phase":"execute","account":a.id}))
+        .await
+        .unwrap();
+    let first = first.await.unwrap();
+    assert_eq!(first["outcome"], "claimed");
+    assert_eq!(second["outcome"], "done");
+    assert!(!first.to_string().contains("private-fixture-sentinel"));
+    let other = h
+        .runtime
+        .call(json!({"operation":"action","action":"checkin","phase":"execute","account":b.id}))
+        .await
+        .unwrap();
+    assert_eq!(other["outcome"], "claimed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn known_workbuddy_checkin_is_discovered_locally_only_for_china() {
+    let h = harness().await;
+    let mut plugin = h.store.plugin("fixture").unwrap();
+    plugin.package = crate::provider_catalog::presets::WORKBUDDY.package.into();
+    h.store.register(plugin).unwrap();
+    for provider in ["workbuddy", "workbuddy-ai"] {
+        h.store
+            .create_account(
+                "fixture",
+                provider,
+                provider,
+                json!({"type":"api","key":"synthetic"}),
+            )
+            .unwrap();
+    }
+    let http = std::sync::Arc::new(crate::http::FakeHttp::new());
+    let service = crate::provider_catalog::CatalogService::new(
+        h.f.path.join("manager"),
+        http.clone(),
+        std::sync::Arc::new(|_| Err("unused".into())),
+    )
+    .with_plugin_root(h.store.root.clone());
+    let plan = service.load(&crate::config::AppConfig::default()).unwrap();
+    assert_eq!(plan.catalog.providers.len(), 2);
+    for provider in &plan.catalog.providers {
+        assert_eq!(
+            provider.operations.len(),
+            usize::from(provider.name.contains("国内版"))
+        );
+        if let Some(operation) = provider.operations.first() {
+            assert!(operation.0.automatic_status());
+        }
+    }
+    assert!(http.calls.lock().unwrap().is_empty());
 }

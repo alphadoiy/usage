@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 mod codex;
+mod reference;
 pub(crate) mod runtime;
 mod service;
 mod store;
@@ -17,14 +18,14 @@ pub(crate) use service::FingerprintService;
 #[cfg(test)]
 mod tests;
 const MODEL: &str = "gpt-6.1-sol";
-const INTERVAL: i64 = 3600;
+const INTERVAL: i64 = 5 * 3600;
 const RETAIN: usize = 168;
 #[derive(Debug, Subcommand)]
 pub enum FingerprintCommand {
     /// 采集 3 条官方订阅样本并本地评分；固定 gpt-6.1-sol / low
     Run {
         profile: String,
-        /// 一小时内已尝试过则跳过；供定时任务使用
+        /// 5 小时内已尝试过则跳过；供定时任务使用
         #[arg(long)]
         due: bool,
         #[arg(long)]
@@ -38,14 +39,16 @@ pub enum FingerprintCommand {
         #[arg(long)]
         json: bool,
     },
-    /// 启用 Usage 应用内每小时测试；退出 Usage 后停止
+    /// 启用 Usage 应用内每 5 小时测试；退出 Usage 后停止
     Enable {
         profile: String,
         #[arg(long)]
         fpd: Option<PathBuf>,
     },
-    /// 停止每小时任务，保留已有测试结果
+    /// 停止每 5 小时任务，保留已有测试结果
     Disable { profile: String },
+    /// 从已保存的离线报告修复旧版摘要，不重新采样
+    Repair { profile: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +75,12 @@ impl std::fmt::Display for ReportStatus {
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Scoring {
+    pub rounds: usize,
+    pub ranked_rounds: usize,
+    pub complete_rounds: usize,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Report {
     pub(crate) model: String,
     pub(crate) channel: String,
@@ -80,8 +89,14 @@ pub(crate) struct Report {
     pub(crate) status: ReportStatus,
     pub(crate) directory: PathBuf,
     pub(crate) accepted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scoring: Option<Scoring>,
     pub(crate) reference_contains_model: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reference_label: Option<String>,
     pub(crate) closest_candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confidence: Option<f64>,
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) http_status: Option<u16>,
@@ -94,6 +109,7 @@ pub(crate) struct Snapshot {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    pub blocked_reason: Option<String>,
     pub latest: Option<Report>,
     pub history: Vec<Report>,
     pub warnings: Vec<String>,
@@ -126,7 +142,14 @@ fn print_report(report: &Report, json: bool) -> Result<()> {
             report.directory.display()
         );
         if let Some(candidate) = &report.closest_candidate {
-            println!("参考库最近候选：{candidate}");
+            if let Some(confidence) = report.confidence {
+                println!(
+                    "最接近：{candidate} · 库内置信度 {:.2}%",
+                    confidence * 100.0
+                );
+            } else {
+                println!("参考库最近候选：{candidate} · 置信度不可用");
+            }
         }
     }
     Ok(())
@@ -155,7 +178,7 @@ pub async fn dispatch(command: FingerprintCommand) -> Result<i32> {
                     if json {
                         println!("{{\"status\":\"skipped\"}}");
                     } else {
-                        println!("已有测试运行中，或距离上次尝试不足一小时，已跳过。");
+                        println!("已有测试运行中，或距离上次尝试不足 5 小时，已跳过。");
                     }
                     Ok(0)
                 }
@@ -176,7 +199,7 @@ pub async fn dispatch(command: FingerprintCommand) -> Result<i32> {
                     println!(
                         "定时任务：{}",
                         if snapshot.enabled {
-                            "已启用 · 仅 Usage 打开期间每小时测试"
+                            "已启用 · 仅 Usage 打开期间每 5 小时测试"
                         } else {
                             "未启用"
                         }
@@ -184,17 +207,31 @@ pub async fn dispatch(command: FingerprintCommand) -> Result<i32> {
                     for warning in snapshot.warnings {
                         println!("提示：{warning}");
                     }
+                    if let Some(reason) = snapshot.blocked_reason {
+                        println!("测试已暂停：{reason}");
+                    }
                 }
                 Ok(0)
             }
             FingerprintCommand::Enable { profile, fpd } => {
                 let name = service.enable(&profile, fpd.as_deref())?;
-                println!("已启用：{name} · {MODEL} · Usage 打开期间每小时测试，退出后停止。");
+                if let Some(reason) = service.status(&profile)?.blocked_reason {
+                    println!("已保存调度配置：{name}；{reason}");
+                } else {
+                    println!(
+                        "已启用：{name} · {MODEL} · Usage 打开期间每 5 小时测试，退出后停止。"
+                    );
+                }
                 Ok(0)
             }
             FingerprintCommand::Disable { profile } => {
                 service.disable(&profile)?;
                 println!("已停用应用内定时测试；历史结果保留。");
+                Ok(0)
+            }
+            FingerprintCommand::Repair { profile } => {
+                let count = service.repair(&profile)?;
+                println!("已离线修复 {count} 份摘要；原始评分和样本保留，未重新采样。");
                 Ok(0)
             }
         }

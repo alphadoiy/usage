@@ -2,12 +2,101 @@ use super::*;
 use crate::auth::*;
 use std::{sync::Arc, time::Duration};
 
+/// Expected failures cross the local API as codes, never arbitrary plugin prose.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum LoginFailure {
+    DesktopEncrypted,
+    DesktopNotSignedIn,
+    TimedOut,
+    #[serde(other)]
+    Failed,
+}
+impl LoginFailure {
+    pub fn from_result(result: &Value) -> Self {
+        let message = result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if message.contains("desktop") && message.contains("encrypted") {
+            Self::DesktopEncrypted
+        } else if message.contains("desktop isn't signed in") {
+            Self::DesktopNotSignedIn
+        } else if message.contains("sign-in timed out") {
+            Self::TimedOut
+        } else {
+            Self::Failed
+        }
+    }
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::DesktopEncrypted => {
+                "桌面登录凭据已加密，插件无法导入；请选择 account (browser) 浏览器登录。"
+            }
+            Self::DesktopNotSignedIn => {
+                "桌面端尚未登录；请先登录桌面端，或选择 account (browser) 浏览器登录。"
+            }
+            Self::TimedOut => "浏览器授权已超时，请重新发起登录。",
+            Self::Failed => "插件登录失败，请更换登录方式或重试。",
+        }
+    }
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::DesktopEncrypted => "desktop_encrypted",
+            Self::DesktopNotSignedIn => "desktop_not_signed_in",
+            Self::TimedOut => "timed_out",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn authorization_url(start: &Value) -> Result<Option<reqwest::Url>> {
+    let method = start["method"].as_str().ok_or("插件未返回授权方式")?;
+    if !matches!(method, "auto" | "code") {
+        return Err("插件授权方式不受支持".into());
+    }
+    let url = match start.get("url") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(url)) => url.trim(),
+        _ => return Err("插件登录地址格式无效".into()),
+    };
+    if url.is_empty() {
+        // Local/desktop automatic callbacks do not open a browser. WorkBuddy's
+        // desktop method explicitly returns an empty URL under this contract.
+        return if method == "auto" {
+            Ok(None)
+        } else {
+            Err("验证码登录缺少登录地址".into())
+        };
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| "插件登录地址无效")?;
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && parsed.host_str() == Some("localhost"))
+    {
+        return Err("插件登录地址不安全".into());
+    }
+    Ok(Some(parsed))
+}
+
 struct Adapter {
     context: AuthContext,
     plugin: String,
     provider: String,
     service: String,
     methods: Vec<AuthMethod>,
+}
+pub fn adapter(plugin: &str, provider: &str, descriptors: &Value) -> Result<Arc<dyn AuthAdapter>> {
+    let mut registry = builtin_registry();
+    register(&mut registry, plugin, descriptors)?;
+    registry
+        .create(
+            &format!("plugin:{plugin}:{provider}"),
+            AuthContext {
+                root: store::root(),
+                account: None,
+            },
+        )
+        .map_err(|e| e.to_string())
 }
 impl AuthAdapter for Adapter {
     fn service(&self) -> &str {
@@ -119,29 +208,48 @@ pub(super) async fn login(
     finish["session"] = session.clone();
     let operation = async {
         if start["ready"] != true {
-            let url = start["url"].as_str().ok_or("插件未返回登录地址")?;
-            let parsed = reqwest::Url::parse(url).map_err(|_| "插件登录地址无效")?;
-            if parsed.scheme() != "https"
-                && !(parsed.scheme() == "http" && parsed.host_str() == Some("localhost"))
-            {
-                return Err("插件登录地址不安全".into());
-            }
+            let url = authorization_url(&start).inspect_err(|_| {
+                tracing::warn!(
+                    event = "plugin_login_rejected",
+                    plugin_id = plugin,
+                    backend = provider,
+                    method_id = method,
+                    reason = "invalid_authorization_response"
+                );
+            })?;
+            tracing::info!(
+                event = "plugin_login_started",
+                plugin_id = plugin,
+                backend = provider,
+                method_id = method,
+                flow = if url.is_none() {
+                    "local"
+                } else if start["method"] == "code" {
+                    "code"
+                } else {
+                    "browser"
+                }
+            );
             println!(
                 "{}",
                 start["instructions"]
                     .as_str()
                     .unwrap_or("请在浏览器完成登录")
             );
-            #[cfg(target_os = "macos")]
-            {
-                if open_browser {
-                    let _ = std::process::Command::new("open").arg(url).status();
-                } else {
-                    println!("{url}");
+            if let Some(url) = &url {
+                #[cfg(target_os = "macos")]
+                {
+                    if open_browser {
+                        let _ = std::process::Command::new("open")
+                            .arg(url.as_str())
+                            .status();
+                    } else {
+                        println!("{url}");
+                    }
                 }
+                #[cfg(not(target_os = "macos"))]
+                println!("{url}");
             }
-            #[cfg(not(target_os = "macos"))]
-            println!("{url}");
             control.waiting().map_err(|e| e.to_string())?;
             finish["operation"] = "login.finish".into();
             if start["method"] == "code" {
@@ -171,6 +279,37 @@ pub(super) async fn login(
         },
         _=async {loop {tokio::time::sleep(Duration::from_millis(50)).await;if control.checkpoint().is_err(){break;}}}=>{
             base["operation"]="login.cancel".into();base["session"]=session;let _=call(base).await;Err("插件登录已取消".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn only_automatic_callbacks_can_skip_the_browser_url() {
+        for value in [json!({"method":"auto","url":""}), json!({"method":"auto"})] {
+            assert_eq!(authorization_url(&value).unwrap(), None);
+        }
+        assert!(authorization_url(&json!({"method":"code","url":""})).is_err());
+        assert!(authorization_url(&json!({"method":"unknown","url":""})).is_err());
+        for method in ["auto", "code"] {
+            for url in [
+                "invalid-url",
+                "file:///tmp/login",
+                "javascript:alert(1)",
+                "http://example.test/login",
+            ] {
+                assert!(authorization_url(&json!({"method":method,"url":url})).is_err());
+            }
+            for url in ["https://example.test/login", "http://localhost:1234/login"] {
+                assert!(
+                    authorization_url(&json!({"method":method,"url":url}))
+                        .unwrap()
+                        .is_some()
+                );
+            }
         }
     }
 }

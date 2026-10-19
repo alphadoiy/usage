@@ -394,7 +394,9 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 {
                     let span = tracing::Span::current();
                     tokio::task::spawn_blocking(move || {
-                        span.in_scope(|| crate::ui::run_codex_with_config(handle, cli.config))
+                        span.in_scope(|| {
+                            crate::ui::run_provider_manager_with_config(handle, cli.config)
+                        })
                     })
                 }
                 .await

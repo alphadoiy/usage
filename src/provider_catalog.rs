@@ -1,5 +1,6 @@
 //! Provider inventory with independent model, quota and balance capabilities.
 mod codex;
+pub mod presets;
 mod usage;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub enum ProviderKind {
     OfficialApi,
     CompatibleApi,
     Subscription,
+    SubscriptionService,
     Plugin,
 }
 impl ProviderKind {
@@ -29,7 +31,8 @@ impl ProviderKind {
             Self::OfficialApi => "官方 API · BYOK",
             Self::CompatibleApi => "兼容 API · BYOK",
             Self::Subscription => "官方订阅 · OAuth",
-            Self::Plugin => "插件提供方",
+            Self::SubscriptionService => "订阅服务",
+            Self::Plugin => "扩展服务",
         }
     }
 }
@@ -50,6 +53,7 @@ pub struct Provider {
     pub configured_model: Option<String>,
     pub models: Models,
     pub usage: ProviderUsage,
+    pub operations: Vec<crate::provider_actions::OperationHandle>,
     pub performance: Option<crate::performance::Binding>,
 }
 
@@ -412,8 +416,13 @@ impl CatalogService {
                         }),
                     }
                 };
-                let provider_kind = if plugin_account.is_some() {
-                    ProviderKind::Plugin
+                let provider_kind = if let Some(account_id) = &plugin_account {
+                    plugin_accounts
+                        .iter()
+                        .find(|a| &a.id == account_id)
+                        .and_then(|a| plugins.get(&a.plugin))
+                        .and_then(|p| presets::for_package(&p.package))
+                        .map_or(ProviderKind::Plugin, |preset| preset.kind)
                 } else if profile.auth_mode == AuthMode::Oauth {
                     ProviderKind::Subscription
                 } else {
@@ -426,6 +435,7 @@ impl CatalogService {
                     kind: provider_kind,
                     configured_model: Some(profile.model.clone()),
                     models,
+                    operations: Vec::new(),
                     usage: ProviderUsage::default(),
                     performance: manager.performance_binding(&profile, profile.revision).ok(),
                 });
@@ -438,6 +448,7 @@ impl CatalogService {
                 continue;
             };
             let endpoint = crate::plugins::account_endpoint(&account.id);
+            let preset = presets::for_package(&plugin.package);
             let existing = plugin_bindings.remove(&account.id).unwrap_or_default();
             let descriptor = descriptors.entry(plugin.id.clone()).or_insert_with(|| {
                 crate::plugins::store::read::<serde_json::Value>(
@@ -464,11 +475,15 @@ impl CatalogService {
                 let id = format!("plugin:{}", account.id);
                 plan.catalog.providers.push(Provider {
                     id: id.clone(),
-                    name: account.name.clone(),
+                    name: preset.map_or_else(
+                        || account.name.clone(),
+                        |p| p.account_name(&account.provider, &account.name),
+                    ),
                     agent: None,
-                    kind: ProviderKind::Plugin,
+                    kind: preset.map_or(ProviderKind::Plugin, |p| p.kind),
                     configured_model: None,
                     models: Models::Loading,
+                    operations: Vec::new(),
                     usage: ProviderUsage::default(),
                     performance: None,
                 });
@@ -500,9 +515,31 @@ impl CatalogService {
                             plugin.entry.display()
                         ),
                     );
-                    usage::attach_reader(&mut plan, &id, "插件订阅".into(), reader);
+                    let label =
+                        preset.map_or_else(|| "账号额度".into(), |p| format!("{} 额度", p.name));
+                    usage::attach_reader(&mut plan, &id, label, reader);
                 } else if let Some(p) = plan.catalog.providers.iter_mut().find(|p| p.id == id) {
-                    p.usage.hint = Some("此插件未提供用量查询".into());
+                    p.usage.hint = Some("此服务暂未提供用量查询".into());
+                }
+                if let Some(checkin) = crate::plugins::capabilities::checkin(
+                    &plugin.package,
+                    &account.provider,
+                    descriptor.as_ref(),
+                ) && let Some(provider) = plan.catalog.providers.iter_mut().find(|p| p.id == id)
+                {
+                    provider.operations.push(
+                        crate::provider_actions::registry()
+                            .create(
+                                "plugin_checkin",
+                                crate::provider_actions::Context {
+                                    root: self.plugins.root.clone(),
+                                    account: account.id.clone(),
+                                    automatic_status: checkin.automatic_status,
+                                    day_offset_seconds: checkin.day_offset_seconds,
+                                },
+                            )
+                            .expect("discovered plugin account operation"),
+                    );
                 }
                 plan.queries.push(query);
             }
@@ -566,6 +603,7 @@ impl CatalogService {
                 kind: kind(&inference.base_url),
                 configured_model: None,
                 models,
+                operations: Vec::new(),
                 usage: ProviderUsage::default(),
                 performance,
             });

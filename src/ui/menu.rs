@@ -10,7 +10,8 @@ pub(super) enum Action {
     Home,
     History,
     Sessions,
-    Codex,
+    Providers,
+    AddProvider,
     Quit,
 }
 
@@ -20,7 +21,8 @@ impl Action {
             Self::Home => "F1  运行与资源首页",
             Self::History => "F2  Token 历史",
             Self::Sessions => "F3  会话浏览",
-            Self::Codex => "F4  Codex 账号管理",
+            Self::Providers => "F4  Provider 管理",
+            Self::AddProvider => "添加 Provider",
             Self::Quit => "    退出 usage",
         }
     }
@@ -30,7 +32,8 @@ impl Action {
             Self::Home => "查看托管 Agent 运行、共享余额与费用，以及官方订阅额度",
             Self::History => "查看本地 Token 贡献图、项目和模型统计",
             Self::Sessions => "浏览项目会话，并在终端或分屏中恢复",
-            Self::Codex => "保存 BYOK/OAuth 账号、导入或同步 CC Switch、多账号多开",
+            Self::Providers => "管理 BYOK、OAuth 与 WorkBuddy，配置 Agent、导入或同步 CC Switch",
+            Self::AddProvider => "添加 BYOK、ChatGPT OAuth、WorkBuddy，或导入已有账号",
             Self::Quit => "关闭面板，返回终端",
         }
     }
@@ -54,7 +57,7 @@ impl Menu {
             Action::Home,
             Action::History,
             Action::Sessions,
-            Action::Codex,
+            Action::Providers,
             Action::Quit,
         ];
         let selected = actions.iter().position(|a| *a == current).unwrap_or(0);
@@ -84,13 +87,14 @@ impl Menu {
             KeyCode::F(1) | KeyCode::Char('1') => self.activate(Action::Home),
             KeyCode::F(2) | KeyCode::Char('2') => self.activate(Action::History),
             KeyCode::F(3) | KeyCode::Char('3') => self.activate(Action::Sessions),
-            KeyCode::F(4) | KeyCode::Char('4') => self.activate(Action::Codex),
+            KeyCode::F(4) | KeyCode::Char('4') => self.activate(Action::Providers),
+            KeyCode::F(5) | KeyCode::Char('5') => self.activate(Action::AddProvider),
             _ => Command::Stay,
         }
     }
 
     fn activate(&self, action: Action) -> Command {
-        if self.actions.contains(&action) {
+        if action == Action::AddProvider || self.actions.contains(&action) {
             Command::Activate(action)
         } else {
             Command::Stay
@@ -157,11 +161,17 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(menu.key(KeyCode::Down), Command::Stay);
         }
-        assert_eq!(menu.key(KeyCode::Enter), Command::Activate(Action::Codex));
-        assert_eq!(menu.key(KeyCode::F(4)), Command::Activate(Action::Codex));
+        assert_eq!(
+            menu.key(KeyCode::Enter),
+            Command::Activate(Action::Providers)
+        );
+        assert_eq!(
+            menu.key(KeyCode::F(4)),
+            Command::Activate(Action::Providers)
+        );
         assert_eq!(
             menu.key(KeyCode::Char('4')),
-            Command::Activate(Action::Codex)
+            Command::Activate(Action::Providers)
         );
         assert_eq!(menu.key(KeyCode::Esc), Command::Dismiss);
     }
@@ -182,8 +192,25 @@ mod tests {
     }
 
     #[test]
+    fn add_is_a_shortcut_under_provider_management_not_a_duplicate_menu_item() {
+        let mut menu = Menu::new(Action::Home);
+        assert!(!menu.actions.contains(&Action::AddProvider));
+        assert_eq!(
+            menu.actions
+                .iter()
+                .filter(|&&a| a == Action::Providers)
+                .count(),
+            1
+        );
+        assert_eq!(
+            menu.key(KeyCode::F(5)),
+            Command::Activate(Action::AddProvider)
+        );
+    }
+
+    #[test]
     fn account_management_is_visible_on_wide_and_narrow_menus() {
-        let menu = Menu::new(Action::Codex);
+        let menu = Menu::new(Action::Providers);
         for width in [32, 80] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
             terminal.draw(|frame| menu.render(frame)).unwrap();
@@ -196,7 +223,7 @@ mod tests {
                 .collect();
             let compact = text.split_whitespace().collect::<String>();
             assert!(compact.contains("功能菜单"), "{text}");
-            assert!(compact.contains("Codex账号管理"), "{text}");
+            assert!(compact.contains("Provider管理"), "{text}");
             assert!(compact.contains("BYOK"), "{text}");
             assert!(compact.contains("Switch"), "{text}");
         }

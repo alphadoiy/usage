@@ -104,6 +104,126 @@ impl Store {
     pub fn latest(&self, id: &str) -> Result<Option<Report>> {
         read_report(&self.account_dir(id).join("latest.json"))
     }
+    pub fn repair(&self, id: &str, fpd: Option<&Path>) -> Result<usize> {
+        let base = self.account_dir(id);
+        private_dir(&base)?;
+        let lock_path = base.join("run.lock");
+        super::super::private_create(&lock_path, b"")?;
+        let lock = fs::File::open(lock_path)?;
+        lock.try_lock_exclusive()
+            .map_err(|_| Error::message("该账号正在测试，请结束后再修复摘要"))?;
+        let runs = base.join("runs");
+        let mut paths = Vec::new();
+        if runs.is_dir() {
+            for entry in fs::read_dir(&runs)?.take(1000) {
+                let entry = entry?;
+                if entry.file_type()?.is_dir()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+                {
+                    paths.push(entry.path().join("report.json"));
+                }
+            }
+        }
+        paths.push(base.join("latest.json"));
+        let mut repaired = 0;
+        for path in paths {
+            let Some(report) = read_report(&path)? else {
+                continue;
+            };
+            let false_failure = report.status == ReportStatus::Failed
+                && report.message == "本轮有效样本不足，无法评分；原始记录已保留";
+            let false_missing_reference = matches!(
+                report.status,
+                ReportStatus::Completed | ReportStatus::Partial
+            ) && !report.reference_contains_model;
+            let split_rounds = report.status == ReportStatus::Partial
+                && report.accepted == 3
+                && report
+                    .scoring
+                    .as_ref()
+                    .is_some_and(|s| s.rounds > 1 && s.complete_rounds == 0);
+            if (!false_failure && !false_missing_reference && !split_rounds)
+                || report.http_status.is_some()
+                || report.directory.parent() != Some(runs.as_path())
+                || !report
+                    .directory
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+                || (path != base.join("latest.json")
+                    && path.parent() != Some(report.directory.as_path()))
+            {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            let detection = report.directory.join("detection.json");
+            let Ok(file) = fs::File::open(detection) else {
+                continue;
+            };
+            file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let mut corrected = report.clone();
+            let rescored = if split_rounds {
+                fpd.and_then(|fpd| {
+                    codex::score_saved(
+                        &report.directory,
+                        fpd,
+                        "detection-round.json",
+                        &std::sync::atomic::AtomicBool::new(false),
+                    )
+                    .ok()
+                })
+            } else {
+                None
+            };
+            if codex::summarize(&mut corrected, rescored.as_ref().unwrap_or(&value)).is_err() {
+                continue;
+            }
+            if (!false_failure && !corrected.reference_contains_model && rescored.is_none())
+                || corrected == report
+            {
+                continue;
+            }
+            let backup = path.with_file_name(format!(
+                "{}.before-{}-fix.json",
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("report"),
+                if rescored.is_some() {
+                    "round"
+                } else if false_failure {
+                    "multiround"
+                } else {
+                    "reference"
+                }
+            ));
+            if !backup.exists() {
+                private_write(&backup, &fs::read(&path)?)?;
+            }
+            save(&path, &corrected)?;
+            repaired += 1;
+        }
+        if repaired > 0 {
+            self.history
+                .lock()
+                .expect("fingerprint history cache")
+                .remove(id);
+            // Directory changes invalidate history caches in other running Usage processes.
+            save(
+                &runs.join(".summary-repair.json"),
+                &serde_json::json!({"repaired_files":repaired,"at":chrono::Utc::now().timestamp()}),
+            )?;
+        }
+        Ok(repaired)
+    }
     pub fn snapshot(&self, profile: &super::super::Profile) -> Option<Snapshot> {
         let base = self.account_dir(&profile.id);
         if !base.is_dir() {
@@ -124,7 +244,8 @@ impl Store {
                 None
             }
         };
-        // Run reports are immutable. A run directory or latest report change
+        // Evidence is immutable; explicit summary repairs update the run directory.
+        // A run directory or latest report change
         // invalidates the cache; idle UI refreshes don't decode all history again.
         let version = (stamp(&base.join("latest.json")), stamp(&base.join("runs")));
         let mut cache = self.history.lock().expect("fingerprint history cache");
@@ -171,6 +292,7 @@ impl Store {
             id: profile.id.clone(),
             name: profile.name.clone(),
             enabled: settings.is_some(),
+            blocked_reason: None,
             latest,
             history: cached.reports.clone(),
             warnings,

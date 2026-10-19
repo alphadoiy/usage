@@ -1,5 +1,6 @@
 // Synthetic provider contract fixture. No vendor credentials or external network.
 let refreshAttempts = 0;
+const checked = new Set();
 const make =
   (id) =>
   async ({ client }) => ({
@@ -28,6 +29,17 @@ const make =
     },
     auth: {
       provider: id,
+      checkinStatus: id === "fixture" ? async (getAuth) => {
+        const auth = await getAuth();
+        return {outcome:checked.has(auth.uid)?"done":"ready"};
+      } : undefined,
+      checkin: id === "fixture" ? async (getAuth) => {
+        const auth = await getAuth();
+        await new Promise((ok) => setTimeout(ok, 200));
+        if (checked.has(auth.uid)) return {outcome:"done"};
+        checked.add(auth.uid);
+        return {outcome:"claimed",credit:10,streak:1,message:"private-fixture-sentinel"};
+      } : undefined,
       refreshLead: 300000,
       refresh: async (a) => {
         refreshAttempts++;
@@ -63,6 +75,21 @@ const make =
           authorize: async (inputs) => ({ type: "success", key: inputs.key }),
         },
         { type: "api", label: "Raw API key" },
+        {
+          type: "oauth",
+          label: "Synthetic desktop sign-in",
+          authorize: async (inputs) => ({
+            url: inputs?.url ?? "",
+            instructions: "Uses the synthetic desktop account.",
+            method: "auto",
+            callback: async () => inputs?.error
+              ? { type: "failed", error: inputs.error }
+              : {
+                  type: "success", source: "desktop", refresh: "", access: "", expires: 0,
+                  accountId: "fixture-desktop", uid: "fixture-desktop",
+                },
+          }),
+        },
       ],
       loader: async (getAuth) => ({
         baseURL: "http://127.0.0.1:1/v1",

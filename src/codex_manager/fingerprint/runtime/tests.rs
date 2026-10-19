@@ -7,7 +7,7 @@ async fn closing_app_cancels_and_reaps_active_sampler_and_preserves_reports() {
     let mut manager = f.manager();
     let source = oauth_source(&f, "schedule-fixture", "synthetic-refresh");
     let p = manager.import_oauth(None, None, &source, None).unwrap();
-    let fake = f.path.join("fpd");
+    let fake = super::super::tests::test_fpd(&f.path);
     fs::write(&fake, "#!/usr/bin/env python3\nimport os,pathlib,time\npathlib.Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))\nwhile True: time.sleep(0.01)\n").unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
     let service = Arc::new(FingerprintService::new(manager.root().to_owned()));
@@ -93,7 +93,7 @@ async fn corrupt_account_and_hung_sampler_do_not_block_healthy_accounts() {
                 .unwrap(),
         );
     }
-    let fake = f.path.join("fpd");
+    let fake = super::super::tests::test_fpd(&f.path);
     let script = r#"#!/usr/bin/env python3
 import json,os,pathlib,sys,time
 args=sys.argv[1:]
@@ -101,7 +101,8 @@ if 'SLOW_ACCOUNT' in os.environ['CODEX_HOME']:
     pathlib.Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
     while True: time.sleep(0.01)
 if args[0]=='sample':
-    p=pathlib.Path(args[args.index('--output-dir')+1]);p.mkdir();(p/'result.json').write_text('{}')
+    p=pathlib.Path(args[args.index('--output-dir')+1]);p.mkdir()
+    (p/'result.json').write_text((pathlib.Path(__file__).parents[2]/'collection-fixture.json').read_text())
     print('{}')
 else:
     print(json.dumps({'schema':'fpd-detection-v1','analysis':{'used_outputs':3,'results':[{'model':'gpt-6-sol'}]}}))

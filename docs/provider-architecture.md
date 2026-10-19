@@ -113,3 +113,11 @@ Codex 适配器继续委托官方 CLI 完成授权和令牌刷新，复用 Manag
 认证桥接根据能力快照注册 `AuthRegistry` 工厂；插件方法采用动态文本并复用 `AuthTask` 的保存边界。资源桥接使用 `ResourceRegistry` 的 `plugin_account` 工厂，首页模型查询独立执行并按包版本、配置 revision 和账号缓存。`RouteAuth::Plugin` 引用插件账号，Agent 只获得本次路由的能力令牌。Rust credential broker 统一保存 opaque auth，按账号串行刷新并用 generation 拒绝过期写入。
 
 原生 HTTP 转发和插件 fetch 共用运行租约、观测及索引。Responses 到 Chat 的转换独立于服务商插件；不支持的协议或工具明确失败。明确绑定的插件恢复通过临时 CLI 配置固定传输，原资源身份仍保持未解析。构造工厂不加载 JS、不读凭据或请求网络；能力发现和插件调用发生在后台服务边界。
+
+## 统一 Provider 管理
+
+F4 的 Provider 管理承接已有账号的操作；首页和管理页的 `a`、F5 共用 `ui::provider_setup` 添加弹窗，功能菜单不单列添加页。BYOK、OAuth 和文件/CC Switch 导入位于 `provider_setup::native`，服务商插件复用统一认证接口，管理 UI 不参与接入流程的状态机。
+
+界面合并不改变凭据和 Agent 配置的数据边界：插件账号继续存入插件账号库，Codex 配置保留模型、推理强度与账号引用。编辑插件绑定只显示名称、模型和推理强度，保留共享账号及其推理凭据。OAuth 提供原地重新登录；当前插件认证仅创建独立账号，其管理项不显示原地重新登录操作。
+
+Provider 操作的确认转换由 `ui::confirmation` 统一管理，重置和签到保留各自业务报告与异步结果生命周期。内置插件动作由 `plugins::capabilities` 投影到账号操作工厂，Rust/JS 共用能力清单，Catalog 只装配操作，不判断具体服务商的签到规则。

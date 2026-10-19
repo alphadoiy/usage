@@ -5,12 +5,14 @@ use std::sync::atomic::AtomicBool;
 pub(crate) struct FingerprintService {
     pub(super) root: PathBuf,
     pub(super) store: store::Store,
+    reference: reference::ReferenceBank,
 }
 impl FingerprintService {
     pub fn new(root: PathBuf) -> Self {
         Self {
             store: store::Store::new(root.clone()),
             root,
+            reference: Default::default(),
         }
     }
     pub fn from_environment() -> Self {
@@ -47,11 +49,24 @@ impl FingerprintService {
         let manager = Manager::open_read_only(self.root.clone())?
             .ok_or_else(|| Error::message("账号库不存在"))?;
         let profile = account(&manager, selector)?;
-        Ok(self.store.snapshot(&profile).unwrap_or(Snapshot {
+        Ok(self.snapshot(&profile).unwrap_or(Snapshot {
             id: profile.id,
             name: profile.name,
             ..Default::default()
         }))
+    }
+    pub fn repair(&self, selector: &str) -> Result<usize> {
+        let manager = Manager::open_read_only(self.root.clone())?
+            .ok_or_else(|| Error::message("账号库不存在"))?;
+        let profile = account(&manager, selector)?;
+        let configured = self
+            .store
+            .settings(&profile.id)
+            .ok()
+            .flatten()
+            .map(|s| s.fpd);
+        let fpd = codex::resolve_fpd(&manager, configured.as_deref()).ok();
+        self.store.repair(&profile.id, fpd.as_deref())
     }
     pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
         let Some(manager) = Manager::open_read_only(self.root.clone())? else {
@@ -63,8 +78,20 @@ impl FingerprintService {
         Ok(profiles
             .iter()
             .filter(|p| p.auth_mode == AuthMode::Oauth)
-            .filter_map(|p| self.store.snapshot(p))
+            .filter_map(|p| self.snapshot(p))
             .collect())
+    }
+    fn snapshot(&self, profile: &super::super::Profile) -> Option<Snapshot> {
+        let mut snapshot = self.store.snapshot(profile)?;
+        let fpd = self
+            .store
+            .settings(&profile.id)
+            .ok()
+            .flatten()
+            .map(|s| s.fpd)
+            .unwrap_or_else(|| update::default_fpd(&self.root));
+        snapshot.blocked_reason = self.reference.reason(&fpd);
+        Some(snapshot)
     }
     pub(super) async fn check_updates(&self, http: &dyn crate::http::HttpClient) {
         let configured = self.jobs().unwrap_or_default().iter().any(|id| {
@@ -109,6 +136,9 @@ impl FingerprintService {
         let Some(settings) = self.store.settings(id)? else {
             return Ok(None);
         };
+        if self.reference.reason(&settings.fpd).is_some() {
+            return Ok(None);
+        }
         self.run(id, true, Some(&settings.fpd), cancel)
     }
     fn run_with_manager(
@@ -124,6 +154,16 @@ impl FingerprintService {
             return Ok(None);
         }
         let profile = account(manager, selector)?;
+        let fpd = codex::resolve_fpd(manager, fpd)?;
+        if let Some(reason) = self.reference.reason(&fpd) {
+            tracing::info!(
+                event = "fingerprint_skipped",
+                provider_id = profile.id,
+                model = MODEL,
+                reason
+            );
+            return Err(Error::message(reason));
+        }
         let base = self.store.account_dir(&profile.id);
         private_dir(&base)?;
         let lock_path = base.join("run.lock");
@@ -140,7 +180,6 @@ impl FingerprintService {
         {
             return Ok(None);
         }
-        let fpd = codex::resolve_fpd(manager, fpd)?;
         private_dir(&base.join("runs"))?;
         let path = base.join("runs").join(uuid::Uuid::new_v4().to_string());
         private_dir(&path)?;
@@ -154,9 +193,12 @@ impl FingerprintService {
             status: ReportStatus::Running,
             directory: path.clone(),
             accepted: 0,
+            scoring: None,
             reference_contains_model: false,
+            reference_label: None,
             closest_candidate: None,
-            message: "正在采集；若进程意外退出，下次定时任务至少间隔一小时再尝试。".into(),
+            confidence: None,
+            message: "正在采集；若进程意外退出，下次定时任务至少间隔 5 小时再尝试。".into(),
         };
         store::save(&latest, &report)?;
         tracing::info!(
@@ -189,8 +231,12 @@ impl FingerprintService {
             model = MODEL,
             status = %report.status,
             accepted = report.accepted,
+            scoring_rounds = report.scoring.as_ref().map(|s| s.rounds),
+            ranked_rounds = report.scoring.as_ref().map(|s| s.ranked_rounds),
+            complete_rounds = report.scoring.as_ref().map(|s| s.complete_rounds),
             reference_contains_model = report.reference_contains_model,
             closest_candidate = report.closest_candidate,
+            confidence = report.confidence,
             http_status = report.http_status,
             quota_resets_at = report.quota_resets_at
         );

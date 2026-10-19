@@ -87,6 +87,92 @@ impl Drop for Fixture {
     }
 }
 #[test]
+fn local_automatic_login_accepts_no_url_and_invalid_browser_urls_cannot_save_accounts() {
+    let f = Fixture::new();
+    f.run(&[
+        "plugins",
+        "add",
+        "fixture",
+        f.path.join("fixture.mjs").to_str().unwrap(),
+        "--runtime",
+        "node",
+    ]);
+    let invalid = f
+        .command(&[
+            "plugins",
+            "login",
+            "fixture",
+            "fixture",
+            "--method",
+            "3",
+            "--input",
+            "url=invalid-url",
+        ])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("插件登录地址无效"));
+    assert!(
+        f.json(&["plugins", "accounts"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let encrypted = f
+        .command(&[
+            "plugins",
+            "login",
+            "fixture",
+            "fixture",
+            "--method",
+            "3",
+            "--input",
+            "error=Desktop keeps its sign-in encrypted; private-echo-do-not-display",
+        ])
+        .output()
+        .unwrap();
+    assert!(!encrypted.status.success());
+    let error = String::from_utf8_lossy(&encrypted.stderr);
+    assert!(error.contains("桌面登录凭据已加密"));
+    assert!(error.contains("account (browser)"));
+    assert!(!error.contains("HTTP 502"));
+    assert!(!error.contains("private-echo"));
+    assert!(
+        f.json(&["plugins", "accounts"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Leave browser opening enabled: a local callback must never call `open`.
+    f.run(&["plugins", "login", "fixture", "fixture", "--method", "3"]);
+    let accounts = f.json(&["plugins", "accounts"]);
+    assert_eq!(accounts.as_array().unwrap().len(), 1);
+    assert_eq!(accounts[0]["name"], "fixture-desktop");
+    let credential: Value = serde_json::from_slice(
+        &fs::read(
+            f.path
+                .join("plugins/accounts")
+                .join(format!("{}.json", accounts[0]["id"].as_str().unwrap())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(credential["auth"]["source"], "desktop");
+    assert_eq!(credential["auth"]["type"], "oauth");
+    assert_eq!(credential["auth"]["access"], "");
+    let logs = fs::read_dir(f.path.join("logs"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .collect::<String>();
+    assert!(logs.contains("plugin_login_rejected"));
+    assert!(logs.contains("\"flow\":\"local\""));
+    assert!(!logs.contains("invalid-url"));
+    assert!(logs.contains("plugin_auth_failed"));
+    assert!(logs.contains("desktop_encrypted"));
+    assert!(!logs.contains("private-echo"));
+}
+#[test]
 fn plugin_login_bind_managed_inference_and_metric_source_are_connected() {
     let f = Fixture::new();
     f.run(&[
@@ -171,4 +257,126 @@ fn plugin_login_bind_managed_inference_and_metric_source_are_connected() {
     assert!(!logs.contains("fresh-cli-user"));
     let profiles = f.json(&["codex", "list", "--json"]);
     assert!(profiles.to_string().contains("usage-plugin.invalid"));
+}
+
+#[test]
+fn explicit_checkin_cli_previews_without_claiming_and_repeats_are_account_scoped() {
+    let f = Fixture::new();
+    f.run(&[
+        "plugins",
+        "add",
+        "fixture",
+        f.path.join("fixture.mjs").to_str().unwrap(),
+        "--runtime",
+        "node",
+    ]);
+    f.run(&[
+        "plugins",
+        "login",
+        "fixture",
+        "fixture",
+        "--method",
+        "0",
+        "--input",
+        "uid=checkin-user",
+        "--no-browser",
+    ]);
+    let accounts = f.json(&["plugins", "accounts"]);
+    let id = accounts[0]["id"].as_str().unwrap();
+    assert_eq!(f.json(&["plugins", "checkin", id])["outcome"], "ready");
+    assert_eq!(f.json(&["plugins", "checkin", id])["outcome"], "ready");
+    let claimed = f.json(&["plugins", "checkin", id, "--confirm"]);
+    assert_eq!(claimed["outcome"], "claimed");
+    assert_eq!(claimed["credit"], 10);
+    assert!(!claimed.to_string().contains("private-fixture-sentinel"));
+    assert_eq!(
+        f.json(&["plugins", "checkin", id, "--confirm"])["outcome"],
+        "done"
+    );
+}
+
+#[test]
+fn checkin_reuses_health_capabilities_and_refuses_old_gateways_before_posting() {
+    use std::sync::{Arc, Mutex};
+    for capability in [None, Some(0), Some(1), Some(2)] {
+        let f = Fixture::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let records = calls.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let app =
+                        axum::Router::new().fallback(move |request: axum::extract::Request| {
+                            let records = records.clone();
+                            async move {
+                                assert_eq!(
+                                    request.headers()["authorization"],
+                                    "Bearer synthetic-control"
+                                );
+                                let path = request.uri().path();
+                                records
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{} {path}", request.method()));
+                                let value = if path == "/_usage/status" {
+                                    let mut value =
+                                        serde_json::json!({"service":"usage-gateway","protocol":9});
+                                    if let Some(version) = capability {
+                                        value["plugin_actions"] = version.into();
+                                    }
+                                    value
+                                } else {
+                                    assert_eq!(path, "/_usage/plugins/call");
+                                    serde_json::json!({"outcome":"done"})
+                                };
+                                axum::Json(value)
+                            }
+                        });
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                        .unwrap();
+                });
+        });
+        let directory = f.path.join("manager/gateway");
+        fs::create_dir_all(&directory).unwrap();
+        let state = directory.join("state.json");
+        fs::write(
+            &state,
+            serde_json::json!({"port":port,"token":"synthetic-control"}).to_string(),
+        )
+        .unwrap();
+        let output = f
+            .command(&["plugins", "checkin", "synthetic-account"])
+            .output()
+            .unwrap();
+        let _ = stop.send(());
+        task.join().unwrap();
+        fs::remove_file(state).unwrap();
+        let mut expected = vec!["GET /_usage/status"];
+        if capability == Some(1) {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["outcome"],
+                "done"
+            );
+            expected.push("POST /_usage/plugins/call");
+        } else {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("网关尚不支持账号操作"));
+        }
+        assert_eq!(*calls.lock().unwrap(), expected);
+    }
 }

@@ -107,11 +107,7 @@ enum AppEvent {
     },
 }
 
-enum ResetStage {
-    Loading,
-    Confirm(ResetPreview),
-    Consuming,
-}
+type ResetStage = super::confirmation::Confirmation<ResetPreview>;
 
 struct ResetFlow {
     provider_id: String,
@@ -216,7 +212,15 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     app.refresh(&handle);
     let result = loop {
         app.maybe_refresh_fingerprint(&handle);
+        let status_started = app.maybe_refresh_operation_status(&handle);
         let (received, reset_consumed) = app.drain_events();
+        if app
+            .provider_action
+            .as_mut()
+            .is_some_and(|panel| panel.take_refresh())
+        {
+            app.refresh_background(&handle);
+        }
         if !app.alerts_queue.is_empty() {
             let alerts = std::mem::take(&mut app.alerts_queue);
             if app.history_config.alerts.bell {
@@ -247,7 +251,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         }
         app.maybe_refresh_home_activity(&handle);
         let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
-        if received || reset_consumed || refresh_started {
+        if received || reset_consumed || refresh_started || status_started {
             redraw.invalidate();
         }
         if redraw.take(Utc::now().timestamp())
@@ -264,6 +268,13 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         break Ok(());
                     }
                     if app.handle_performance_key(key.code, &handle) {
+                        redraw.invalidate();
+                        continue;
+                    }
+                    if let Some(panel) = &mut app.provider_action {
+                        if panel.key(key.code, &handle) {
+                            app.provider_action = None;
+                        }
                         redraw.invalidate();
                         continue;
                     }
@@ -284,9 +295,9 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                 app.browser_filter = None;
                                 app.open_browser(&handle);
                             }
-                            MenuCommand::Activate(MenuAction::Codex) => {
+                            MenuCommand::Activate(MenuAction::Providers) => {
                                 ratatui::restore();
-                                let result = crate::ui::run_codex_with_config(
+                                let result = crate::ui::run_provider_manager_with_config(
                                     handle.clone(),
                                     Some(app.config_path.clone()),
                                 );
@@ -306,6 +317,24 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                         &instance.path,
                                     );
                                 }
+                            }
+                            MenuCommand::Activate(MenuAction::AddProvider) => {
+                                let result = super::provider_setup::run(
+                                    handle.clone(),
+                                    &mut terminal,
+                                    &|frame| draw(frame, &app),
+                                );
+                                app.notice = match result {
+                                    Ok(Some(added)) => {
+                                        if let Some(profile) = added.profile {
+                                            app.home_provider = Some(profile.id);
+                                        }
+                                        Some(added.notice)
+                                    }
+                                    Ok(None) => None,
+                                    Err(error) => Some(error.to_string()),
+                                };
+                                app.refresh_background(&handle);
                             }
                             MenuCommand::Stay | MenuCommand::Dismiss => {}
                         }
@@ -430,6 +459,8 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    subscription_tests: super::subscription_tests::Tests,
+    home_subscription_details: bool,
     fingerprint_service: Arc<crate::codex_manager::fingerprint::FingerprintService>,
     fingerprint_task: Option<tokio::task::JoinHandle<()>>,
     fingerprint_generation: u64,
@@ -497,6 +528,8 @@ struct Dashboard {
     tx: Sender<AppEvent>,
     rx: Receiver<AppEvent>,
     notice: Option<String>,
+    provider_action: Option<super::provider_actions::Panel>,
+    operation_statuses: super::provider_actions::Statuses,
     reset: Option<ResetFlow>,
     reset_generation: u64,
     session_homes: sessions::SessionHomes,
@@ -600,6 +633,8 @@ impl Dashboard {
             })
             .collect();
         Self {
+            subscription_tests: super::subscription_tests::Tests::default(),
+            home_subscription_details: false,
             fingerprint_service: Arc::new(
                 crate::codex_manager::fingerprint::FingerprintService::from_environment(),
             ),
@@ -673,6 +708,8 @@ impl Dashboard {
             tx,
             rx,
             notice: None,
+            provider_action: None,
+            operation_statuses: super::provider_actions::Statuses::default(),
             reset: None,
             reset_generation: 0,
             session_homes,
@@ -718,7 +755,15 @@ impl Dashboard {
             KeyCode::F(1) => Some(MenuCommand::Activate(MenuAction::Home)),
             KeyCode::F(2) => Some(MenuCommand::Activate(MenuAction::History)),
             KeyCode::F(3) => Some(MenuCommand::Activate(MenuAction::Sessions)),
-            KeyCode::F(4) => Some(MenuCommand::Activate(MenuAction::Codex)),
+            KeyCode::F(4) => Some(MenuCommand::Activate(MenuAction::Providers)),
+            KeyCode::F(5) => Some(MenuCommand::Activate(MenuAction::AddProvider)),
+            KeyCode::Char('a')
+                if self.history.is_none()
+                    && self.browser.is_none()
+                    && self.home_focus == super::home::Focus::Providers =>
+            {
+                Some(MenuCommand::Activate(MenuAction::AddProvider))
+            }
             _ => None,
         }
     }
@@ -1121,6 +1166,33 @@ impl Dashboard {
             KeyCode::Char('v') if self.home_focus == HomeFocus::Providers => {
                 self.open_performance(handle)
             }
+            KeyCode::Char('c') if self.home_focus == HomeFocus::Providers => {
+                if let Some((_, provider)) =
+                    super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+                {
+                    if let Some(operation) =
+                        provider.operations.iter().find(|op| op.0.id() == "checkin")
+                    {
+                        self.provider_action = Some(super::provider_actions::Panel::open(
+                            provider.name.clone(),
+                            operation.clone(),
+                            handle,
+                        ));
+                    } else {
+                        self.notice = Some("此 Provider 暂不支持签到".into());
+                    }
+                }
+            }
+            KeyCode::Char('t') if self.home_focus == HomeFocus::Providers => {
+                if super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+                    .is_some_and(|(_, p)| super::subscription_tests::supports(p))
+                {
+                    self.home_subscription_details = !self.home_subscription_details;
+                    self.home_scroll = 0;
+                } else {
+                    self.notice = Some("订阅测试目前仅支持 GPT 官方订阅 Provider".into());
+                }
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.home_focus = self.home_focus.next(key == KeyCode::BackTab)
             }
@@ -1161,6 +1233,12 @@ impl Dashboard {
             }
             KeyCode::Enter if self.home_focus == HomeFocus::Connections => {
                 self.home_connections.open();
+            }
+            KeyCode::Esc
+                if self.home_focus == HomeFocus::Providers && self.home_subscription_details =>
+            {
+                self.home_subscription_details = false;
+                self.home_scroll = 0;
             }
             KeyCode::Esc
                 if self.home_focus == HomeFocus::Connections
@@ -1232,6 +1310,7 @@ impl Dashboard {
         self.home_provider = Some(catalog.providers[next].id.clone());
         self.home_scroll = 0;
         self.home_models_expanded = false;
+        self.home_subscription_details = false;
     }
 
     fn scroll_home(&mut self, delta: i16, (width, height): (u16, u16)) {
@@ -1243,7 +1322,37 @@ impl Dashboard {
             (i32::from(self.home_scroll) + i32::from(delta) * 3).clamp(0, max) as u16;
     }
 
+    fn maybe_refresh_operation_status(&mut self, handle: &Handle) -> bool {
+        if self.history.is_some()
+            || self.browser.is_some()
+            || self.provider_action.is_some()
+            || self.reset.is_some()
+            || self.home_subscription_details
+        {
+            return false;
+        }
+        let Some((_, provider)) =
+            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+        else {
+            return false;
+        };
+        let mut started = false;
+        for operation in &provider.operations {
+            started |= self
+                .operation_statuses
+                .ensure(operation, Utc::now(), handle);
+        }
+        started
+    }
+
     fn refresh(&mut self, handle: &Handle) {
+        if let Some((_, provider)) =
+            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
+        {
+            for operation in &provider.operations {
+                self.operation_statuses.invalidate(operation);
+            }
+        }
         self.refresh_with_models(handle, true);
     }
 
@@ -1631,17 +1740,16 @@ impl Dashboard {
     }
 
     fn handle_reset_key(&mut self, key: KeyCode, handle: &Handle) -> bool {
-        let Some(flow) = self.reset.as_ref() else {
+        let Some(flow) = self.reset.as_mut() else {
             return false;
         };
-        match (&flow.stage, key) {
-            (ResetStage::Loading | ResetStage::Confirm(_), KeyCode::Esc)
-            | (ResetStage::Loading | ResetStage::Confirm(_), KeyCode::Char('n' | 'q')) => {
+        match flow.stage.key(key) {
+            super::confirmation::Decision::Cancel => {
                 self.reset = None;
                 self.reset_generation = self.reset_generation.wrapping_add(1);
             }
-            (ResetStage::Confirm(_), KeyCode::Char('y')) => self.consume_reset(handle),
-            _ => {}
+            super::confirmation::Decision::Execute => self.consume_reset(handle),
+            super::confirmation::Decision::Ignore => {}
         }
         true
     }
@@ -1652,7 +1760,6 @@ impl Dashboard {
         };
         let provider = flow.provider.clone();
         let generation = flow.generation;
-        flow.stage = ResetStage::Consuming;
         let tx = self.tx.clone();
         handle.spawn(async move {
             let result = match provider.reset() {
@@ -1704,14 +1811,21 @@ impl Dashboard {
     }
 
     fn drain_events(&mut self) -> (bool, bool) {
-        let mut changed = false;
+        let mut changed = self
+            .provider_action
+            .as_mut()
+            .is_some_and(|panel| panel.poll());
+        changed |= self.operation_statuses.poll();
+        if let Some(panel) = &mut self.provider_action {
+            panel.update_status(&mut self.operation_statuses);
+        }
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
                 AppEvent::FingerprintLoaded { generation, result } => {
                     if generation == self.fingerprint_generation {
                         self.fingerprint_task = None;
-                        changed |= self.home_connections.set_fingerprints(result);
+                        changed |= self.subscription_tests.set(result);
                     }
                     continue;
                 }
@@ -1861,10 +1975,17 @@ impl Dashboard {
                                 )
                                 .map(|(_, p)| p.id.clone());
                                 if selected != self.home_provider {
+                                    self.home_subscription_details = false;
                                     self.home_scroll = 0;
                                     self.home_models_expanded = false;
                                 }
                                 self.home_provider = selected;
+                                self.operation_statuses.retain(
+                                    snapshot
+                                        .providers
+                                        .iter()
+                                        .flat_map(|p| p.operations.iter().cloned()),
+                                );
                                 self.overview = Some(snapshot);
                                 self.overview_pending = pending;
                                 self.overview_loading = pending > 0;
@@ -2184,11 +2305,11 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         })
     };
     let header_title = if app.history.is_some() {
-        " F10 菜单  F1 首页  [F2 历史]  F3 会话  F4 账号 "
+        " F10 菜单  F1 首页  [F2 历史]  F3 会话  F4 Provider "
     } else if app.browser.is_some() {
-        " F10 菜单  F1 首页  F2 历史  [F3 会话]  F4 账号 "
+        " F10 菜单  F1 首页  F2 历史  [F3 会话]  F4 Provider "
     } else {
-        " F10 菜单  [F1 首页]  F2 历史  F3 会话  F4 账号 "
+        " F10 菜单  [F1 首页]  F2 历史  F3 会话  F4 Provider "
     };
     Paragraph::new(Line::from(vec![header_title.bold(), status.dim()]))
         .style(
@@ -2228,11 +2349,21 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         match app.reset.as_ref().map(|flow| &flow.stage) {
             Some(ResetStage::Loading) => " 正在查询重置次数…   n/Esc 取消",
             Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次   n/Esc 取消",
-            Some(ResetStage::Consuming) => " 正在提交主动重置，请等待结果…",
+            Some(ResetStage::Executing) => " 正在提交主动重置，请等待结果…",
+            Some(ResetStage::Result(_)) => " Enter / Esc 返回",
             None if app.home_sessions.launching => " 正在恢复会话，请等待…",
             None => match app.home_focus {
                 super::home::Focus::Providers => {
-                    " Tab 看板  ←/→ Provider  ↑/↓ 滚动  Enter 模型  v 性能  x 重置  r 刷新  F4 管理  q 退出"
+                    if super::overview::selected(
+                        app.overview.as_ref(),
+                        app.home_provider.as_deref(),
+                    )
+                    .is_some_and(|(_, provider)| super::subscription_tests::supports(provider))
+                    {
+                        " Tab 看板  ←/→ Provider  ↑/↓ 滚动  a 添加  Enter 模型  t 订阅测试  v 性能  x 重置  c 签到  r 刷新  F4 管理  q 退出"
+                    } else {
+                        " Tab 看板  ←/→ Provider  ↑/↓ 滚动  a 添加  Enter 模型  v 性能  x 重置  c 签到  r 刷新  F4 管理  q 退出"
+                    }
                 }
                 super::home::Focus::Connections => {
                     if app.home_connections.is_details() {
@@ -2255,6 +2386,9 @@ fn draw(frame: &mut Frame, app: &Dashboard) {
         )
         .render(footer, frame.buffer_mut());
     draw_reset_modal(frame, app);
+    if let Some(panel) = &app.provider_action {
+        panel.render(frame);
+    }
     if let Some(panel) = &app.performance {
         super::performance::draw(frame, panel);
     }
@@ -2299,7 +2433,8 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
             lines.push("将消耗 1 次，重置当前 5 小时额度。".into());
             lines.push("按 y 确认，按 n 或 Esc 取消".into());
         }
-        ResetStage::Consuming => lines.push("正在提交，请勿重复操作…".into()),
+        ResetStage::Executing => lines.push("正在提交，请勿重复操作…".into()),
+        ResetStage::Result(message) => lines.push(message.clone()),
     }
     Clear.render(modal, frame.buffer_mut());
     let block = Block::bordered()
@@ -2318,6 +2453,13 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
 }
 
 fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
+    if app.home_subscription_details
+        && let Some((_, provider)) =
+            super::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
+        && super::subscription_tests::supports(provider)
+    {
+        return app.subscription_tests.details(provider, width);
+    }
     let summary = super::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
         .and_then(|(_, p)| p.performance.as_ref())
         .and_then(|b| app.home_performance.get(&b.cache_key()));
@@ -2329,6 +2471,10 @@ fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
             app.home_models_expanded,
             app.home_provider.as_deref(),
             summary,
+            super::overview::Extras {
+                subscription_tests: Some(&app.subscription_tests),
+                operation_statuses: Some(&app.operation_statuses),
+            },
         ),
         width,
     )
@@ -2358,11 +2504,7 @@ fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     let inner = home::board(
         connections,
         buf,
-        if app.home_connections.has_fingerprints() {
-            "厂商状态 · 订阅测试"
-        } else {
-            "官方 API · 厂商状态"
-        },
+        "官方 API · 厂商状态",
         app.home_focus == HomeFocus::Connections,
     );
     app.home_connections.render(
@@ -2557,6 +2699,7 @@ mod tests {
             providers: providers
                 .iter()
                 .map(|provider| Provider {
+                    operations: Vec::new(),
                     id: provider.cache_key(),
                     name: provider.display_name().into(),
                     agent: Some("Codex".into()),
@@ -2960,6 +3103,7 @@ mod tests {
                     true,
                     Some("codex"),
                     None,
+                    Default::default(),
                 )
                 .iter()
                 .flat_map(|line| &line.spans)
@@ -3019,6 +3163,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_add_shortcut_is_scoped_to_the_provider_board() {
+        let mut app = reset_dashboard(1, Arc::new(AtomicUsize::new(0)));
+        app.home_focus = super::super::home::Focus::Providers;
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::Char('a')),
+            Some(MenuCommand::Activate(MenuAction::AddProvider))
+        );
+        assert_eq!(
+            app.handle_navigation_key(KeyCode::F(5)),
+            Some(MenuCommand::Activate(MenuAction::AddProvider))
+        );
+        app.home_focus = super::super::home::Focus::Projects;
+        assert_eq!(app.handle_navigation_key(KeyCode::Char('a')), None);
+        app.home_focus = super::super::home::Focus::Providers;
+        app.history = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
+        assert_eq!(app.handle_navigation_key(KeyCode::Char('a')), None);
+    }
+
+    #[test]
     fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
         let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
         assert_eq!(
@@ -3034,12 +3197,12 @@ mod tests {
         }
         assert_eq!(
             app.handle_navigation_key(KeyCode::Enter),
-            Some(MenuCommand::Activate(MenuAction::Codex))
+            Some(MenuCommand::Activate(MenuAction::Providers))
         );
         assert!(app.menu.is_none());
         assert_eq!(
             app.handle_navigation_key(KeyCode::F(4)),
-            Some(MenuCommand::Activate(MenuAction::Codex))
+            Some(MenuCommand::Activate(MenuAction::Providers))
         );
         app.history = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
         assert_eq!(app.handle_navigation_key(KeyCode::Char('m')), None);
@@ -3422,6 +3585,7 @@ mod overview_regression_tests {
     fn overview() -> Catalog {
         Catalog {
             providers: vec![Provider {
+                operations: Vec::new(),
                 id: "hidden-profile-uuid".into(),
                 name: "工作 Provider".into(),
                 agent: Some("Codex".into()),
@@ -3830,6 +3994,7 @@ options={user_id=1}
         catalog.providers[0].models =
             Models::Ready((0..24).map(|n| format!("available-model-{n}")).collect());
         catalog.providers.push(Provider {
+            operations: Vec::new(),
             id: "hidden-oauth-id".into(),
             name: "个人订阅".into(),
             agent: Some("Codex".into()),
@@ -4166,6 +4331,7 @@ mod home_board_tests {
         );
         app.overview = Some(crate::provider_catalog::Catalog {
             providers: vec![crate::provider_catalog::Provider {
+                operations: Vec::new(),
                 id: id.into(),
                 name: "工作账号".into(),
                 agent: Some("Codex".into()),
@@ -4370,6 +4536,7 @@ mod performance_regression_tests {
             providers: [a.clone(), b.clone()]
                 .into_iter()
                 .map(|binding| Provider {
+                    operations: Vec::new(),
                     id: binding.provider.clone(),
                     name: binding.provider.clone(),
                     agent: None,
@@ -4421,8 +4588,9 @@ mod performance_regression_tests {
                 .map(|s| s.content.to_string())
                 .collect::<String>()
         };
-        assert!(text(&app).contains("2.00s（90 样本）"));
-        assert!(text(&app).contains("≥100.0 tok/s（4 样本）"));
+        assert!(text(&app).contains("100 次请求 · 平均首字 2.00s"));
+        assert!(text(&app).contains("速度下限 ≥100.0 tok/s"));
+        assert!(!text(&app).contains("样本）"));
         assert!(text(&app).contains("60.0 tok/s"));
         app.home_provider = Some(b.provider.clone());
         assert!(!text(&app).contains("60.0 tok/s"));
@@ -4669,6 +4837,7 @@ mod performance_regression_tests {
         );
         app.overview = Some(Catalog {
             providers: vec![Provider {
+                operations: Vec::new(),
                 id: "api".into(),
                 name: "API".into(),
                 agent: None,
@@ -4689,13 +4858,46 @@ mod performance_regression_tests {
 #[cfg(test)]
 mod fingerprint_event_tests {
     use super::*;
-    #[test]
-    fn fingerprint_updates_follow_dashboard_generation_and_isolate_read_errors() {
+    use crate::codex_manager::fingerprint::Snapshot;
+    use crate::provider_catalog::{Catalog, Models, Provider, ProviderKind};
+
+    fn provider(id: &str, kind: ProviderKind) -> Provider {
+        Provider {
+            operations: Vec::new(),
+            id: id.into(),
+            name: "Same display name".into(),
+            agent: Some("Codex".into()),
+            kind,
+            configured_model: None,
+            models: Models::Ready(Vec::new()),
+            usage: Default::default(),
+            performance: None,
+        }
+    }
+    fn text(app: &Dashboard) -> String {
+        home_lines(app, 100)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn fingerprint_events_and_provider_switches_keep_account_identity() {
         let mut app = Dashboard::new(
             Vec::new(),
-            AppConfig::default(),
+            isolated_config(),
             PathBuf::from("/tmp/config.toml"),
         );
+        app.overview = Some(Catalog {
+            providers: vec![
+                provider("account-a", ProviderKind::Subscription),
+                provider("account-b", ProviderKind::Subscription),
+                provider("workbuddy", ProviderKind::SubscriptionService),
+            ],
+            ..Default::default()
+        });
+        app.home_provider = Some("account-a".into());
         app.fingerprint_generation = 2;
         app.tx
             .send(AppEvent::FingerprintLoaded {
@@ -4704,22 +4906,38 @@ mod fingerprint_event_tests {
             })
             .unwrap();
         assert!(!app.drain_events().0);
-        assert!(!app.home_connections.has_fingerprints());
         app.tx
             .send(AppEvent::FingerprintLoaded {
                 generation: 2,
-                result: Err("current read failure".into()),
+                result: Ok(vec![
+                    Snapshot {
+                        id: "account-a".into(),
+                        warnings: vec!["A-only warning".into()],
+                        ..Default::default()
+                    },
+                    Snapshot {
+                        id: "account-b".into(),
+                        warnings: vec!["B-only warning".into()],
+                        ..Default::default()
+                    },
+                ]),
             })
             .unwrap();
         assert!(app.drain_events().0);
-        assert!(app.home_connections.has_fingerprints());
-        app.tx
-            .send(AppEvent::FingerprintLoaded {
-                generation: 2,
-                result: Ok(Vec::new()),
-            })
-            .unwrap();
-        assert!(app.drain_events().0);
-        assert!(!app.home_connections.has_fingerprints());
+        assert!(text(&app).contains("订阅测试"));
+        app.handle_home_key(KeyCode::Char('t'), &Handle::current(), (100, 32));
+        assert!(text(&app).contains("A-only warning"));
+        assert!(!text(&app).contains("B-only warning"));
+        app.handle_home_key(KeyCode::Right, &Handle::current(), (100, 32));
+        assert!(!app.home_subscription_details);
+        app.handle_home_key(KeyCode::Char('t'), &Handle::current(), (100, 32));
+        assert!(text(&app).contains("B-only warning"));
+        assert!(!text(&app).contains("A-only warning"));
+        app.handle_home_key(KeyCode::Esc, &Handle::current(), (100, 32));
+        assert!(!app.home_subscription_details);
+        app.handle_home_key(KeyCode::Right, &Handle::current(), (100, 32));
+        assert!(!text(&app).contains("订阅测试"));
+        app.handle_home_key(KeyCode::Char('t'), &Handle::current(), (100, 32));
+        assert!(!app.home_subscription_details);
     }
 }

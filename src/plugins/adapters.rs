@@ -43,7 +43,7 @@ impl Reader {
         match result {
             Ok(v) if v["signIn"] == "expired" => {
                 snapshot.state = ResourceState::AuthenticationFailed;
-                snapshot.message = Some("插件账号登录已过期，请重新登录".into());
+                snapshot.message = Some("账号登录已过期，请重新登录".into());
             }
             Ok(v) if v["error"].as_str().is_none() => {
                 if let Some(windows) = v["windows"].as_array() {
@@ -87,7 +87,7 @@ impl Reader {
             }
             _ => {
                 snapshot.state = ResourceState::TransientFailure;
-                snapshot.message = Some("插件用量不可用；未知额度不会显示为零".into());
+                snapshot.message = Some("用量查询暂不可用；未知额度不会显示为零".into());
             }
         }
         snapshot

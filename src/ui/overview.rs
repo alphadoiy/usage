@@ -27,6 +27,12 @@ pub(super) fn selected<'a>(
         .map(|provider| (index, provider))
 }
 
+#[derive(Default)]
+pub(super) struct Extras<'a> {
+    pub subscription_tests: Option<&'a super::subscription_tests::Tests>,
+    pub operation_statuses: Option<&'a super::provider_actions::Statuses>,
+}
+
 pub(super) fn lines(
     catalog: Option<&Catalog>,
     loading: bool,
@@ -34,6 +40,7 @@ pub(super) fn lines(
     expanded: bool,
     selected_id: Option<&str>,
     performance: Option<&super::performance::CachedSummary>,
+    extras: Extras<'_>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(error) = error {
@@ -54,7 +61,7 @@ pub(super) fn lines(
         .dim(),
     );
     if catalog.providers.is_empty() {
-        lines.push(Line::from("尚无 Provider · F4 添加账号").dim());
+        lines.push(Line::from("尚无 Provider · a 添加服务商 · F4 添加账号").dim());
     }
     if let Some((_, provider)) = selected(Some(catalog), selected_id) {
         lines.push(Line::from(""));
@@ -68,6 +75,18 @@ pub(super) fn lines(
             lines.extend(super::performance::summary_lines(performance));
         }
         lines.extend(usage_lines(&provider.usage, expanded));
+        for operation in &provider.operations {
+            if operation.0.id() == "checkin" {
+                let text = extras.operation_statuses.map_or_else(
+                    || "签到：c 手动操作".into(),
+                    |statuses| statuses.summary(operation, chrono::Utc::now()),
+                );
+                lines.push(Line::from(text).dim());
+            }
+        }
+        if let Some(tests) = extras.subscription_tests {
+            lines.extend(tests.summary(provider));
+        }
         if provider.usage.reset.is_some() && !provider.usage.sources.iter().any(|source| {
             matches!(&source.state, QueryState::Result(snapshot) if snapshot.metrics.iter().any(|metric|
                 matches!(metric, ResourceMetric::ResetCredits { .. })))
@@ -192,14 +211,17 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                         } => format!(
                             "{} · 已用 {} · {}",
                             unit,
-                            used.as_deref().unwrap_or("未知"),
+                            allowance_amount(used.as_deref(), unit),
                             if *unlimited {
                                 match remaining {
-                                    Some(value) => format!("剩余 {value} · 令牌不限额"),
+                                    Some(value) => format!(
+                                        "剩余 {} · 令牌不限额",
+                                        allowance_amount(Some(value), unit)
+                                    ),
                                     None => "额度不限量（非账号余额）".into(),
                                 }
                             } else {
-                                format!("剩余 {}", remaining.as_deref().unwrap_or("未知"))
+                                format!("剩余 {}", allowance_amount(remaining.as_deref(), unit))
                             }
                         ),
                         ResourceMetric::QuotaWindow {
@@ -278,6 +300,39 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
     lines
 }
 
+/// Credits are counts, not currency. Match Magpie's presentation without changing stored values.
+fn allowance_amount(value: Option<&str>, unit: &str) -> String {
+    let Some(value) = value else {
+        return "未知".into();
+    };
+    if unit != "credits" {
+        return value.into();
+    }
+    let Ok(amount) = value.parse::<rust_decimal::Decimal>() else {
+        return "未知".into();
+    };
+    let rounded = amount
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+        .normalize()
+        .to_string();
+    let (whole, fraction) = rounded.split_once('.').unwrap_or((&rounded, ""));
+    let (sign, digits) = whole
+        .strip_prefix('-')
+        .map_or(("", whole), |digits| ("-", digits));
+    let mut out = String::from(sign);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if !fraction.is_empty() {
+        out.push('.');
+        out.push_str(fraction);
+    }
+    out
+}
+
 /// Hard-wrap styled lines once so viewport scrolling is by terminal rows, including CJK.
 pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width.max(2));
@@ -305,4 +360,28 @@ pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> 
         output.push(Line::from(row).style(line.style));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credit_display_rounds_only_for_presentation_and_keeps_unknown_values_unknown() {
+        for (raw, shown) in [
+            ("2675.16999969", "2,675.17"),
+            ("4624.83000031", "4,624.83"),
+            ("7300.0000", "7,300"),
+            ("0", "0"),
+            ("1.005", "1.01"),
+            ("-1234.505", "-1,234.51"),
+            ("999.999", "1,000"),
+            ("0.000001", "0"),
+        ] {
+            assert_eq!(allowance_amount(Some(raw), "credits"), shown);
+            assert_eq!(allowance_amount(Some(raw), "tokens"), raw);
+        }
+        assert_eq!(allowance_amount(None, "credits"), "未知");
+        assert_eq!(allowance_amount(Some("invalid"), "credits"), "未知");
+    }
 }

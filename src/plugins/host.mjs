@@ -4,7 +4,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
 import { Readable } from "node:stream";
 import { translateRequest, translateResponse } from "./protocol.mjs";
-const [entry, broker, token] = process.argv.slice(2);
+import { supportsCheckin, supportsCheckinStatus, accountAction } from "./actions.mjs";
+const [entry, broker, token, packageName] = process.argv.slice(2);
 const scope = new AsyncLocalStorage();
 const pending = new Map();
 const activeLogins = new Map();
@@ -159,6 +160,8 @@ function descriptor(id, h) {
       usage: typeof h.auth.usage === "function",
       refresh: typeof h.auth.refresh === "function",
       fetch: typeof h.auth.loader === "function",
+      checkin: supportsCheckin(packageName, h, p),
+      checkin_status: supportsCheckinStatus(packageName, h, p),
     },
     compatibility: "opencode-provider-v1+magpie-provider-extensions",
     runtime: globalThis.Bun ? "bun" : "node",
@@ -256,6 +259,11 @@ async function rpc(x, signal) {
     return { ready: true };
   }
   if (x.operation === "models") return models(h, p);
+  if (x.operation === "action") {
+    if (x.action !== "checkin" || !["preview", "execute"].includes(x.phase) || !supportsCheckin(packageName, h, p)) fail("operation_unsupported");
+    try { return await accountAction({ packageName, hooks: h, provider: p, getAuth, phase: x.phase, signal }); }
+    catch { return { outcome: "failed", reason: "request_failed" }; }
+  }
   if (x.operation === "usage") {
     if (!h.auth.usage) fail("usage_unsupported");
     return h.auth.usage(getAuth, p);
