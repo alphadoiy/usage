@@ -26,8 +26,8 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
       USAGE_LOG: "off"
-      USAGE_CODEX_DIR: ${{ runner.temp }}/usage-release-test
-      USAGE_PLUGIN_DIR: ${{ runner.temp }}/usage-release-plugins
+      USAGE_CODEX_DIR: /tmp/usage-release-test
+      USAGE_PLUGIN_DIR: /tmp/usage-release-plugins
     steps:
       - uses: actions/checkout@v4
       - name: Check version tag
