@@ -146,8 +146,12 @@ if sys.argv[1:]==['--help']:
 base=None
 for i,arg in enumerate(sys.argv):
     if arg=='-c' and sys.argv[i+1].split('=',1)[0].endswith('.base_url'):
+        key=sys.argv[i+1].split('=',1)[0]
+        # Codex splits override keys on dots without TOML quoting.
+        assert all(part.replace('_','').replace('-','').isalnum() for part in key.split('.')), key
         base=json.loads(sys.argv[i+1].split('=',1)[1])
 direct=os.environ.get('FIXTURE_EXPECT_DIRECT')=='1'
+assert 'CODEX_SQLITE_HOME' not in os.environ, 'managed Home inherited a shared state directory'
 if direct:
     import re
     assert base is None, 'fallback retained a gateway override'
@@ -193,6 +197,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .env("FIXTURE_ROOT", &self.path)
+            .env("CODEX_SQLITE_HOME", self.path.join("shared-state"))
             .current_dir(&self.path);
         c
     }
@@ -496,6 +501,64 @@ fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch(
         assert!(logs.contains("gateway_fallback"));
         assert!(!logs.contains("synthetic-key"));
     }
+}
+
+#[test]
+fn unaddressable_provider_id_fails_launch_instead_of_connecting_directly() {
+    let f = Fixture::new();
+    let upstream = Upstream::new();
+    let config = f.path.join("dotted.toml");
+    fs::write(
+        &config,
+        format!(
+            "model = \"requested-model\"\nmodel_provider = \"my.relay\"\n\n[model_providers.\"my.relay\"]\nname = \"Relay\"\nbase_url = \"http://127.0.0.1:{}/relay/v1\"\n",
+            upstream.port
+        ),
+    )
+    .unwrap();
+    let mut child = f
+        .command(&[
+            "codex",
+            "add",
+            "dotted",
+            "--config",
+            config.to_str().unwrap(),
+            "--key-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"synthetic-key\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = f
+        .start_expect(
+            "dotted",
+            "123e4567-e89b-12d3-a456-426614174009",
+            "json",
+            true,
+        )
+        .wait()
+        .unwrap();
+    assert!(!status.success());
+    let stderr = fs::read_to_string(f.path.join("dotted.stderr")).unwrap();
+    assert!(stderr.contains("启动失败"), "{stderr}");
+    assert!(
+        !f.path.join("dotted.ready").exists(),
+        "Codex must not start directly"
+    );
+    assert!(upstream.calls.lock().unwrap().is_empty());
 }
 
 #[test]

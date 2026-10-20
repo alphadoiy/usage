@@ -121,3 +121,7 @@ F4 的 Provider 管理承接已有账号的操作；首页和管理页的 `a`、
 界面合并不改变凭据和 Agent 配置的数据边界：插件账号继续存入插件账号库，Codex 配置保留模型、推理强度与账号引用。编辑插件绑定只显示名称、模型和推理强度，保留共享账号及其推理凭据。OAuth 提供原地重新登录；当前插件认证仅创建独立账号，其管理项不显示原地重新登录操作。
 
 Provider 操作的确认转换由 `ui::confirmation` 统一管理，重置和签到保留各自业务报告与异步结果生命周期。内置插件动作由 `plugins::capabilities` 投影到账号操作工厂，Rust/JS 共用能力清单，Catalog 只装配操作，不判断具体服务商的签到规则。
+
+Agent 配置表单的模型与推理强度使用选项列表，可筛选，也可输入自定义值。模型选项来自 `CatalogService::models`：已保存的 Provider 与首页共用同一套查询构造（托管账号经 Manager，插件账号经同一插件查询），只读取当前 Provider 的凭据；新 BYOK 按表单中的端点和密钥查询。推理强度的取值属于 Codex 配置语义，由 `codex_manager::config::REASONING_EFFORTS` 提供，UI 只负责展示文案。
+
+管理页启动前先选择项目目录。项目由 `projects` 模块管理：`projects.sqlite3` 只保存用户意图（手动添加、置顶、移出与从 Usage 启动的时间），会话派生的目录在读取时由 `projects::catalog` 合并，不写入项目库；项目库不参与 Run 归属。首页项目看板、管理页的项目选择与 `usage projects` 共用这一合并规则，会话目录通过调用方注入的 `SessionRegistry` 与 `SessionHomes` 读取；`SessionHomes::from_config` 统一解析默认目录与数据实例。启动终端只承载 Agent 输出：启动前的 CC Switch 同步结果写入日志，由管理页和 `usage codex sync` 展示。网关以 `-c model_providers.<id>.base_url` 注入，参数名的构造规则在 `launcher::provider_override` 中维护；Codex 不解析带引号的 TOML 键，无法以裸键引用的 provider ID 直接启动失败，不回退为不经观测的直连。

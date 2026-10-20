@@ -1749,3 +1749,30 @@ fn byok_hook_review_state_survives_relaunch_without_allowing_new_definitions() {
         assert!(!config::matches_runtime_config(&invalid, &saved));
     }
 }
+
+#[test]
+fn gateway_overrides_address_providers_with_bare_keys_only() {
+    assert_eq!(
+        super::launcher::provider_override("usage_byok", "base_url").as_deref(),
+        Some("model_providers.usage_byok.base_url")
+    );
+    assert!(super::launcher::provider_override("my.provider", "base_url").is_none());
+    assert!(super::launcher::provider_override("\"quoted\"", "base_url").is_none());
+    assert!(super::launcher::provider_override("", "base_url").is_none());
+}
+
+#[test]
+fn official_login_skips_do_not_need_attention_at_launch() {
+    let mut report = SyncReport::default();
+    report
+        .skipped
+        .push(("OpenAI Official".into(), ccswitch::MISSING_API_KEY.into()));
+    assert!(!report.needs_attention());
+    report
+        .skipped
+        .push(("Proxy".into(), "供应商 JSON 无法解析".into()));
+    assert!(report.needs_attention());
+    let mut report = SyncReport::default();
+    report.missing.push("Removed".into());
+    assert!(report.needs_attention());
+}

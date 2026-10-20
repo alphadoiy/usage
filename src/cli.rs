@@ -56,6 +56,11 @@ enum Command {
         #[command(subcommand)]
         command: crate::plugins::PluginCommand,
     },
+    /// 项目目录：手动添加、置顶或移出，并合并本机会话所在目录
+    Projects {
+        #[command(subcommand)]
+        command: crate::projects::ProjectCommand,
+    },
     /// 本地 HTTP/SSE 请求观测网关
     Gateway {
         #[command(subcommand)]
@@ -201,6 +206,7 @@ pub async fn run() -> i32 {
     let command = match &cli.command {
         Some(Command::Plugins { .. }) => "plugins",
         Some(Command::Gateway { .. }) => "gateway",
+        Some(Command::Projects { .. }) => "projects",
         Some(Command::Resources { .. }) => "resources",
         Some(Command::Status { .. }) => "status",
         Some(Command::Codex {
@@ -264,6 +270,16 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     match cli.command {
         Some(Command::Plugins { command }) => {
             crate::plugins::dispatch(command).await.map_err(CliError)
+        }
+        Some(Command::Projects { command }) => {
+            let config = cli.config.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::projects::execute(command, config.as_deref())
+            })
+            .await
+            .map_err(|_| CliError("项目命令中断".into()))?
+            .map_err(CliError)?;
+            Ok(0)
         }
         Some(Command::Gateway { command }) => {
             crate::gateway::execute(command).await.map_err(CliError)?;
@@ -395,7 +411,22 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                     let span = tracing::Span::current();
                     tokio::task::spawn_blocking(move || {
                         span.in_scope(|| {
-                            crate::ui::run_provider_manager_with_config(handle, cli.config)
+                            let path = cli
+                                .config
+                                .clone()
+                                .unwrap_or_else(crate::config::default_config_path);
+                            let homes = crate::config::load_config(&path, cli.config.is_some())
+                                .map(|config| crate::sessions::SessionHomes::from_config(&config))
+                                .unwrap_or_default();
+                            crate::ui::run_provider_manager_with_config(
+                                handle,
+                                cli.config,
+                                crate::ui::ProjectSessions::Scan(
+                                    crate::sessions::builtin_registry(),
+                                    homes,
+                                ),
+                                None,
+                            )
                         })
                     })
                 }

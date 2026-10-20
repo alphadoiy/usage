@@ -89,6 +89,16 @@ pub(super) fn validate_run_args(args: &[String], mode: AuthMode) -> Result<()> {
     Ok(())
 }
 
+/// Codex splits `-c` keys on dots without TOML quoting, so a quoted segment would name a new,
+/// incomplete provider. Only bare-key provider IDs can be addressed by a dotted override.
+pub(super) fn provider_override(provider: &str, field: &str) -> Option<String> {
+    (!provider.is_empty()
+        && provider
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then(|| format!("model_providers.{provider}.{field}"))
+}
+
 fn oauth_args_error() -> Error {
     Error::message(
         "OAuth 托管启动不能覆盖 profile / -c 或运行认证服务命令；请通过账号编辑配置、通过登录功能重新认证",

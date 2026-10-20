@@ -401,7 +401,7 @@ impl CatalogService {
                     if available_accounts.contains(account.as_str()) {
                         Models::Loading
                     } else {
-                        Models::Unavailable("插件账号不可用或插件已停用".into())
+                        unavailable_plugin()
                     }
                 } else {
                     match manager.model_catalog_query(&profile) {
@@ -409,11 +409,7 @@ impl CatalogService {
                             plan.queries.push(query);
                             Models::Loading
                         }
-                        Err(_) => Models::Unavailable(if profile.auth_mode == AuthMode::Oauth {
-                            "无法读取此 OAuth 账号的模型查询凭据，请重新登录".into()
-                        } else {
-                            "无法读取此 Provider 的模型查询凭据".into()
-                        }),
+                        Err(_) => unreadable_query(&profile),
                     }
                 };
                 let provider_kind = if let Some(account_id) = &plugin_account {
@@ -447,7 +443,6 @@ impl CatalogService {
             let Some(plugin) = plugins.get(&account.plugin) else {
                 continue;
             };
-            let endpoint = crate::plugins::account_endpoint(&account.id);
             let preset = presets::for_package(&plugin.package);
             let existing = plugin_bindings.remove(&account.id).unwrap_or_default();
             let descriptor = descriptors.entry(plugin.id.clone()).or_insert_with(|| {
@@ -492,18 +487,7 @@ impl CatalogService {
                 existing
             };
             for id in ids {
-                let query = ModelQuery {
-                    id: id.clone(),
-                    url: reqwest::Url::parse(&endpoint).expect("plugin endpoint"),
-                    key: format!(
-                        "{}:{}:{}:{}",
-                        plugin.id, plugin.version, plugin.revision, account.id
-                    ),
-                    protocol: Protocol::Plugin {
-                        root: self.plugins.root.clone(),
-                        account: account.id.clone(),
-                    },
-                };
+                let query = self.plugin_query(id.clone(), plugin, &account.id);
                 if supports_usage {
                     let reader = crate::plugins::adapters::resource(
                         &self.plugins.root,
@@ -615,6 +599,92 @@ impl CatalogService {
             .map(|query| (query.id.clone(), query.cache_key()))
             .collect();
         Ok(plan)
+    }
+}
+
+fn unreadable_query(profile: &crate::codex_manager::Profile) -> Models {
+    Models::Unavailable(if profile.auth_mode == AuthMode::Oauth {
+        "无法读取此 OAuth 账号的模型查询凭据，请重新登录".into()
+    } else {
+        "无法读取此 Provider 的模型查询凭据".into()
+    })
+}
+fn unavailable_plugin() -> Models {
+    Models::Unavailable("插件账号不可用或插件已停用".into())
+}
+
+/// Where an Agent form lists models: a saved Provider, or an endpoint typed into the form.
+pub enum ModelSource {
+    Saved(String),
+    Endpoint { base: String, key: String },
+}
+
+impl CatalogService {
+    /// Cached by package version, plugin revision and account, so a plugin update refetches.
+    fn plugin_query(
+        &self,
+        id: String,
+        plugin: &crate::plugins::store::Plugin,
+        account: &str,
+    ) -> ModelQuery {
+        ModelQuery {
+            id,
+            url: reqwest::Url::parse(&crate::plugins::account_endpoint(account))
+                .expect("plugin endpoint"),
+            key: format!(
+                "{}:{}:{}:{}",
+                plugin.id, plugin.version, plugin.revision, account
+            ),
+            protocol: Protocol::Plugin {
+                root: self.plugins.root.clone(),
+                account: account.into(),
+            },
+        }
+    }
+
+    /// The query the home board makes for one Provider, outside a full refresh.
+    pub async fn models(self: Arc<Self>, source: ModelSource) -> Models {
+        let http = self.http.clone();
+        let query = tokio::task::spawn_blocking(move || match source {
+            ModelSource::Endpoint { base, key } => ModelQuery::new("form".into(), &base, key)
+                .map_err(|e| Models::Unavailable(e.into())),
+            // Only this Provider's credentials are read, through the same construction as `load`.
+            ModelSource::Saved(id) => {
+                let manager = Manager::open_read_only(self.root.clone())
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| Models::Unavailable("读取 Provider 账号库失败".into()))?;
+                let profile = manager
+                    .list()
+                    .ok()
+                    .and_then(|profiles| profiles.into_iter().find(|p| p.id == id))
+                    .ok_or_else(|| Models::Unavailable("Provider 不存在".into()))?;
+                match crate::plugins::endpoint_account(&profile.base_url) {
+                    Some(account) => self
+                        .plugins
+                        .account(&account)
+                        .ok()
+                        .and_then(|a| {
+                            self.plugins
+                                .plugins()
+                                .ok()?
+                                .into_iter()
+                                .find(|p| p.enabled && p.id == a.plugin)
+                        })
+                        .map(|plugin| self.plugin_query(profile.id.clone(), &plugin, &account))
+                        .ok_or_else(unavailable_plugin),
+                    None => manager
+                        .model_catalog_query(&profile)
+                        .map_err(|_| unreadable_query(&profile)),
+                }
+            }
+        })
+        .await;
+        match query {
+            Ok(Ok(query)) => query.read(http.as_ref()).await,
+            Ok(Err(models)) => models,
+            Err(_) => Models::Unavailable("模型列表查询任务中断".into()),
+        }
     }
 }
 
@@ -968,6 +1038,73 @@ mod tests {
             );
         }
         assert!(!format!("{:?}", plan.catalog).contains("synthetic-"));
+    }
+
+    #[tokio::test]
+    async fn single_provider_models_match_the_board_query_for_saved_and_typed_endpoints() {
+        struct KeyHttp;
+        #[async_trait]
+        impl HttpClient for KeyHttp {
+            async fn request(
+                &self,
+                _method: &str,
+                url: &str,
+                headers: &[(&str, String)],
+                _body: Option<Vec<u8>>,
+            ) -> Result<HttpResponse, TransportError> {
+                let model = match (url, headers[0].1.as_str()) {
+                    ("https://relay.invalid/v1/models", "Bearer synthetic-a") => "model-for-a",
+                    ("https://typed.invalid/v1/models", "Bearer typed-key") => "typed-model",
+                    other => panic!("unexpected fixture request: {other:?}"),
+                };
+                response(200, &json!({"data":[{"id":model}]}).to_string())
+            }
+        }
+        let f = Fixture::new();
+        let mut manager = Manager::open(f.0.clone()).unwrap();
+        let text = crate::codex_manager::config::new_config(
+            "https://relay.invalid/v1",
+            "configured-only",
+            None,
+        )
+        .unwrap();
+        let a = manager.add("A", &text, "synthetic-a").unwrap();
+        let plugin_text = crate::codex_manager::config::new_config(
+            &crate::plugins::account_endpoint(&uuid::Uuid::new_v4().to_string()),
+            "model",
+            None,
+        )
+        .unwrap();
+        let orphan = manager.add("Plugin", &plugin_text, "inference").unwrap();
+        let service = Arc::new(
+            CatalogService::new(
+                f.0.clone(),
+                Arc::new(KeyHttp),
+                Arc::new(|_| panic!("unexpected env lookup")),
+            )
+            .with_plugin_root(f.0.join("plugins")),
+        );
+        let models = |source| service.clone().models(source);
+        assert_eq!(
+            models(ModelSource::Saved(a.id)).await,
+            Models::Ready(vec!["model-for-a".into()])
+        );
+        assert_eq!(
+            models(ModelSource::Endpoint {
+                base: "https://typed.invalid/v1".into(),
+                key: "typed-key".into(),
+            })
+            .await,
+            Models::Ready(vec!["typed-model".into()])
+        );
+        assert_eq!(
+            models(ModelSource::Saved(orphan.id)).await,
+            unavailable_plugin()
+        );
+        assert!(matches!(
+            models(ModelSource::Saved("missing".into())).await,
+            Models::Unavailable(_)
+        ));
     }
 
     #[tokio::test]

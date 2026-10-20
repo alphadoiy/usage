@@ -104,9 +104,7 @@ pub(super) fn read_with_hook(
             }),
             Err(e) => {
                 let reason = match e.to_string().as_str() {
-                    "没有可导入的 API Key（可能是官方登录或环境变量认证）" => {
-                        "missing_api_key"
-                    }
+                    MISSING_API_KEY => "missing_api_key",
                     "此供应商绑定订阅账号，首版仅导入 BYOK" => {
                         "managed_oauth_account"
                     }
@@ -125,6 +123,9 @@ pub(super) fn read_with_hook(
     }
     Ok(result)
 }
+
+/// Official logins have no API Key to import; CC Switch lists them alongside BYOK providers.
+pub(super) const MISSING_API_KEY: &str = "没有可导入的 API Key（可能是官方登录或环境变量认证）";
 
 fn convert(raw: &str, meta: &str, common: Option<&str>) -> Result<(String, String)> {
     let settings: Value =
@@ -167,7 +168,7 @@ fn convert(raw: &str, meta: &str, common: Option<&str>) -> Result<(String, Strin
                 .and_then(Item::as_str)
         })
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| Error::message("没有可导入的 API Key（可能是官方登录或环境变量认证）"))?;
+        .ok_or_else(|| Error::message(MISSING_API_KEY))?;
     if ["cc-switch-official", "ccswitch", "cc_switch"].contains(&selected)
         || ["cc-switch-proxy", "PROXY_MANAGED"].contains(&key)
     {

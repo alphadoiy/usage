@@ -1,5 +1,7 @@
 //! Native BYOK/OAuth/import forms shared by every Provider entry point.
+use super::picker::{self, Picker};
 use crate::codex_manager::{self, AuthMode, Manager, Profile, config, oauth};
+use crate::provider_catalog::{CatalogService, ModelSource, Models};
 use crate::ui::forms::{edit_input, expand_path, modal};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Stylize};
@@ -7,6 +9,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
@@ -16,8 +19,80 @@ struct Form {
     editing: Option<(String, i64, String)>,
     auth_mode: AuthMode,
     plugin: bool,
+    picker: Option<Picker>,
+    /// None until requested; a saved Provider is fetched when its form opens.
+    models: Option<Models>,
 }
 impl Form {
+    fn new(
+        fields: Vec<String>,
+        editing: Option<(String, i64, String)>,
+        auth_mode: AuthMode,
+        plugin: bool,
+    ) -> Self {
+        Self {
+            fields,
+            selected: 0,
+            editing,
+            auth_mode,
+            plugin,
+            picker: None,
+            models: None,
+        }
+    }
+    fn model_field(&self) -> usize {
+        if self.auth_mode == AuthMode::Oauth {
+            1
+        } else {
+            2
+        }
+    }
+    fn effort_field(&self) -> usize {
+        if self.auth_mode == AuthMode::Oauth {
+            2
+        } else {
+            3
+        }
+    }
+    /// A typed key lists models at the typed endpoint; otherwise the saved Provider's query is used.
+    fn model_source(&self) -> Option<ModelSource> {
+        if self.auth_mode == AuthMode::Byok && !self.plugin && !self.fields[4].trim().is_empty() {
+            return Some(ModelSource::Endpoint {
+                base: self.fields[1].trim().into(),
+                key: self.fields[4].trim().into(),
+            });
+        }
+        self.editing
+            .as_ref()
+            .map(|(id, _, _)| ModelSource::Saved(id.clone()))
+    }
+    fn open_picker(&mut self, field: usize, query: String) {
+        let optional = self.auth_mode == AuthMode::Oauth;
+        let (label, items, models) = if field == self.model_field() {
+            ("模型", picker::models(self.models.as_ref(), optional), true)
+        } else {
+            ("推理强度", picker::efforts(optional), false)
+        };
+        self.picker = Some(Picker {
+            field,
+            label,
+            query,
+            cursor: 0,
+            items: picker::with_current(items, &self.fields[field]),
+            models,
+        });
+    }
+    /// A model list that arrives while its picker is open replaces the options, keeping the query.
+    fn models_arrived(&mut self, models: Models) {
+        self.models = Some(models);
+        if let Some(open) = self.picker.take() {
+            let (field, query, cursor) = (open.field, open.query, open.cursor);
+            self.open_picker(field, query);
+            if let Some(p) = &mut self.picker {
+                p.cursor = cursor.min(p.matches().len().saturating_sub(1));
+            }
+        }
+    }
     fn fields(&self) -> Vec<(usize, &'static str)> {
         if self.auth_mode == AuthMode::Oauth {
             vec![
@@ -119,13 +194,12 @@ pub(in crate::ui) fn edit(
             String::new(),
         ]
     };
-    let form = Form {
+    let form = Form::new(
         fields,
-        selected: 0,
-        editing: Some((profile.id.clone(), profile.revision, rev.config)),
-        auth_mode: profile.auth_mode,
-        plugin: crate::plugins::endpoint_account(&profile.base_url).is_some(),
-    };
+        Some((profile.id.clone(), profile.revision, rev.config)),
+        profile.auth_mode,
+        crate::plugins::endpoint_account(&profile.base_url).is_some(),
+    );
     let added = run_inner(handle, terminal, background, &mut manager, Some(form), None)?;
     Ok(added.map(|mut added| {
         added.notice = "已保存 Agent 配置".into();
@@ -160,7 +234,17 @@ fn run_inner(
     mut prompt: Option<Prompt>,
 ) -> io::Result<Option<super::Added>> {
     let mut notice = String::new();
+    let mut models_rx = match &mut form {
+        Some(f) if f.editing.is_some() => fetch_models(&handle, f),
+        _ => None,
+    };
     loop {
+        if let (Some(rx), Some(f)) = (&models_rx, &mut form)
+            && let Ok(models) = rx.try_recv()
+        {
+            f.models_arrived(models);
+            models_rx = None;
+        }
         if !notice.is_empty() {
             super::show_notice(terminal, background, &notice)?;
             notice.clear();
@@ -190,8 +274,38 @@ fn run_inner(
             return Ok(None);
         }
         if let Some(edit) = &mut form {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            if let Some(open) = &mut edit.picker {
+                match key.code {
+                    KeyCode::Esc => edit.picker = None,
+                    KeyCode::Up => open.move_by(-1),
+                    KeyCode::Down => open.move_by(1),
+                    KeyCode::Char('p') if control => open.move_by(-1),
+                    KeyCode::Char('n') if control => open.move_by(1),
+                    KeyCode::Char('r') if control && open.models => {
+                        models_rx = fetch_models(&handle, edit)
+                    }
+                    KeyCode::Char('u') if control => {
+                        open.query.clear();
+                        open.cursor = 0;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(value) = open.choice() {
+                            edit.fields[open.field] = value;
+                            edit.picker = None;
+                        }
+                    }
+                    code if !control => {
+                        edit_input(&mut open.query, code);
+                        open.cursor = 0;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let fields = edit.fields();
             let index = fields[edit.selected].0;
+            let choosable = index == edit.model_field() || index == edit.effort_field();
             match key.code {
                 KeyCode::Esc => form = None,
                 KeyCode::Tab | KeyCode::Down => edit.selected = (edit.selected + 1) % fields.len(),
@@ -201,18 +315,32 @@ fn run_inner(
                 KeyCode::Backspace => {
                     edit.fields[index].pop();
                 }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    edit.fields[index].clear()
-                }
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    edit.fields[index].push(ch)
-                }
-                KeyCode::Enter => match save_form(manager, edit) {
-                    Ok(p) => {
-                        return Ok(Some(p.into()));
+                KeyCode::Char('u') if control => edit.fields[index].clear(),
+                // Enter or Space opens the options; typing starts filtering them.
+                code @ (KeyCode::Enter | KeyCode::Char(_))
+                    if choosable && (code == KeyCode::Enter || !control) =>
+                {
+                    if index == edit.model_field()
+                        && models_rx.is_none()
+                        && !matches!(edit.models, Some(Models::Ready(_)))
+                    {
+                        models_rx = fetch_models(&handle, edit);
                     }
-                    Err(e) => notice = e.to_string(),
-                },
+                    let query = match code {
+                        KeyCode::Char(ch) if ch != ' ' => ch.to_string(),
+                        _ => String::new(),
+                    };
+                    edit.open_picker(index, query);
+                }
+                KeyCode::Char(ch) if !control => edit.fields[index].push(ch),
+                KeyCode::Enter | KeyCode::Char('s') if key.code == KeyCode::Enter || control => {
+                    match save_form(manager, edit) {
+                        Ok(p) => {
+                            return Ok(Some(p.into()));
+                        }
+                        Err(e) => notice = e.to_string(),
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -399,19 +527,33 @@ fn save_form(manager: &mut Manager, form: &Form) -> codex_manager::Result<Profil
     }
 }
 fn byok_form() -> Form {
-    Form {
-        fields: vec![
+    Form::new(
+        vec![
             String::new(),
             "https://api.openai.com/v1".into(),
             String::new(),
             "high".into(),
             String::new(),
         ],
-        selected: 0,
-        editing: None,
-        auth_mode: AuthMode::Byok,
-        plugin: false,
-    }
+        None,
+        AuthMode::Byok,
+        false,
+    )
+}
+fn fetch_models(handle: &Handle, form: &mut Form) -> Option<mpsc::Receiver<Models>> {
+    let Some(source) = form.model_source() else {
+        form.models_arrived(Models::Unavailable(
+            "填写 Base URL 和 API Key 后可获取".into(),
+        ));
+        return None;
+    };
+    form.models_arrived(Models::Loading);
+    let (tx, rx) = mpsc::channel();
+    let service = Arc::new(CatalogService::from_environment());
+    handle.spawn(async move {
+        let _ = tx.send(service.models(source).await);
+    });
+    Some(rx)
 }
 
 fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
@@ -429,36 +571,64 @@ fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
         }),
         Line::from(""),
     ];
-    for (visible, (index, label)) in form.fields().into_iter().enumerate() {
-        let text = if index == 4 {
+    let fields = form.fields();
+    for (visible, (index, label)) in fields.iter().copied().enumerate() {
+        let selected = visible == form.selected;
+        let choosable = index == form.model_field() || index == form.effort_field();
+        let mut text = if index == 4 {
             if form.fields[index].is_empty() && form.editing.is_some() {
                 "（留空保留原密钥）".into()
             } else {
                 "•".repeat(form.fields[index].chars().count().min(32))
             }
+        } else if choosable && form.fields[index].is_empty() {
+            "（默认）".into()
         } else {
             form.fields[index].clone()
         };
+        if selected && choosable {
+            text.push_str("  ▾ Enter 选择或输入");
+        } else if selected
+            && !(index == 4 && form.fields[index].is_empty() && form.editing.is_some())
+        {
+            text.push('▏');
+        }
         let line = Line::from(format!(
             "{} {label}: {text}",
-            if visible == form.selected { "›" } else { " " }
+            if selected { "›" } else { " " }
         ));
-        lines.push(if visible == form.selected {
+        lines.push(if selected {
             line.fg(Color::LightBlue)
         } else {
             line
         });
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(
-        "Tab / ↑↓ 换字段 · Ctrl+U 清空 · Enter 保存 · Esc 取消",
-    ));
+    let choosable = fields
+        .get(form.selected)
+        .is_some_and(|(i, _)| *i == form.model_field() || *i == form.effort_field());
+    lines.push(Line::from(if choosable {
+        "Tab / ↑↓ 换字段 · Enter 选择 · Ctrl+S 保存 · Esc 取消"
+    } else {
+        "Tab / ↑↓ 换字段 · Ctrl+U 清空 · Enter / Ctrl+S 保存 · Esc 取消"
+    }));
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered())
             .wrap(Wrap { trim: false }),
         area,
     );
+    if let Some(open) = &form.picker {
+        const ROWS: usize = 8;
+        let area = modal(frame.area(), ROWS as u16 + 9);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(open.lines(form.models.as_ref(), ROWS))
+                .block(Block::bordered().title(format!("选择{}", open.label)))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
 }
 
 fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
@@ -522,19 +692,18 @@ mod tests {
         let profile = manager
             .add("Subscription", &config, "synthetic-inference-key")
             .unwrap();
-        let mut form = Form {
-            fields: vec![
+        let mut form = Form::new(
+            vec![
                 profile.name.clone(),
                 endpoint.clone(),
                 "model-b".into(),
                 "low".into(),
                 String::new(),
             ],
-            selected: 0,
-            editing: Some((profile.id.clone(), profile.revision, config)),
-            auth_mode: AuthMode::Byok,
-            plugin: true,
-        };
+            Some((profile.id.clone(), profile.revision, config)),
+            AuthMode::Byok,
+            true,
+        );
         assert_eq!(
             form.fields().iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             [0, 2, 3]
@@ -652,20 +821,83 @@ mod tests {
     }
 
     #[test]
+    fn model_and_effort_fields_pick_fetched_options_or_custom_values() {
+        let mut form = Form::new(
+            vec![
+                "Trae".into(),
+                String::new(),
+                "model-a".into(),
+                "high".into(),
+                String::new(),
+            ],
+            Some(("fixture".into(), 1, String::new())),
+            AuthMode::Byok,
+            true,
+        );
+        assert!(matches!(form.model_source(), Some(ModelSource::Saved(id)) if id == "fixture"));
+        form.open_picker(form.model_field(), String::new());
+        assert_eq!(
+            form.picker.as_ref().unwrap().items.len(),
+            1,
+            "only the current value before fetch"
+        );
+        // A list arriving while the picker is open replaces its options and keeps the query.
+        form.picker.as_mut().unwrap().query = "flash".into();
+        form.models_arrived(Models::Ready(vec![
+            "DeepSeek-V4-Flash".into(),
+            "model-b".into(),
+        ]));
+        let open = form.picker.as_ref().unwrap();
+        assert_eq!(open.query, "flash");
+        assert_eq!(open.choice().as_deref(), Some("DeepSeek-V4-Flash"));
+        for (width, height) in [(100, 30), (40, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw_form(frame, &form)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(text.contains("选择模型"), "{text}");
+            assert!(text.contains("DeepSeek-V4-Flash"));
+        }
+        form.picker.as_mut().unwrap().query = "custom-model".into();
+        assert_eq!(
+            form.picker.as_ref().unwrap().choice().as_deref(),
+            Some("custom-model")
+        );
+        form.open_picker(form.effort_field(), "x".into());
+        assert_eq!(
+            form.picker.as_ref().unwrap().choice().as_deref(),
+            Some("xhigh")
+        );
+        // A key typed into a new BYOK form lists models at the typed endpoint.
+        let mut form = byok_form();
+        assert!(form.model_source().is_none());
+        form.fields[4] = "synthetic-key".into();
+        assert!(
+            matches!(form.model_source(), Some(ModelSource::Endpoint { base, .. }) if base == "https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
     fn key_field_is_masked_on_wide_and_narrow_terminals() {
-        let form = Form {
-            fields: vec![
+        let mut form = Form::new(
+            vec![
                 "A".into(),
                 "https://example.com/v1".into(),
                 "m".into(),
                 "high".into(),
                 "fixture-ui-secret".into(),
             ],
-            selected: 4,
-            editing: None,
-            auth_mode: AuthMode::Byok,
-            plugin: false,
-        };
+            None,
+            AuthMode::Byok,
+            false,
+        );
+        form.selected = 4;
         for (width, height) in [(100, 30), (40, 18), (20, 10)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw_form(frame, &form)).unwrap();

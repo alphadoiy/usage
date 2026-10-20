@@ -19,7 +19,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 use tokio::runtime::Handle;
 
-use crate::config::{AppConfig, home_dir};
+use crate::config::AppConfig;
 use crate::model::UsageSnapshot;
 use crate::providers::{
     ProviderError, QUERY_TIMEOUT, ResetPreview, UsageProvider, query_with_timeout,
@@ -100,6 +100,7 @@ enum AppEvent {
     HomeSessionsLoaded {
         generation: u64,
         catalog: sessions::SessionCatalog,
+        projects: Result<Vec<crate::projects::Record>, String>,
     },
     HomeSessionLaunched {
         generation: u64,
@@ -300,6 +301,23 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                 let result = crate::ui::run_provider_manager_with_config(
                                     handle.clone(),
                                     Some(app.config_path.clone()),
+                                    // Reuse the home board's sessions once loaded rather than scanning again.
+                                    if app.home_sessions_generation > 0
+                                        && !app.home_sessions_loading
+                                    {
+                                        crate::ui::ProjectSessions::from_sessions(
+                                            &app.home_sessions.sessions,
+                                        )
+                                    } else {
+                                        crate::ui::ProjectSessions::Scan(
+                                            app.session_registry.clone(),
+                                            app.session_homes.clone(),
+                                        )
+                                    },
+                                    // The project picked on the home board becomes the launch default.
+                                    (app.home_focus == super::home::Focus::Projects)
+                                        .then(|| app.home_sessions.selected_project().cloned())
+                                        .flatten(),
                                 );
                                 terminal = match ratatui::try_init() {
                                     Ok(t) => t,
@@ -480,6 +498,7 @@ struct Dashboard {
     home_activity_generation: u64,
     home_activity_last_poll: std::time::Instant,
     home_activity_root: PathBuf,
+    project_store: Arc<crate::projects::Store>,
     home_focus: super::home::Focus,
     home_connections: super::home::Connections,
     home_sessions: SessionBrowser,
@@ -573,39 +592,7 @@ impl Dashboard {
         config: AppConfig,
         config_path: std::path::PathBuf,
     ) -> Self {
-        let home = home_dir();
-        let mut session_homes = sessions::SessionHomes::new()
-            .with(
-                "claude",
-                config
-                    .claude_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".claude")),
-            )
-            .with(
-                "codex",
-                config
-                    .codex_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".codex")),
-            )
-            .with(
-                "grok",
-                config
-                    .grok_dir
-                    .clone()
-                    .unwrap_or_else(|| home.join(".grok")),
-            );
-        for instance in config.data_instances() {
-            if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
-                continue;
-            }
-            session_homes = session_homes.with_instance(
-                &instance.id,
-                &instance.provider,
-                instance.path.clone(),
-            );
-        }
+        let session_homes = sessions::SessionHomes::from_config(&config);
         Self::new_with_sessions(
             providers,
             config,
@@ -656,6 +643,7 @@ impl Dashboard {
             home_activity_generation: 0,
             home_activity_last_poll: std::time::Instant::now(),
             home_activity_root: crate::codex_manager::default_root(),
+            project_store: Arc::new(crate::projects::Store::from_environment()),
             home_focus: super::home::Focus::Providers,
             home_connections: super::home::Connections::default(),
             home_sessions: {
@@ -1098,6 +1086,7 @@ impl Dashboard {
         let generation = self.home_sessions_generation;
         let mut homes = self.session_homes.clone();
         let registry = self.session_registry.clone();
+        let store = self.project_store.clone();
         let tx = self.tx.clone();
         self.home_sessions_task = Some(handle.spawn_blocking(move || {
             // Discover newly materialized managed homes without blocking terminal input.
@@ -1110,6 +1099,7 @@ impl Dashboard {
             let _ = tx.send(AppEvent::HomeSessionsLoaded {
                 generation,
                 catalog,
+                projects: store.list(),
             });
         }));
     }
@@ -1927,15 +1917,17 @@ impl Dashboard {
                 AppEvent::HomeSessionsLoaded {
                     generation,
                     catalog,
+                    projects,
                 } => {
                     if generation == self.home_sessions_generation {
                         self.home_sessions_loading = false;
-                        self.home_sessions_warning = if catalog.warnings.is_empty() {
-                            None
-                        } else {
-                            Some(catalog.warnings.join(" · "))
-                        };
-                        self.home_sessions.refresh(catalog.sessions);
+                        let mut warnings = catalog.warnings;
+                        // A failed read keeps the last project records rather than dropping manual projects.
+                        let records = projects.map_err(|error| warnings.push(error)).ok();
+                        self.home_sessions_warning =
+                            (!warnings.is_empty()).then(|| warnings.join(" · "));
+                        self.home_sessions
+                            .refresh_with_projects(catalog.sessions, records);
                         if let Some(task) = self.home_activity_task.take() {
                             task.abort();
                         }
@@ -4385,6 +4377,7 @@ mod home_board_tests {
             .send(AppEvent::HomeSessionsLoaded {
                 generation: 1,
                 catalog: sessions::SessionCatalog::default(),
+                projects: Ok(Vec::new()),
             })
             .unwrap();
         app.tx

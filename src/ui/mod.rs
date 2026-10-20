@@ -17,4 +17,4 @@ mod subscription_tests;
 pub mod widgets;
 
 pub use app::{run, run_history, run_history_with_query, run_with_sessions};
-pub use provider_manager::run_with_config as run_provider_manager_with_config;
+pub use provider_manager::{ProjectSessions, run_with_config as run_provider_manager_with_config};

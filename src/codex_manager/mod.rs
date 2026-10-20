@@ -208,6 +208,15 @@ pub struct SyncReport {
     pub missing: Vec<String>,
 }
 impl SyncReport {
+    /// Skipped official logins recur on every sync and do not affect launching other accounts.
+    pub fn needs_attention(&self) -> bool {
+        !self.conflicts.is_empty()
+            || !self.missing.is_empty()
+            || self
+                .skipped
+                .iter()
+                .any(|(_, reason)| reason != ccswitch::MISSING_API_KEY)
+    }
     fn log(&self, dry_run: bool) {
         tracing::info!(
             event = "source_sync_summary",
@@ -932,13 +941,8 @@ impl Manager {
     ) -> Result<crate::agents::ProcessHandle> {
         logging::operation("codex.run_start", |op| {
             // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
-            let report = op.step("source_sync", || self.sync(false))?;
-            if !report.skipped.is_empty()
-                || !report.conflicts.is_empty()
-                || !report.missing.is_empty()
-            {
-                eprintln!("{report}");
-            }
+            // The launch terminal belongs to Codex; the report is logged and shown in Provider management.
+            op.step("source_sync", || self.sync(false))?;
             let profile = op.step("account_resolve", || self.resolve(selector))?;
             let revision = revision.unwrap_or(profile.revision);
             op.account(&profile.id, revision, profile.auth_mode.log_name());
@@ -1023,7 +1027,11 @@ impl Manager {
             }
             let mut command = Command::new(program);
             clear_auth_env(&mut command);
-            command.current_dir(&cwd).env("CODEX_HOME", &home);
+            // An inherited state directory would share the user's state database with this Home.
+            command
+                .current_dir(&cwd)
+                .env("CODEX_HOME", &home)
+                .env_remove("CODEX_SQLITE_HOME");
             if let Some(key) = &key {
                 command.env(config::KEY_ENV, key);
             }
@@ -1073,6 +1081,16 @@ impl Manager {
                     } else if route_effective.gateway_supported {None}
                     else {Some(route_effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
                     if reason.is_none() {
+                        // Launching directly would silently drop observation, so an unaddressable provider fails the launch.
+                        let base_url_key = if profile.auth_mode==AuthMode::Oauth {None} else {
+                            match launcher::provider_override(route_effective.identity.model_provider.as_deref().expect("resolved provider"),"base_url") {
+                                Some(key) => Some(key),
+                                None => {
+                                    tracing::error!(event="gateway_provider_unaddressable", run_id, provider_id=profile.id);
+                                    return Err(Error::message("启动失败：模型提供方 ID 只能包含字母、数字、_ 或 -，Codex 无法通过 -c 参数接入本地网关；请在 Agent 配置中修改 model_provider 名称"));
+                                }
+                            }
+                        };
                         let prepared = (|| -> Result<crate::gateway::Attachment> {
                             let binding = self.performance_binding(&profile, revision)?;
                             let (upstream,provider,auth)=if profile.auth_mode==AuthMode::Oauth {
@@ -1097,11 +1115,13 @@ impl Manager {
                                 let base=toml::Value::String(attached.base.clone());
                                 if profile.auth_mode==AuthMode::Oauth {
                                     command.args(["-c",&format!("openai_base_url={base}")]);
-                                } else {
+                                } else if let Some(key)=&base_url_key {
                                     command.env(route_effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
-                                    let provider=toml::Value::String(route_effective.identity.model_provider.clone().expect("resolved provider"));
-                                    command.args(["-c",&format!("model_providers.{provider}.base_url={base}")]);
-                                    if plugin_account.is_some(){command.args(["-c",&format!("model_provider={provider}")]);}
+                                    command.args(["-c",&format!("{key}={base}")]);
+                                    if plugin_account.is_some(){
+                                        let provider=route_effective.identity.model_provider.as_deref().expect("resolved provider");
+                                        command.args(["-c",&format!("model_provider={}",toml::Value::String(provider.into()))]);
+                                    }
                                 }
                                 for variable in ["NO_PROXY", "no_proxy"] {
                                     let mut bypass = std::env::var(variable).unwrap_or_default();

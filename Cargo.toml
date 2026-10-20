@@ -36,6 +36,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "json", "env-filter"] }
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+ruzstd = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

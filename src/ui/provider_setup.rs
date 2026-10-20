@@ -1,5 +1,6 @@
 //! Shared onboarding; implementation packages remain behind provider identities.
 mod native;
+mod picker;
 use crate::{auth, codex_manager::Profile, plugins, provider_catalog::presets};
 pub(super) use native::run as run_native;
 pub(super) use native::{AddMethod, edit, relogin};

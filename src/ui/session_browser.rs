@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::buffer::Buffer;
@@ -25,6 +25,8 @@ struct Project {
     sessions: Vec<usize>,
     latest_ms: i64,
     tokens: Tokens,
+    pinned: bool,
+    missing: bool,
 }
 
 pub struct SessionBrowser {
@@ -41,6 +43,8 @@ pub struct SessionBrowser {
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
     pub resume_mode: crate::config::ResumeMode,
+    /// Set on the home board: projects come from the project store merged with sessions.
+    project_records: Option<Vec<crate::projects::Record>>,
 }
 
 impl SessionBrowser {
@@ -59,9 +63,22 @@ impl SessionBrowser {
             filter_label: None,
             sort_tokens: false,
             resume_mode: crate::config::ResumeMode::Auto,
+            project_records: None,
         };
         browser.rebuild();
         browser
+    }
+
+    /// Records and sessions are applied together so a selected session-less project survives.
+    pub fn refresh_with_projects(
+        &mut self,
+        sessions: Vec<Session>,
+        records: Option<Vec<crate::projects::Record>>,
+    ) {
+        if let Some(records) = records {
+            self.project_records = Some(records);
+        }
+        self.refresh(sessions);
     }
 
     pub fn set_usage(&mut self, usage: HashMap<SessionKey, SessionUsage>, label: Option<String>) {
@@ -207,6 +224,31 @@ impl SessionBrowser {
                 groups.entry(session.cwd.clone()).or_default().push(index);
             }
         }
+        let mut stored = HashMap::new();
+        if let Some(records) = &self.project_records {
+            let catalog = crate::projects::catalog(
+                records,
+                self.sessions
+                    .iter()
+                    .map(|s| (s.cwd.as_path(), s.recency_at_ms)),
+            );
+            let listed: HashSet<&PathBuf> = catalog.iter().map(|p| &p.path).collect();
+            groups.retain(|cwd, _| listed.contains(cwd));
+            for project in &catalog {
+                // Projects without matching sessions appear only while not narrowing by usage.
+                if self.filter_label.is_none()
+                    && (needle.is_empty()
+                        || project
+                            .path
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&needle))
+                {
+                    groups.entry(project.path.clone()).or_default();
+                }
+            }
+            stored = catalog.into_iter().map(|p| (p.path.clone(), p)).collect();
+        }
         self.projects = groups
             .into_iter()
             .map(|(cwd, mut sessions)| {
@@ -216,9 +258,11 @@ impl SessionBrowser {
                         tokens.add(usage.tokens);
                     }
                 }
+                let project = stored.get(&cwd);
                 let latest_ms = sessions
                     .iter()
                     .map(|&index| self.sessions[index].recency_at_ms)
+                    .chain(project.map(|p| p.recency_ms))
                     .max()
                     .unwrap_or(0);
                 sessions.sort_by(|&a, &b| {
@@ -252,6 +296,8 @@ impl SessionBrowser {
                         })
                 });
                 Project {
+                    pinned: project.is_some_and(|p| p.pinned),
+                    missing: project.is_some_and(|p| p.missing),
                     cwd,
                     sessions,
                     latest_ms,
@@ -260,13 +306,17 @@ impl SessionBrowser {
             })
             .collect();
         self.projects.sort_by(|a, b| {
-            (if self.sort_tokens {
-                b.tokens.total().cmp(&a.tokens.total())
-            } else {
-                std::cmp::Ordering::Equal
-            })
-            .then_with(|| b.latest_ms.cmp(&a.latest_ms))
-            .then_with(|| a.cwd.cmp(&b.cwd))
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| {
+                    if self.sort_tokens {
+                        b.tokens.total().cmp(&a.tokens.total())
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| b.latest_ms.cmp(&a.latest_ms))
+                .then_with(|| a.cwd.cmp(&b.cwd))
         });
         self.project_selected = previous_project
             .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
@@ -457,7 +507,15 @@ fn render_projects(area: Rect, buf: &mut Buffer, browser: &SessionBrowser, show_
                 || project.cwd.to_string_lossy().into_owned(),
                 |name| name.to_string_lossy().into_owned(),
             );
-            let mut title = format!("{}  ({})", clean(&name), project.sessions.len());
+            let mut title = format!(
+                "{}{}  ({})",
+                if project.pinned { "★ " } else { "" },
+                clean(&name),
+                project.sessions.len()
+            );
+            if project.missing {
+                title.push_str(" · 目录不存在");
+            }
             if show_usage
                 && project
                     .sessions
@@ -516,6 +574,12 @@ fn render_session_list(
     let Some(project) = browser.projects.get(browser.project_selected) else {
         return;
     };
+    if project.sessions.is_empty() {
+        Paragraph::new("暂无会话\nF4 选择 Provider，在此项目启动 Agent")
+            .style(Style::new().fg(DIM))
+            .render(inner, buf);
+        return;
+    }
     let mut items = Vec::new();
     let mut selected_display = None;
     let mut session_index = 0;
@@ -753,6 +817,72 @@ mod tests {
             unicode_width::UnicodeWidthStr::width(preview_text("目录  /tmp/中文项目", 12).as_str())
                 <= 12
         );
+    }
+
+    #[test]
+    fn home_projects_merge_stored_entries_with_sessions() {
+        let record =
+            |path: &str, manual: bool, pinned: bool, hidden: bool| crate::projects::Record {
+                path: path.into(),
+                manual,
+                pinned,
+                hidden,
+                added_at_ms: 5,
+                launched_at_ms: None,
+            };
+        let sessions = vec![
+            session(AgentKind::CODEX, "Recent", "/tmp/recent", 30),
+            session(AgentKind::CODEX, "Hidden", "/tmp/hidden", 40),
+            session(AgentKind::CLAUDE, "Pinned", "/tmp/pinned", 10),
+        ];
+        let mut browser = SessionBrowser::new(sessions.clone());
+        assert_eq!(
+            browser.project_count(),
+            3,
+            "without records every session directory is listed"
+        );
+        browser.refresh_with_projects(
+            sessions.clone(),
+            Some(vec![
+                record("/tmp/hidden", false, false, true),
+                record("/tmp/pinned", false, true, false),
+                record("/synthetic/new-project", true, false, false),
+            ]),
+        );
+        let paths: Vec<_> = browser.projects.iter().map(|p| p.cwd.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/tmp/pinned"),
+                "/tmp/recent".into(),
+                "/synthetic/new-project".into()
+            ]
+        );
+        assert_eq!(
+            browser.visible_count(),
+            2,
+            "hidden project sessions leave the home board"
+        );
+        // A failed store read keeps the previous records; search still finds a session-less project.
+        browser.refresh_with_projects(sessions, None);
+        browser.type_char('n');
+        browser.type_char('e');
+        browser.type_char('w');
+        assert_eq!(
+            browser.selected_project(),
+            Some(&PathBuf::from("/synthetic/new-project"))
+        );
+        assert!(browser.selected_session().is_none());
+        let area = Rect::new(0, 0, 90, 12);
+        let mut buffer = Buffer::empty(area);
+        render_compact(area, &mut buffer, &browser, &|s| s.instance.clone());
+        let text: String = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .map(|p| buffer[p].symbol().to_string())
+            .collect::<String>()
+            .replace(' ', "");
+        assert!(text.contains("new-project(0)"));
+        assert!(text.contains("暂无会话"));
     }
 
     #[test]

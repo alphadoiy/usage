@@ -8,7 +8,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 const CODEX_QUERY: &str = "SELECT id, cwd, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), id) AS title, recency_at_ms FROM threads WHERE archived=0 AND cwd<>'' AND COALESCE(thread_source,'user')='user' AND source<>'exec' ORDER BY recency_at_ms DESC;";
@@ -58,6 +57,20 @@ pub struct SessionHomes {
 impl SessionHomes {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The configured data instances: built-in tool Homes as primaries, then extra and managed ones.
+    pub fn from_config(config: &crate::config::AppConfig) -> Self {
+        config
+            .data_instances()
+            .into_iter()
+            .fold(Self::new(), |homes, instance| {
+                if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
+                    homes.with(&instance.id, instance.path)
+                } else {
+                    homes.with_instance(&instance.id, &instance.provider, instance.path)
+                }
+            })
     }
 
     pub fn with(mut self, provider_id: &str, home: impl Into<PathBuf>) -> Self {
@@ -251,7 +264,6 @@ pub fn load_all(homes: &SessionHomes) -> SessionCatalog {
     builtin_registry().load_all(homes)
 }
 
-#[derive(Deserialize)]
 struct CodexRow {
     id: String,
     cwd: PathBuf,
@@ -259,8 +271,41 @@ struct CodexRow {
     recency_at_ms: i64,
 }
 
+const ZST_SUFFIX: &str = ".jsonl.zst";
+/// The Codex app compresses older rollouts from `.jsonl` to `.jsonl.zst`.
+fn is_compressed(path: &Path) -> bool {
+    path.to_str().is_some_and(|p| p.ends_with(ZST_SUFFIX))
+}
+fn is_rollout(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl") || is_compressed(path)
+}
+/// While a rollout is being compressed both copies exist and the new `.zst` may lack its
+/// trailer, so the readable plain twin in the same directory is preferred.
+fn shadowed_by_plain_twin(path: &Path) -> bool {
+    path.to_str()
+        .and_then(|p| p.strip_suffix(".zst"))
+        .is_some_and(|plain| Path::new(plain).is_file())
+}
+fn open_rollout(path: &Path) -> Option<Box<dyn BufRead>> {
+    let file = File::open(path).ok()?;
+    if is_compressed(path) {
+        let decoder = ruzstd::decoding::StreamingDecoder::new(file).ok()?;
+        Some(Box::new(BufReader::new(decoder)))
+    } else {
+        Some(Box::new(BufReader::new(file)))
+    }
+}
+
 pub(crate) fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
-    match load_codex_index(home) {
+    // A Home Codex has never run in (e.g. it exited at startup) has no sessions yet; not a failure.
+    let index = codex_index(home)?;
+    if index.is_none() && !home.join("sessions").is_dir() {
+        return Ok(Vec::new());
+    }
+    match index
+        .ok_or_else(|| "未找到 Codex 会话索引".to_string())
+        .and_then(|database| load_codex_index(&database))
+    {
         Ok(sessions) => Ok(sessions),
         Err(index_error) => match load_codex_rollouts(home) {
             Ok(sessions) if sessions.iter().any(is_local_record) => Ok(sessions),
@@ -313,8 +358,50 @@ fn user_prompt(text: &str) -> Option<String> {
     display_title(text)
 }
 
-fn load_codex_index(home: &Path) -> Result<Vec<SessionRecord>, String> {
-    let database = fs::read_dir(home)
+/// Where Codex keeps the Home's state database: `sqlite_home` in its config.toml, or
+/// `$CODEX_SQLITE_HOME`, which wins. As in magpie, the environment applies only to the user's
+/// own Codex Home; managed launches clear it, so their state stays in their own Home.
+fn codex_state_dir(home: &Path) -> PathBuf {
+    state_dir_in(
+        home,
+        std::env::var_os("CODEX_SQLITE_HOME").as_deref(),
+        &default_codex_home(),
+    )
+}
+fn state_dir_in(home: &Path, environment: Option<&std::ffi::OsStr>, own_home: &Path) -> PathBuf {
+    if let Some(dir) = environment.filter(|d| !d.is_empty())
+        && same_dir(home, own_home)
+    {
+        return dir.into();
+    }
+    fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|config| config.get("sqlite_home")?.as_str().map(str::to_string))
+        .filter(|dir| !dir.trim().is_empty())
+        .map(|dir| match dir.strip_prefix("~/") {
+            Some(rest) => crate::config::home_dir().join(rest),
+            None => home.join(dir),
+        })
+        .unwrap_or_else(|| home.to_path_buf())
+}
+fn default_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home_dir().join(".codex"))
+}
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The newest `state_<N>.sqlite` for the Home, if Codex has created one.
+fn codex_index(home: &Path) -> Result<Option<PathBuf>, String> {
+    let dir = codex_state_dir(home);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    Ok(fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -328,27 +415,32 @@ fn load_codex_index(home: &Path) -> Result<Vec<SessionRecord>, String> {
             Some((version, entry.path()))
         })
         .max_by_key(|(version, _)| *version)
-        .map(|(_, path)| path)
-        .ok_or_else(|| "未找到 Codex 会话索引".to_string())?;
-    let output = Command::new("sqlite3")
-        .args(["-readonly", "-json"])
-        .arg(database)
-        .arg(CODEX_QUERY)
-        .output()
-        .map_err(|e| format!("无法读取索引（需要 sqlite3）：{e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "读取索引失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    // sqlite3 -json prints nothing (rather than []) when SELECT matches no rows.
-    // This is an authoritative empty index, not a parse failure or rollout fallback.
-    if output.stdout.iter().all(u8::is_ascii_whitespace) {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<CodexRow> =
-        serde_json::from_slice(&output.stdout).map_err(|e| format!("索引格式不兼容：{e}"))?;
+        .map(|(_, path)| path))
+}
+
+fn load_codex_index(database: &Path) -> Result<Vec<SessionRecord>, String> {
+    let db = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("读取索引失败：{e}"))?;
+    db.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| format!("读取索引失败：{e}"))?;
+    let mut statement = db
+        .prepare(CODEX_QUERY)
+        .map_err(|e| format!("读取索引失败：{e}"))?;
+    // A query matching no rows is an authoritative empty index, not a reason to scan rollouts.
+    let rows = statement
+        .query_map([], |row| {
+            Ok(CodexRow {
+                id: row.get(0)?,
+                cwd: PathBuf::from(row.get::<_, String>(1)?),
+                title: row.get(2)?,
+                recency_at_ms: row.get(3)?,
+            })
+        })
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| format!("索引格式不兼容：{e}"))?;
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -396,7 +488,7 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
                 directories.push(path);
                 continue;
             }
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
+            if !is_rollout(&path) || shadowed_by_plain_twin(&path) {
                 continue;
             }
             let Some(session) = codex_rollout_metadata(&path, &titles) else {
@@ -425,11 +517,11 @@ fn archived_codex_ids(home: &Path) -> HashSet<String> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            (path.extension().is_some_and(|ext| ext == "jsonl"))
-                .then_some(path)
-                .and_then(|path| File::open(path).ok())
-                .and_then(|file| {
-                    let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+            is_rollout(&path)
+                .then(|| open_rollout(&path))
+                .flatten()
+                .and_then(|reader| {
+                    let mut lines = reader.lines().map_while(Result::ok);
                     codex_metadata(&mut lines)
                 })
                 .and_then(|meta| meta.get("id").and_then(Value::as_str).map(str::to_string))
@@ -447,8 +539,7 @@ fn codex_metadata(lines: &mut impl Iterator<Item = String>) -> Option<Value> {
 }
 
 fn codex_rollout_metadata(path: &Path, titles: &HashMap<String, String>) -> Option<SessionRecord> {
-    let file = File::open(path).ok()?;
-    let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+    let mut lines = open_rollout(path)?.lines().map_while(Result::ok);
     let metadata = codex_metadata(&mut lines)?;
     if metadata
         .get("thread_source")
@@ -1232,11 +1323,131 @@ mod tests {
         assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
         db.execute_batch("DROP TABLE threads;").unwrap();
         assert!(
-            load_codex_index(&home)
+            load_codex_index(&home.join("state_5.sqlite"))
                 .unwrap_err()
                 .contains("读取索引失败")
         );
         drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_home_that_never_ran_has_no_sessions_and_no_warning() {
+        let root = std::env::temp_dir().join(format!("usage-unused-home-{}", uuid::Uuid::new_v4()));
+        let home = root.join("codex");
+        fs::create_dir_all(home.join("tmp")).unwrap();
+        // What Usage writes before launching: configuration only, no index and no rollouts.
+        fs::write(home.join("config.toml"), "model = \"m\"\n").unwrap();
+        fs::write(home.join("usage-binding.json"), "{}").unwrap();
+        let homes = SessionHomes::new().with("codex", &home);
+        let catalog = load_all(&homes);
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        // Rollouts without an index still report the missing index when none can be read.
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::write(home.join("sessions/broken.jsonl"), "not json").unwrap();
+        let catalog = load_all(&homes);
+        assert_eq!(catalog.warnings.len(), 1);
+        assert!(catalog.warnings[0].contains("未找到 Codex 会话索引"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn codex_index_at(dir: &Path, cwd: &Path, id: &str, title: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let db = rusqlite::Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT, cwd TEXT, name TEXT, title TEXT, preview TEXT, recency_at_ms INTEGER, archived INTEGER, thread_source TEXT, source TEXT);").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES(?1,?2,?3,'','',100,0,'user','cli')",
+            rusqlite::params![id, cwd.to_string_lossy(), title],
+        )
+        .unwrap();
+    }
+    fn rollout(id: &str, cwd: &Path, prompt: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":cwd,"thread_source":"user","source":"cli"}}),
+            serde_json::json!({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":prompt}]}}),
+        )
+    }
+
+    #[test]
+    fn codex_index_follows_sqlite_home_and_the_environment_only_for_the_own_home() {
+        let root = std::env::temp_dir().join(format!("usage-sqlite-home-{}", uuid::Uuid::new_v4()));
+        let home = root.join("codex");
+        let cwd = root.join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        codex_index_at(
+            &root.join("state"),
+            &cwd,
+            "123e4567-e89b-12d3-a456-426614174000",
+            "Moved index",
+        );
+        fs::write(home.join("config.toml"), "sqlite_home = \"../state\"\n").unwrap();
+        let catalog = load_all(&SessionHomes::new().with("codex", &home));
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        assert_eq!(catalog.sessions[0].title, "Moved index");
+        // The environment overrides only the user's own Home; other Homes keep their config.
+        let shared = std::ffi::OsStr::new("/synthetic/shared");
+        assert_eq!(
+            state_dir_in(&home, Some(shared), &home),
+            PathBuf::from("/synthetic/shared")
+        );
+        assert_eq!(
+            state_dir_in(&home, Some(shared), &root.join("other")),
+            home.join("../state")
+        );
+        fs::remove_file(home.join("config.toml")).unwrap();
+        assert_eq!(state_dir_in(&home, None, &home), home);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compressed_rollouts_are_listed_and_a_plain_twin_is_preferred() {
+        let root = std::env::temp_dir().join(format!("usage-zst-{}", uuid::Uuid::new_v4()));
+        let home = root.join("codex");
+        let cwd = root.join("project");
+        let day = home.join("sessions/2026/09/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let zst = |text: &str| {
+            ruzstd::encoding::compress_to_vec(
+                text.as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            )
+        };
+        let packed = "123e4567-e89b-12d3-a456-426614174000";
+        fs::write(
+            day.join(format!("rollout-{packed}.jsonl.zst")),
+            zst(&rollout(packed, &cwd, "Compressed title")),
+        )
+        .unwrap();
+        // Mid-compression: the new .zst is unreadable, and its plain twin is used instead.
+        let twin = "123e4567-e89b-12d3-a456-426614174001";
+        fs::write(
+            day.join(format!("rollout-{twin}.jsonl")),
+            rollout(twin, &cwd, "Plain twin"),
+        )
+        .unwrap();
+        fs::write(day.join(format!("rollout-{twin}.jsonl.zst")), b"incomplete").unwrap();
+        // A compressed archive still hides its session.
+        let archived = "123e4567-e89b-12d3-a456-426614174002";
+        fs::write(
+            day.join(format!("rollout-{archived}.jsonl")),
+            rollout(archived, &cwd, "Archived"),
+        )
+        .unwrap();
+        fs::write(
+            home.join(format!("archived_sessions/rollout-{archived}.jsonl.zst")),
+            zst(&rollout(archived, &cwd, "Archived")),
+        )
+        .unwrap();
+        let catalog = load_all(&SessionHomes::new().with("codex", &home));
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        let mut titles: Vec<_> = catalog.sessions.iter().map(|s| s.title.as_str()).collect();
+        titles.sort();
+        assert_eq!(titles, ["Compressed title", "Plain twin"]);
         fs::remove_dir_all(root).unwrap();
     }
 

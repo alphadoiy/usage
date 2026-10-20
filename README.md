@@ -71,6 +71,8 @@ usage history         # TUI 贡献看板（也可用 usage dashboard）
 usage history --providers codex,claude --monthly
 usage history --year 2026 --json  # 导出日/月 Token 汇总
 usage providers       # 列出已注册的工具
+usage projects list   # 列出项目：手动添加的目录与本机会话所在目录（--json）
+usage projects add <目录>   # 手动添加项目；remove / pin / unpin 移出、置顶、取消置顶
 usage codex runs --json  # 查看运行记录及启动时选中的账号、配置版本
 usage resources --list   # 列出独立资源连接，不读取凭据或请求网络
 usage resources --json   # 查询 New API 余额/额度与 OpenAI 官方费用
@@ -138,13 +140,13 @@ Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时�
 
 Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板会显示剩余次数（包括 0）；未返回次数时提示按 `x` 查询，不把未知显示为 0。按 `x` 查询首页当前选中 Provider 的最新次数和最近到期时间，同时更新其已加载的看板次数。查询与确认都绑定该 Provider 的独立账号目录，不回退到默认登录或 Keychain。确认框显示 Provider 名称与账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消；打开确认后目标固定。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。BYOK、Claude Code 和 Grok 没有主动重置入口。
 
-按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 索引，无法打开时改读本机会话日志。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
+按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引（遵循 `config.toml` 的 `sqlite_home`；`CODEX_SQLITE_HOME` 只作用于本机默认 Codex 目录，托管实例启动时清除该变量以免共用状态库），无法打开时改读本机会话日志；从未运行过的实例目录视为没有会话。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
-会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
+会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话；Codex 应用压缩后的 `.jsonl.zst` 日志同样可读，压缩过程中同目录存在明文副本时优先读取明文。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
 
 ## Provider 管理与 Codex 多开
 
-运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`o` 选择项目目录，`Enter` 启动。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，密钥字段始终遮罩。
+运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`Enter` 先选择项目再启动，`o` 只更改默认项目。项目列表合并独立的项目库与本机会话所在目录：置顶项在前，其余按会话活动、从 Usage 启动的时间排序；输入可筛选，也可输入 `/` 或 `~` 开头的完整路径。选择框中 `Ctrl+A` 添加输入的路径（或选中项）、`Ctrl+T` 置顶、`Ctrl+D` 移出列表（会话保留）；在未收录的目录启动后自动加入项目库。从首页项目看板进入 F4 时，默认项目为看板中选中的项目。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，`Enter` 或 `Ctrl+S` 保存，密钥字段始终遮罩。模型和推理强度在字段上按 `Enter` 或直接输入打开选择列表：当前值排在首位，模型列表沿用首页的查询（已保存的 Provider 打开表单即获取；新 BYOK 填写 API Key 后按当前 Base URL 获取），输入可筛选，没有匹配项时 `Enter` 使用输入的自定义值，`Ctrl+R` 重新获取模型列表。
 
 添加时会检测相同配置与凭据，重复项提示使用已有 Provider；不同模型或配置可以分别保存，显式“复制”仍可创建独立副本。插件账号再次登录同一身份会更新原账号凭据并保留绑定，不按昵称合并不同账号。
 
