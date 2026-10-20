@@ -24,7 +24,20 @@
 
 ## 安装
 
-需要 Rust 1.88 或更新版本。
+### Homebrew（GitHub Release）
+
+macOS 15 或更新版本，支持 Apple Silicon 和 Intel，无需安装 Rust：
+
+```bash
+brew install alphadoiy/tap/usage
+usage
+```
+
+更新用 `brew update && brew upgrade alphadoiy/tap/usage`。如果已经安装本机版，先运行 `brew uninstall usage-local`，再安装上述版本；已有用户配置继续保留。GitHub 发布步骤见[发布与 tap 维护](docs/github-release.md)。
+
+### 本机构建
+
+从源码构建需要 Rust 1.88 或更新版本。
 
 只在本机使用时，可交给 Homebrew 管理。打包脚本用当前源码构建 macOS 二进制，生成 Formula 并放入本机 `alphadoiy/local` tap；无需 GitHub 仓库或发布版本。具体步骤和产物说明见[本机 Homebrew 安装与更新](docs/homebrew-local.md)。
 

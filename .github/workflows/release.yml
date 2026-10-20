@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      USAGE_LOG: "off"
+      USAGE_CODEX_DIR: ${{ runner.temp }}/usage-release-test
+      USAGE_PLUGIN_DIR: ${{ runner.temp }}/usage-release-plugins
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version tag
+        shell: bash
+        run: |
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+          [[ "$GITHUB_REF" == "refs/tags/v$version" ]]
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Test
+        run: cargo +stable test --locked -- --test-threads=1
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo +stable build --release --locked --target "$TARGET"
+          "target/$TARGET/release/usage" --help
+          mkdir -p dist
+          tar -czf "dist/usage-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C "target/$TARGET/release" usage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usage-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: usage-*
+          path: dist
+          merge-multiple: true
+      - name: Generate formula and checksums
+        run: |
+          python3 scripts/release-formula.py --repo "$GITHUB_REPOSITORY"
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/usage.rb dist/SHA256SUMS --verify-tag --generate-notes --draft
+          gh release edit "$GITHUB_REF_NAME" --draft=false
