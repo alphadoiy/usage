@@ -114,11 +114,15 @@ async fn register(
         crate::performance::Service::from_environment().register_gateway_run(&scope, &run, &owner)
     })
     .await;
+    // Observation is optional: an unavailable metrics store must not refuse the route, which
+    // plugin accounts depend on. The run then reports through its session log instead.
     if !matches!(registered, Ok(Ok(()))) {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Cannot register performance source",
+        tracing::warn!(
+            event = "gateway_run_unregistered",
+            run_id = registration.run,
+            action = "cli_source"
         );
+        source.fallback();
     }
     let id = uuid::Uuid::new_v4().to_string();
     tracing::info!(
@@ -562,11 +566,17 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
     let lock = private_file(&directory.join("service.lock"))?;
     lock.try_lock_exclusive().map_err(|_| "观测网关已运行")?;
     let owner = directory.to_string_lossy().into_owned();
-    tokio::task::spawn_blocking(move || {
+    // Closing earlier runs' metric ranges is housekeeping; the gateway serves without it.
+    let recovered = tokio::task::spawn_blocking(move || {
         crate::performance::Service::from_environment().recover_gateway_runs(&owner)
     })
-    .await
-    .map_err(|_| "无法恢复网关索引")??;
+    .await;
+    if !matches!(recovered, Ok(Ok(()))) {
+        tracing::warn!(
+            event = "gateway_recovery_skipped",
+            reason = "metrics_store_unavailable"
+        );
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| "无法监听本地网关端口")?;

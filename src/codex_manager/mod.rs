@@ -57,11 +57,7 @@ pub fn default_root() -> PathBuf {
     if let Some(path) = std::env::var_os("USAGE_CODEX_DIR").filter(|v| !v.is_empty()) {
         return crate::config::resolved_data_path(Path::new(&path));
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| crate::config::home_dir().join(".local/share"));
-    crate::config::resolved_data_path(&base.join("usage/codex"))
+    crate::config::resolved_data_path(&crate::paths::data_dir().join("codex"))
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -340,7 +336,8 @@ impl Manager {
             })?;
             conn.busy_timeout(Duration::from_secs(5))?;
             op.begin("database_schema");
-            conn.execute_batch("PRAGMA foreign_keys=ON;
+            // WAL keeps the TUI's polling reads and launch-time syncs from blocking hook writes.
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS profiles (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
                 source_path TEXT, source_provider TEXT, source_hash TEXT, source_revision INTEGER,
@@ -677,9 +674,17 @@ impl Manager {
             for path in sources {
                 match op.step("source_read", || ccswitch::read(Path::new(&path))) {
                     Ok(source) => {
-                        let one = op.step("source_apply", || {
+                        // One source that cannot be applied is reported; it must not block the
+                        // others, nor launches of unrelated accounts.
+                        let one = match op.step("source_apply", || {
                             self.apply_source(source, true, &[], dry_run, true)
-                        })?;
+                        }) {
+                            Ok(one) => one,
+                            Err(error) => {
+                                report.skipped.push((path, error.to_string()));
+                                continue;
+                            }
+                        };
                         report.created.extend(one.created);
                         report.updated.extend(one.updated);
                         report.unchanged.extend(one.unchanged);
@@ -942,7 +947,9 @@ impl Manager {
         logging::operation("codex.run_start", |op| {
             // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
             // The launch terminal belongs to Codex; the report is logged and shown in Provider management.
-            op.step("source_sync", || self.sync(false))?;
+            if let Err(error) = op.step("source_sync", || self.sync(false)) {
+                tracing::warn!(event = "source_sync_failed", error = %error, action = "launch_saved_snapshot");
+            }
             let profile = op.step("account_resolve", || self.resolve(selector))?;
             let revision = revision.unwrap_or(profile.revision);
             op.account(&profile.id, revision, profile.auth_mode.log_name());

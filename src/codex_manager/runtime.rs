@@ -71,15 +71,12 @@ pub(super) fn inject(
         "{} codex event",
         super::shell_quote(&std::env::current_exe()?.to_string_lossy())
     );
+    // Codex loads hooks from every config layer and appends them (codex-rs hooks discovery), so
+    // the account's own hooks stay active from its config file. Repeating them in this session
+    // layer would register them twice; only Usage's callback is added here.
+    let groups = toml::Value::Array(vec![super::launcher::command_hook(&callback, 3, false)?]);
     for event in EVENTS {
-        let mut groups = match config.get("hooks").and_then(|v| v.get(event)) {
-            None => Vec::new(),
-            Some(toml::Value::Array(groups)) => groups.clone(),
-            Some(_) => return Err(Error::message("原有生命周期 hook 配置必须是数组")),
-        };
-        groups.push(super::launcher::command_hook(&callback, 3, false)?);
-        let value = toml::Value::Array(groups);
-        command.args(["-c", &format!("hooks.{event}={value}")]);
+        command.args(["-c", &format!("hooks.{event}={groups}")]);
     }
     tracing::info!(event = "run_events_injected", requires_hook_trust = true);
     Ok(())
@@ -166,14 +163,15 @@ fn receive_inner(context: &Context, data: &Value) -> Result<()> {
     let Some(manager) = Manager::open_read_only(context.root.clone())? else {
         return Err(Error::message("运行库不存在"));
     };
-    // A fast child can invoke SessionStart before its parent commits the run.
+    // A fast child can invoke SessionStart before its parent commits the run. Wait up to 2 s,
+    // inside the 3 s hook timeout, rather than drop the event that binds the session.
     let mut run = None;
-    for attempt in 0..10 {
+    for attempt in 0..100 {
         run = manager.run_record(&context.run_id)?;
-        if run.is_some() {
+        if run.as_ref().is_some_and(|run| run.pid.is_some()) {
             break;
         }
-        if attempt < 9 {
+        if attempt < 99 {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -193,7 +191,7 @@ fn receive_inner(context: &Context, data: &Value) -> Result<()> {
         context.root.join("manager.sqlite3"),
         OpenFlags::SQLITE_OPEN_READ_WRITE,
     )?;
-    conn.busy_timeout(Duration::from_millis(500))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
     conn.execute_batch("PRAGMA foreign_keys=ON")?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let live: bool = tx.query_row(

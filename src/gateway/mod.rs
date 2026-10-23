@@ -296,10 +296,15 @@ pub(crate) fn attach(
             let deadline = Instant::now() + STARTUP_BUDGET;
             let result = (|| {
                 private_dir(&directory)?;
+                // Simultaneous launches wait their turn within the budget instead of skipping
+                // observation (or failing a plugin launch) on the first contention.
                 let start = private_file(&directory.join("start.lock"))?;
-                start
-                    .try_lock_exclusive()
-                    .map_err(|_| "观测网关正在由其他启动准备")?;
+                while start.try_lock_exclusive().is_err() {
+                    if Instant::now() >= deadline {
+                        return Err("观测网关正在由其他启动准备".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 let lease = private_file(&registration.lease)?;
                 FileExt::lock_shared(&lease).map_err(|_| "无法创建网关运行租约")?;
                 let client = control_client()?;
@@ -310,8 +315,11 @@ pub(crate) fn attach(
                         return Err("观测网关准备超时".into());
                     }
                     let state = ensure(&directory, &client, deadline)?.state;
+                    // Registration may wait on the metrics store; it gets the remaining budget,
+                    // not the short health-probe timeout.
                     let response = client
                         .post(url(&state, "/_usage/routes"))
+                        .timeout(deadline.saturating_duration_since(Instant::now()))
                         .bearer_auth(&state.token)
                         .json(&registration)
                         .send()

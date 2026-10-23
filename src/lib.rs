@@ -15,6 +15,7 @@ pub mod hub;
 pub mod labels;
 pub mod logging;
 pub mod model;
+pub mod paths;
 pub mod performance;
 pub mod plain;
 pub mod plugins;

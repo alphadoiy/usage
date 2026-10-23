@@ -34,12 +34,7 @@ pub struct Store {
 pub fn root() -> PathBuf {
     std::env::var_os("USAGE_PLUGIN_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::config::home_dir().join(".local/share"))
-                .join("usage/plugins")
-        })
+        .unwrap_or_else(|| crate::paths::data_dir().join("plugins"))
 }
 pub(crate) fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let mut bytes = Vec::new();

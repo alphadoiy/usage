@@ -580,7 +580,7 @@ fn login_account(
                 }
             };
             // Browser/code instructions continue to use the existing cancellable auth task.
-            ratatui::restore();
+            crate::ui::terminal::leave();
             let result = handle.block_on(auth::run_in_terminal(
                 adapter.as_ref(),
                 auth::AuthRequest {
@@ -590,7 +590,7 @@ fn login_account(
                     program: PathBuf::new(),
                 },
             ));
-            *terminal.terminal = ratatui::try_init().map_err(io::Error::other)?;
+            *terminal.terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
             match result {
                 Ok(account) => {
                     return Ok(Some(plugins::store::Account {

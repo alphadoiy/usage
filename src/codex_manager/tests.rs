@@ -692,6 +692,47 @@ fn synchronization_preserves_pinned_versions_and_does_not_follow_current_provide
 }
 
 #[test]
+fn a_followed_source_that_cannot_be_applied_is_skipped_without_failing_sync() {
+    let f = Fixture::new();
+    let conn = f.source();
+    let mut m = f.manager();
+    insert(
+        &conn,
+        "a",
+        "A",
+        &native("https://example.com/a/v1", "a1"),
+        "fixture-a1",
+        json!({}),
+    );
+    m.import_ccswitch(&f.db(), true, &[], false).unwrap();
+    let a = m.resolve("A").unwrap();
+    insert(
+        &conn,
+        "a",
+        "A",
+        &native("https://example.com/a/v1", "a2"),
+        "fixture-a2",
+        json!({}),
+    );
+    // Saving the changed key fails, so applying this source fails as a whole.
+    let keys = m.root().join("keys");
+    let saved = m.root().join("keys.saved");
+    fs::rename(&keys, &saved).unwrap();
+    fs::write(&keys, "not a directory").unwrap();
+    let report = m.sync(false);
+    fs::remove_file(&keys).unwrap();
+    fs::rename(&saved, &keys).unwrap();
+    let report = report.expect("an unappliable source is reported, not raised");
+    assert_eq!(report.skipped.len(), 1);
+    assert!(report.needs_attention());
+    assert_eq!(
+        m.resolve(&a.id).unwrap().revision,
+        1,
+        "the saved snapshot stays usable"
+    );
+}
+
+#[test]
 fn local_edits_pause_following_and_reimport_reports_conflict() {
     let f = Fixture::new();
     let conn = f.source();
@@ -1657,7 +1698,16 @@ fn concurrent_native_processes_only_inherit_their_own_account_run_lease() {
     child_a.0.kill().unwrap();
     child_a.0.wait().unwrap();
     assert!(child_b.0.try_wait().unwrap().is_none());
-    assert!(m.oauth_lease(&a.id).is_ok(), "B must not retain A's lease");
+    // Other tests fork concurrently; a sibling child between fork and exec briefly shares A's
+    // lock description, so the release is observed within a short window, not instantly.
+    let released = (0..50).any(|_| {
+        let free = m.oauth_lease(&a.id).is_ok();
+        if !free {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        free
+    });
+    assert!(released, "B must not retain A's lease");
     assert!(m.oauth_lease(&b.id).is_err());
     child_b.0.kill().unwrap();
     child_b.0.wait().unwrap();

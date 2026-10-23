@@ -198,7 +198,7 @@ fn concurrent_nonblocking_runs_keep_session_events_separate_and_finish_once() {
 }
 
 #[test]
-fn injection_preserves_user_hooks_and_does_not_bypass_trust_or_write_home() {
+fn injection_adds_only_the_usage_hook_and_does_not_bypass_trust_or_write_home() {
     let f = Fixture::new();
     let mut command = Command::new("codex");
     let run = uuid::Uuid::new_v4().to_string();
@@ -215,16 +215,14 @@ fn injection_preserves_user_hooks_and_does_not_bypass_trust_or_write_home() {
         .find(|arg| arg.starts_with("hooks.SessionStart="))
         .unwrap();
     let config: toml::Value = toml::from_str(start).unwrap();
+    // The account's hook stays in its own config layer; repeating it here would run it twice.
     let groups = config["hooks"]["SessionStart"].as_array().unwrap();
-    assert_eq!(groups.len(), 2);
-    assert_eq!(groups[1]["hooks"][0]["timeout"].as_integer(), Some(3));
-    assert_eq!(groups[1]["hooks"][0]["async"].as_bool(), Some(false));
-    assert_eq!(
-        groups[0]["hooks"][0]["command"].as_str(),
-        Some("existing hook")
-    );
+    assert_eq!(groups.len(), 1);
+    assert!(!start.contains("existing hook"));
+    assert_eq!(groups[0]["hooks"][0]["timeout"].as_integer(), Some(3));
+    assert_eq!(groups[0]["hooks"][0]["async"].as_bool(), Some(false));
     assert!(
-        !groups[1]["hooks"][0]["command"]
+        !groups[0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
             .contains(&run)

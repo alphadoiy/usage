@@ -8,10 +8,9 @@ use std::time::SystemTime;
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::AppConfig;
-#[cfg(not(test))]
-use crate::config::home_dir;
 
 pub const SOURCES: [&str; 3] = ["codex", "claude", "grok"];
 
@@ -290,6 +289,7 @@ impl History {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct ParserState {
     high: Tokens,
     signatures: HashMap<String, String>,
@@ -301,12 +301,14 @@ struct ParserState {
     invalid_fork: bool,
     line: usize,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct CachedFile {
     source: String,
     len: u64,
     modified: Option<SystemTime>,
     offset: u64,
+    /// SHA-256 of the file's boundary bytes. Older ledgers stored the bytes themselves.
     fingerprint: Vec<u8>,
     state: ParserState,
     records: Vec<Record>,
@@ -324,11 +326,7 @@ impl Default for HistoryCache {
         }
         #[cfg(not(test))]
         {
-            let base = std::env::var_os("XDG_DATA_HOME")
-                .filter(|p| !p.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home_dir().join(".local/share"));
-            Self::at(base.join("usage/history.sqlite3"))
+            Self::at(crate::paths::data_dir().join("history.sqlite3"))
         }
     }
 }
@@ -599,11 +597,24 @@ fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFil
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(|e| e.to_string())?;
     let mut files = HashMap::new();
+    let mut scrubbed = Vec::new();
     for row in rows {
-        let (path, data) = row.map_err(|e| e.to_string())?;
-        let entry: CachedFile =
-            serde_json::from_str(&data).map_err(|e| format!("无效的历史缓存：{e}"))?;
-        let path = crate::config::resolved_data_path(Path::new(&path));
+        let (raw_path, data) = row.map_err(|e| e.to_string())?;
+        // One undecodable row must not disable the whole ledger; it is left in place and skipped.
+        let mut entry: CachedFile = match serde_json::from_str(&data) {
+            Ok(entry) => entry,
+            Err(_) => {
+                tracing::warn!(event = "history_row_skipped", reason = "undecodable");
+                continue;
+            }
+        };
+        // Older ledgers kept raw log bytes, which may include conversation text. Their digest
+        // equals what `fingerprint` now computes, so the file needs no reparse.
+        if entry.fingerprint.len() != FINGERPRINT_LEN {
+            entry.fingerprint = Sha256::digest(&entry.fingerprint).to_vec();
+            scrubbed.push((raw_path.clone(), entry.clone()));
+        }
+        let path = crate::config::resolved_data_path(Path::new(&raw_path));
         files
             .entry(path)
             .and_modify(|existing: &mut CachedFile| {
@@ -612,6 +623,21 @@ fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFil
                 }
             })
             .or_insert(entry);
+    }
+    drop(stmt);
+    let rewrite = !scrubbed.is_empty();
+    for (path, entry) in scrubbed {
+        if let Ok(data) = serde_json::to_string(&entry) {
+            // Best effort: a failed rewrite is retried on the next load.
+            let _ = db.execute(
+                "UPDATE history_files SET data=?1 WHERE path=?2",
+                rusqlite::params![data, path],
+            );
+        }
+    }
+    // Freed pages would still hold the old bytes; compact once, outside any transaction.
+    if rewrite && db.is_autocommit() {
+        let _ = db.execute_batch("VACUUM");
     }
     Ok(files)
 }
@@ -722,6 +748,9 @@ fn fresh_file(path: &Path, source: &str) -> CachedFile {
         malformed: 0,
     }
 }
+const FINGERPRINT_LEN: usize = 32;
+/// Identifies the indexed prefix by a digest of its first and last 2 KiB; the bytes themselves
+/// can hold conversation text and are never stored.
 fn fingerprint(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let mut bytes = Vec::new();
@@ -730,7 +759,7 @@ fn fingerprint(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
         .read_to_end(&mut bytes)?;
     file.seek(SeekFrom::Start(offset.saturating_sub(2048)))?;
     file.take(offset.min(2048)).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(Sha256::digest(&bytes).to_vec())
 }
 fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Result<()> {
     let mut file = File::open(path)?;
@@ -1243,6 +1272,62 @@ mod tests {
                 .total(),
             110
         );
+    }
+    #[test]
+    fn legacy_raw_fingerprints_are_scrubbed_and_a_bad_row_does_not_disable_the_ledger() {
+        let f = Fixture::new();
+        let config = f.config(&["codex"]);
+        let db = f.0.join("ledger.sqlite3");
+        let path = f.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        HistoryCache::at(db.clone()).load(&config);
+        // Rewrite the row as an older ledger did: the boundary bytes themselves.
+        let content = fs::read(&path).unwrap();
+        let raw: Vec<u8> = content.iter().chain(content.iter()).copied().collect();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let (key, data): (String, String) = conn
+            .query_row("SELECT path,data FROM history_files", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let mut row: Value = serde_json::from_str(&data).unwrap();
+        row["fingerprint"] = json!(raw);
+        conn.execute(
+            "UPDATE history_files SET data=?1 WHERE path=?2",
+            rusqlite::params![row.to_string(), key],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO history_files VALUES('/gone/broken.jsonl','not json')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let loaded = HistoryCache::at(db.clone()).load(&config);
+        assert_eq!(loaded.report(2026, &config.providers).totals.total(), 110);
+        assert_eq!(
+            loaded.read_bytes, 0,
+            "the legacy fingerprint still matches; no reparse"
+        );
+        let data: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT data FROM history_files WHERE path=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stored: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            stored["fingerprint"].as_array().unwrap().len(),
+            FINGERPRINT_LEN
+        );
+        assert!(!data.contains("session_meta"));
     }
     #[test]
     fn append_cursor_preserves_model_and_dedup_state_across_restart() {

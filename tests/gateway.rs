@@ -457,7 +457,9 @@ fn partial_stream_and_nonstream_json_do_not_invent_first_token_or_tps() {
 #[test]
 fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch() {
     use fs2::FileExt;
-    for obstruction in ["busy", "filesystem", "metrics"] {
+    // An unavailable metrics store no longer blocks the route: the launch is still proxied and
+    // its statistics come from the session log. The other obstructions launch directly.
+    for (obstruction, direct) in [("busy", true), ("filesystem", true), ("metrics", false)] {
         let f = Fixture::new();
         let upstream = Upstream::new();
         f.add("one", upstream.port, "synthetic-key");
@@ -484,7 +486,12 @@ fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch(
             }
         };
         let start = Instant::now();
-        let mut child = f.start_expect("one", "123e4567-e89b-12d3-a456-426614174001", "json", true);
+        let mut child = f.start_expect(
+            "one",
+            "123e4567-e89b-12d3-a456-426614174001",
+            "json",
+            direct,
+        );
         f.wait("one.ready");
         assert!(
             start.elapsed() < Duration::from_secs(3),
@@ -498,7 +505,11 @@ fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch(
             .unwrap()
             .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
             .collect::<String>();
-        assert!(logs.contains("gateway_fallback"));
+        assert!(logs.contains(if direct {
+            "gateway_fallback"
+        } else {
+            "gateway_run_unregistered"
+        }));
         assert!(!logs.contains("synthetic-key"));
     }
 }
@@ -559,6 +570,34 @@ fn unaddressable_provider_id_fails_launch_instead_of_connecting_directly() {
         "Codex must not start directly"
     );
     assert!(upstream.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_launch_waits_for_a_brief_concurrent_preparation_instead_of_skipping_observation() {
+    use fs2::FileExt;
+    let f = Fixture::new();
+    let upstream = Upstream::new();
+    f.add("one", upstream.port, "synthetic-key");
+    let path = f.path.join("manager/gateway");
+    fs::create_dir_all(&path).unwrap();
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path.join("start.lock"))
+        .unwrap();
+    held.lock_exclusive().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let mut child = f.start_expect("one", "123e4567-e89b-12d3-a456-426614174003", "json", false);
+    f.wait("one.ready");
+    release.join().unwrap();
+    fs::write(f.path.join("one.go"), "").unwrap();
+    f.wait("one.result");
+    assert!(child.wait().unwrap().success());
+    assert_eq!(upstream.calls.lock().unwrap().len(), 1);
 }
 
 #[test]

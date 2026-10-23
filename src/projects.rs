@@ -89,23 +89,8 @@ impl Store {
     pub fn at(path: PathBuf) -> Self {
         Self { path }
     }
-    /// Like `HistoryCache::default`, tests never read the user's store.
     pub fn from_environment() -> Self {
-        #[cfg(test)]
-        {
-            Self::at(
-                std::env::temp_dir()
-                    .join(format!("usage-projects-{}.sqlite3", uuid::Uuid::new_v4())),
-            )
-        }
-        #[cfg(not(test))]
-        {
-            let base = std::env::var_os("XDG_DATA_HOME")
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::config::home_dir().join(".local/share"));
-            Self::at(base.join("usage/projects.sqlite3"))
-        }
+        Self::at(crate::paths::data_dir().join("projects.sqlite3"))
     }
 
     fn open(&self) -> Result<Connection, String> {

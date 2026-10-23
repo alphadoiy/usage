@@ -246,7 +246,7 @@ pub fn run_with_config(
         let _ = projects_tx.send((sessions.directories(), store.list()));
     });
     let mut refreshed = Instant::now();
-    let mut terminal = ratatui::try_init().map_err(io::Error::other)?;
+    let mut terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
     let result = (|| -> io::Result<()> {
         loop {
             if projects.sessions.is_none()
@@ -463,9 +463,10 @@ pub fn run_with_config(
                     if let Some(p) = profile {
                         match manager.revision(&p.id, p.revision) {
                             Ok(rev) => {
-                                ratatui::restore();
+                                crate::ui::terminal::leave();
                                 let edited = codex_manager::cli::edit_text(&rev.config);
-                                terminal = ratatui::try_init().map_err(io::Error::other)?;
+                                terminal =
+                                    crate::ui::terminal::enter().map_err(io::Error::other)?;
                                 notice = edited
                                     .and_then(|text| {
                                         manager.update(&p.id, p.revision, &text, None, None)
@@ -535,7 +536,7 @@ pub fn run_with_config(
             }
         }
     })();
-    ratatui::restore();
+    crate::ui::terminal::leave();
     result
 }
 fn reload(
@@ -604,7 +605,7 @@ fn launch(
                 .unwrap_or_else(|e| e.to_string()),
         );
     }
-    ratatui::restore();
+    crate::ui::terminal::leave();
     let status = {
         let _runtime = handle.enter();
         #[cfg(unix)]
@@ -624,7 +625,7 @@ fn launch(
         )
         .map(|outcome| outcome.status)
     };
-    *terminal = ratatui::try_init().map_err(io::Error::other)?;
+    *terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
     Ok(status
         .map(|s| format!("Codex 已退出：{s}"))
         .unwrap_or_else(|e| e.to_string()))

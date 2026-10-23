@@ -104,11 +104,7 @@ impl Service {
         }
     }
     pub fn from_environment() -> Self {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| crate::config::home_dir().join(".local/share"));
-        Self::at(base.join("usage/performance.sqlite3"))
+        Self::at(crate::paths::data_dir().join("performance.sqlite3"))
     }
     pub(super) fn open(&self) -> Result<Connection, String> {
         if let Some(parent) = self.path.parent() {

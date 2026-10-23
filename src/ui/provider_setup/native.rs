@@ -358,7 +358,7 @@ fn run_inner(
                     .contains(&key.code)
                     {
                         let device = [KeyCode::Char('2'), KeyCode::Char('d')].contains(&key.code);
-                        ratatui::restore();
+                        crate::ui::terminal::leave();
                         let result = {
                             let _runtime = handle.enter();
                             let adapter =
@@ -388,7 +388,7 @@ fn run_inner(
                                     ))
                                 })
                         };
-                        *terminal = ratatui::try_init().map_err(io::Error::other)?;
+                        *terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
                         match result {
                             Ok(account) => {
                                 return manager

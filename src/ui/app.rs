@@ -208,7 +208,7 @@ pub fn run_history_with_query(
 }
 
 fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
-    let mut terminal = ratatui::try_init().map_err(io::Error::other)?;
+    let mut terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
     let mut redraw = RedrawSchedule::new();
     app.refresh(&handle);
     let result = loop {
@@ -297,7 +297,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                 app.open_browser(&handle);
                             }
                             MenuCommand::Activate(MenuAction::Providers) => {
-                                ratatui::restore();
+                                crate::ui::terminal::leave();
                                 let result = crate::ui::run_provider_manager_with_config(
                                     handle.clone(),
                                     Some(app.config_path.clone()),
@@ -319,7 +319,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                         .then(|| app.home_sessions.selected_project().cloned())
                                         .flatten(),
                                 );
-                                terminal = match ratatui::try_init() {
+                                terminal = match crate::ui::terminal::enter() {
                                     Ok(t) => t,
                                     Err(e) => break Err(io::Error::other(e)),
                                 };
@@ -430,7 +430,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
             Err(error) => break Err(error),
         }
     };
-    ratatui::restore();
+    crate::ui::terminal::leave();
     result
 }
 
@@ -458,9 +458,9 @@ fn fulfill_resume_request(
     let Some(session) = app.resume_request.take() else {
         return Ok(());
     };
-    ratatui::restore();
+    crate::ui::terminal::leave();
     let result = resume_in_terminal(handle, &session);
-    *terminal = ratatui::try_init().map_err(io::Error::other)?;
+    *terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
     if let Some(browser) = &mut app.browser {
         browser.launching = false;
     }
@@ -1375,7 +1375,22 @@ impl Dashboard {
             handle.spawn(
                 async move {
                     let target = provider.cache_key();
-                    let snapshot = query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await;
+                    // A panicking provider still answers, as in the CLI: otherwise `pending`
+                    // never reaches zero and every later refresh is skipped.
+                    let query = {
+                        let provider = Arc::clone(&provider);
+                        tokio::spawn(
+                            async move { query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await }
+                                .in_current_span(),
+                        )
+                    };
+                    let snapshot = query.await.unwrap_or_else(|_| {
+                        crate::model::snapshot_transient(
+                            provider.id(),
+                            provider.display_name(),
+                            "查询任务中断",
+                        )
+                    });
                     let _ = tx.send(AppEvent::Quota(Box::new(RefreshEvent {
                         generation,
                         target,
@@ -3328,6 +3343,38 @@ mod tests {
         app.refresh(&handle);
         drain_until(&mut app, |a| a.pending == 0).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    struct PanickingQuota;
+    #[async_trait]
+    impl UsageProvider for PanickingQuota {
+        fn id(&self) -> &'static str {
+            "codex"
+        }
+        fn display_name(&self) -> &'static str {
+            "Codex"
+        }
+        async fn query(&self) -> UsageSnapshot {
+            panic!("synthetic provider panic")
+        }
+    }
+    #[tokio::test]
+    async fn a_panicking_quota_query_answers_and_later_refreshes_still_run() {
+        let mut app = Dashboard::new(
+            vec![Arc::new(PanickingQuota)],
+            isolated_config(),
+            "/tmp/test-config".into(),
+        );
+        app.service_http = Arc::new(crate::http::FakeHttp::new());
+        let handle = Handle::current();
+        app.refresh(&handle);
+        drain_until(&mut app, |a| a.pending == 0).await;
+        let generation = app.generation;
+        app.refresh(&handle);
+        assert_ne!(
+            app.generation, generation,
+            "the next refresh is not skipped"
+        );
+        drain_until(&mut app, |a| a.pending == 0).await;
     }
     #[tokio::test]
     async fn switching_history_preserves_date_source_and_monthly_view() {
