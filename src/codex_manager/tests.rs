@@ -149,9 +149,9 @@ fn launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly() {
         "--config=model='first'",
         "-cmodel='second'",
         "-c",
-        "model_providers.\"a.b\"={base_url='https://b.invalid/v1',env_key='OTHER'}",
+        "model_providers.other={base_url='https://b.invalid/v1',env_key='OTHER'}",
         "-c",
-        "model_provider='a.b'",
+        "model_provider='other'",
         "--model=flag-model",
     ];
     let resolution = effective::resolve(
@@ -192,6 +192,27 @@ fn launch_identity_applies_toml_paths_and_replaces_table_assignments_exactly() {
         crate::runs::IdentityState::Unresolved
     );
     assert!(resolution.key.is_none());
+    // Codex splits override keys on every dot and ignores TOML quoting, so a quoted key names
+    // segments `"a` and `b"` and the selected provider `a.b` does not exist.
+    let args = [
+        "-c",
+        "model_providers.\"a.b\"={base_url='https://b.invalid/v1',env_key='OTHER'}",
+        "-c",
+        "model_provider='a.b'",
+    ];
+    let resolution = effective::resolve(
+        &text,
+        AuthMode::Byok,
+        &f.path,
+        false,
+        &args.map(str::to_string),
+        Some("managed-key"),
+        &|name| (name == "OTHER").then(|| "other-key".into()),
+    );
+    assert_eq!(
+        resolution.identity.state,
+        crate::runs::IdentityState::Unresolved
+    );
 }
 
 #[test]

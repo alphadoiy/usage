@@ -313,34 +313,23 @@ pub(super) fn resolve(
     }
 }
 
+/// Mirrors Codex's `-c` parsing (`codex-rs/utils/cli/src/config_override.rs` and
+/// `config/src/overrides.rs`): the key is split on every `.` without TOML quoting, and a value
+/// that is not valid TOML becomes a string with surrounding quotes stripped.
 fn apply_override(document: &mut toml::Value, key: &str, raw: &str) -> Result<(), &'static str> {
-    // Parse a sentinel separately to distinguish a dotted path from a table-valued assignment.
-    let sentinel: toml::Value =
-        toml::from_str(&format!("{key}=0")).map_err(|_| "配置覆盖路径无法解析")?;
-    let mut cursor = &sentinel;
-    let mut path = Vec::new();
-    while let Some(table) = cursor.as_table() {
-        if table.len() != 1 {
-            return Err("配置覆盖路径不唯一");
-        }
-        let (part, value) = table.iter().next().ok_or("配置覆盖路径为空")?;
-        path.push(part);
-        cursor = value;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("配置覆盖路径为空");
     }
-    if cursor.as_integer() != Some(0) || path.is_empty() {
-        return Err("配置覆盖路径无效");
-    }
+    let path: Vec<String> = key.split('.').map(str::to_string).collect();
     if ["profile", "profiles"].contains(&path[0].as_str()) {
         return Err("原生 profile 覆盖尚未解析");
     }
-    let parsed: toml::Value = toml::from_str(&format!("value={raw}"))
-        .or_else(|_| toml::from_str(&format!("value={}", toml::Value::String(raw.into()))))
-        .map_err(|_| "配置覆盖值无法解析")?;
-    let table = parsed
-        .as_table()
-        .filter(|t| t.len() == 1)
-        .ok_or("配置覆盖值不唯一")?;
-    let value = table.get("value").ok_or("配置覆盖值不存在")?.clone();
+    let raw = raw.trim();
+    let value = toml::from_str::<toml::Table>(&format!("_x_ = {raw}"))
+        .ok()
+        .and_then(|table| table.get("_x_").cloned())
+        .unwrap_or_else(|| toml::Value::String(raw.trim_matches(['"', '\'']).to_string()));
     let mut target = document;
     for part in &path[..path.len() - 1] {
         let table = target.as_table_mut().ok_or("配置覆盖路径与已有字段冲突")?;
@@ -393,113 +382,22 @@ mod gateway_tests {
     }
 }
 
-/// OAuth remains a native sign-in. Only the public built-in base override is injected.
-/// This eligibility check deliberately does not claim a billing/resource credential identity.
-pub(super) fn oauth_gateway_reason(
-    saved: &str,
-    cwd: &Path,
-    resume: bool,
-    args: &[String],
-) -> Option<&'static str> {
-    if resume {
-        return Some("恢复会话尚未确认实际配置");
-    }
-    for directory in cwd.ancestors() {
-        if directory.join(".codex/config.toml").exists() {
-            return Some("存在未解析的项目配置层");
-        }
-        if directory.join(".git").exists() {
-            break;
-        }
-    }
-    let Ok(document) = toml::from_str::<toml::Value>(saved) else {
-        return Some("OAuth 配置无法解析");
-    };
-    if document.get("model_provider").and_then(toml::Value::as_str) != Some("openai")
-        || [
-            "profile",
-            "profiles",
-            "model_providers",
-            "openai_base_url",
-            "chatgpt_base_url",
-            "enforce_residency",
-        ]
-        .iter()
-        .any(|k| document.get(k).is_some())
-    {
-        return Some("OAuth 路由或配置层尚未解析");
-    }
-    if document
-        .get("features")
-        .and_then(|f| f.get("respect_system_proxy"))
-        .and_then(toml::Value::as_bool)
-        == Some(true)
-    {
-        return Some("原生系统代理路由尚未解析");
-    }
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--model" | "-m" => {
-                if args.next().is_none() {
-                    return Some("模型选项缺少值");
-                }
-            }
-            "exec"
-            | "e"
-            | "--json"
-            | "--full-auto"
-            | "--skip-git-repo-check"
-            | "--no-alt-screen"
-            | "--no-daemon" => {}
-            "resume" | "fork" | "review" => return Some("此 OAuth 子命令保持原生路由"),
-            arg if arg.starts_with("--model=") => {}
-            arg if arg.starts_with('-') => return Some("存在尚未解析的 OAuth 启动选项"),
-            _ => {}
-        }
-    }
-    None
-}
-
 #[cfg(test)]
-mod oauth_observation_tests {
+mod oauth_identity_tests {
     use super::*;
+    /// A native sign-in never claims a billing or resource credential identity.
     #[test]
-    fn native_gateway_eligibility_keeps_auth_and_billing_resolution_separate() {
+    fn oauth_launch_identity_stays_unresolved() {
         let path =
-            std::env::temp_dir().join(format!("usage-oauth-observation-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("usage-oauth-identity-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(path.join(".git")).unwrap();
         let config = "model_provider='openai'\nforced_login_method='chatgpt'\n";
-        assert!(oauth_gateway_reason(config, &path, false, &[]).is_none());
-        assert!(
-            oauth_gateway_reason(
-                config,
-                &path,
-                false,
-                &["exec".into(), "--json".into(), "hello".into()]
-            )
-            .is_none()
-        );
         assert_eq!(
             resolve(config, AuthMode::Oauth, &path, false, &[], None, &|_| None)
                 .identity
                 .state,
             IdentityState::Unresolved
         );
-        for (text, resume, args) in [
-            (config, true, vec![]),
-            (config, false, vec!["--enable".into(), "unknown".into()]),
-            (
-                "model_provider='openai'\nenforce_residency='us'",
-                false,
-                vec![],
-            ),
-        ] {
-            assert!(oauth_gateway_reason(text, &path, resume, &args).is_some());
-        }
-        std::fs::create_dir_all(path.join(".codex")).unwrap();
-        std::fs::write(path.join(".codex/config.toml"), "").unwrap();
-        assert!(oauth_gateway_reason(config, &path, false, &[]).is_some());
         std::fs::remove_dir_all(path).unwrap();
     }
 }

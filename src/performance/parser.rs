@@ -39,6 +39,13 @@ struct Payload {
     time_to_first_token_ms: Option<i64>,
     forked_from_id: Option<String>,
     thread_spawn: Option<Value>,
+    item: Item,
+    started_at_ms: Option<i64>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Item {
+    r#type: String,
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -100,6 +107,12 @@ struct Codex {
     first_call: Option<Observation>,
     fork_at: Option<i64>,
     invalid_fork: bool,
+    /// Earliest start of an answer item in the current request.
+    first_output: Option<i64>,
+    /// Newer rollouts write `token_usage_record` when the response ends, before the
+    /// `token_count` that may wait for tool output; its time and the first output are kept here.
+    record_end: Option<i64>,
+    record_first: Option<i64>,
 }
 pub(super) fn codex(state: Value) -> Box<dyn RequestParser> {
     Box::new(serde_json::from_value::<Codex>(state).unwrap_or_default())
@@ -122,6 +135,9 @@ impl RequestParser for Codex {
                 self.fork_at = at;
                 self.invalid_fork = at.is_none();
             }
+        } else if e.r#type == "token_usage_record" {
+            self.record_end = at;
+            self.record_first = self.first_output.take();
         } else if e.r#type == "turn_context" {
             if !p.model.is_empty() {
                 self.model = p.model;
@@ -158,7 +174,23 @@ impl RequestParser for Codex {
             self.start = at;
         } else if e.r#type == "event_msg" {
             match p.r#type.as_str() {
+                // An answer item's start matches Codex's own `time_to_first_token_ms`. Reasoning
+                // items are written whole (start equals end), often after the answer began, so
+                // they do not mark the first token.
+                "item_completed" if p.item.r#type == "AgentMessage" => {
+                    if let Some(started) = p.started_at_ms
+                        && self.start.is_none_or(|start| started >= start)
+                    {
+                        self.first_output = Some(
+                            self.first_output
+                                .map_or(started, |first| first.min(started)),
+                        );
+                    }
+                }
                 "task_started" => {
+                    self.first_output = None;
+                    self.record_end = None;
+                    self.record_first = None;
                     self.start = at;
                     self.asked = None;
                     self.answered = None;
@@ -178,6 +210,16 @@ impl RequestParser for Codex {
                     }
                     let signature = serde_json::to_string(&total).unwrap_or_default();
                     if total.is_some() && signature == self.previous {
+                        // Codex emits token_count when a sampling attempt ends. Without new usage
+                        // the attempt failed (e.g. a stream timeout before a retry), so the next
+                        // attempt is timed from here rather than from the abandoned one.
+                        self.start = Some(self.start.map_or(at, |start| start.max(at)));
+                        self.asked = None;
+                        self.answered = None;
+                        self.answering_turn = None;
+                        self.first_output = None;
+                        self.record_end = None;
+                        self.record_first = None;
                         return Ok(Vec::new());
                     }
                     let usage = last.unwrap_or_else(|| {
@@ -204,6 +246,10 @@ impl RequestParser for Codex {
                     if self.fork_at.is_some_and(|cutoff| at < cutoff) {
                         return Ok(Vec::new());
                     }
+                    // A request ended by `token_usage_record` is timed from that record; the
+                    // observation keeps the `token_count` identity already used in the index.
+                    let recorded = self.record_end.take().filter(|end| *end <= at);
+                    let recorded_first = self.record_first.take();
                     let mut hash = Sha256::new();
                     hash.update(self.session.as_bytes());
                     hash.update([0]);
@@ -211,35 +257,45 @@ impl RequestParser for Codex {
                     hash.update([0]);
                     hash.update(signature.as_bytes());
                     hash.update(serde_json::to_vec(&usage).unwrap_or_default());
-                    let call =
-                        Observation {
-                            id: format!("cx-{:x}", hash.finalize()),
-                            session: self.session.clone(),
-                            turn: self.turn.clone(),
-                            at,
-                            model: self.model.clone(),
-                            upstream: self.upstream.clone(),
-                            output: usage.output_tokens,
-                            reasoning: usage.reasoning_output_tokens.min(usage.output_tokens),
-                            duration_ms: {
-                                // Older rollouts emit usage after their own tool output. Keep the
-                                // input captured when answering began and exclude the tool's runtime.
-                                let captured =
-                                    self.answered.is_some() && self.answering_turn == self.turn;
-                                let start = if captured { self.asked } else { self.start };
-                                let start = start.map(|v| v.max(self.last_end.unwrap_or(v)));
-                                let end = if captured
-                                    && self.start.zip(self.answered).is_some_and(
-                                        |(input, output)| input > output && output <= at,
-                                    ) {
-                                    self.answered.unwrap()
-                                } else {
-                                    at
-                                };
-                                duration(start, end)
-                            },
-                            ..Default::default()
-                        };
+                    let mut call = Observation {
+                        id: format!("cx-{:x}", hash.finalize()),
+                        session: self.session.clone(),
+                        turn: self.turn.clone(),
+                        at,
+                        model: self.model.clone(),
+                        upstream: self.upstream.clone(),
+                        output: usage.output_tokens,
+                        reasoning: usage.reasoning_output_tokens.min(usage.output_tokens),
+                        ..Default::default()
+                    };
+                    // Older rollouts emit usage after their own tool output. Keep the input
+                    // captured when answering began and exclude the tool's runtime.
+                    let captured = self.answered.is_some() && self.answering_turn == self.turn;
+                    let start = if captured { self.asked } else { self.start };
+                    let start = start.map(|v| v.max(self.last_end.unwrap_or(v)));
+                    let end = if let Some(end) = recorded {
+                        end
+                    } else if captured
+                        && self
+                            .start
+                            .zip(self.answered)
+                            .is_some_and(|(input, output)| input > output && output <= at)
+                    {
+                        self.answered.unwrap()
+                    } else {
+                        at
+                    };
+                    call.duration_ms = duration(start, end);
+                    if recorded.is_some()
+                        && let Some(duration) = call.duration_ms
+                    {
+                        call.ttft_ms = recorded_first
+                            .zip(start)
+                            .and_then(|(first, start)| first.checked_sub(start))
+                            .filter(|ttft| *ttft > 0 && *ttft <= duration);
+                        call.native_timing = true;
+                    }
+                    self.first_output = None;
                     self.last_end = Some(at);
                     self.asked = None;
                     self.answered = None;
@@ -251,9 +307,11 @@ impl RequestParser for Codex {
                     return Ok(vec![call]);
                 }
                 "task_complete" => {
+                    // Turn timing stands in only for a request without its own record.
                     if self.calls == 1
                         && self.turn.as_deref() == Some(p.turn_id.as_str())
                         && let Some(mut call) = self.first_call.clone()
+                        && !call.native_timing
                         && let Some(ms) = p.duration_ms.filter(|ms| *ms > 0)
                     {
                         call.duration_ms = Some(ms);

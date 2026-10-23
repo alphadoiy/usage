@@ -1,6 +1,8 @@
 # 本地请求观测网关
 
-Usage 启动能够确认配置来源的托管 Codex BYOK / OAuth 新会话时，会按需启动本地网关。BYOK 使用临时注入的地址和本地路由令牌，网关再使用该次启动选定的真实端点与凭据转发请求；OAuth 保留内置 openai 提供方和 CLI 原生认证，透传 CLI 请求或握手中的当前令牌。账号配置、保存版本和原生用户配置不被改写，首页切换 Provider 不会改变已有路由。
+Usage 启动能够确认配置来源的托管 Codex BYOK 新会话时，会按需启动本地网关。BYOK 使用临时注入的地址和本地路由令牌，网关再使用该次启动选定的真实端点与凭据转发请求。账号配置、保存版本和原生用户配置不被改写，首页切换 Provider 不会改变已有路由。
+
+官方订阅（ChatGPT OAuth）始终直连 OpenAI，不经过网关，也不注入 `openai_base_url` 或代理绕过设置；日志记录 `gateway_skipped`（`official_direct`）。其请求性能来自会话日志：Codex 在响应结束时写入的 `token_usage_record` 提供逐请求结束时间，回答项的 `started_at_ms` 提供首字，详见[Provider 性能](performance.md)。下文第二阶段的 OAuth 路由已移除，相关记录保留作历史说明。
 
 ```text
 Usage 启动 → 解析原始 Provider / 账号 / 版本 → 注册本次启动路由
@@ -10,7 +12,7 @@ Agent → 127.0.0.1 网关 → 已绑定的推理端点
 
 ## 使用
 
-正常通过 Usage 启动受支持的 BYOK / OAuth 新会话即可，无需手动启动服务。重新启动 Agent 才能接入，已经运行的会话不会被追溯接管。
+正常通过 Usage 启动受支持的 BYOK 新会话即可，无需手动启动服务。重新启动 Agent 才能接入，已经运行的会话不会被追溯接管。
 
 ```sh
 usage gateway status
@@ -29,7 +31,7 @@ USAGE_GATEWAY=off usage codex run <账号>
 
 - 托管 Codex BYOK 新会话，且原始推理端点、模型提供方、凭据引用可由现有启动解析器确认。
 - HTTP/SSE 的 Responses、Chat Completions 流量；实际 CLI 仍需支持其保存的协议。`models` 和 `responses/compact` 原样转发，不计入本期生成性能统计。
-- OAuth 新会话保留内置 `openai`，仅临时覆盖 `openai_base_url`。网关不获取、缓存或刷新 OAuth token，认证与刷新继续由 CLI 处理。
+- OAuth 新会话直连官方服务，不接入网关。
 - 恢复会话、本地未托管实例、项目 `.codex/config.toml`、原生 profile、显式 `-c` 覆盖、未知启动选项、BYOK 显式 WebSocket 或强制系统代理配置等继续使用原有调用路径。默认 WebSocket 升级请求返回 426，引导 Codex 回退 HTTP/SSE；单次启动可选择 WS 观测。跳过时记录 `gateway_skipped` 及原因。保持原生认证，不修改保存的配置。
 
 独立资源连接仍通过显式绑定的日志实例查询历史性能，不会因展示余额自动代理流量。
@@ -44,7 +46,7 @@ USAGE_GATEWAY=off usage codex run <账号>
 
 服务独立于 TUI 进程。启动器持有文件租约，并将租约继承给 Agent；退出首页、释放进程句柄或启动器意外退出，不会释放仍由 Agent 持有的租约。服务定期清理已释放且没有进行中请求的路由；所有路由空闲 60 秒后退出。进行中的请求不受空闲回收影响。
 
-运行文件位于 `<Manager 根目录>/gateway`，目录权限 700，文件权限 600。`state.json` 只保存本地端口与控制令牌；BYOK 上游密钥只存在服务内存。OAuth 注册仅保存绑定的工作区标识，不注册 access token 或 refresh token。上游固定为已注册的地址，禁止 HTTP 重定向，调用方不能把它当作任意目标代理。服务仅监听 `127.0.0.1`，路由也需要独立令牌。BYOK 使用本地 Bearer；OAuth 使用不可猜测的路由路径能力令牌，并核对原生 `chatgpt-account-id`，保留请求本身的 Bearer，拒绝工作区不匹配、API Key 误用和跨目标令牌转发。Agent 的 `NO_PROXY` / `no_proxy` 临时增加回环地址，并保留原有规则。
+运行文件位于 `<Manager 根目录>/gateway`，目录权限 700，文件权限 600。`state.json` 只保存本地端口与控制令牌；BYOK 上游密钥只存在服务内存。上游固定为已注册的地址，禁止 HTTP 重定向，调用方不能把它当作任意目标代理。服务仅监听 `127.0.0.1`，路由也需要独立令牌。BYOK 使用本地 Bearer；OAuth 使用不可猜测的路由路径能力令牌，并核对原生 `chatgpt-account-id`，保留请求本身的 Bearer，拒绝工作区不匹配、API Key 误用和跨目标令牌转发。Agent 的 `NO_PROXY` / `no_proxy` 临时增加回环地址，并保留原有规则。
 
 网关异常退出可能中断当前正在传输的请求，交给 Agent 原生错误处理与重试机制；网关不自动重放，避免重复执行或计费。下一次 Usage 启动会检查失效状态并重新启动；恢复失败则直连启动，不等待服务恢复。已启动 Agent 不会被偷偷重启或改写认证。新服务按自己的 Manager 根目录收束上次未完成的采集范围，不影响其他 Manager 的服务。
 
@@ -89,7 +91,9 @@ USAGE_GATEWAY=off usage codex run <账号>
 
 60 秒空闲策略通过可推进的时间参数验证边界和活跃路由重置；端到端另行验证运行租约和路由回收。没有为这项回归真实等待 60 秒，也没有把真实 Codex/中转站联调作为开发启动的前置条件。实际厂商兼容性仍需在正常使用中观察日志。
 
-## 第二阶段：OAuth 原生认证与传输
+## 第二阶段：OAuth 原生认证与传输（已移除）
+
+> 2026-10-24 起官方订阅一律直连，以下 OAuth 路由及其验证仅作历史记录；WebSocket 426 引导与逐请求采集仍适用于 BYOK。
 
 OAuth 路由固定为官方 Codex 后端，或经过控制接口显式注册的本机回环测试服务；普通外部服务不能接收 OAuth 透传令牌。Agent 的登录文件、模型提供方、原生 profile 和刷新行为保持不变，保存的配置不写入网关 URL。本地路径能力令牌不输出到文件日志。
 

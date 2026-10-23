@@ -418,10 +418,6 @@ async fn forward(
         session_id = capture.session,
         endpoint = path
     );
-    let requested_stream = request_json
-        .as_ref()
-        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-        .unwrap_or(false);
     let response = if let RouteAuth::Plugin { account } = &route.registration.auth {
         if path == "models" {
             match state
@@ -477,14 +473,11 @@ async fn forward(
     capture.status = response.status().as_u16();
     let status = response.status();
     let mut headers = clean_headers(response.headers());
-    let native_stream = matches!(route.registration.auth, RouteAuth::NativeOauth { .. })
-        && response.headers().get("content-type").is_none();
-    let mut streaming = (native_stream && requested_stream)
-        || response
-            .headers()
-            .get("content-type")
-            .and_then(|s| s.to_str().ok())
-            .is_some_and(|s| s.starts_with("text/event-stream"));
+    let streaming = response
+        .headers()
+        .get("content-type")
+        .and_then(|s| s.to_str().ok())
+        .is_some_and(|s| s.starts_with("text/event-stream"));
     headers.remove("content-length");
     let mut upstream = response.into_body().into_data_stream();
     let stream = async_stream::stream! {
@@ -495,11 +488,6 @@ async fn forward(
             match next {
                 Ok(Some(Ok(bytes))) => {
                     if inference {
-                        if native_stream && !streaming && bytes.iter().find(|b|!b.is_ascii_whitespace()).is_some_and(|b|matches!(b,b'd'|b'e'|b':')) {
-                            streaming=true;
-                            capture.observer.feed(&json,capture.start.elapsed().as_millis() as i64);
-                            json.clear();
-                        }
                         if streaming { capture.observer.feed(&bytes, capture.start.elapsed().as_millis() as i64); }
                         else if !large {
                             if json.len() + bytes.len() <= 1024 * 1024 { json.extend_from_slice(&bytes); }
@@ -871,114 +859,6 @@ mod failure_tests {
         assert_eq!(record.outcome, "stream_timeout");
         assert!(!record.complete && record.decode.is_none());
         assert_eq!(hits.load(Ordering::Relaxed), 1);
-        task.abort();
-    }
-}
-
-#[cfg(test)]
-mod oauth_tests {
-    use super::*;
-    #[tokio::test]
-    async fn native_http_uses_each_current_token_and_observes_sse_without_content_type() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = seen.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream = format!("http://{}", listener.local_addr().unwrap());
-        let app=Router::new().route("/responses",post(move |headers:HeaderMap| {
-            let capture=capture.clone();async move {
-                assert_eq!(headers["chatgpt-account-id"],"workspace");
-                capture.lock().unwrap().push(headers["authorization"].to_str().unwrap().to_owned());
-                let stream=async_stream::stream! {
-                    for _ in 0..7 {
-                        yield Ok::<_,std::io::Error>(bytes::Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n"));
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    yield Ok(bytes::Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"served\",\"usage\":{\"output_tokens\":200}}}\n\n"));
-                };
-                Response::new(Body::from_stream(stream))
-            }
-        }));
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let (records, mut receiver) = mpsc::channel(8);
-        let sources = Arc::new(recording::Sources::default());
-        let state = Arc::new(Shared {
-            plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), 0),
-            sources: sources.clone(),
-            directory: PathBuf::new(),
-            token: "admin".into(),
-            port: 0,
-            stopping: AtomicBool::new(false),
-            routes: RwLock::new(HashMap::from([(
-                "route".into(),
-                Arc::new(Route {
-                    source: sources.reserve("scope", "run").unwrap(),
-                    active: AtomicUsize::new(0),
-                    registration: Registration {
-                        observe_websocket: false,
-                        run: "run".into(),
-                        scope: "scope".into(),
-                        provider: "provider".into(),
-                        upstream,
-                        model_provider: "openai".into(),
-                        auth: RouteAuth::NativeOauth {
-                            account_id: "workspace".into(),
-                        },
-                        token: "capability".into(),
-                        lease: PathBuf::new(),
-                    },
-                }),
-            )])),
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            idle_timeout: Duration::from_secs(2),
-            records,
-        });
-        for token in ["native-before", "native-after-refresh"] {
-            let handshake = axum::http::Request::builder()
-                .method("GET")
-                .header("authorization", format!("Bearer {token}"))
-                .header("chatgpt-account-id", "workspace")
-                .header("upgrade", "websocket")
-                .header("connection", "Upgrade")
-                .body(Body::empty())
-                .unwrap();
-            let response = forward(
-                State(state.clone()),
-                RoutePath((
-                    "route".into(),
-                    "capability/backend-api/codex/responses".into(),
-                )),
-                handshake,
-            )
-            .await;
-            assert_eq!(response.status(), 426);
-            assert!(receiver.try_recv().is_err());
-            let request = axum::http::Request::builder()
-                .method("POST")
-                .header("authorization", format!("Bearer {token}"))
-                .header("chatgpt-account-id", "workspace")
-                .body(Body::from(r#"{"model":"asked"}"#))
-                .unwrap();
-            let response = forward(
-                State(state.clone()),
-                RoutePath((
-                    "route".into(),
-                    "capability/backend-api/codex/responses".into(),
-                )),
-                request,
-            )
-            .await;
-            assert_eq!(response.status(), 200);
-            to_bytes(response.into_body(), 4096).await.unwrap();
-            let (_, _, record) = receiver.recv().await.unwrap();
-            assert_eq!(record.output, Some(200));
-            assert!(record.complete && record.decode.is_some());
-        }
-        assert_eq!(
-            *seen.lock().unwrap(),
-            ["Bearer native-before", "Bearer native-after-refresh"]
-        );
         task.abort();
     }
 }

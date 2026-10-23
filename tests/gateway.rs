@@ -606,9 +606,10 @@ fn new_launch_restarts_crashed_gateway_without_replaying_old_requests() {
 }
 
 #[test]
-fn oauth_launch_keeps_native_auth_refresh_and_falls_back_without_modifying_saved_config() {
+fn oauth_launch_always_connects_directly_and_keeps_native_auth_refresh() {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    for (direct, websocket) in [(false, false), (false, true), (true, true)] {
+    // Official subscriptions never use the gateway, whatever transport is requested.
+    for websocket in [false, true] {
         let f = Fixture::new();
         let claims = json!({"sub":"synthetic-user","email":"synthetic@example.test","https://api.openai.com/auth":{"chatgpt_account_id":"workspace","chatgpt_user_id":"synthetic-user"}});
         let token = format!(
@@ -638,9 +639,6 @@ fn oauth_launch_keeps_native_auth_refresh_and_falls_back_without_modifying_saved
             .output()
             .unwrap()
             .stdout;
-        if direct {
-            fs::write(f.path.join("manager/gateway"), "unavailable").unwrap();
-        }
         fs::write(f.path.join("fake-codex"),r#"#!/usr/bin/env python3
 import os,sys,json
 from pathlib import Path
@@ -653,15 +651,14 @@ assert not os.getenv('USAGE_CODEX_API_KEY') and not os.getenv('OPENAI_API_KEY')
 overrides=[args[i+1] for i,arg in enumerate(args[:-1]) if arg=='-c']
 assert 'model_provider="openai"' in overrides and 'forced_login_method="chatgpt"' in overrides
 assert not any(value.startswith('model_providers.') for value in overrides)
-bases=[json.loads(value.split('=',1)[1]) for value in overrides if value.startswith('openai_base_url=')]
-if os.environ['FIXTURE_EXPECT_DIRECT']=='1': assert not bases
-else: assert len(bases)==1 and bases[0].startswith('http://127.0.0.1:') and bases[0].endswith('/backend-api/codex')
+assert not any(value.startswith(('openai_base_url=','chatgpt_base_url=')) for value in overrides), overrides
+assert os.environ['NO_PROXY']==os.environ['no_proxy']=='127.0.0.1,localhost', 'proxy bypass was extended for a gateway'
 home=Path(os.environ['CODEX_HOME']);config=(home/'config.toml').read_text()
 assert '127.0.0.1' not in config
 saved=json.loads((home/'auth.json').read_text());assert saved['tokens']['access_token']=='synthetic-access-before'
 saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refresh_token']='synthetic-refresh-rotated'
 (home/'auth.json').write_text(json.dumps(saved))
-(Path(os.environ['FIXTURE_ROOT'])/'oauth-capture.json').write_text(json.dumps({'home':str(home),'proxied':bool(bases)}))
+(Path(os.environ['FIXTURE_ROOT'])/'oauth-capture.json').write_text(json.dumps({'home':str(home)}))
 "#).unwrap();
         let output = f
             .command(&[
@@ -673,7 +670,6 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 "--binary",
                 f.path.join("fake-codex").to_str().unwrap(),
             ])
-            .env("FIXTURE_EXPECT_DIRECT", if direct { "1" } else { "0" })
             .env(
                 "USAGE_GATEWAY_TRANSPORT",
                 if websocket { "ws" } else { "sse" },
@@ -687,7 +683,6 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
         );
         let capture: Value =
             serde_json::from_slice(&fs::read(f.path.join("oauth-capture.json")).unwrap()).unwrap();
-        assert_eq!(capture["proxied"], !direct);
         let auth: Value = serde_json::from_slice(
             &fs::read(PathBuf::from(capture["home"].as_str().unwrap()).join("auth.json")).unwrap(),
         )
@@ -700,15 +695,15 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 .stdout,
             before
         );
-        let mut registered = false;
+        let mut skipped = false;
         for entry in fs::read_dir(f.path.join("logs")).unwrap() {
             let text = fs::read_to_string(entry.unwrap().path()).unwrap();
             for line in text.lines() {
-                if let Ok(event) = serde_json::from_str::<Value>(line)
-                    && event["fields"]["event"] == "gateway_route_registered"
-                {
-                    assert_eq!(event["fields"]["websocket_observation"], websocket);
-                    registered = true;
+                if let Ok(event) = serde_json::from_str::<Value>(line) {
+                    assert_ne!(event["fields"]["event"], "gateway_route_registered");
+                    assert_ne!(event["fields"]["event"], "gateway_injected");
+                    skipped |= event["fields"]["event"] == "gateway_skipped"
+                        && event["fields"]["reason"] == "official_direct";
                 }
             }
             for secret in [
@@ -719,6 +714,10 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
                 assert!(!text.contains(secret));
             }
         }
-        assert_eq!(registered, !direct);
+        assert!(skipped, "the direct launch is logged");
+        assert!(
+            !f.path.join("manager/gateway/state.json").exists(),
+            "an official launch must not start the gateway"
+        );
     }
 }

@@ -16,8 +16,8 @@ fn tracker() -> (Tracker, mpsc::Receiver<recording::Sample>) {
             provider: "provider".into(),
             upstream: "http://127.0.0.1".into(),
             model_provider: "openai".into(),
-            auth: RouteAuth::NativeOauth {
-                account_id: "workspace".into(),
+            auth: RouteAuth::ApiKey {
+                key: "fixture-key".into(),
             },
             token: "capability".into(),
             lease: PathBuf::new(),
@@ -324,11 +324,7 @@ async fn native_socket(compressed: bool) {
             let expected_client = expected_client.clone();
             let frames = server_frames.clone();
             async move {
-                assert_eq!(
-                    request.headers()["authorization"],
-                    "Bearer rotated-native-token"
-                );
-                assert_eq!(request.headers()["chatgpt-account-id"], "workspace");
+                assert_eq!(request.headers()["authorization"], "Bearer fixture-key");
                 assert_eq!(
                     request.headers()["sec-websocket-key"],
                     "dGhlIHNhbXBsZSBub25jZQ=="
@@ -382,7 +378,7 @@ async fn native_socket(compressed: bool) {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!(
-        "http://{}/r/route/capability/backend-api/codex/responses",
+        "http://{}/r/route/responses",
         listener.local_addr().unwrap()
     );
     let app = Router::new()
@@ -396,8 +392,7 @@ async fn native_socket(compressed: bool) {
         .build()
         .unwrap()
         .get(endpoint)
-        .header("authorization", "Bearer rotated-native-token")
-        .header("chatgpt-account-id", "workspace")
+        .header("authorization", "Bearer capability")
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-version", "13")
@@ -537,18 +532,14 @@ async fn websocket_refusal_preserves_status_body_and_retry_after_without_inferen
     });
     let request = axum::http::Request::builder()
         .method("GET")
-        .header("authorization", "Bearer rotated-token")
-        .header("chatgpt-account-id", "workspace")
+        .header("authorization", "Bearer capability")
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .body(Body::empty())
         .unwrap();
     let response = super::super::forward(
         State(state),
-        RoutePath((
-            "route".into(),
-            "capability/backend-api/codex/responses".into(),
-        )),
+        RoutePath(("route".into(), "responses".into())),
         request,
     )
     .await;

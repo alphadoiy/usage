@@ -665,6 +665,158 @@ fn delayed_codex_usage_excludes_tool_runtime_and_survives_checkpoint() {
     assert!(s.recent[0].speed().is_none());
 }
 
+fn item(sec: u32, kind: &str) -> String {
+    line(
+        sec,
+        "event_msg",
+        json!({"type":"item_completed","item":{"type":kind},"started_at_ms":at(sec),"completed_at_ms":at(sec)}),
+    )
+}
+fn usage_record(sec: u32, output: u64) -> String {
+    line(
+        sec,
+        "token_usage_record",
+        json!({"response_id":format!("resp-{sec}"),"usage":{"output_tokens":output}}),
+    )
+}
+fn token_count(sec: u32, total: u64, last: u64) -> String {
+    line(
+        sec,
+        "event_msg",
+        json!({"type":"token_count","info":{"total_token_usage":{"output_tokens":total},"last_token_usage":{"output_tokens":last}}}),
+    )
+}
+
+/// Mirrors a Codex 0.16x rollout: each response ends with `token_usage_record`, output items
+/// carry their start time, and `token_count` follows only after the tool ran.
+#[test]
+fn recorded_codex_requests_get_their_own_first_token_and_end_across_a_checkpoint() {
+    let f = Fixture::new("codex");
+    let first = line(
+        0,
+        "session_meta",
+        json!({"id":"rec","model_provider":"relay"}),
+    ) + &line(0, "turn_context", json!({"model":"m","turn_id":"t"}))
+        + &line(0, "event_msg", json!({"type":"task_started","turn_id":"t"}))
+        + &line(0, "response_item", json!({"type":"message","role":"user"}))
+        + &item(0, "UserMessage")
+        + &item(2, "AgentMessage")
+        + &line(
+            3,
+            "response_item",
+            json!({"type":"message","role":"assistant"}),
+        )
+        + &line(4, "response_item", json!({"type":"custom_tool_call"}))
+        + &usage_record(5, 152);
+    let path = f.file("recorded.jsonl", &first);
+    f.update();
+    // The tool's runtime (5 s → 6 s) and the later token_count are not part of the request.
+    let rest = item(6, "CommandExecution")
+        + &line(6, "response_item", json!({"type":"custom_tool_call_output"}))
+        + &token_count(6, 152, 152)
+        // A tool-call-only response has no output item, so its first token stays unknown.
+        + &line(9, "response_item", json!({"type":"custom_tool_call"}))
+        + &usage_record(10, 300)
+        + &line(10, "response_item", json!({"type":"custom_tool_call_output"}))
+        + &token_count(11, 452, 300)
+        + &item(12, "Reasoning")
+        + &item(13, "AgentMessage")
+        + &line(20, "response_item", json!({"type":"message","role":"assistant"}))
+        + &usage_record(20, 1200)
+        + &token_count(20, 1652, 1200)
+        + &line(21, "event_msg", json!({"type":"task_complete","turn_id":"t","duration_ms":21000,"time_to_first_token_ms":2000}));
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(rest.as_bytes())
+        .unwrap();
+    f.update();
+    let s = f.snapshot();
+    let timing: Vec<_> = s
+        .recent
+        .iter()
+        .rev()
+        .map(|c| (c.output, c.duration_ms, c.ttft_ms, c.native_timing))
+        .collect();
+    assert_eq!(
+        timing,
+        [
+            (152, Some(5000), Some(2000), true),
+            (300, Some(4000), None, true),
+            (1200, Some(9000), Some(2000), true),
+        ]
+    );
+    // The reasoning item does not count as the first token; the answer at 13 s does.
+    // The last request now yields a generation sample: 1200 tokens over 9 s − 2 s.
+    assert_eq!(s.recent[0].speed(), Some((1200, 7000)));
+    assert_eq!(s.summary.mean_ttft_ms, Some(2000.0));
+}
+
+/// Codex writes token_count when a sampling attempt ends; one without new usage is an attempt
+/// that failed (here a stream that went idle for five minutes) and the retry is timed alone.
+#[test]
+fn a_failed_attempt_does_not_inflate_the_retried_request() {
+    let mut parser = (source("codex").unwrap().parser)(serde_json::Value::Null);
+    let text = line(0, "session_meta", json!({"id":"retry","model_provider":"relay"}))
+        + &line(0, "turn_context", json!({"model":"m","turn_id":"t"}))
+        + &line(0, "event_msg", json!({"type":"task_started","turn_id":"t"}))
+        + &token_count(1, 100, 100)
+        + &line(2, "response_item", json!({"type":"reasoning"}))
+        // The abandoned attempt: same totals again, no token_usage_record.
+        + &token_count(30, 100, 100)
+        + &item(40, "AgentMessage")
+        + &line(45, "response_item", json!({"type":"message","role":"assistant"}))
+        + &usage_record(45, 600)
+        + &token_count(46, 700, 600);
+    let calls: Vec<_> = text
+        .lines()
+        .flat_map(|ln| parser.feed(ln.as_bytes()).unwrap())
+        .collect();
+    let retried = calls.last().unwrap();
+    assert_eq!(
+        (retried.duration_ms, retried.ttft_ms),
+        (Some(15000), Some(10000))
+    );
+}
+
+#[test]
+fn a_recorded_single_call_turn_keeps_request_timing_over_turn_timing() {
+    let mut parser = (source("codex").unwrap().parser)(serde_json::Value::Null);
+    let text = line(
+        0,
+        "session_meta",
+        json!({"id":"one","model_provider":"relay"}),
+    ) + &line(0, "turn_context", json!({"model":"m","turn_id":"turn-a"}))
+        + &line(
+            0,
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-a"}),
+        )
+        + &item(3, "AgentMessage")
+        + &line(
+            8,
+            "response_item",
+            json!({"type":"message","role":"assistant"}),
+        )
+        + &usage_record(8, 500)
+        + &token_count(9, 500, 500)
+        + &complete();
+    let calls: Vec<_> = text
+        .lines()
+        .flat_map(|ln| parser.feed(ln.as_bytes()).unwrap())
+        .collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "task_complete adds nothing to a recorded request"
+    );
+    assert_eq!(
+        (calls[0].duration_ms, calls[0].ttft_ms),
+        (Some(8000), Some(3000))
+    );
+}
+
 #[test]
 fn old_cursor_is_reparsed_once_without_duplicating_requests_or_losing_deleted_history() {
     let f = Fixture::new("codex");

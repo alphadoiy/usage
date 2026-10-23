@@ -137,7 +137,7 @@ grok = ""
 
 首页 Provider 定时在后台更新用量与余额，刷新期间保留现有内容；连接未变化时复用模型列表。首次加载或推理连接变化后查询模型，按 `r` 可强制重新查询。返回首页、左右切换 Provider 或上下滚动不会重复请求未变化的模型列表。余额查询失败后显示本次错误，避免继续把旧金额当作当前余额。
 
-首页 Provider 的性能摘要展示近 24 小时已索引请求的平均首字、生成速度与速度下限，分别标注样本数。托管 BYOK / OAuth 新会话可通过[本地观测网关](docs/gateway.md)自动采集 HTTP/SSE 请求；默认通过 426 引导 Codex 使用 HTTP/SSE；单次启动设置 `USAGE_GATEWAY_TRANSPORT=ws` 可保留 WS 并采集逐请求首字和 TPS。历史日志继续使用 Magpie 本地日志口径。摘要按绑定缓存 5 分钟，切换 Provider 复用缓存；首页仅查询已有索引，按 `v` 更新日志并查看模型详情。
+首页 Provider 的性能摘要展示近 24 小时已索引请求的平均首字、生成速度与速度下限，分别标注样本数。托管 BYOK 新会话可通过[本地观测网关](docs/gateway.md)自动采集 HTTP/SSE 请求；官方订阅（OAuth）始终直连，性能取自 Codex 会话日志中逐请求的结束记录与回答开始时间；默认通过 426 引导 Codex 使用 HTTP/SSE；单次启动设置 `USAGE_GATEWAY_TRANSPORT=ws` 可保留 WS 并采集逐请求首字和 TPS。历史日志继续使用 Magpie 本地日志口径。摘要按绑定缓存 5 分钟，切换 Provider 复用缓存；首页仅查询已有索引，按 `v` 更新日志并查看模型详情。
 
 官方 OAuth 订阅支持[模型指纹测试](docs/fingerprint.md)：`usage codex fingerprint run <账号>` 采集固定 `gpt-6.1-sol` 的 3 条样本并本地评分，`enable <账号>` 在 Usage 打开期间每 5 小时运行（退出即停止），`status <账号>` 查看结果，`disable <账号>` 停用。结果仅为参考库相对排名。
 

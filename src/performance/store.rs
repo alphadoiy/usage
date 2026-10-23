@@ -11,7 +11,7 @@ const BATCH_BYTES: u64 = 4 * 1024 * 1024;
 const BATCH_FILES: usize = 64;
 const DISCOVER_ENTRIES: usize = 256;
 const PAGE: usize = 40;
-const PARSER_VERSION: u32 = 2;
+const PARSER_VERSION: u32 = 3;
 const MATCHED: &str =
     "scope=?1 AND at>=?2 AND at<=?3 AND model<>'' AND (?4 IS NULL OR upstream=?4)";
 

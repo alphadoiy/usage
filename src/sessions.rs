@@ -358,9 +358,9 @@ fn user_prompt(text: &str) -> Option<String> {
     display_title(text)
 }
 
-/// Where Codex keeps the Home's state database: `sqlite_home` in its config.toml, or
-/// `$CODEX_SQLITE_HOME`, which wins. As in magpie, the environment applies only to the user's
-/// own Codex Home; managed launches clear it, so their state stays in their own Home.
+/// Where Codex keeps the Home's state database: `sqlite_home` in its config.toml, else
+/// `$CODEX_SQLITE_HOME` (codex-rs `config_toml.rs`), else the Home. The environment applies only
+/// to the user's own Codex Home; managed launches clear it, so their state stays in their Home.
 fn codex_state_dir(home: &Path) -> PathBuf {
     state_dir_in(
         home,
@@ -369,11 +369,6 @@ fn codex_state_dir(home: &Path) -> PathBuf {
     )
 }
 fn state_dir_in(home: &Path, environment: Option<&std::ffi::OsStr>, own_home: &Path) -> PathBuf {
-    if let Some(dir) = environment.filter(|d| !d.is_empty())
-        && same_dir(home, own_home)
-    {
-        return dir.into();
-    }
     fs::read_to_string(home.join("config.toml"))
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
@@ -382,6 +377,11 @@ fn state_dir_in(home: &Path, environment: Option<&std::ffi::OsStr>, own_home: &P
         .map(|dir| match dir.strip_prefix("~/") {
             Some(rest) => crate::config::home_dir().join(rest),
             None => home.join(dir),
+        })
+        .or_else(|| {
+            environment
+                .filter(|dir| !dir.is_empty() && same_dir(home, own_home))
+                .map(PathBuf::from)
         })
         .unwrap_or_else(|| home.to_path_buf())
 }
@@ -1387,17 +1387,19 @@ mod tests {
         let catalog = load_all(&SessionHomes::new().with("codex", &home));
         assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
         assert_eq!(catalog.sessions[0].title, "Moved index");
-        // The environment overrides only the user's own Home; other Homes keep their config.
+        // As in Codex, `sqlite_home` wins; the environment is the fallback, and only for the
+        // user's own Home, since managed launches clear it.
         let shared = std::ffi::OsStr::new("/synthetic/shared");
+        assert_eq!(
+            state_dir_in(&home, Some(shared), &home),
+            home.join("../state")
+        );
+        fs::remove_file(home.join("config.toml")).unwrap();
         assert_eq!(
             state_dir_in(&home, Some(shared), &home),
             PathBuf::from("/synthetic/shared")
         );
-        assert_eq!(
-            state_dir_in(&home, Some(shared), &root.join("other")),
-            home.join("../state")
-        );
-        fs::remove_file(home.join("config.toml")).unwrap();
+        assert_eq!(state_dir_in(&home, Some(shared), &root.join("other")), home);
         assert_eq!(state_dir_in(&home, None, &home), home);
         fs::remove_dir_all(root).unwrap();
     }

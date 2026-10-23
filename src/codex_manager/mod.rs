@@ -1075,36 +1075,28 @@ impl Manager {
                 // remains unresolved until an Agent event confirms the session configuration.
                 let resume_transport=if plugin_account.is_some()&&resume.is_some(){Some(effective::resolve(&saved.config,profile.auth_mode,&cwd,false,args,key.as_deref(),&environment))}else{None};
                 let route_effective=resume_transport.as_ref().unwrap_or(&effective);
-                if crate::gateway::enabled() {
-                    let reason=if profile.auth_mode==AuthMode::Oauth {
-                        effective::oauth_gateway_reason(&saved.config,&cwd,resume.is_some(),args)
-                    } else if route_effective.gateway_supported {None}
+                // Official subscriptions always reach OpenAI directly; their performance comes from
+                // the session log, never from routing a ChatGPT sign-in through the local gateway.
+                if profile.auth_mode==AuthMode::Oauth {
+                    tracing::info!(event="gateway_skipped", run_id, reason="official_direct");
+                } else if crate::gateway::enabled() {
+                    let reason=if route_effective.gateway_supported {None}
                     else {Some(route_effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
                     if reason.is_none() {
                         // Launching directly would silently drop observation, so an unaddressable provider fails the launch.
-                        let base_url_key = if profile.auth_mode==AuthMode::Oauth {None} else {
-                            match launcher::provider_override(route_effective.identity.model_provider.as_deref().expect("resolved provider"),"base_url") {
-                                Some(key) => Some(key),
-                                None => {
-                                    tracing::error!(event="gateway_provider_unaddressable", run_id, provider_id=profile.id);
-                                    return Err(Error::message("启动失败：模型提供方 ID 只能包含字母、数字、_ 或 -，Codex 无法通过 -c 参数接入本地网关；请在 Agent 配置中修改 model_provider 名称"));
-                                }
-                            }
+                        let Some(base_url_key) = launcher::provider_override(route_effective.identity.model_provider.as_deref().expect("resolved provider"),"base_url") else {
+                            tracing::error!(event="gateway_provider_unaddressable", run_id, provider_id=profile.id);
+                            return Err(Error::message("启动失败：模型提供方 ID 只能包含字母、数字、_ 或 -，Codex 无法通过 -c 参数接入本地网关；请在 Agent 配置中修改 model_provider 名称"));
                         };
                         let prepared = (|| -> Result<crate::gateway::Attachment> {
                             let binding = self.performance_binding(&profile, revision)?;
-                            let (upstream,provider,auth)=if profile.auth_mode==AuthMode::Oauth {
-                                ("https://chatgpt.com/backend-api/codex","openai",crate::gateway::RouteAuth::NativeOauth {
-                                    account_id:profile.oauth.as_ref().expect("verified OAuth identity").account_id.clone()
-                                })
-                            } else {
-                                (route_effective.identity.endpoint.as_deref().expect("resolved endpoint"),
-                                 route_effective.identity.model_provider.as_deref().expect("resolved provider"),
-                                 if let Some(id)=&plugin_account {
-                                     if route_effective.identity.endpoint.as_deref()!=plugin_base.as_deref() || route_effective.key!=key {return Err(Error::message("插件启动配置被覆盖，无法确认账号关联"));}
-                                     crate::gateway::RouteAuth::Plugin {account:id.clone()}
-                                 } else {crate::gateway::RouteAuth::ApiKey {key:route_effective.key.clone().expect("resolved credential")}})
-                            };
+                            let (upstream,provider,auth)=(
+                                route_effective.identity.endpoint.as_deref().expect("resolved endpoint"),
+                                route_effective.identity.model_provider.as_deref().expect("resolved provider"),
+                                if let Some(id)=&plugin_account {
+                                    if route_effective.identity.endpoint.as_deref()!=plugin_base.as_deref() || route_effective.key!=key {return Err(Error::message("插件启动配置被覆盖，无法确认账号关联"));}
+                                    crate::gateway::RouteAuth::Plugin {account:id.clone()}
+                                } else {crate::gateway::RouteAuth::ApiKey {key:route_effective.key.clone().expect("resolved credential")}});
                             let attached=crate::gateway::attach(&self.root,&run_id,&binding,upstream,provider,auth).map_err(Error::message)?;
                             #[cfg(unix)]
                             launcher::inherit_run_lease(&mut command, &attached.lease)?;
@@ -1113,15 +1105,11 @@ impl Manager {
                         match prepared {
                             Ok(attached) => {
                                 let base=toml::Value::String(attached.base.clone());
-                                if profile.auth_mode==AuthMode::Oauth {
-                                    command.args(["-c",&format!("openai_base_url={base}")]);
-                                } else if let Some(key)=&base_url_key {
-                                    command.env(route_effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
-                                    command.args(["-c",&format!("{key}={base}")]);
-                                    if plugin_account.is_some(){
-                                        let provider=route_effective.identity.model_provider.as_deref().expect("resolved provider");
-                                        command.args(["-c",&format!("model_provider={}",toml::Value::String(provider.into()))]);
-                                    }
+                                command.env(route_effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
+                                command.args(["-c",&format!("{base_url_key}={base}")]);
+                                if plugin_account.is_some(){
+                                    let provider=route_effective.identity.model_provider.as_deref().expect("resolved provider");
+                                    command.args(["-c",&format!("model_provider={}",toml::Value::String(provider.into()))]);
                                 }
                                 for variable in ["NO_PROXY", "no_proxy"] {
                                     let mut bypass = std::env::var(variable).unwrap_or_default();
@@ -1416,6 +1404,8 @@ const CLEARED_AUTH_ENV: &[&str] = &[
     "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
     "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
     "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    // Overrides the auth API used for personal access token sign-in (codex-rs login crate).
+    "CODEX_AUTHAPI_BASE_URL",
     config::KEY_ENV,
     bark::CONTEXT_ENV,
 ];

@@ -68,60 +68,6 @@ fn chat_usage_tokens_are_authoritative_and_completion_fixes_the_generation_windo
 }
 
 #[test]
-fn native_oauth_route_keeps_rotated_bearer_and_rejects_cross_account_or_missing_capability() {
-    let registration = Registration {
-        observe_websocket: false,
-        run: "run".into(),
-        scope: "scope".into(),
-        provider: "account".into(),
-        upstream: "https://chatgpt.com/backend-api/codex".into(),
-        model_provider: "openai".into(),
-        auth: RouteAuth::NativeOauth {
-            account_id: "workspace-one".into(),
-        },
-        token: "local-capability".into(),
-        lease: PathBuf::new(),
-    };
-    assert!(registration.valid_auth());
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("chatgpt-account-id", "workspace-one".parse().unwrap());
-    for bearer in ["Bearer access-before", "Bearer access-after-refresh"] {
-        headers.insert("authorization", bearer.parse().unwrap());
-        let (path, auth) = registration
-            .request_auth("local-capability/backend-api/codex/responses", &headers)
-            .unwrap();
-        assert_eq!(path, "responses");
-        assert_eq!(auth, bearer);
-    }
-    assert!(
-        registration
-            .request_auth("wrong/backend-api/codex/responses", &headers)
-            .is_none()
-    );
-    headers.insert("chatgpt-account-id", "workspace-two".parse().unwrap());
-    assert!(
-        registration
-            .request_auth("local-capability/backend-api/codex/responses", &headers)
-            .is_none()
-    );
-    headers.insert("chatgpt-account-id", "workspace-one".parse().unwrap());
-    headers.insert(
-        "authorization",
-        "Bearer sk-accidental-api-key".parse().unwrap(),
-    );
-    assert!(
-        registration
-            .request_auth("local-capability/backend-api/codex/responses", &headers)
-            .is_none()
-    );
-    assert!(
-        !serde_json::to_string(&registration)
-            .unwrap()
-            .contains("access-after-refresh")
-    );
-}
-
-#[test]
 fn thread_identity_is_explicit_and_does_not_use_cache_affinity_as_a_session() {
     let thread = "123e4567-e89b-12d3-a456-426614174001";
     let affinity = "123e4567-e89b-12d3-a456-426614174002";

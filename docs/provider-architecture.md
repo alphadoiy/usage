@@ -46,7 +46,7 @@ flowchart TD
 - 内置会话目录使用 Agent 注册表创建对应 Home 的读取器，并在 Session 上保留该 Agent；当前终端恢复委托其 Launcher。复制命令与 Ghostty 分屏使用 Launcher 显式提供的命令导出能力，不支持时返回错误。原 `SessionRegistry::register` 仍支持仅有 loader 的旧来源。
 - `Provider::sessions()` 从实例的 AgentContext 解析 Home，并将 Provider ID 作为会话实例身份，调用方不能替换为其他账号目录。
 - `Provider::resources()` 与 `ResourceService` 共用资源层的并发收集和查询时间限制；单个任务 panic 或超时返回带原绑定的失败快照，其他结果继续返回并保持配置顺序。
-- 托管 BYOK / OAuth 启动可动态接入独立的[本地观测网关](gateway.md)，固定本次 Provider、凭据和上游，后台记录 HTTP/SSE 指标。OAuth 保留内置提供方与 CLI 原生认证；默认 WebSocket 握手返回 426，后续使用 HTTP/SSE；单次启动可选择 WS，复用相同的指标计算和存储。网关记录与历史日志共享性能查询入口，按明确的会话及启动范围选择来源；仅旧版透传或无法可靠观测的 WS 启动回退 CLI 来源，避免重复计数。
+- 托管 BYOK 启动可动态接入独立的[本地观测网关](gateway.md)，固定本次 Provider、凭据和上游，后台记录 HTTP/SSE 指标。官方订阅（OAuth）始终直连，性能来自会话日志；默认 WebSocket 握手返回 426，后续使用 HTTP/SSE；单次启动可选择 WS，复用相同的指标计算和存储。网关记录与历史日志共享性能查询入口，按明确的会话及启动范围选择来源；仅旧版透传或无法可靠观测的 WS 启动回退 CLI 来源，避免重复计数。
 - `AgentAdapter::request_source()` 声明性能日志格式工厂；`Provider::performance_binding()` 解析实例 Home 与版本，`Provider::performance()` 读取独立索引。首页 Provider 按 `v` 打开模型性能弹窗，按需后台增量采集并分页读取；独立推理连接可显式配置日志实例。绑定、估算口径和读取预算见[Provider 性能](performance.md)。
 
 工厂构造不请求网络、读取密钥或启动进程。HTTP、时间、凭据解析器由上下文传入，API 服务使用 `ApiConnection`，凭据引用仅在查询时解析。
