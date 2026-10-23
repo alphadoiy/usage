@@ -52,16 +52,19 @@ fn request() -> AuthRequest {
 #[test]
 fn registered_auth_is_lazy_optional_and_accepts_provider_specific_methods() {
     let starts = Arc::new(AtomicUsize::new(0));
-    let mut hub = Hub::default();
     let count = starts.clone();
-    hub.auth
-        .register("custom_sso", move |context| {
-            Ok(Arc::new(CustomAuth {
-                context,
-                starts: count.clone(),
-            }) as Arc<dyn AuthAdapter>)
-        })
-        .unwrap();
+    let mut auth = crate::auth::builtin_registry();
+    auth.register("custom_sso", move |context| {
+        Ok(Arc::new(CustomAuth {
+            context,
+            starts: count.clone(),
+        }) as Arc<dyn AuthAdapter>)
+    })
+    .unwrap();
+    let hub = Hub {
+        auth: Arc::new(auth),
+        ..Hub::default()
+    };
     let root = std::env::temp_dir().join(format!("usage-auth-lazy-{}", uuid::Uuid::new_v4()));
     let provider = hub
         .provider(ProviderDefinition {

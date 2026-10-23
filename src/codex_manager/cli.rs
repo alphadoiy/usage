@@ -282,7 +282,7 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
             } else {
                 text
             };
-            let adapter = crate::hub::Hub::default()
+            let adapter = crate::hub::shared()
                 .authentication(crate::auth::AuthSpec {
                     service: "codex_oauth".into(),
                     context: crate::auth::AuthContext {
@@ -373,7 +373,7 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                 #[cfg(unix)]
                 let _interrupts =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-                let outcome = crate::hub::spawn_managed_codex(
+                let outcome = super::managed::spawn(
                     &super::default_root(),
                     &profile,
                     revision,

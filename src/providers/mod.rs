@@ -248,7 +248,7 @@ impl Default for ProviderFactory {
 
 pub fn builtin_factory() -> ProviderFactory {
     let mut factory = ProviderFactory::new();
-    let resources = Arc::new(crate::resources::builtin_registry());
+    let resources = crate::hub::shared().resources.clone();
     for (id, service) in [
         ("claude", "claude_subscription"),
         ("codex", "chatgpt_subscription"),

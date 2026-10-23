@@ -122,7 +122,7 @@ fn local_session_resume_paths_all_use_notification_injection() {
     let cwd = f.path.join("project ' with $ punctuation");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&cwd).unwrap();
-    let agent = usage::agents::builtin_registry().create("codex",AgentContext::Local {home:home.clone()}).unwrap();
+    let agent = usage::hub::builtin_agents().create("codex",AgentContext::Local {home:home.clone()}).unwrap();
     let mut session = usage::sessions::Session {
         agent:Some(agent),provider:AgentKind::CODEX,instance:"default".into(),
         id:uuid::Uuid::new_v4().to_string(),cwd:cwd.clone(),home:home.clone(),

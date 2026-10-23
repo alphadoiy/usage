@@ -100,18 +100,38 @@ impl Hash for AgentKind {
     }
 }
 
-/// Managed account storage is resolved only during spawn, after source synchronization.
+/// Where an Agent instance lives. A managed instance belongs to an account store, which is
+/// reached only through `ManagedInstance`; this layer never names a concrete Agent or store.
 #[derive(Debug, Clone)]
 pub enum AgentContext {
-    Local {
-        home: PathBuf,
-    },
-    ManagedCodex {
-        root: PathBuf,
-        account: String,
-        revision: Option<i64>,
-    },
+    Local { home: PathBuf },
+    Managed(Arc<dyn ManagedInstance>),
 }
+
+/// An instance an account store manages. The store resolves its account and revision when
+/// used (after any source synchronization), not when the instance is described.
+pub trait ManagedInstance: Send + Sync + std::fmt::Debug {
+    /// The Agent type this store's instances run.
+    fn agent(&self) -> &str;
+    fn home(&self) -> Result<PathBuf, String>;
+    fn performance_binding(
+        &self,
+        provider: &str,
+        source: crate::performance::RequestSource,
+    ) -> Result<crate::performance::Binding, String>;
+    fn start(&self, request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String>;
+    fn resume_shell_command(&self, session: &crate::sessions::Session) -> Result<String, String>;
+}
+
+/// Agent-specific handling of a local Home, such as recognizing a Home an account store
+/// manages. Without hooks a local Agent runs its command with the Home in its environment.
+#[derive(Clone, Copy, Default)]
+pub struct LocalHooks {
+    pub start: Option<LocalStart>,
+    pub resume: Option<LocalResume>,
+}
+pub type LocalStart = fn(&Path, &SpawnRequest) -> Result<Box<dyn RunningAgent>, String>;
+pub type LocalResume = fn(&crate::sessions::Session) -> Result<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
@@ -126,7 +146,7 @@ pub struct SpawnRequest {
 pub struct SpawnOutcome {
     pub status: ExitStatus,
     /// Local, unmanaged launches do not claim a persisted managed run binding.
-    pub run: Option<crate::codex_manager::RunRecord>,
+    pub run: Option<crate::runs::RunRecord>,
 }
 
 pub trait Launcher: Send + Sync {
@@ -174,6 +194,7 @@ struct LocalAgent {
     kind: AgentKind,
     context: AgentContext,
     load: fn(&Path) -> Result<Vec<SessionRecord>, String>,
+    hooks: LocalHooks,
 }
 
 impl AgentAdapter for LocalAgent {
@@ -199,17 +220,12 @@ impl Launcher for LocalAgent {
         true
     }
     fn resume_shell_command(&self, session: &crate::sessions::Session) -> Result<String, String> {
-        match &self.context {
-            AgentContext::ManagedCodex {
-                account, revision, ..
-            } => crate::codex_manager::launch_shell_command(
-                account,
-                &session.cwd,
-                *revision,
-                Some(&session.id),
-            )
-            .map_err(|error| error.to_string()),
-            AgentContext::Local { .. } => crate::sessions::local_resume_shell_command(session),
+        match (&self.context, self.hooks.resume) {
+            (AgentContext::Managed(instance), _) => instance.resume_shell_command(session),
+            (AgentContext::Local { .. }, Some(resume)) => resume(session),
+            (AgentContext::Local { .. }, None) => {
+                crate::sessions::local_resume_shell_command(session)
+            }
         }
     }
     fn spawn(&self, request: &SpawnRequest) -> Result<SpawnOutcome, String> {
@@ -217,40 +233,10 @@ impl Launcher for LocalAgent {
     }
     fn start(&self, request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String> {
         match &self.context {
-            AgentContext::ManagedCodex {
-                root,
-                account,
-                revision,
-            } => crate::codex_manager::Manager::open(root.clone())
-                .and_then(|mut manager| {
-                    manager.start_recorded_with_config(
-                        account,
-                        &request.cwd,
-                        *revision,
-                        request.resume.as_deref(),
-                        &request.program,
-                        &request.args,
-                        request.usage_config.as_deref(),
-                    )
-                })
-                .map(|handle| Box::new(handle) as Box<dyn RunningAgent>)
-                .map_err(|error| error.to_string()),
+            AgentContext::Managed(instance) => instance.start(request),
             AgentContext::Local { home } => {
-                if self.kind == AgentKind::CODEX
-                    && let Some((account, revision)) = crate::codex_manager::binding_for_home(home)
-                        .map_err(|error| error.to_string())?
-                {
-                    return crate::hub::start_managed_codex(
-                        &crate::codex_manager::default_root(),
-                        &account,
-                        Some(revision),
-                        request,
-                    );
-                }
-                if self.kind == AgentKind::CODEX {
-                    return crate::codex_manager::start_local_codex(home, request)
-                        .map(|handle| Box::new(handle) as Box<dyn RunningAgent>)
-                        .map_err(|error| error.to_string());
+                if let Some(start) = self.hooks.start {
+                    return start(home, request);
                 }
                 let mut command = Command::new(&request.program);
                 if let Some(id) = &request.resume {
@@ -273,29 +259,28 @@ impl Launcher for LocalAgent {
     }
 }
 
-pub fn builtin_registry() -> AgentRegistry {
-    let mut registry = AgentRegistry::new();
-    type Loader = fn(&Path) -> Result<Vec<SessionRecord>, String>;
-    for (kind, load) in [
-        (AgentKind::CLAUDE, crate::sessions::load_claude as Loader),
-        (AgentKind::CODEX, crate::sessions::load_codex as Loader),
-        (AgentKind::GROK, crate::sessions::load_grok as Loader),
-    ] {
-        registry
-            .register(kind.id(), move |context| {
-                if matches!(context, AgentContext::ManagedCodex { .. }) && kind != AgentKind::CODEX
-                {
-                    return Err(RegistryError::Factory(
-                        "此 Agent 不支持 Codex 托管账号".into(),
-                    ));
-                }
-                Ok(Arc::new(LocalAgent {
-                    kind,
-                    context,
-                    load,
-                }) as Arc<dyn AgentAdapter>)
-            })
-            .expect("内置 Agent ID 唯一");
+/// Factory for an Agent whose instances keep sessions in a local Home. A managed context is
+/// accepted only from a store that manages this Agent type.
+pub fn local(
+    kind: AgentKind,
+    load: fn(&Path) -> Result<Vec<SessionRecord>, String>,
+    hooks: LocalHooks,
+) -> impl Fn(AgentContext) -> Result<Arc<dyn AgentAdapter>, RegistryError> + Send + Sync + 'static {
+    move |context| {
+        if let AgentContext::Managed(instance) = &context
+            && instance.agent() != kind.id()
+        {
+            return Err(RegistryError::Factory(format!(
+                "此账号库管理的是 {} 实例，不能用于 {}",
+                instance.agent(),
+                kind.name()
+            )));
+        }
+        Ok(Arc::new(LocalAgent {
+            kind,
+            context,
+            load,
+            hooks,
+        }) as Arc<dyn AgentAdapter>)
     }
-    registry
 }

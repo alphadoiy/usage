@@ -1,6 +1,7 @@
 //! Provider inventory with independent model, quota and balance capabilities.
 mod codex;
 pub mod presets;
+mod sources;
 mod usage;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -107,10 +108,13 @@ impl Plan {
                     .find(|p| p.id == query.id)
                     .unwrap()
                     .models = cached.models.clone();
-                if refresh_models {
+                // Failed queries are retried on the next scheduled refresh; only successful
+                // catalogs may be reused indefinitely. Keep the last error visible meanwhile.
+                let retry = refresh_models || matches!(cached.models, Models::Unavailable(_));
+                if retry {
                     self.catalog.refreshing_models.insert(query.id.clone());
                 }
-                return refresh_models;
+                return retry;
             }
             true
         });
@@ -339,6 +343,7 @@ pub struct CatalogService {
     pub(crate) http: Arc<dyn HttpClient>,
     credentials: Arc<CredentialResolver>,
     plugins: crate::plugins::store::Store,
+    resources: Arc<crate::resources::ResourceRegistry>,
 }
 impl CatalogService {
     pub fn new(
@@ -351,6 +356,7 @@ impl CatalogService {
             http,
             credentials,
             plugins: crate::plugins::store::Store::new(crate::plugins::store::root()),
+            resources: crate::hub::shared().resources.clone(),
         }
     }
     pub fn with_plugin_root(mut self, root: PathBuf) -> Self {
@@ -367,231 +373,19 @@ impl CatalogService {
             }),
         )
     }
+    /// Discovery runs in a fixed order: managed accounts record which plugin accounts they
+    /// bind, plugin accounts reuse those bindings, and resource connections skip Providers
+    /// already listed.
     pub fn load(&self, config: &AppConfig) -> Result<Plan, String> {
         let mut plan = Plan {
             catalog: Catalog::default(),
             queries: Vec::new(),
             resources: Vec::new(),
         };
-        let plugin_accounts = self.plugins.accounts().unwrap_or_default();
-        let plugins: HashMap<_, _> = self
-            .plugins
-            .plugins()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|p| p.enabled)
-            .map(|p| (p.id.clone(), p))
-            .collect();
-        let available_accounts: HashSet<_> = plugin_accounts
-            .iter()
-            .filter(|a| plugins.contains_key(&a.plugin))
-            .map(|a| a.id.as_str())
-            .collect();
-        let mut plugin_bindings: HashMap<String, Vec<String>> = HashMap::new();
-        if let Some(manager) =
-            Manager::open_read_only(self.root.clone()).map_err(|_| "读取 Provider 账号库失败")?
-        {
-            for profile in manager.list().map_err(|_| "读取 Provider 配置失败")? {
-                let plugin_account = crate::plugins::endpoint_account(&profile.base_url);
-                let models = if let Some(account) = &plugin_account {
-                    plugin_bindings
-                        .entry(account.clone())
-                        .or_default()
-                        .push(profile.id.clone());
-                    if available_accounts.contains(account.as_str()) {
-                        Models::Loading
-                    } else {
-                        unavailable_plugin()
-                    }
-                } else {
-                    match manager.model_catalog_query(&profile) {
-                        Ok(query) => {
-                            plan.queries.push(query);
-                            Models::Loading
-                        }
-                        Err(_) => unreadable_query(&profile),
-                    }
-                };
-                let provider_kind = if let Some(account_id) = &plugin_account {
-                    plugin_accounts
-                        .iter()
-                        .find(|a| &a.id == account_id)
-                        .and_then(|a| plugins.get(&a.plugin))
-                        .and_then(|p| presets::for_package(&p.package))
-                        .map_or(ProviderKind::Plugin, |preset| preset.kind)
-                } else if profile.auth_mode == AuthMode::Oauth {
-                    ProviderKind::Subscription
-                } else {
-                    kind(&profile.base_url)
-                };
-                plan.catalog.providers.push(Provider {
-                    id: profile.id.clone(),
-                    name: profile.name.clone(),
-                    agent: Some("Codex".into()),
-                    kind: provider_kind,
-                    configured_model: Some(profile.model.clone()),
-                    models,
-                    operations: Vec::new(),
-                    usage: ProviderUsage::default(),
-                    performance: manager.performance_binding(&profile, profile.revision).ok(),
-                });
-                self.add_profile_usage(&mut plan, &manager, &profile, config);
-            }
-        }
-        let mut descriptors: HashMap<String, Option<serde_json::Value>> = HashMap::new();
-        for account in plugin_accounts {
-            let Some(plugin) = plugins.get(&account.plugin) else {
-                continue;
-            };
-            let preset = presets::for_package(&plugin.package);
-            let existing = plugin_bindings.remove(&account.id).unwrap_or_default();
-            let descriptor = descriptors.entry(plugin.id.clone()).or_insert_with(|| {
-                crate::plugins::store::read::<serde_json::Value>(
-                    &self
-                        .plugins
-                        .root
-                        .join("descriptors")
-                        .join(format!("{}.json", plugin.id)),
-                )
-                .ok()
-                .filter(|d| d["revision"].as_u64() == Some(plugin.revision))
-            });
-            let supports_usage = descriptor
-                .as_ref()
-                .and_then(|d| {
-                    d["providers"]
-                        .as_array()?
-                        .iter()
-                        .find(|p| p["id"] == account.provider)
-                        .map(|p| p["capabilities"]["usage"] == true)
-                })
-                .unwrap_or(true);
-            let ids = if existing.is_empty() {
-                let id = format!("plugin:{}", account.id);
-                plan.catalog.providers.push(Provider {
-                    id: id.clone(),
-                    name: preset.map_or_else(
-                        || account.name.clone(),
-                        |p| p.account_name(&account.provider, &account.name),
-                    ),
-                    agent: None,
-                    kind: preset.map_or(ProviderKind::Plugin, |p| p.kind),
-                    configured_model: None,
-                    models: Models::Loading,
-                    operations: Vec::new(),
-                    usage: ProviderUsage::default(),
-                    performance: None,
-                });
-                vec![id]
-            } else {
-                existing
-            };
-            for id in ids {
-                let query = self.plugin_query(id.clone(), plugin, &account.id);
-                if supports_usage {
-                    let reader = crate::plugins::adapters::resource(
-                        &self.plugins.root,
-                        &account,
-                        format!(
-                            "{}:{}:{}",
-                            plugin.version,
-                            plugin.revision,
-                            plugin.entry.display()
-                        ),
-                    );
-                    let label =
-                        preset.map_or_else(|| "账号额度".into(), |p| format!("{} 额度", p.name));
-                    usage::attach_reader(&mut plan, &id, label, reader);
-                } else if let Some(p) = plan.catalog.providers.iter_mut().find(|p| p.id == id) {
-                    p.usage.hint = Some("此服务暂未提供用量查询".into());
-                }
-                if let Some(checkin) = crate::plugins::capabilities::checkin(
-                    &plugin.package,
-                    &account.provider,
-                    descriptor.as_ref(),
-                ) && let Some(provider) = plan.catalog.providers.iter_mut().find(|p| p.id == id)
-                {
-                    provider.operations.push(
-                        crate::provider_actions::registry()
-                            .create(
-                                "plugin_checkin",
-                                crate::provider_actions::Context {
-                                    root: self.plugins.root.clone(),
-                                    account: account.id.clone(),
-                                    automatic_status: checkin.automatic_status,
-                                    day_offset_seconds: checkin.day_offset_seconds,
-                                },
-                            )
-                            .expect("discovered plugin account operation"),
-                    );
-                }
-                plan.queries.push(query);
-            }
-        }
-        for connection in &config.resources {
-            let Some(inference) = &connection.inference else {
-                continue;
-            };
-            // Billing services for an existing managed provider are not extra inference providers.
-            if connection
-                .profile_ids
-                .iter()
-                .any(|id| plan.catalog.providers.iter().any(|p| &p.id == id))
-            {
-                continue;
-            }
-            let id = format!("resource:{}", connection.id);
-            let query = (self.credentials)(&format!("env:{}", inference.credential_env))
-                .map_err(|_| "推理凭据环境变量未设置")
-                .and_then(|key| ModelQuery::new(id.clone(), &inference.base_url, key));
-            let models = match query {
-                Ok(query) => {
-                    plan.queries.push(query);
-                    Models::Loading
-                }
-                Err(error) => Models::Unavailable(error.into()),
-            };
-            let performance = inference
-                .performance_instance
-                .as_deref()
-                .map(|instance_id| {
-                    let instance = config
-                        .instances
-                        .iter()
-                        .find(|i| i.id == instance_id)
-                        .ok_or("性能日志实例不存在")?;
-                    let agent = crate::agents::builtin_registry()
-                        .create(
-                            &instance.provider,
-                            crate::agents::AgentContext::Local {
-                                home: instance.path.clone(),
-                            },
-                        )
-                        .map_err(|_| "性能日志 Agent 无效")?;
-                    let source = agent.request_source().ok_or("此 Agent 尚不支持性能日志")?;
-                    Ok::<_, &str>(crate::performance::local_binding(
-                        &id,
-                        agent.kind().id(),
-                        &instance.path,
-                        source,
-                    ))
-                })
-                .transpose()?;
-            plan.catalog.providers.push(Provider {
-                id,
-                name: connection
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| connection.id.clone()),
-                agent: None,
-                kind: kind(&inference.base_url),
-                configured_model: None,
-                models,
-                operations: Vec::new(),
-                usage: ProviderUsage::default(),
-                performance,
-            });
-        }
+        let plugins = self.plugin_snapshot();
+        let bindings = self.add_managed_profiles(&mut plan, config, &plugins)?;
+        self.add_plugin_accounts(&mut plan, &plugins, bindings);
+        self.add_resource_connections(&mut plan, config)?;
         self.add_configured_usage(&mut plan, config);
         plan.catalog.model_keys = plan
             .queries
@@ -911,6 +705,24 @@ mod tests {
                 .catalog
                 .apply_models(&id, Models::Ready(vec!["duplicate".into()]))
         );
+        let mut recovered = service.load(&config).unwrap();
+        recovered.reuse(&manual.catalog, false);
+        assert_eq!(recovered.queries.len(), 1);
+        assert_eq!(
+            recovered.catalog.providers[0].models,
+            manual.catalog.providers[0].models
+        );
+        collect_models(http.clone(), recovered.queries, |id, models| {
+            assert!(recovered.catalog.apply_models(&id, models));
+        })
+        .await;
+        assert_eq!(
+            recovered.catalog.providers[0].models,
+            Models::Ready(vec!["cached-model".into()])
+        );
+        let mut stable = service.load(&config).unwrap();
+        stable.reuse(&recovered.catalog, false);
+        assert!(stable.queries.is_empty());
         let mut failed = snapshot.clone();
         failed.state = crate::resources::ResourceState::TransientFailure;
         failed.metrics.clear();

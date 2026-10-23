@@ -6,9 +6,12 @@ pub mod config;
 mod duplicates;
 mod effective;
 pub mod fingerprint;
+mod launch;
 mod launcher;
 mod local;
+mod run_store;
 pub use local::{local_resume_shell_command, start_local_codex};
+pub mod managed;
 pub mod oauth;
 pub mod runtime;
 mod secrets;
@@ -17,7 +20,7 @@ use crate::logging;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -146,53 +149,7 @@ pub struct Revision {
     secret_ref: String,
 }
 
-/// Selected account/revision at launch. A home can contain many runs and conversations.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct RunRecord {
-    pub id: String,
-    pub profile_id: String,
-    pub revision: i64,
-    pub cwd: PathBuf,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub pid: Option<u32>,
-    pub exit_code: Option<i32>,
-    /// Absent for records written before launch identity capture was introduced.
-    pub context: Option<crate::runs::RunContext>,
-    pub sessions: Vec<crate::runs::RunSession>,
-    #[serde(skip_serializing)]
-    pub process_identity: Option<crate::runs::ProcessIdentity>,
-}
-
-impl RunRecord {
-    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        let capture = row
-            .get::<_, Option<String>>(8)?
-            .map(|text| {
-                serde_json::from_str::<crate::runs::CapturedContext>(&text).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        8,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
-            })
-            .transpose()?;
-        Ok(Self {
-            id: row.get(0)?,
-            profile_id: row.get(1)?,
-            revision: row.get(2)?,
-            cwd: PathBuf::from(row.get::<_, String>(3)?),
-            started_at: row.get(4)?,
-            finished_at: row.get(5)?,
-            pid: row.get(6)?,
-            exit_code: row.get(7)?,
-            process_identity: capture.as_ref().and_then(|capture| capture.process.clone()),
-            context: capture.map(|capture| capture.context),
-            sessions: Vec::new(),
-        })
-    }
-}
+pub use crate::runs::RunRecord;
 
 #[derive(Debug, Default, Serialize)]
 pub struct SyncReport {
@@ -296,31 +253,6 @@ impl Manager {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(500))?;
         Ok(Some(Self { root, conn }))
-    }
-
-    /// Keep all pages bounded; unfinished records precede completed history.
-    pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
-        let has_contexts: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_contexts')",
-            [],
-            |row| row.get(0),
-        )?;
-        let (column, join) = if has_contexts {
-            (
-                "c.context_json",
-                "LEFT JOIN run_contexts c ON c.run_id=r.id",
-            )
-        } else {
-            ("NULL", "")
-        };
-        let sql = format!("SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,{column} FROM runs r {join}
-            ORDER BY r.finished_at IS NOT NULL,r.started_at DESC,r.id DESC LIMIT ?1");
-        let mut query = self.conn.prepare(&sql)?;
-        let mut runs = query
-            .query_map([limit.min(1000) as i64], RunRecord::from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        runtime::load_sessions(&self.conn, &mut runs)?;
-        Ok(runs)
     }
 
     pub fn open_default() -> Result<Self> {
@@ -878,420 +810,6 @@ impl Manager {
         })
     }
 
-    pub fn run(
-        &mut self,
-        selector: &str,
-        cwd: &Path,
-        revision: Option<i64>,
-        resume: Option<&str>,
-        program: &Path,
-        args: &[String],
-    ) -> Result<ExitStatus> {
-        self.run_recorded(selector, cwd, revision, resume, program, args)
-            .map(|(status, _)| status)
-    }
-
-    pub fn run_recorded(
-        &mut self,
-        selector: &str,
-        cwd: &Path,
-        revision: Option<i64>,
-        resume: Option<&str>,
-        program: &Path,
-        args: &[String],
-    ) -> Result<(ExitStatus, RunRecord)> {
-        self.run_recorded_with_config(selector, cwd, revision, resume, program, args, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn run_recorded_with_config(
-        &mut self,
-        selector: &str,
-        cwd: &Path,
-        revision: Option<i64>,
-        resume: Option<&str>,
-        program: &Path,
-        args: &[String],
-        usage_config: Option<&Path>,
-    ) -> Result<(ExitStatus, RunRecord)> {
-        use crate::agents::RunningAgent;
-        let mut handle = self.start_recorded_with_config(
-            selector,
-            cwd,
-            revision,
-            resume,
-            program,
-            args,
-            usage_config,
-        )?;
-        let outcome = handle.wait().map_err(Error::message)?;
-        Ok((
-            outcome.status,
-            outcome
-                .run
-                .ok_or_else(|| Error::message("启动记录不存在"))?,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_recorded_with_config(
-        &mut self,
-        selector: &str,
-        cwd: &Path,
-        revision: Option<i64>,
-        resume: Option<&str>,
-        program: &Path,
-        args: &[String],
-        usage_config: Option<&Path>,
-    ) -> Result<crate::agents::ProcessHandle> {
-        logging::operation("codex.run_start", |op| {
-            // Sync completes before selecting a revision. Failures keep the last saved snapshot usable.
-            // The launch terminal belongs to Codex; the report is logged and shown in Provider management.
-            if let Err(error) = op.step("source_sync", || self.sync(false)) {
-                tracing::warn!(event = "source_sync_failed", error = %error, action = "launch_saved_snapshot");
-            }
-            let profile = op.step("account_resolve", || self.resolve(selector))?;
-            let revision = revision.unwrap_or(profile.revision);
-            op.account(&profile.id, revision, profile.auth_mode.log_name());
-            tracing::info!(event = "run_selected", resume = resume.is_some());
-            let _oauth_lease = if profile.auth_mode == AuthMode::Oauth {
-                Some(op.step("oauth_run_lease", || self.oauth_run_lease(&profile.id))?)
-            } else {
-                None
-            };
-            let home = op.step("home_materialize", || {
-                self.materialize(&profile.id, revision)
-            })?;
-            let saved = op.step("revision_read", || self.revision(&profile.id, revision))?;
-            let key = if profile.auth_mode == AuthMode::Byok {
-                Some(op.step("credential_read", || {
-                    secrets::get(&self.root, &saved.secret_ref)
-                })?)
-            } else {
-                let auth = op.step("oauth_auth_read", || {
-                    oauth::read_auth(&home.join("auth.json"))
-                })?;
-                if profile.oauth.as_ref().is_none_or(|o| {
-                    o.account_id != auth.identity.account_id || o.user_id != auth.identity.user_id
-                }) {
-                    tracing::error!(event = "oauth_identity_mismatch");
-                    return Err(Error::message("OAuth 登录文件与账号身份不匹配；请重新登录"));
-                }
-                None
-            };
-            let plugin_base = if profile.auth_mode == AuthMode::Byok {
-                Some(config::summary(&saved.config)?.0)
-            } else {
-                None
-            };
-            let plugin_account = plugin_base
-                .as_deref()
-                .and_then(crate::plugins::endpoint_account);
-            if let Some(id) = &plugin_account {
-                let plugin_store = crate::plugins::store::Store::new(crate::plugins::store::root());
-                let account = plugin_store.account(id).map_err(Error::message)?;
-                plugin_store
-                    .plugin(&account.plugin)
-                    .map_err(Error::message)?;
-                let expected = plugin_store.inference_key(id).map_err(Error::message)?;
-                if key.as_deref() != Some(expected.as_str()) {
-                    return Err(Error::message("插件账号与启动凭据不匹配"));
-                }
-                if !crate::gateway::enabled() {
-                    return Err(Error::message("插件推理依赖本地网关，请启用 USAGE_GATEWAY"));
-                }
-            }
-            op.begin("cwd_validate");
-            let cwd = cwd
-                .canonicalize()
-                .map_err(|_| Error::message("项目目录不存在"))?;
-            if !cwd.is_dir() {
-                return Err(Error::message("项目路径不是目录"));
-            }
-            if let Some(id) = resume {
-                uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的会话 ID"))?;
-            }
-            if profile.auth_mode == AuthMode::Oauth {
-                op.step("arguments_validate", || oauth::validate_run_args(args))?;
-                op.step("cli_version_detect", || oauth::verify_cli_version(program))?;
-            } else {
-                op.step("arguments_validate", || {
-                    launcher::validate_run_args(args, profile.auth_mode)
-                })?;
-            }
-            op.begin("cli_capability_detect");
-            let mut help = Command::new(program);
-            clear_auth_env(&mut help);
-            help.arg("--help");
-            let help = crate::credentials::output_with_timeout(help, Duration::from_secs(10))
-            .ok_or_else(|| {
-                Error::message(
-                    "无法运行 Codex CLI 或能力检测超时；请先安装 codex 或使用 --binary 指定路径",
-                )
-            })?;
-            if !help.status.success() {
-                return Err(Error::message("Codex CLI 能力检测失败"));
-            }
-            let mut command = Command::new(program);
-            clear_auth_env(&mut command);
-            // An inherited state directory would share the user's state database with this Home.
-            command
-                .current_dir(&cwd)
-                .env("CODEX_HOME", &home)
-                .env_remove("CODEX_SQLITE_HOME");
-            if let Some(key) = &key {
-                command.env(config::KEY_ENV, key);
-            }
-            if profile.auth_mode == AuthMode::Oauth {
-                if !String::from_utf8_lossy(&help.stdout).contains("--profile") {
-                    return Err(Error::message(
-                        "OAuth 配置版本需要支持独立 profile 文件的新版 Codex CLI；请升级 codex",
-                    ));
-                }
-                command.args(["--profile", &format!("usage-r{revision}")]);
-                command.args([
-                    "-c",
-                    "cli_auth_credentials_store=\"file\"",
-                    "-c",
-                    "forced_login_method=\"chatgpt\"",
-                    "-c",
-                    "model_provider=\"openai\"",
-                ]);
-                if let Some(identity) = &profile.oauth {
-                    command.args([
-                        "-c",
-                        &format!(
-                            "forced_chatgpt_workspace_id={}",
-                            toml_edit::value(&identity.account_id)
-                        ),
-                    ]);
-                }
-            }
-            if String::from_utf8_lossy(&help.stdout).contains("--no-daemon") {
-                command.arg("--no-daemon");
-            }
-            let run_id = op.id().to_owned();
-            let mut gateway = None;
-            let mut capture = op.step("run_identity_capture", || {
-                let environment = |name: &str| std::env::var(name).ok();
-                let effective = effective::resolve(&saved.config, profile.auth_mode, &cwd, resume.is_some(), args, key.as_deref(), &environment);
-                if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
-                    command.env(env, key);
-                }
-                // A plugin resume pins its transport explicitly, while its resource identity
-                // remains unresolved until an Agent event confirms the session configuration.
-                let resume_transport=if plugin_account.is_some()&&resume.is_some(){Some(effective::resolve(&saved.config,profile.auth_mode,&cwd,false,args,key.as_deref(),&environment))}else{None};
-                let route_effective=resume_transport.as_ref().unwrap_or(&effective);
-                // Official subscriptions always reach OpenAI directly; their performance comes from
-                // the session log, never from routing a ChatGPT sign-in through the local gateway.
-                if profile.auth_mode==AuthMode::Oauth {
-                    tracing::info!(event="gateway_skipped", run_id, reason="official_direct");
-                } else if crate::gateway::enabled() {
-                    let reason=if route_effective.gateway_supported {None}
-                    else {Some(route_effective.identity.reason.as_deref().unwrap_or("HTTP/SSE route cannot be confirmed"))};
-                    if reason.is_none() {
-                        // Launching directly would silently drop observation, so an unaddressable provider fails the launch.
-                        let Some(base_url_key) = launcher::provider_override(route_effective.identity.model_provider.as_deref().expect("resolved provider"),"base_url") else {
-                            tracing::error!(event="gateway_provider_unaddressable", run_id, provider_id=profile.id);
-                            return Err(Error::message("启动失败：模型提供方 ID 只能包含字母、数字、_ 或 -，Codex 无法通过 -c 参数接入本地网关；请在 Agent 配置中修改 model_provider 名称"));
-                        };
-                        let prepared = (|| -> Result<crate::gateway::Attachment> {
-                            let binding = self.performance_binding(&profile, revision)?;
-                            let (upstream,provider,auth)=(
-                                route_effective.identity.endpoint.as_deref().expect("resolved endpoint"),
-                                route_effective.identity.model_provider.as_deref().expect("resolved provider"),
-                                if let Some(id)=&plugin_account {
-                                    if route_effective.identity.endpoint.as_deref()!=plugin_base.as_deref() || route_effective.key!=key {return Err(Error::message("插件启动配置被覆盖，无法确认账号关联"));}
-                                    crate::gateway::RouteAuth::Plugin {account:id.clone()}
-                                } else {crate::gateway::RouteAuth::ApiKey {key:route_effective.key.clone().expect("resolved credential")}});
-                            let attached=crate::gateway::attach(&self.root,&run_id,&binding,upstream,provider,auth).map_err(Error::message)?;
-                            #[cfg(unix)]
-                            launcher::inherit_run_lease(&mut command, &attached.lease)?;
-                            Ok(attached)
-                        })();
-                        match prepared {
-                            Ok(attached) => {
-                                let base=toml::Value::String(attached.base.clone());
-                                command.env(route_effective.credential_env.as_deref().expect("resolved environment"),&attached.token);
-                                command.args(["-c",&format!("{base_url_key}={base}")]);
-                                if plugin_account.is_some(){
-                                    let provider=route_effective.identity.model_provider.as_deref().expect("resolved provider");
-                                    command.args(["-c",&format!("model_provider={}",toml::Value::String(provider.into()))]);
-                                }
-                                for variable in ["NO_PROXY", "no_proxy"] {
-                                    let mut bypass = std::env::var(variable).unwrap_or_default();
-                                    if !bypass.is_empty() { bypass.push(','); }
-                                    bypass.push_str("127.0.0.1,localhost,::1");
-                                    command.env(variable, bypass);
-                                }
-                                tracing::info!(event="gateway_injected", run_id, provider_id=profile.id);
-                                gateway = Some(attached);
-                            }
-                            Err(error) => {
-                                if plugin_account.is_some(){return Err(error);}
-                                tracing::warn!(event="gateway_fallback", run_id, provider_id=profile.id, reason=%error, action="direct_launch");
-                            }
-                        }
-                    } else {
-                        if plugin_account.is_some(){return Err(Error::message("插件会话的启动配置无法确认，请移除冲突覆盖参数"));}
-                        tracing::info!(event="gateway_skipped", run_id, reason);
-                    }
-                }
-                let path = usage_config.map(Path::to_path_buf).unwrap_or_else(crate::config::default_config_path);
-                let config = crate::config::load_config(&path, usage_config.is_some());
-                let resources = std::cell::OnceCell::new();
-                let captured = crate::runs::CapturedContext::capture(
-                    &run_id, &profile.id, effective.identity, effective.key.as_deref(),
-                    config.as_ref().map(|c| c.resources.as_slice()).map_err(|_| "启动时资源配置读取失败"),
-                    &environment,
-                    &|config| resources.get_or_init(|| crate::resources::connections::ResourceService::from_environment(crate::resources::builtin_registry())).prepare(config).ok().map(|reader| reader.scope()),
-                );
-                tracing::info!(event="run_identity_captured", state=?captured.context.identity.state,
-                    reason=captured.context.identity.reason.as_deref(),
-                    resource_count=captured.context.resources.len(),
-                    matched_resources=captured.context.resources.iter().filter(|l| l.state == crate::runs::LinkState::Matched).count(),
-                    resources_error=captured.context.resources_error.as_deref());
-                for link in &captured.context.resources {
-                    tracing::info!(event="run_resource_link", connection_id=link.binding.account,
-                        service=link.service, revision=link.binding.revision, state=?link.state);
-                }
-                Ok::<_, Error>(captured)
-            })?;
-            op.step("notification_inject", || {
-                bark::inject(
-                    &mut command,
-                    &self.root,
-                    &home,
-                    &profile.name,
-                    &run_id,
-                    &saved.config,
-                )
-            })?;
-            op.step("runtime_events_inject", || {
-                runtime::inject(
-                    &mut command,
-                    &self.root,
-                    &home,
-                    &run_id,
-                    &saved.config,
-                    String::from_utf8_lossy(&help.stdout)
-                        .contains("--dangerously-bypass-hook-trust"),
-                )
-            })?;
-            if let Some(id) = resume {
-                command.args(["resume", id]);
-            }
-            command.args(args);
-            #[cfg(unix)]
-            if let Some(lease) = &_oauth_lease {
-                launcher::inherit_run_lease(&mut command, lease)?;
-            }
-            let mut child = op.step("child_spawn", || command.spawn())?;
-            tracing::info!(event = "child_spawned", child_pid = child.id());
-            op.begin("run_record");
-            let recorded = (|| -> Result<RunRecord> {
-                capture.process = crate::runs::ProcessIdentity::capture(child.id());
-                let capture = serde_json::to_string(&capture)
-                    .map_err(|_| Error::message("运行身份无法序列化"))?;
-                let tx = self.conn.transaction()?;
-                tx.execute("INSERT INTO runs(id,profile_id,revision,cwd,started_at,pid) VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![run_id,profile.id,revision,cwd.to_string_lossy(),now(),child.id()])?;
-                tx.execute(
-                    "INSERT INTO run_contexts(run_id,context_json) VALUES (?1,?2)",
-                    params![run_id, capture],
-                )?;
-                runtime::record_started(&tx, &run_id)?;
-                tx.commit()?;
-                self.run_record(&run_id)?
-                    .ok_or_else(|| Error::message("启动记录不存在"))
-            })();
-            let run = match recorded {
-                Ok(run) => run,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-            };
-            let root = self.root.clone();
-            let span = op.span();
-            let finish = Box::new(move |status: ExitStatus| {
-                // Keep the OAuth lease owned by this process handle until exit.
-                let _lease = &_oauth_lease;
-                let _gateway = &gateway;
-                span.in_scope(|| {
-                    runtime::finish_run(&root, &home, &run_id, profile.auth_mode, status)
-                })
-                .map_err(|error| error.to_string())
-            });
-            Ok(crate::agents::ProcessHandle::new(
-                child,
-                Some(run),
-                Some(finish),
-            ))
-        })
-    }
-
-    /// Read persisted runs without guessing liveness from an unfinished record.
-    pub fn runs(&self, profile_id: Option<&str>) -> Result<Vec<RunRecord>> {
-        let mut query = self.conn.prepare(
-            "SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,c.context_json FROM runs r
-             LEFT JOIN run_contexts c ON c.run_id=r.id
-             WHERE (?1 IS NULL OR r.profile_id=?1) ORDER BY r.started_at DESC,r.id DESC",
-        )?;
-        let mut records = query
-            .query_map([profile_id], RunRecord::from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        runtime::load_sessions(&self.conn, &mut records)?;
-        Ok(records)
-    }
-
-    pub fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
-        let record = self.conn.query_row(
-            "SELECT r.id,r.profile_id,r.revision,r.cwd,r.started_at,r.finished_at,r.pid,r.exit_code,c.context_json FROM runs r
-             LEFT JOIN run_contexts c ON c.run_id=r.id WHERE r.id=?1",
-            [id], RunRecord::from_row,
-        ).optional()?;
-        let mut records: Vec<_> = record.into_iter().collect();
-        runtime::load_sessions(&self.conn, &mut records)?;
-        Ok(records.pop())
-    }
-
-    pub fn resources_for_run(
-        &self,
-        id: &str,
-        configs: &[crate::resources::connections::ConnectionConfig],
-        ids: &[String],
-    ) -> Result<crate::runs::PinnedResources> {
-        self.resources_for_run_with(id, configs, ids, &|name| std::env::var(name).ok())
-    }
-
-    pub(crate) fn resources_for_run_with(
-        &self,
-        id: &str,
-        configs: &[crate::resources::connections::ConnectionConfig],
-        ids: &[String],
-        credentials: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<crate::runs::PinnedResources> {
-        let (profile_id, text): (String, Option<String>) = self
-            .conn
-            .query_row(
-                "SELECT r.profile_id,c.context_json FROM runs r
-                 LEFT JOIN run_contexts c ON c.run_id=r.id WHERE r.id=?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or_else(|| Error::message("找不到运行记录"))?;
-        let captured: crate::runs::CapturedContext = serde_json::from_str(
-            &text.ok_or_else(|| Error::message("旧运行未记录实际配置，不能推断资源关联"))?,
-        )
-        .map_err(|_| Error::message("运行身份记录无法解析"))?;
-        captured
-            .select(id, &profile_id, configs, ids, credentials)
-            .map_err(Error::message)
-    }
-
     pub async fn test_connection(&self, selector: &str) -> Result<u16> {
         let mut op = logging::Operation::new("codex.connection_test");
         let span = op.span();
@@ -1544,6 +1062,19 @@ pub fn launch_shell_command(
     revision: Option<i64>,
     session: Option<&str>,
 ) -> Result<String> {
+    launch_shell_command_in(&default_root(), selector, cwd, revision, session)
+}
+
+pub(super) fn launch_shell_command_in(
+    root: &Path,
+    selector: &str,
+    cwd: &Path,
+    revision: Option<i64>,
+    session: Option<&str>,
+) -> Result<String> {
+    // A command exported to another terminal must keep the instance's store,
+    // including when the caller supplied a relative root.
+    let root = std::path::absolute(root)?;
     let executable = std::env::current_exe()?;
     let mut args = vec![
         executable.to_string_lossy().to_string(),
@@ -1559,15 +1090,19 @@ pub fn launch_shell_command(
     if let Some(id) = session {
         args.extend(["--resume".into(), id.into()]);
     }
-    Ok(usage_shell_command(&args))
+    Ok(usage_shell_command_in(&root, &args))
 }
 
 fn usage_shell_command(args: &[String]) -> String {
+    usage_shell_command_in(&default_root(), args)
+}
+
+fn usage_shell_command_in(root: &Path, args: &[String]) -> String {
     #[cfg(not(target_os = "windows"))]
     {
         let mut command = format!(
             "env USAGE_CODEX_DIR={} ",
-            shell_quote(&default_root().to_string_lossy())
+            shell_quote(&root.to_string_lossy())
         );
         command.push_str(
             &args
@@ -1582,7 +1117,7 @@ fn usage_shell_command(args: &[String]) -> String {
     {
         format!(
             "$env:USAGE_CODEX_DIR={}; & {}",
-            shell_quote(&default_root().to_string_lossy()),
+            shell_quote(&root.to_string_lossy()),
             args.iter()
                 .map(|s| shell_quote(s))
                 .collect::<Vec<_>>()

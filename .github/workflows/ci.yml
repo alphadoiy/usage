@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      USAGE_LOG: "off"
+      USAGE_CODEX_DIR: ${{ runner.temp }}/usage-ci/accounts
+      USAGE_PLUGIN_DIR: ${{ runner.temp }}/usage-ci/plugins
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+      - name: Format
+        run: cargo +stable fmt --all -- --check
+      - name: Lint
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo +stable test --locked -- --test-threads=1
+      - name: Plugin protocol and action tests
+        run: node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
+      - name: Experiment runner tests
+        run: python3 -m unittest discover -s scripts/ablation -p 'test_*.py'

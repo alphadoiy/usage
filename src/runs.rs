@@ -1,6 +1,7 @@
 //! Launch-time identity and pinned resource associations. No raw arguments or keys are stored.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 use crate::resources::ResourceBinding;
 use crate::resources::connections::ConnectionConfig;
@@ -100,10 +101,58 @@ pub struct ProcessIdentity {
     started: String,
 }
 
+/// Selected account/revision at launch. A home can contain many runs and conversations.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub revision: i64,
+    pub cwd: PathBuf,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    /// Absent for records written before launch identity capture was introduced.
+    pub context: Option<RunContext>,
+    pub sessions: Vec<RunSession>,
+    #[serde(skip_serializing)]
+    pub process_identity: Option<ProcessIdentity>,
+}
+
+impl RunRecord {
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let capture = row
+            .get::<_, Option<String>>(8)?
+            .map(|text| {
+                serde_json::from_str::<CapturedContext>(&text).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            id: row.get(0)?,
+            profile_id: row.get(1)?,
+            revision: row.get(2)?,
+            cwd: PathBuf::from(row.get::<_, String>(3)?),
+            started_at: row.get(4)?,
+            finished_at: row.get(5)?,
+            pid: row.get(6)?,
+            exit_code: row.get(7)?,
+            process_identity: capture.as_ref().and_then(|capture| capture.process.clone()),
+            context: capture.map(|capture| capture.context),
+            sessions: Vec::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod process_tests {
+    use super::RunRecord;
     use super::*;
-    use crate::codex_manager::RunRecord;
 
     fn run(pid: u32) -> RunRecord {
         RunRecord {
@@ -223,7 +272,7 @@ impl RunState {
         }
     }
 
-    pub fn observe(run: &crate::codex_manager::RunRecord) -> Self {
+    pub fn observe(run: &RunRecord) -> Self {
         if run.finished_at.is_some() {
             return if run.exit_code == Some(0) {
                 Self::Completed

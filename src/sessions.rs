@@ -257,7 +257,7 @@ fn load_source(
 }
 
 pub fn builtin_registry() -> SessionRegistry {
-    SessionRegistry::from_agents(Arc::new(crate::agents::builtin_registry()))
+    SessionRegistry::from_agents(crate::hub::shared().agents.clone())
 }
 
 pub fn load_all(homes: &SessionHomes) -> SessionCatalog {
@@ -271,29 +271,9 @@ struct CodexRow {
     recency_at_ms: i64,
 }
 
-const ZST_SUFFIX: &str = ".jsonl.zst";
-/// The Codex app compresses older rollouts from `.jsonl` to `.jsonl.zst`.
-fn is_compressed(path: &Path) -> bool {
-    path.to_str().is_some_and(|p| p.ends_with(ZST_SUFFIX))
-}
-fn is_rollout(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "jsonl") || is_compressed(path)
-}
-/// While a rollout is being compressed both copies exist and the new `.zst` may lack its
-/// trailer, so the readable plain twin in the same directory is preferred.
-fn shadowed_by_plain_twin(path: &Path) -> bool {
-    path.to_str()
-        .and_then(|p| p.strip_suffix(".zst"))
-        .is_some_and(|plain| Path::new(plain).is_file())
-}
-fn open_rollout(path: &Path) -> Option<Box<dyn BufRead>> {
-    let file = File::open(path).ok()?;
-    if is_compressed(path) {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(file).ok()?;
-        Some(Box::new(BufReader::new(decoder)))
-    } else {
-        Some(Box::new(BufReader::new(file)))
-    }
+fn open_rollout(path: &Path) -> Option<Box<dyn BufRead + Send>> {
+    let (path, _) = crate::logfiles::resolve(path).ok()?;
+    crate::logfiles::open(&path).ok()
 }
 
 pub(crate) fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
@@ -488,7 +468,7 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
                 directories.push(path);
                 continue;
             }
-            if !is_rollout(&path) || shadowed_by_plain_twin(&path) {
+            if crate::logfiles::discovered(&path).is_none() {
                 continue;
             }
             let Some(session) = codex_rollout_metadata(&path, &titles) else {
@@ -517,9 +497,8 @@ fn archived_codex_ids(home: &Path) -> HashSet<String> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            is_rollout(&path)
-                .then(|| open_rollout(&path))
-                .flatten()
+            crate::logfiles::discovered(&path)
+                .and_then(|path| open_rollout(&path))
                 .and_then(|reader| {
                     let mut lines = reader.lines().map_while(Result::ok);
                     codex_metadata(&mut lines)
@@ -844,7 +823,7 @@ pub fn uses_ghostty(mode: crate::config::ResumeMode) -> bool {
         }
     }
 }
-fn validate_resume(session: &Session) -> Result<(), String> {
+pub(crate) fn validate_resume(session: &Session) -> Result<(), String> {
     if session
         .agent
         .as_ref()
@@ -875,20 +854,7 @@ fn validate_resume(session: &Session) -> Result<(), String> {
 /// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
 pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
     validate_resume(session)?;
-    let agent = match &session.agent {
-        Some(agent) => Some(Arc::clone(agent)),
-        None if session.provider == AgentKind::CODEX => Some(
-            crate::agents::builtin_registry()
-                .create(
-                    "codex",
-                    crate::agents::AgentContext::Local {
-                        home: session.home.clone(),
-                    },
-                )
-                .map_err(|error| error.to_string())?,
-        ),
-        None => None,
-    };
+    let agent = session.agent.clone().or_else(|| legacy_agent(session));
     if let Some(agent) = agent {
         let program = session
             .provider
@@ -925,32 +891,32 @@ pub fn resume_shell_command(session: &Session) -> Result<String, String> {
             .launcher()
             .ok_or("此 Agent 不支持恢复会话")?
             .resume_shell_command(session),
-        None => local_resume_shell_command(session),
+        None => match legacy_agent(session) {
+            Some(agent) => agent
+                .launcher()
+                .ok_or("此 Agent 不支持恢复会话")?
+                .resume_shell_command(session),
+            None => local_resume_shell_command(session),
+        },
     }
+}
+
+/// Sessions discovered by a source-only registry carry no adapter; the built-in Agent for
+/// their Home supplies the same launch behavior a registry-discovered session would have.
+fn legacy_agent(session: &Session) -> Option<Arc<dyn crate::agents::AgentAdapter>> {
+    crate::hub::shared()
+        .agents
+        .create(
+            session.provider.id(),
+            crate::agents::AgentContext::Local {
+                home: session.home.clone(),
+            },
+        )
+        .ok()
 }
 
 pub(crate) fn local_resume_shell_command(session: &Session) -> Result<String, String> {
     validate_resume(session)?;
-    if session.provider == AgentKind::CODEX
-        && let Some((profile, revision)) =
-            crate::codex_manager::binding_for_home(&session.home).map_err(|e| e.to_string())?
-    {
-        return crate::codex_manager::launch_shell_command(
-            &profile,
-            &session.cwd,
-            Some(revision),
-            Some(&session.id),
-        )
-        .map_err(|e| e.to_string());
-    }
-    if session.provider == AgentKind::CODEX {
-        return crate::codex_manager::local_resume_shell_command(
-            &session.home,
-            &session.cwd,
-            &session.id,
-        )
-        .map_err(|error| error.to_string());
-    }
     #[cfg(not(target_os = "windows"))]
     {
         let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));

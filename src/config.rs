@@ -411,15 +411,7 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
                         "performance_instance 必须引用 [[instances]] 中的显式实例 ID".into(),
                     )
                 })?;
-            let agent = crate::agents::builtin_registry()
-                .create(
-                    &instance.provider,
-                    crate::agents::AgentContext::Local {
-                        home: instance.path.clone(),
-                    },
-                )
-                .map_err(|_| ConfigError("性能日志实例的 Agent 无效".into()))?;
-            if agent.request_source().is_none() {
+            if crate::performance::source(&instance.provider).is_none() {
                 return Err(ConfigError("此实例的 Agent 尚不支持性能日志".into()));
             }
         }

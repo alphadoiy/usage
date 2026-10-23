@@ -283,6 +283,111 @@ impl Drop for Stage {
     }
 }
 
+/// Filesystem compensation for a live OAuth save. The account's exclusive lease
+/// must cover this guard. This handles returned errors, not power loss or SIGKILL
+/// between the filesystem changes and SQLite commit.
+struct SaveFiles {
+    directory: PathBuf,
+    files: Vec<SavedFile>,
+    armed: bool,
+    preserve: bool,
+}
+
+struct SavedFile {
+    path: PathBuf,
+    backup: Option<PathBuf>,
+    restored: bool,
+}
+
+impl SaveFiles {
+    fn capture(home: &Path, revision: i64) -> Result<Self> {
+        let directory = home.join(format!(".usage-oauth-recovery-{}", uuid::Uuid::new_v4()));
+        private_dir(&directory)?;
+        let mut saved = Self {
+            directory,
+            files: Vec::new(),
+            armed: false,
+            preserve: false,
+        };
+        for name in [
+            "auth.json".into(),
+            "config.toml".into(),
+            "usage-binding.json".into(),
+            format!("usage-r{revision}.config.toml"),
+        ] {
+            let path = home.join(&name);
+            let backup = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let backup = saved.directory.join(&name);
+                    fs::copy(&path, &backup)?;
+                    File::open(&backup)?.sync_all()?;
+                    Some(backup)
+                }
+                Ok(_) => return Err(Error::message("OAuth 账号文件必须是普通文件")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            saved.files.push(SavedFile {
+                path,
+                backup,
+                restored: false,
+            });
+        }
+        saved.armed = true;
+        Ok(saved)
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let mut failed = false;
+        for file in self.files.iter_mut().filter(|file| !file.restored) {
+            let result = match &file.backup {
+                Some(backup) => fs::rename(backup, &file.path),
+                None => match fs::remove_file(&file.path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+            };
+            if result.is_ok() {
+                file.restored = true;
+            } else {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(Error::message(format!(
+                "部分 OAuth 账号文件恢复失败；恢复副本保留在 {}，请恢复后重试登录",
+                self.directory.display()
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rollback(mut self) -> Result<()> {
+        let result = self.restore();
+        self.armed = false;
+        self.preserve = result.is_err();
+        result
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SaveFiles {
+    fn drop(&mut self) {
+        if self.armed && self.restore().is_err() {
+            self.preserve = true;
+            tracing::error!(event = "oauth_save_restore_failed", recovery = %self.directory.display());
+        }
+        if !self.preserve && fs::remove_dir_all(&self.directory).is_err() {
+            // Cleanup cannot turn a committed save into an apparent failure.
+            tracing::warn!(event = "oauth_save_recovery_cleanup_failed", recovery = %self.directory.display());
+        }
+    }
+}
+
 /// Own the login subprocess and, for task-based login, its private process group.
 struct LoginChild {
     child: std::process::Child,
@@ -477,17 +582,39 @@ impl Manager {
             }
             tx.execute("INSERT INTO oauth_accounts VALUES (?1,?2,?3) ON CONFLICT(profile_id) DO UPDATE SET identity_key=excluded.identity_key,identity_json=excluded.identity_json",
             params![id,auth.identity.key(),serde_json::to_string(&auth.identity).map_err(|_| Error::message("无法保存账号信息"))?])?;
+            // Resolve the return value before committing. No fallible lookup or
+            // materialization may report failure after the new login is committed.
+            let p = super::list_profiles(&tx, true)?
+                .into_iter()
+                .find(|profile| profile.id == id)
+                .ok_or_else(|| Error::message("OAuth 账号保存记录不存在"))?;
+            let saved: String = tx.query_row(
+                "SELECT config FROM revisions WHERE profile_id=?1 AND revision=?2",
+                params![id, p.revision],
+                |row| row.get(0),
+            )?;
             let home = self.root.join("homes").join(&id).join("r1");
             private_dir(&home)?;
-            op.step("auth_write", || {
-                private_write(&home.join("auth.json"), &auth.bytes)
-            })?;
-            op.step("database_commit", || tx.commit())?;
-            let p = self.resolve(&id)?;
+            let files = SaveFiles::capture(&home, p.revision)?;
+            let result = (|| -> Result<()> {
+                op.step("home_materialize", || {
+                    materialize_home(&tx, &home, &id, p.revision, &saved)
+                })?;
+                op.step("auth_write", || {
+                    private_write(&home.join("auth.json"), &auth.bytes)
+                })?;
+                op.step("database_commit", || tx.commit())?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if let Err(recovery) = files.rollback() {
+                    tracing::error!(event = "oauth_save_restore_failed");
+                    return Err(Error::message(format!("{error}；{recovery}")));
+                }
+                return Err(error);
+            }
+            files.commit();
             op.account(&id, p.revision, "oauth");
-            op.step("home_materialize", || {
-                self.materialize_oauth(&id, p.revision)
-            })?;
             Ok(p)
         })
     }
@@ -629,43 +756,54 @@ impl Manager {
     }
 
     pub(crate) fn materialize_oauth(&self, id: &str, revision: i64) -> Result<PathBuf> {
-        logging::operation("codex.oauth_home_materialize", |op| {
-            op.account(id, revision, "oauth");
-            let saved = op.step("revision_read", || self.revision(id, revision))?;
-            let home = self.home(id, revision)?;
-            op.step("home_prepare", || private_dir(&home))?;
-            let profile = home.join(format!("usage-r{revision}.config.toml"));
-            op.begin("runtime_config_validate");
-            if profile.exists() {
-                let runtime = fs::read_to_string(&profile)?;
-                if !super::config::matches_runtime_config(&runtime, &saved.config) {
-                    tracing::error!(event = "config_mismatch", reason = "oauth_profile_changed",
-                        changed_fields = ?super::config::runtime_differences(&runtime, &saved.config));
-                    return Err(Error::message(
-                        "OAuth 配置版本被手动修改；请通过编辑保存新版本",
-                    ));
-                }
-            } else {
-                op.step("profile_write", || {
-                    private_write(&profile, saved.config.as_bytes())
-                })?;
-            }
-            op.begin("binding_write");
-            // Codex may legitimately add project trust entries here; never overwrite its mutable base.
-            super::private_create(&home.join("config.toml"), normalize_config("")?.as_bytes())?;
-            private_write(
-                &home.join("usage-binding.json"),
-                &serde_json::to_vec(&HomeBinding {
-                    profile_id: id.into(),
-                    revision: 1,
-                })
-                .map_err(|_| Error::message("无法保存账号绑定"))?,
-            )?;
-            self.conn.execute(
-                "INSERT OR IGNORE INTO homes VALUES (?1,1,?2)",
-                params![id, home.to_string_lossy()],
-            )?;
-            Ok(home)
-        })
+        let saved = self.revision(id, revision)?;
+        let home = self.home(id, revision)?;
+        materialize_home(&self.conn, &home, id, revision, &saved.config)?;
+        Ok(home)
     }
+}
+
+fn materialize_home(
+    conn: &rusqlite::Connection,
+    home: &Path,
+    id: &str,
+    revision: i64,
+    saved: &str,
+) -> Result<()> {
+    logging::operation("codex.oauth_home_materialize", |op| {
+        op.account(id, revision, "oauth");
+        op.step("home_prepare", || private_dir(home))?;
+        let profile = home.join(format!("usage-r{revision}.config.toml"));
+        op.begin("runtime_config_validate");
+        if profile.exists() {
+            let runtime = fs::read_to_string(&profile)?;
+            if !super::config::matches_runtime_config(&runtime, saved) {
+                tracing::error!(event = "config_mismatch", reason = "oauth_profile_changed",
+                        changed_fields = ?super::config::runtime_differences(&runtime, saved));
+                return Err(Error::message(
+                    "OAuth 配置版本被手动修改；请通过编辑保存新版本",
+                ));
+            }
+        } else {
+            op.step("profile_write", || {
+                private_write(&profile, saved.as_bytes())
+            })?;
+        }
+        op.begin("binding_write");
+        // Codex may legitimately add project trust entries here; never overwrite its mutable base.
+        super::private_create(&home.join("config.toml"), normalize_config("")?.as_bytes())?;
+        private_write(
+            &home.join("usage-binding.json"),
+            &serde_json::to_vec(&HomeBinding {
+                profile_id: id.into(),
+                revision: 1,
+            })
+            .map_err(|_| Error::message("无法保存账号绑定"))?,
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO homes VALUES (?1,1,?2)",
+            params![id, home.to_string_lossy()],
+        )?;
+        Ok(())
+    })
 }

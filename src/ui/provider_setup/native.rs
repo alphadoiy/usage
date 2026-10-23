@@ -362,7 +362,7 @@ fn run_inner(
                         let result = {
                             let _runtime = handle.enter();
                             let adapter =
-                                crate::hub::Hub::default().authentication(crate::auth::AuthSpec {
+                                crate::hub::shared().authentication(crate::auth::AuthSpec {
                                     service: "codex_oauth".into(),
                                     context: crate::auth::AuthContext {
                                         root: manager.root().into(),

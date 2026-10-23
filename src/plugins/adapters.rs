@@ -99,42 +99,42 @@ impl Reader {
         snapshot
     }
 }
+fn reader(
+    context: ResourceContext,
+) -> std::result::Result<Arc<dyn ResourceReader>, crate::registry::RegistryError> {
+    let ResourceConnection::Plugin { root, account } = &context.connection else {
+        return Err(crate::registry::RegistryError::Factory(
+            "插件资源连接类型不匹配".into(),
+        ));
+    };
+    Ok(Arc::new(Reader {
+        root: root.clone(),
+        account: account.clone(),
+        context,
+    }) as Arc<dyn ResourceReader>)
+}
 pub(crate) fn register(registry: &mut ResourceRegistry) {
     registry
-        .register("plugin_account", |context| {
-            let ResourceConnection::Plugin { root, account } = &context.connection else {
-                return Err(crate::registry::RegistryError::Factory(
-                    "插件资源连接类型不匹配".into(),
-                ));
-            };
-            Ok(Arc::new(Reader {
-                root: root.clone(),
-                account: account.clone(),
-                context,
-            }) as Arc<dyn ResourceReader>)
-        })
+        .register("plugin_account", reader)
         .expect("unique plugin resource factory");
 }
+/// A discovered account's reader, built directly rather than through a whole registry.
 pub(crate) fn resource(
     root: &Path,
     account: &store::Account,
     revision: String,
 ) -> Arc<dyn ResourceReader> {
-    crate::resources::builtin_registry()
-        .create(
-            "plugin_account",
-            ResourceContext {
-                binding: ResourceBinding {
-                    account: account.id.clone(),
-                    revision,
-                },
-                connection: ResourceConnection::Plugin {
-                    root: root.to_owned(),
-                    account: account.id.clone(),
-                },
-            },
-        )
-        .expect("validated plugin resource factory")
+    reader(ResourceContext {
+        binding: ResourceBinding {
+            account: account.id.clone(),
+            revision,
+        },
+        connection: ResourceConnection::Plugin {
+            root: root.to_owned(),
+            account: account.id.clone(),
+        },
+    })
+    .expect("plugin connection")
 }
 
 #[cfg(test)]

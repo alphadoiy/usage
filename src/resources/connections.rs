@@ -143,14 +143,14 @@ pub struct ResourceReport {
 }
 
 pub struct ResourceService {
-    registry: ResourceRegistry,
+    registry: Arc<ResourceRegistry>,
     http: Arc<dyn crate::http::HttpClient>,
     credentials: Arc<CredentialResolver>,
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
 }
 impl ResourceService {
     pub fn new(
-        registry: ResourceRegistry,
+        registry: Arc<ResourceRegistry>,
         http: Arc<dyn crate::http::HttpClient>,
         credentials: Arc<CredentialResolver>,
         now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -162,7 +162,7 @@ impl ResourceService {
             now,
         }
     }
-    pub fn from_environment(registry: ResourceRegistry) -> Self {
+    pub fn from_environment(registry: Arc<ResourceRegistry>) -> Self {
         Self::new(
             registry,
             Arc::new(crate::http::ReqwestClient::new()),

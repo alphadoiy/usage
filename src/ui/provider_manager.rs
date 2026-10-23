@@ -611,7 +611,7 @@ fn launch(
         #[cfg(unix)]
         let _interrupts =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        crate::hub::spawn_managed_codex(
+        crate::codex_manager::managed::spawn(
             manager.root(),
             &profile.id,
             None,

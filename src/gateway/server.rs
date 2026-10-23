@@ -591,6 +591,7 @@ pub(super) async fn serve(directory: PathBuf) -> Result<(), String> {
         receiver,
         sources.clone(),
         Arc::new(crate::performance::Service::from_environment()),
+        directory.clone(),
     ));
     let state = Arc::new(Shared {
         plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), port),

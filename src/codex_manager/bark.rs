@@ -236,7 +236,15 @@ pub(super) fn inject(
     saved_config: &str,
 ) -> Result<bool> {
     command.env_remove(CONTEXT_ENV);
-    let Some(settings) = read_settings(root)?.filter(|s| s.enabled) else {
+    let settings = match read_settings(root) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(event = "bark_launch_disabled", reason = %error);
+            eprintln!("Usage：{error}；本次启动不发送 Bark 通知。");
+            return Ok(false);
+        }
+    };
+    let Some(settings) = settings.filter(|s| s.enabled) else {
         return Ok(false);
     };
     let executable = std::env::current_exe()?;

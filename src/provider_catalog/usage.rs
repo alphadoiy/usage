@@ -89,7 +89,7 @@ impl Catalog {
 impl CatalogService {
     pub(super) fn usage_service(&self) -> ResourceService {
         ResourceService::new(
-            crate::resources::builtin_registry(),
+            self.resources.clone(),
             self.http.clone(),
             self.credentials.clone(),
             Arc::new(Utc::now),
@@ -145,7 +145,7 @@ impl CatalogService {
                         keychain: Arc::new(|_, _| None),
                         now: Arc::new(Utc::now),
                     };
-                    crate::resources::builtin_registry()
+                    self.resources
                         .create(
                             "chatgpt_subscription",
                             crate::resources::ResourceContext {

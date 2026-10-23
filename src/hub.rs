@@ -21,23 +21,51 @@ pub struct ProviderDefinition {
     pub auth: Option<crate::auth::AuthSpec>,
 }
 
+/// The composition root: which Agents, resource services and auth backends exist. Registries
+/// are built once and shared; services take them from here instead of composing their own.
 pub struct Hub {
-    pub agents: AgentRegistry,
-    pub resources: ResourceRegistry,
-    pub auth: crate::auth::AuthRegistry,
+    pub agents: Arc<AgentRegistry>,
+    pub resources: Arc<ResourceRegistry>,
+    pub auth: Arc<crate::auth::AuthRegistry>,
 }
 
 impl Default for Hub {
     fn default() -> Self {
-        Self {
-            agents: crate::agents::builtin_registry(),
-            resources: crate::resources::builtin_registry(),
-            auth: crate::auth::builtin_registry(),
-        }
+        Self::new(
+            builtin_agents(),
+            builtin_resources(),
+            crate::auth::builtin_registry(),
+        )
     }
 }
 
+static SHARED: std::sync::OnceLock<Arc<Hub>> = std::sync::OnceLock::new();
+
+/// The process's Hub, built on first use. Embedders add factories by installing their own Hub
+/// before anything uses it.
+pub fn shared() -> Arc<Hub> {
+    SHARED.get_or_init(|| Arc::new(Hub::default())).clone()
+}
+
+/// Fails, returning the Hub, once the shared Hub has been built or installed.
+pub fn install(hub: Hub) -> Result<(), Hub> {
+    SHARED
+        .set(Arc::new(hub))
+        .map_err(|hub| Arc::into_inner(hub).expect("rejected Hub is not shared"))
+}
+
 impl Hub {
+    pub fn new(
+        agents: AgentRegistry,
+        resources: ResourceRegistry,
+        auth: crate::auth::AuthRegistry,
+    ) -> Self {
+        Self {
+            agents: Arc::new(agents),
+            resources: Arc::new(resources),
+            auth: Arc::new(auth),
+        }
+    }
     /// New-account login need not construct an Agent or have an existing Provider ID.
     pub fn authentication(
         &self,
@@ -141,24 +169,9 @@ impl Provider {
                 home,
                 source,
             )),
-            AgentContext::ManagedCodex {
-                root,
-                account,
-                revision,
-            } => {
-                let manager = crate::codex_manager::Manager::open_read_only(root.clone())
-                    .map_err(|_| CapabilityError::Failed("无法读取性能账号绑定".into()))?
-                    .ok_or_else(|| CapabilityError::Failed("账号库不存在".into()))?;
-                let profile = manager
-                    .resolve(account)
-                    .map_err(|_| CapabilityError::Failed("账号不存在".into()))?;
-                let mut binding = manager
-                    .performance_binding(&profile, revision.unwrap_or(profile.revision))
-                    .map_err(|_| CapabilityError::Failed("无法读取性能账号绑定".into()))?;
-                binding.provider = self.id.clone();
-                binding.source = source;
-                Ok(binding)
-            }
+            AgentContext::Managed(instance) => instance
+                .performance_binding(&self.id, source)
+                .map_err(CapabilityError::Failed),
         }
     }
 
@@ -245,20 +258,7 @@ impl Provider {
             .ok_or(CapabilityError::Unsupported("sessions"))?;
         let home = match &self.context {
             AgentContext::Local { home } => home.clone(),
-            AgentContext::ManagedCodex {
-                root,
-                account,
-                revision,
-            } => {
-                let manager = crate::codex_manager::Manager::open(root.clone())
-                    .map_err(|error| CapabilityError::Failed(error.to_string()))?;
-                let profile = manager
-                    .resolve(account)
-                    .map_err(|error| CapabilityError::Failed(error.to_string()))?;
-                manager
-                    .home(&profile.id, revision.unwrap_or(profile.revision))
-                    .map_err(|error| CapabilityError::Failed(error.to_string()))?
-            }
+            AgentContext::Managed(instance) => instance.home().map_err(CapabilityError::Failed)?,
         };
         let homes = SessionHomes::new().with_instance(&self.id, self.agent.kind().id(), home);
         let mut registry = SessionRegistry::new();
@@ -271,36 +271,41 @@ impl Provider {
     }
 }
 
-/// Common application entry point for account launches and managed session resumes.
-pub fn spawn_managed_codex(
-    root: &std::path::Path,
-    account: &str,
-    revision: Option<i64>,
-    request: &SpawnRequest,
-) -> Result<SpawnOutcome, String> {
-    start_managed_codex(root, account, revision, request)?.wait()
+/// Built-in resource services plus plugin-backed accounts.
+pub fn builtin_resources() -> ResourceRegistry {
+    let mut registry = crate::resources::builtin_registry();
+    crate::plugins::adapters::register(&mut registry);
+    registry
 }
 
-pub fn start_managed_codex(
-    root: &std::path::Path,
-    account: &str,
-    revision: Option<i64>,
-    request: &SpawnRequest,
-) -> Result<Box<dyn crate::agents::RunningAgent>, String> {
-    let provider = Hub::default()
-        .provider(ProviderDefinition {
-            id: account.into(),
-            agent: "codex".into(),
-            context: AgentContext::ManagedCodex {
-                root: root.to_path_buf(),
-                account: account.into(),
-                revision,
-            },
-            resources: Vec::new(),
-            auth: None,
-        })
-        .map_err(|error| error.to_string())?;
-    provider.start(request).map_err(|error| error.to_string())
+/// The built-in Agents. Agent-specific local behavior is supplied here, at composition, so the
+/// Agent layer itself never depends on a concrete account store.
+pub fn builtin_agents() -> AgentRegistry {
+    use crate::agents::{AgentKind, LocalHooks, local};
+    type Loader = fn(&std::path::Path) -> Result<Vec<crate::sessions::SessionRecord>, String>;
+    let mut registry = AgentRegistry::new();
+    for (kind, load, hooks) in [
+        (
+            AgentKind::CLAUDE,
+            crate::sessions::load_claude as Loader,
+            LocalHooks::default(),
+        ),
+        (
+            AgentKind::CODEX,
+            crate::sessions::load_codex as Loader,
+            crate::codex_manager::managed::LOCAL_HOOKS,
+        ),
+        (
+            AgentKind::GROK,
+            crate::sessions::load_grok as Loader,
+            LocalHooks::default(),
+        ),
+    ] {
+        registry
+            .register(kind.id(), local(kind, load, hooks))
+            .expect("内置 Agent ID 唯一");
+    }
+    registry
 }
 
 #[cfg(test)]
@@ -428,21 +433,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_hub_cannot_be_installed_once_the_shared_one_is_in_use() {
+        let shared = shared();
+        assert!(
+            Arc::ptr_eq(&shared, &super::shared()),
+            "built once and reused"
+        );
+        let rejected = install(Hub::new(
+            AgentRegistry::new(),
+            ResourceRegistry::new(),
+            crate::auth::AuthRegistry::new(),
+        ))
+        .unwrap_err();
+        assert!(
+            rejected.agents.ids().is_empty(),
+            "the rejected Hub is handed back"
+        );
+    }
+
     #[tokio::test]
     async fn custom_agent_and_balance_service_compose_without_changing_builtin_dispatch() {
-        let mut hub = Hub {
-            agents: AgentRegistry::new(),
-            resources: ResourceRegistry::new(),
-            auth: crate::auth::AuthRegistry::new(),
-        };
-        hub.agents
+        let mut agents = AgentRegistry::new();
+        let mut resources = ResourceRegistry::new();
+        agents
             .register("custom", |_| {
                 Ok(Arc::new(CatalogAgent) as Arc<dyn AgentAdapter>)
             })
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        hub.resources
+        resources
             .register("balance_api", move |context| {
                 Ok(Arc::new(BalanceReader {
                     binding: context.binding,
@@ -450,6 +471,7 @@ mod tests {
                 }) as Arc<dyn ResourceReader>)
             })
             .unwrap();
+        let hub = Hub::new(agents, resources, crate::auth::AuthRegistry::new());
         let home = std::env::temp_dir().join(format!("usage-hub-session-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&home).unwrap();
         let provider = hub
@@ -506,7 +528,7 @@ mod tests {
         assert_eq!(sessions.sessions[0].id, "conversation-1");
         assert_eq!(sessions.sessions[0].instance, "work");
         assert!(sessions.sessions[0].agent.is_some());
-        let sessions = SessionRegistry::from_agents(Arc::new(hub.agents)).load_all(&homes);
+        let sessions = SessionRegistry::from_agents(hub.agents.clone()).load_all(&homes);
         assert_eq!(sessions.sessions.len(), 1);
         std::fs::remove_dir(home).unwrap();
     }
@@ -584,7 +606,7 @@ mod regression_tests {
 
     #[tokio::test]
     async fn failed_or_stalled_resource_preserves_healthy_result() {
-        let agent = crate::agents::builtin_registry()
+        let agent = builtin_agents()
             .create(
                 "codex",
                 AgentContext::Local {

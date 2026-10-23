@@ -1,11 +1,12 @@
 //! Local token history. Quota percentages cannot reconstruct daily consumption.
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -305,6 +306,7 @@ struct ParserState {
 #[serde(default)]
 struct CachedFile {
     source: String,
+    compressed: bool,
     len: u64,
     modified: Option<SystemTime>,
     offset: u64,
@@ -354,8 +356,35 @@ impl HistoryCache {
         cached: impl FnOnce(History),
     ) -> History {
         let mut history = History::default();
-        let mut paths = Vec::new();
         let roots = history_roots(config);
+        let database = self.database.as_ref().map(|path| open_database(path));
+        if let Some(Ok(db)) = &database {
+            match read_database(db) {
+                Ok(files) => self.files = files,
+                Err(e) => history.warnings.push(format!("读取历史账本失败：{e}")),
+            }
+            let synced: Option<String> = db
+                .query_row(
+                    "SELECT value FROM history_meta WHERE key='synced_at'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            let mut previous = aggregate(&self.files, &roots, History::default());
+            previous.synced_at = synced
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|t| t.with_timezone(&Utc));
+            if previous.synced_at.is_some() {
+                cached(previous);
+            }
+        }
+        if let Some(Err(e)) = &database {
+            history
+                .warnings
+                .push(format!("历史账本不可用，本次使用内存：{e}"));
+        }
+        // Return the persisted view before walking or decoding potentially large logs.
+        let mut paths = Vec::new();
         for (source, id, root) in &roots {
             collect_files(
                 root,
@@ -379,86 +408,66 @@ impl HistoryCache {
                     .push(format!("{source}: 未找到本地历史日志"));
             }
         }
-        let mut database = self.database.as_ref().map(|path| open_database(path));
-        if let Some(Ok(db)) = &database {
-            match read_database(db) {
-                Ok(files) => self.files = files,
-                Err(e) => history.warnings.push(format!("读取历史账本失败：{e}")),
-            }
-            let synced: Option<String> = db
-                .query_row(
-                    "SELECT value FROM history_meta WHERE key='synced_at'",
-                    [],
-                    |r| r.get(0),
-                )
-                .ok();
-            let mut previous = aggregate(&self.files, &roots, History::default());
-            previous.synced_at = synced
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|t| t.with_timezone(&Utc));
-            if previous.synced_at.is_some() {
-                cached(previous);
-            }
-        }
-        let mut transaction = None;
-        if let Some(Err(e)) = &database {
-            history
-                .warnings
-                .push(format!("历史账本不可用，本次使用内存：{e}"));
-        }
-        if let Some(Ok(db)) = database.as_mut() {
-            match db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
-                Ok(tx) => transaction = Some(tx),
-                Err(e) => history.warnings.push(format!("历史账本暂不可写：{e}")),
-            }
-        }
-
-        if let Some(tx) = &transaction {
-            match read_database(tx) {
-                Ok(files) => self.files = files,
-                Err(e) => history.warnings.push(format!("读取历史账本失败：{e}")),
-            }
-        }
         paths.sort();
+        paths.dedup();
         for (path, source) in paths {
             history.scanned_files += 1;
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
+            let (physical, metadata) = match crate::logfiles::resolve(&path) {
+                Ok(file) => file,
                 Err(_) => {
                     history.warnings.push(format!("{source}: 无法读取日志文件"));
                     continue;
                 }
             };
-            if self
-                .files
-                .get(&path)
-                .is_some_and(|e| e.len == metadata.len() && e.modified == metadata.modified().ok())
-            {
+            let compressed = crate::logfiles::compressed(&physical);
+            if self.files.get(&path).is_some_and(|e| {
+                e.compressed == compressed
+                    && e.len == metadata.len()
+                    && e.modified == metadata.modified().ok()
+            }) {
                 continue;
             }
-            let mut entry = self
+            let fallback = self
                 .files
                 .remove(&path)
                 .unwrap_or_else(|| fresh_file(&path, &source));
-            let fallback = entry.clone();
-            let incremental = entry.offset <= metadata.len()
-                && fingerprint(&path, entry.offset).is_ok_and(|f| f == entry.fingerprint)
+            let persisted = database
+                .as_ref()
+                .and_then(|db| db.as_ref().ok())
+                .map(|db| read_file_row(db, &path));
+            let expected = match &persisted {
+                Some(Ok(data)) => data.as_deref(),
+                Some(Err(e)) => {
+                    history.warnings.push(format!("读取历史账本失败：{e}"));
+                    None
+                }
+                None => None,
+            };
+            let mut entry = expected
+                .and_then(|data| serde_json::from_str(data).ok())
+                .unwrap_or_else(|| fallback.clone());
+            let incremental = !compressed
+                && !entry.compressed
+                && entry.offset <= metadata.len()
+                && fingerprint(&physical, entry.offset).is_ok_and(|f| f == entry.fingerprint)
                 && metadata.len() > entry.len;
             if !incremental {
                 entry = fresh_file(&path, &source);
             }
+            entry.compressed = compressed;
             let start = entry.offset;
-            match append_file(&path, &source, &mut entry) {
+            match append_file(&physical, &source, &mut entry) {
                 Ok(()) => {
                     history.read_bytes += entry.offset.saturating_sub(start);
                     entry.len = metadata.len();
                     entry.modified = metadata.modified().ok();
-                    if let Some(tx) = &transaction {
-                        let result = serde_json::to_string(&entry).map_err(|e| e.to_string()).and_then(|data| {
-                            tx.execute("INSERT INTO history_files(path,data) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET data=excluded.data", rusqlite::params![path.to_string_lossy(), data]).map(|_| ()).map_err(|e| e.to_string())
-                        });
-                        if let Err(e) = result {
-                            history.warnings.push(format!("保存历史账本失败：{e}"));
+                    if let Some(Ok(db)) = &database
+                        && matches!(persisted, Some(Ok(_)))
+                    {
+                        match store_file(db, &path, expected, &entry) {
+                            Ok(Some(winner)) => entry = winner,
+                            Ok(None) => {}
+                            Err(e) => history.warnings.push(format!("保存历史账本失败：{e}")),
                         }
                     }
                 }
@@ -472,16 +481,44 @@ impl HistoryCache {
             self.files.insert(path, entry);
         }
         history.synced_at = Some(Utc::now());
-        if let Some(tx) = transaction {
-            let result = tx.execute("INSERT INTO history_meta(key,value) VALUES('synced_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [history.synced_at.unwrap().to_rfc3339()]);
+        if let Some(Ok(db)) = &database {
+            let result = db.execute("INSERT INTO history_meta(key,value) VALUES('synced_at',?1) ON CONFLICT(key) DO UPDATE SET value=MAX(history_meta.value,excluded.value)", [history.synced_at.unwrap().to_rfc3339()]);
             if let Err(e) = result {
                 history.warnings.push(format!("保存同步时间失败：{e}"));
             }
-            if let Err(e) = tx.commit() {
-                history.warnings.push(format!("提交历史账本失败：{e}"));
-            }
         }
         aggregate(&self.files, &roots, history)
+    }
+}
+fn read_file_row(db: &rusqlite::Connection, path: &Path) -> Result<Option<String>, String> {
+    db.query_row(
+        "SELECT data FROM history_files WHERE path=?1",
+        [path.to_string_lossy()],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Parse and serialize before taking SQLite's write lock. Compare-and-swap prevents
+/// a slower refresh from replacing a row another process advanced in the meantime.
+fn store_file(
+    db: &rusqlite::Connection,
+    path: &Path,
+    expected: Option<&str>,
+    entry: &CachedFile,
+) -> Result<Option<CachedFile>, String> {
+    let data = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+    let changed = db.execute(
+        "INSERT INTO history_files(path,data) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET data=excluded.data WHERE history_files.data=?3",
+        rusqlite::params![path.to_string_lossy(), data, expected],
+    ).map_err(|e| e.to_string())?;
+    if changed == 0 {
+        read_file_row(db, path)?
+            .map(|data| serde_json::from_str(&data).map_err(|e| e.to_string()))
+            .transpose()
+    } else {
+        Ok(None)
     }
 }
 // Missing logs remain in the ledger. Configured roots isolate data directories.
@@ -612,7 +649,7 @@ fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFil
         // equals what `fingerprint` now computes, so the file needs no reparse.
         if entry.fingerprint.len() != FINGERPRINT_LEN {
             entry.fingerprint = Sha256::digest(&entry.fingerprint).to_vec();
-            scrubbed.push((raw_path.clone(), entry.clone()));
+            scrubbed.push((raw_path.clone(), data, entry.clone()));
         }
         let path = crate::config::resolved_data_path(Path::new(&raw_path));
         files
@@ -626,12 +663,12 @@ fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFil
     }
     drop(stmt);
     let rewrite = !scrubbed.is_empty();
-    for (path, entry) in scrubbed {
+    for (path, expected, entry) in scrubbed {
         if let Ok(data) = serde_json::to_string(&entry) {
-            // Best effort: a failed rewrite is retried on the next load.
+            // Best effort: retry later without replacing a concurrent refresh.
             let _ = db.execute(
-                "UPDATE history_files SET data=?1 WHERE path=?2",
-                rusqlite::params![data, path],
+                "UPDATE history_files SET data=?1 WHERE path=?2 AND data=?3",
+                rusqlite::params![data, path, expected],
             );
         }
     }
@@ -667,10 +704,10 @@ fn collect_files(
         if kind.is_dir() {
             collect_files(&entry.path(), source, name, out, warnings);
         } else if kind.is_file()
-            && entry.path().extension().is_some_and(|ext| ext == "jsonl")
-            && name.is_none_or(|n| entry.file_name() == n)
+            && let Some(path) = crate::logfiles::discovered(&entry.path())
+            && name.is_none_or(|n| path.file_name().is_some_and(|file| file == n))
         {
-            out.push((entry.path(), source.into()));
+            out.push((path, source.into()));
         }
     }
 }
@@ -739,6 +776,7 @@ fn fresh_file(path: &Path, source: &str) -> CachedFile {
     }
     CachedFile {
         source: source.into(),
+        compressed: false,
         len: 0,
         modified: None,
         offset: 0,
@@ -762,9 +800,7 @@ fn fingerprint(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     Ok(Sha256::digest(&bytes).to_vec())
 }
 fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Result<()> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(entry.offset))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = crate::logfiles::open_at(path, entry.offset)?;
     let ParserState {
         high,
         signatures,
@@ -1011,7 +1047,11 @@ fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Re
             }
         }
     }
-    entry.fingerprint = fingerprint(path, entry.offset)?;
+    entry.fingerprint = if entry.compressed {
+        Sha256::digest([]).to_vec()
+    } else {
+        fingerprint(path, entry.offset)?
+    };
     Ok(())
 }
 
@@ -1212,6 +1252,108 @@ mod tests {
         assert_eq!(total(cache.load(&config)), 220);
         fs::remove_file(path).unwrap();
         assert_eq!(total(cache.load(&config)), 220);
+    }
+    #[test]
+    fn compressed_history_preserves_identity_cache_and_last_good_counts() {
+        let f = Fixture::new();
+        let config = f.config(&["codex"]);
+        let database = f.0.join("history.sqlite3");
+        let path = f.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let archive = path.with_extension("jsonl.zst");
+        let mut cache = HistoryCache::at(database.clone());
+        assert_eq!(cache.load(&config).records.len(), 1);
+        fs::write(&archive, b"unfinished compression").unwrap();
+        let twin = cache.load(&config);
+        assert_eq!(twin.scanned_files, 1);
+        assert_eq!(twin.read_bytes, 0);
+        assert!(twin.warnings.is_empty());
+        let content = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let damaged = cache.load(&config);
+        assert_eq!(damaged.report(2026, &config.providers).totals.total(), 110);
+        assert!(damaged.warnings.iter().any(|w| w.contains("保留上次统计")));
+        fs::write(
+            &archive,
+            ruzstd::encoding::compress_to_vec(
+                content.as_slice(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        let compressed = cache.load(&config);
+        assert_eq!(compressed.read_bytes, content.len() as u64);
+        assert_eq!(
+            compressed.report(2026, &config.providers).totals.total(),
+            110
+        );
+        assert_eq!(cache.files.len(), 1);
+        assert_eq!(HistoryCache::at(database).load(&config).read_bytes, 0);
+        let fresh = HistoryCache::memory().load(&config);
+        assert_eq!(fresh.report(2026, &config.providers).totals.total(), 110);
+    }
+    #[test]
+    fn compressed_claude_and_named_grok_logs_are_discovered() {
+        let f = Fixture::new();
+        let claude = json!({"type":"assistant","timestamp":"2026-09-01T12:00:00Z","message":{"id":"msg","usage":{"input_tokens":10,"output_tokens":5}}});
+        let grok = json!({"timestamp":1788264000,"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"prompt","usage":{"inputTokens":20,"outputTokens":10}}}});
+        for (name, record) in [
+            ("claude/projects/p/a.jsonl", claude),
+            ("grok/sessions/p/s/updates.jsonl", grok),
+        ] {
+            let path = f.write(name, &[record]);
+            let content = fs::read(&path).unwrap();
+            fs::write(
+                path.with_extension("jsonl.zst"),
+                ruzstd::encoding::compress_to_vec(
+                    content.as_slice(),
+                    ruzstd::encoding::CompressionLevel::Fastest,
+                ),
+            )
+            .unwrap();
+            fs::remove_file(path).unwrap();
+        }
+        let config = f.config(&["claude", "grok"]);
+        let history = HistoryCache::memory().load(&config);
+        assert_eq!(history.records.len(), 2);
+        assert_eq!(history.report(2026, &config.providers).totals.total(), 45);
+        assert!(history.warnings.is_empty());
+    }
+    #[test]
+    fn slower_refresh_cannot_replace_a_concurrent_ledger_update() {
+        let f = Fixture::new();
+        let path = f.0.join("a.jsonl");
+        let db = open_database(&f.0.join("history.sqlite3")).unwrap();
+        let mut old = fresh_file(&path, "codex");
+        old.len = 1;
+        assert!(store_file(&db, &path, None, &old).unwrap().is_none());
+        let expected = read_file_row(&db, &path).unwrap().unwrap();
+        let other = open_database(&f.0.join("history.sqlite3")).unwrap();
+        let mut newer = old.clone();
+        newer.len = 20;
+        assert!(
+            store_file(&other, &path, Some(&expected), &newer)
+                .unwrap()
+                .is_none()
+        );
+        old.len = 10;
+        assert_eq!(
+            store_file(&db, &path, Some(&expected), &old)
+                .unwrap()
+                .unwrap()
+                .len,
+            20
+        );
+        assert_eq!(store_file(&db, &path, None, &old).unwrap().unwrap().len, 20);
+        assert_eq!(
+            read_database(&db).unwrap()[&crate::config::resolved_data_path(&path)].len,
+            20
+        );
     }
     #[test]
     fn local_dates_leap_year_zero_days_and_bad_lines() {

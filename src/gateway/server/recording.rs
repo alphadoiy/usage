@@ -3,6 +3,8 @@ use super::*;
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
+mod recovery;
+
 pub(super) type Sample = (Arc<Source>, String, Record);
 type Key = (String, String);
 
@@ -72,15 +74,17 @@ impl Sources {
             .expect("source registry")
             .retain(|_, source| Arc::strong_count(source) > 1 || source.pending());
     }
-    async fn flush(&self, service: Arc<crate::performance::Service>) -> bool {
-        let pending: Vec<_> = self
-            .entries
+    fn pending(&self) -> Vec<Arc<Source>> {
+        self.entries
             .lock()
             .expect("source registry")
             .values()
             .filter(|s| s.pending())
             .cloned()
-            .collect();
+            .collect()
+    }
+    async fn flush(&self, service: Arc<crate::performance::Service>) -> bool {
+        let pending = self.pending();
         if pending.is_empty() {
             return true;
         }
@@ -107,19 +111,58 @@ pub(super) async fn write(
     mut receiver: mpsc::Receiver<Sample>,
     sources: Arc<Sources>,
     service: Arc<crate::performance::Service>,
+    directory: PathBuf,
 ) {
+    let recovery = recovery::Recovery::new(&directory);
     let mut retry = tokio::time::interval(Duration::from_secs(1));
-    let mut closed = false;
+    let mut closing = None;
+    let mut storage_failed = false;
     loop {
-        let flushed = sources.flush(service.clone()).await;
-        sources.collect();
-        if closed && flushed {
+        if receiver.is_closed() && closing.is_none() {
+            closing = Some(tokio::time::Instant::now());
+        }
+        if closing.is_some_and(|started| {
+            receiver.is_empty() || storage_failed || started.elapsed() >= Duration::from_millis(250)
+        }) {
+            // One final source transaction, never one blocked DB write per queued sample.
+            // CLI selection covers all queued samples, including runs with earlier saved samples.
+            let mut dropped = 0;
+            while let Ok((source, _, _)) = receiver.try_recv() {
+                source.fallback();
+                dropped += 1;
+            }
+            if dropped > 0 {
+                tracing::warn!(
+                    event = "gateway_shutdown_samples_deferred",
+                    samples = dropped
+                );
+            }
+            sources.flush(service.clone()).await;
+            let pending: Vec<_> = sources.pending().iter().map(|s| s.key.clone()).collect();
+            if !pending.is_empty() {
+                let count = pending.len();
+                match tokio::task::spawn_blocking(move || recovery.save(pending)).await {
+                    Ok(Ok(())) => {
+                        tracing::warn!(event = "gateway_cli_sources_deferred", runs = count)
+                    }
+                    result => tracing::error!(
+                        event = "gateway_cli_sources_recovery_save_failed",
+                        runs = count,
+                        reason = result
+                            .ok()
+                            .and_then(Result::err)
+                            .unwrap_or("recovery_task_failed"),
+                        action = "release_gateway_lock"
+                    ),
+                }
+            }
             break;
         }
+        sources.flush(service.clone()).await;
+        sources.collect();
         tokio::select! {
-            sample = receiver.recv(), if !closed => {
+            sample = receiver.recv() => {
                 let Some((source, upstream, record)) = sample else {
-                    closed = true;
                     continue;
                 };
                 // The queued sample owns its source even after the route expires.
@@ -128,13 +171,20 @@ pub(super) async fn write(
                 let run_id = record.run.clone();
                 let service = service.clone();
                 let result = tokio::task::spawn_blocking(move || service.record_gateway(&scope, &upstream, &record)).await;
-                if !matches!(result, Ok(Ok(()))) {
+                storage_failed = !matches!(result, Ok(Ok(())));
+                if storage_failed {
                     source.fallback();
                     tracing::error!(event = "gateway_record_failed", request_id, run_id);
                 }
             }
             _ = sources.wake.notified() => {},
-            _ = retry.tick() => {},
+            _ = retry.tick() => {
+                let recovery = recovery.clone();
+                let service = service.clone();
+                if !matches!(tokio::task::spawn_blocking(move || recovery.replay_one(&service)).await, Ok(Ok(_))) {
+                    tracing::warn!(event = "gateway_cli_sources_recovery_failed", retry = true);
+                }
+            },
         }
     }
 }
@@ -142,13 +192,13 @@ pub(super) async fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture {
-        root: PathBuf,
-        path: PathBuf,
-        service: Arc<crate::performance::Service>,
+    pub(super) struct Fixture {
+        pub(super) root: PathBuf,
+        pub(super) path: PathBuf,
+        pub(super) service: Arc<crate::performance::Service>,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let root =
                 std::env::temp_dir().join(format!("usage-recording-{}", uuid::Uuid::new_v4()));
             let path = root.join("index/performance.sqlite3");
@@ -159,7 +209,7 @@ mod tests {
                 service,
             }
         }
-        fn markers(&self) -> i64 {
+        pub(super) fn markers(&self) -> i64 {
             rusqlite::Connection::open(&self.path)
                 .unwrap()
                 .query_row("SELECT COUNT(*) FROM perf_gateway_native", [], |r| r.get(0))
@@ -194,25 +244,75 @@ mod tests {
         assert!(sources.get("scope", "run").is_none());
     }
     #[tokio::test]
-    async fn sample_write_failure_selects_cli_and_shutdown_waits_for_source_retry() {
+    async fn healthy_shutdown_preserves_queued_gateway_samples() {
+        let f = Fixture::new();
+        let sources = Arc::new(Sources::default());
+        let source = sources.reserve("scope", "run").unwrap();
+        let (tx, rx) = mpsc::channel(2);
+        for id in ["first", "second"] {
+            tx.try_send((
+                source.clone(),
+                "openai".into(),
+                Record {
+                    id: id.into(),
+                    run: "run".into(),
+                    ..Default::default()
+                },
+            ))
+            .ok()
+            .unwrap();
+        }
+        drop(tx);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            write(rx, sources, f.service.clone(), f.root.join("gateway")),
+        )
+        .await
+        .unwrap();
+        assert!(!source.is_fallback());
+        assert_eq!(f.markers(), 0);
+        let db = rusqlite::Connection::open(&f.path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM perf_gateway_calls", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_storage_failure_releases_shutdown_and_replays_after_restart() {
         let f = Fixture::new();
         std::fs::create_dir_all(&f.root).unwrap();
         std::fs::write(f.root.join("index"), b"block storage").unwrap();
         let sources = Arc::new(Sources::default());
-        let source = sources.reserve("scope", "run").unwrap();
+        let scope = "a".repeat(64);
+        let run = uuid::Uuid::new_v4().to_string();
+        let source = sources.reserve(&scope, &run).unwrap();
         let (tx, rx) = mpsc::channel(1);
         tx.try_send((
             source.clone(),
             "openai".into(),
             Record {
-                run: "run".into(),
+                run,
                 ..Default::default()
             },
         ))
         .ok()
         .unwrap();
-        drop(tx);
-        let writer = tokio::spawn(write(rx, sources, f.service.clone()));
+        let directory = f.root.join("gateway");
+        private_dir(&directory).unwrap();
+        let lock_path = directory.join("service.lock");
+        let lock = private_file(&lock_path).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let writer = tokio::spawn({
+            let service = f.service.clone();
+            let directory = directory.clone();
+            async move {
+                write(rx, sources, service, directory).await;
+                drop(lock);
+            }
+        });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !source.is_fallback() {
                 tokio::task::yield_now().await;
@@ -220,12 +320,20 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!writer.is_finished());
-        std::fs::remove_file(f.root.join("index")).unwrap();
+        drop(tx);
         tokio::time::timeout(Duration::from_secs(5), writer)
             .await
             .unwrap()
             .unwrap();
+        let next_lock = private_file(&lock_path).unwrap();
+        next_lock
+            .try_lock_exclusive()
+            .expect("another gateway must be able to start while metrics remain unavailable");
+        let recovery = recovery::Recovery::new(&directory);
+        assert!(recovery.replay_one(&f.service).is_err());
+        std::fs::remove_file(f.root.join("index")).unwrap();
+        assert!(recovery.replay_one(&f.service).unwrap());
+        assert!(!recovery.replay_one(&f.service).unwrap());
         assert_eq!(f.markers(), 1);
     }
     #[test]

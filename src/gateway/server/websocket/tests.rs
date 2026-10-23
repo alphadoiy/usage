@@ -710,7 +710,7 @@ async fn full_sample_queue_cannot_drop_websocket_source_fallback() {
     drop(t);
     tokio::time::timeout(
         Duration::from_secs(5),
-        recording::write(rx, sources, service),
+        recording::write(rx, sources, service, root.join("gateway")),
     )
     .await
     .unwrap();

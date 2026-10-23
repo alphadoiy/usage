@@ -368,11 +368,12 @@ fn revision_updates_do_not_rewrite_existing_home_or_credentials() {
         .provider(crate::hub::ProviderDefinition {
             id: "configured-provider".into(),
             agent: "codex".into(),
-            context: crate::agents::AgentContext::ManagedCodex {
+            context: managed::ManagedAccount {
                 root: m.root().to_owned(),
                 account: p.id.clone(),
                 revision: Some(1),
-            },
+            }
+            .context(),
             resources: Vec::new(),
             auth: None,
         })
@@ -1147,6 +1148,177 @@ pub(super) fn oauth_source(f: &Fixture, workspace: &str, refresh: &str) -> PathB
     let path = f.path.join(format!("{workspace}.json"));
     fs::write(&path,json!({"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":jwt,"access_token":jwt,"refresh_token":refresh,"account_id":workspace},"last_refresh":"2026-10-11T00:00:00Z"}).to_string()).unwrap();
     path
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_resume_command_keeps_the_instances_explicit_account_store() {
+    use crate::agents::ManagedInstance;
+    let f = Fixture::new();
+    let root = f.path.join("separate 'account store");
+    let mut manager = Manager::open(root.clone()).unwrap();
+    let profile = manager
+        .add("A", &native("https://a.invalid/v1", "model"), "synthetic")
+        .unwrap();
+    let instance = managed::ManagedAccount {
+        root: root.clone(),
+        account: profile.id.clone(),
+        revision: Some(profile.revision),
+    };
+    let session = crate::sessions::Session {
+        agent: None,
+        provider: crate::agents::AgentKind::CODEX,
+        instance: profile.id.clone(),
+        id: uuid::Uuid::new_v4().to_string(),
+        cwd: f.path.clone(),
+        title: "test".into(),
+        recency_at_ms: 0,
+        home: instance.home().unwrap(),
+    };
+    let command = instance.resume_shell_command(&session).unwrap();
+    let args = shlex::split(&command).unwrap();
+    assert_eq!(args[0], "env");
+    assert_eq!(args[1], format!("USAGE_CODEX_DIR={}", root.display()));
+    assert_eq!(&args[3..6], &["codex", "run", profile.id.as_str()]);
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--resume", &session.id])
+    );
+    assert!(args.windows(2).any(|pair| pair == ["--revision", "1"]));
+}
+
+#[test]
+fn oauth_save_validates_existing_revision_before_replacing_login() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let source = oauth_source(&f, "preflight", "original-refresh");
+    let profile = manager
+        .import_oauth(Some("Original"), None, &source, None)
+        .unwrap();
+    let home = manager.home(&profile.id, profile.revision).unwrap();
+    let original_auth = fs::read(home.join("auth.json")).unwrap();
+    let altered_config = "model_provider='changed-outside-manager'\n";
+    fs::write(home.join("usage-r1.config.toml"), altered_config).unwrap();
+    let source = oauth_source(&f, "preflight", "replacement-refresh");
+    let error = manager
+        .import_oauth(Some("Replacement"), None, &source, Some(&profile.id))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("手动修改"), "{error}");
+    assert_eq!(fs::read(home.join("auth.json")).unwrap(), original_auth);
+    assert_eq!(
+        fs::read_to_string(home.join("usage-r1.config.toml")).unwrap(),
+        altered_config
+    );
+    assert_eq!(manager.resolve(&profile.id).unwrap().name, "Original");
+}
+
+#[test]
+fn oauth_commit_failure_restores_login_and_home_files_and_allows_retry() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let source = oauth_source(&f, "commit-failure", "original-refresh");
+    let profile = manager
+        .import_oauth(Some("Original"), None, &source, None)
+        .unwrap();
+    let home = manager.home(&profile.id, profile.revision).unwrap();
+    let trust = format!(
+        "{}\n[projects.fixture]\ntrust_level='trusted'\n",
+        fs::read_to_string(home.join("config.toml")).unwrap()
+    );
+    fs::write(home.join("config.toml"), trust).unwrap();
+    let original: Vec<_> = [
+        "auth.json",
+        "config.toml",
+        "usage-binding.json",
+        "usage-r1.config.toml",
+    ]
+    .into_iter()
+    .map(|name| (name, fs::read(home.join(name)).unwrap()))
+    .collect();
+    // Deferred foreign keys fail at COMMIT, after the new auth and Home files
+    // have been written, rather than rejecting an earlier SQL statement.
+    manager
+        .conn
+        .execute_batch(
+            "CREATE TABLE oauth_commit_fault (
+        profile_id TEXT REFERENCES profiles(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_oauth_commit AFTER UPDATE ON oauth_accounts BEGIN
+            INSERT INTO oauth_commit_fault VALUES ('nonexistent-test-account');
+        END;",
+        )
+        .unwrap();
+    let source = oauth_source(&f, "commit-failure", "replacement-refresh");
+    assert!(
+        manager
+            .import_oauth(
+                Some("Replacement"),
+                Some("model='failed-model'"),
+                &source,
+                Some(&profile.id)
+            )
+            .is_err()
+    );
+    assert_eq!(manager.resolve(&profile.id).unwrap().revision, 1);
+    assert_eq!(manager.resolve(&profile.id).unwrap().name, "Original");
+    for (name, bytes) in original {
+        assert_eq!(fs::read(home.join(name)).unwrap(), bytes, "{name}");
+    }
+    assert!(!home.join("usage-r2.config.toml").exists());
+    assert!(fs::read_dir(&home).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".usage-oauth-recovery-")
+    }));
+    manager
+        .conn
+        .execute_batch("DROP TRIGGER reject_oauth_commit;")
+        .unwrap();
+    let saved = manager
+        .import_oauth(
+            Some("Retried"),
+            Some("model='successful-retry'"),
+            &source,
+            Some(&profile.id),
+        )
+        .unwrap();
+    assert_eq!(saved.revision, 2);
+    assert_eq!(saved.name, "Retried");
+    assert!(
+        fs::read_to_string(home.join("auth.json"))
+            .unwrap()
+            .contains("replacement-refresh")
+    );
+    assert!(
+        fs::read_to_string(home.join("usage-r2.config.toml"))
+            .unwrap()
+            .contains("successful-retry")
+    );
+}
+
+#[test]
+fn oauth_new_account_commit_failure_removes_new_login_and_config_files() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    manager
+        .conn
+        .execute_batch(
+            "CREATE TABLE oauth_commit_fault (
+        profile_id TEXT REFERENCES profiles(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER reject_oauth_commit AFTER INSERT ON oauth_accounts BEGIN
+            INSERT INTO oauth_commit_fault VALUES ('nonexistent-test-account');
+        END;",
+        )
+        .unwrap();
+    let source = oauth_source(&f, "new-commit-failure", "new-refresh");
+    assert!(manager.import_oauth(None, None, &source, None).is_err());
+    assert!(manager.list().unwrap().is_empty());
+    for entry in fs::read_dir(manager.root().join("homes")).unwrap() {
+        let home = entry.unwrap().path().join("r1");
+        assert_eq!(fs::read_dir(home).unwrap().count(), 0);
+    }
 }
 
 #[test]

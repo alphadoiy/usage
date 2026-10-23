@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+// Metadata clients buffer JSON/protobuf responses. Inference streams use the gateway's
+// streaming transport instead and are not subject to this metadata limit.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 pub(crate) enum BaseUrlError {
     Invalid,
     Policy,
@@ -126,7 +130,7 @@ impl HttpClient for ReqwestClient {
         if let Some(body) = body {
             builder = builder.body(body);
         }
-        let response = builder
+        let mut response = builder
             .send()
             .await
             .map_err(|error| TransportError(error.to_string()))?;
@@ -141,11 +145,23 @@ impl HttpClient for ReqwestClient {
                     .map(|text| (name.as_str().to_string(), text.to_string()))
             })
             .collect();
-        let body = response
-            .bytes()
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(TransportError("HTTP response exceeds size limit".into()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|error| TransportError(error.to_string()))?
-            .to_vec();
+        {
+            if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+                return Err(TransportError("HTTP response exceeds size limit".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(HttpResponse {
             status,
             headers,
@@ -223,6 +239,61 @@ impl HttpClient for FakeHttp {
 mod redirect_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn oversized_metadata_stops_at_headers_or_at_the_chunked_body_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for declared in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                if declared {
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                MAX_RESPONSE_BYTES + 1
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // Do not send a body: rejection must not wait for the announced bytes.
+                    let _ = stream.read_u8().await;
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await
+                        .unwrap();
+                    for _ in 0..MAX_RESPONSE_BYTES / 4096 {
+                        stream.write_all(b"1000\r\n").await.unwrap();
+                        stream.write_all(&[b'x'; 4096]).await.unwrap();
+                        stream.write_all(b"\r\n").await.unwrap();
+                    }
+                    stream.write_all(b"1\r\nx\r\n").await.unwrap();
+                    // No final chunk: the client must reject before the response completes.
+                    let _ = stream.read_u8().await;
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                ReqwestClient::new().request("GET", &url, &[], None),
+            )
+            .await
+            .unwrap();
+            assert!(result.unwrap_err().0.contains("size limit"));
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     fn server(
         count: usize,
         location: Option<String>,

@@ -257,6 +257,67 @@ with open(os.environ['CAPTURE_FILE'], 'w') as file:
 
 #[cfg(unix)]
 #[test]
+fn invalid_bark_settings_do_not_prevent_managed_or_local_launches() {
+    let f = Fixture::new();
+    let account = f.add();
+    fs::write(f.path.join("manager/bark.json"), "invalid fixture settings").unwrap();
+    let binary = bark_binary(&f);
+    let capture = f.path.join("capture.json");
+    let local_home = f.path.join("local-home");
+    fs::create_dir(&local_home).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    for args in [
+        vec![
+            "run",
+            account.as_str(),
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ],
+        vec![
+            "resume-local",
+            "--home",
+            local_home.to_str().unwrap(),
+            "--cwd",
+            f.path.to_str().unwrap(),
+            "--session",
+            &session,
+            "--binary",
+            binary.to_str().unwrap(),
+        ],
+    ] {
+        let output = f
+            .command(&args)
+            .env("CAPTURE_FILE", &capture)
+            .env("USAGE_CODEX_BARK_CONTEXT", "invalid-inherited-fixture")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("本次启动不发送 Bark 通知"));
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
+        assert!(record["context"].is_null());
+        assert!(
+            !record["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|arg| arg.starts_with("notify=")))
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(f.path.join("manager/bark.json")).unwrap(),
+        "invalid fixture settings"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn bark_is_injected_per_managed_run_without_changing_byok_or_oauth_homes() {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new();

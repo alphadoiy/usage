@@ -125,3 +125,21 @@ Provider 操作的确认转换由 `ui::confirmation` 统一管理，重置和签
 Agent 配置表单的模型与推理强度使用选项列表，可筛选，也可输入自定义值。模型选项来自 `CatalogService::models`：已保存的 Provider 与首页共用同一套查询构造（托管账号经 Manager，插件账号经同一插件查询），只读取当前 Provider 的凭据；新 BYOK 按表单中的端点和密钥查询。推理强度的取值属于 Codex 配置语义，由 `codex_manager::config::REASONING_EFFORTS` 提供，UI 只负责展示文案。
 
 管理页启动前先选择项目目录。项目由 `projects` 模块管理：`projects.sqlite3` 只保存用户意图（手动添加、置顶、移出与从 Usage 启动的时间），会话派生的目录在读取时由 `projects::catalog` 合并，不写入项目库；项目库不参与 Run 归属。首页项目看板、管理页的项目选择与 `usage projects` 共用这一合并规则，会话目录通过调用方注入的 `SessionRegistry` 与 `SessionHomes` 读取；`SessionHomes::from_config` 统一解析默认目录与数据实例。启动终端只承载 Agent 输出：启动前的 CC Switch 同步结果写入日志，由管理页和 `usage codex sync` 展示。网关以 `-c model_providers.<id>.base_url` 注入，参数名的构造规则在 `launcher::provider_override` 中维护；Codex 不解析带引号的 TOML 键，无法以裸键引用的 provider ID 直接启动失败，不回退为不经观测的直连。
+
+## 解耦（2026-10-24）
+
+- **组合根**：`hub::Hub` 是唯一决定有哪些 Agent、资源服务与认证后端的位置。注册表只构建一次并以 `Arc` 共享，`hub::shared()` 返回进程内的 Hub；嵌入方在首次使用前调用 `hub::install` 注入自定义工厂。资源服务、模型目录、会话目录、认证入口与托管启动都从 Hub 取注册表，不再各自调用 `builtin_registry()`。插件资源与认证工厂在组合时注册，`resources` 与 `plugins` 之间不再互相构建注册表。
+- **托管实例**：`AgentContext` 为 `Local { home }` 或 `Managed(Arc<dyn ManagedInstance>)`。账号库通过 `ManagedInstance`（Agent 类型、Home、性能绑定、启动、导出恢复命令）接入，`agents` 与 `hub` 不再引用 `codex_manager`。Codex 对本地 Home 的特殊处理（识别托管目录、注入通知）以 `LocalHooks` 在组合时提供；`RunRecord` 移至 `runs`。其他 Agent 接入托管多开只需实现 `ManagedInstance`。
+- **首页目录**：`CatalogService::load` 按托管账号、插件账号、资源连接三个来源依次收集（`provider_catalog/sources.rs`），来源间的绑定关系以参数显式传递。插件库读取失败与单个签到操作创建失败会记录日志，不再静默隐藏或让整个目录失败。
+- **托管启动**：`start_recorded_with_config` 拆为选择账号、准备命令、解析配置并接入观测、注入 hooks、启动并记录五个阶段（`codex_manager/launch.rs`），日志步骤名称不变；运行记录读写位于 `codex_manager/run_store.rs`。
+
+## 稳定性与负载边界（2026-10-24）
+
+- 插件账号锁和动作锁仅在定位单个账号的锁时持有全局映射锁，等待账号锁前释放映射锁。同账号保持串行，不同账号不会因其中一个账号排队而一起阻塞。
+- OAuth 保存先验证并准备 Home，再替换登录、提交账号事务。返回错误时恢复原认证、配置及绑定文件；恢复失败会保留私有备份目录并返回位置。提交成功后不再执行会让调用者误判保存失败的查询或物化。该补偿覆盖可返回的错误，不提供断电或 SIGKILL 下跨 SQLite 与文件系统的原子性。
+- 资源查询同时最多执行 8 项，排队后的超时从实际开始查询计时；整体取消会撤销正在执行的任务。模型查询失败在下一轮刷新时重试，成功缓存仍按原身份复用。元数据 HTTP 响应按块读取并限制为 4 MiB，推理流继续由网关流式转发。
+- 历史、会话和性能读取共用 `logfiles` 的普通／压缩日志身份与读取入口。历史账本先提供缓存，再发现和解析日志；解析和 JSON 序列化不持有 SQLite 写事务，每个文件用条件更新避免旧刷新覆盖并发写入。账本仍按文件保存记录集合，超大历史的内存与序列化成本尚需独立优化。
+- 托管恢复命令携带实例自己的账号库路径；已删除项目的相对路径仍归一到原项目身份。损坏的 Bark 配置会停用本次通知并显示原因，Agent 启动继续执行。
+- 捕获输出的后台探测拥有独立进程组，取消或超时回收组内子进程；前台 Agent 的终止先通知所持有的子进程，给包装器转发与回收机会，再强制终止。前台路径不声称拥有任意后代进程树。
+
+日常 push 与 PR 的 CI 执行 Rust 格式检查、Clippy 全 target、串行 Rust 回归、插件 JavaScript 回归及 Python 执行器测试。测试使用临时账号目录与本地模拟服务。

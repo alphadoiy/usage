@@ -119,6 +119,13 @@ pub(crate) fn output_with_cancel(
         return None;
     }
     command.stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // These captured-output probes run independently of the foreground terminal.
+        // Own a group so cancellation also stops wrappers' children and pipe holders.
+        command.process_group(0);
+    }
     let mut child = command.spawn().ok()?;
     let started = Instant::now();
     let result = (|| {
@@ -175,25 +182,16 @@ pub(crate) fn output_with_cancel(
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
-            match child.try_wait().ok()? {
-                Some(status) => break status,
-                None => std::thread::sleep(Duration::from_millis(5)),
+            // Keep the group leader unreaped while descendants hold its stdout.
+            // On cancellation the PID still belongs to this command's group.
+            if output.is_some()
+                && let Some(status) = child.try_wait().ok()?
+            {
+                break status;
             }
+            std::thread::sleep(Duration::from_millis(5));
         };
-        let stdout = if let Some(output) = output {
-            output
-        } else {
-            loop {
-                if started.elapsed() >= timeout || cancel.load(Ordering::Acquire) {
-                    return None;
-                }
-                match receiver.recv_timeout(Duration::from_millis(10)) {
-                    Ok(Some(bytes)) => break bytes,
-                    Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-            }
-        };
+        let stdout = output?;
         Some(Output {
             status,
             stdout,
@@ -201,6 +199,12 @@ pub(crate) fn output_with_cancel(
         })
     })();
     if result.is_none() {
+        #[cfg(unix)]
+        // SAFETY: this child was started in its own process group above. Never target
+        // the caller's foreground group; descendants can outlive the direct child.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -497,6 +501,51 @@ mod tests {
         let mut unlimited = Command::new("python3");
         unlimited.args(["-c", "import sys; sys.stdout.write('x'*(5*1048576))"]);
         assert!(output_with_timeout(unlimited, Duration::from_secs(2)).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_descendants_of_captured_output_commands() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root =
+            std::env::temp_dir().join(format!("usage-probe-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let ready = root.join("ready");
+        let survived = root.join("survived");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "( : > \"$1\"; sleep 0.4; : > \"$2\" ) & wait",
+                "fixture",
+            ])
+            .arg(&ready)
+            .arg(&survived);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            output_with_cancel(command, Duration::from_secs(3), &worker_cancel)
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = ready.exists();
+        cancel.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().is_none());
+        assert!(
+            started,
+            "the descendant must be running before cancellation"
+        );
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(
+            !survived.exists(),
+            "the descendant continued after cancellation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

@@ -193,6 +193,92 @@ fn pending_lines_replacement_cancellation_and_large_lines_are_bounded() {
 }
 
 #[test]
+fn compressed_logs_share_plain_identity_and_import_without_a_plain_twin() {
+    let f = Fixture::new("codex");
+    let text = codex_session("compressed-session", "model-a");
+    let plain = f.file("a.jsonl", &text);
+    let archive = plain.with_extension("jsonl.zst");
+    fs::write(&archive, b"still writing").unwrap();
+    f.update();
+    assert_eq!(f.snapshot().models[0].calls, 1);
+    assert_eq!(f.snapshot().models[0].timed_samples, 0);
+    assert_eq!(f.update().bytes, 0);
+    let finished = text + &complete();
+    fs::write(
+        &archive,
+        ruzstd::encoding::compress_to_vec(
+            finished.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    fs::remove_file(&plain).unwrap();
+    assert_eq!(f.update().bytes, finished.len() as u64);
+    assert_eq!(f.snapshot().models[0].calls, 1);
+    assert_eq!(f.snapshot().models[0].timed_samples, 1);
+    assert_eq!(f.update().bytes, 0);
+    let fresh = Service::at(f.root.join("fresh.sqlite3"));
+    let imported = fresh
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(imported.bytes, finished.len() as u64);
+    assert_eq!(
+        fresh
+            .snapshot(&f.binding, Period::Month, None, 0, at(30))
+            .unwrap()
+            .models[0]
+            .calls,
+        1
+    );
+    let reopened = Service::at(f.root.join("index/performance.sqlite3"));
+    assert_eq!(
+        reopened
+            .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+            .unwrap()
+            .bytes,
+        0
+    );
+}
+
+#[test]
+fn compressed_batches_resume_skip_large_lines_and_replay_safely_after_restart() {
+    let mut f = Fixture::new("codex");
+    let text = codex_session("before", "model-a")
+        + &"x".repeat(5 * 1024 * 1024)
+        + "\n"
+        + &codex_session("after", "model-b")
+        + &complete();
+    let path = f.file("large.jsonl.zst", "");
+    fs::write(
+        path,
+        ruzstd::encoding::compress_to_vec(
+            text.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    let stopped = f
+        .service
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(true))
+        .unwrap();
+    assert_eq!(stopped.bytes, 0);
+    let first = f
+        .service
+        .refresh(&f.binding, f.binding.source, &AtomicBool::new(false))
+        .unwrap();
+    assert!(first.more);
+    assert!(first.bytes > 0 && first.bytes <= 4 * 1024 * 1024);
+    f.service = Service::at(f.root.join("index/performance.sqlite3"));
+    let replay = f.update();
+    assert_eq!(replay.bytes, text.len() as u64);
+    assert_eq!(replay.skipped, 1);
+    let result = f.snapshot();
+    assert_eq!(result.models.len(), 2);
+    assert_eq!(result.models.iter().map(|m| m.calls).sum::<u64>(), 2);
+    assert_eq!(f.update().bytes, 0);
+}
+
+#[test]
 fn provider_home_and_upstream_identity_are_isolated() {
     let a = Fixture::new("codex");
     let b = Fixture::new("codex");

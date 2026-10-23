@@ -27,6 +27,8 @@ struct Cursor {
     parser: serde_json::Value,
     skip: bool,
     pending_line: bool,
+    compressed: bool,
+    complete: bool,
 }
 struct Walker {
     stack: Vec<ReadDir>,
@@ -62,8 +64,10 @@ impl Walker {
                 if let Ok(dir) = fs::read_dir(entry.path()) {
                     self.stack.push(dir);
                 }
-            } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "jsonl") {
-                return Some(entry.path());
+            } else if kind.is_file()
+                && let Some(path) = crate::logfiles::discovered(&entry.path())
+            {
+                return Some(path);
             }
         }
         None
@@ -72,6 +76,77 @@ impl Walker {
 #[derive(Default)]
 struct Workers {
     walkers: HashMap<String, Walker>,
+    // Only one archive is decoded at a time. Keep its stream and bounded partial line
+    // between batches; unlike plain logs, a Zstd stream cannot seek to a saved offset.
+    archive: Option<Archive>,
+}
+
+struct Archive {
+    scope: String,
+    path: String,
+    reader: Box<dyn BufRead + Send>,
+    offset: u64,
+    line: Vec<u8>,
+    skip: bool,
+}
+#[derive(Default)]
+struct ArchiveBatch {
+    bytes: u64,
+    skipped: u64,
+    complete: bool,
+    calls: Vec<Observation>,
+}
+impl Archive {
+    fn read(
+        &mut self,
+        parser: &mut dyn RequestParser,
+        limit: u64,
+        began: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<ArchiveBatch, String> {
+        let mut batch = ArchiveBatch::default();
+        while batch.bytes < limit
+            && began.elapsed() < Duration::from_millis(100)
+            && !cancelled(cancel)
+        {
+            let buf = self.reader.fill_buf().map_err(|_| "读取压缩日志失败")?;
+            if buf.is_empty() {
+                batch.complete = true;
+                break;
+            }
+            let n = buf
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(buf.len(), |i| i + 1)
+                .min((limit - batch.bytes) as usize);
+            let ended = buf[n - 1] == b'\n';
+            if !self.skip {
+                if self.line.len() + n > MAX_LINE {
+                    self.skip = true;
+                    self.line.clear();
+                    batch.skipped += 1;
+                } else {
+                    self.line.extend_from_slice(&buf[..n]);
+                }
+            }
+            self.reader.consume(n);
+            self.offset += n as u64;
+            batch.bytes += n as u64;
+            if ended {
+                if !self.skip {
+                    match parser.feed(&self.line) {
+                        Ok(calls) => batch
+                            .calls
+                            .extend(calls.into_iter().filter(Observation::valid)),
+                        Err(_) => batch.skipped += 1,
+                    }
+                }
+                self.line.clear();
+                self.skip = false;
+            }
+        }
+        Ok(batch)
+    }
 }
 pub struct Service {
     path: PathBuf,
@@ -267,6 +342,9 @@ impl Service {
             Err(TryLockError::Poisoned(_)) => return Err("性能采集状态不可用，请重启 Usage".into()),
         };
         let scope = binding.scope();
+        if workers.archive.as_ref().is_some_and(|a| a.scope != scope) {
+            workers.archive = None;
+        }
         // Bound open directory handles when users rapidly switch many providers.
         if !workers.walkers.contains_key(&scope) && workers.walkers.len() >= 4 {
             workers.walkers.clear();
@@ -294,6 +372,7 @@ impl Service {
             )
             .map_err(|_| "无法保存日志索引")?;
         }
+        let discovering = !walker.stack.is_empty();
         let mut paths: Vec<(String, String)> = tx
             .prepare(
                 "SELECT path,cursor FROM perf_files WHERE scope=?1 ORDER BY checked,path LIMIT ?2",
@@ -320,6 +399,19 @@ impl Service {
             .chain(paths)
             .filter(|(path, _)| seen.insert(path.clone()))
             .collect();
+        // An unfinished archive must remain first even when round-robin ordering changes;
+        // otherwise rotating through many files would repeatedly discard its decoder.
+        if let Some(archive) = &workers.archive {
+            let cursor: String = tx
+                .query_row(
+                    "SELECT cursor FROM perf_files WHERE scope=?1 AND path=?2",
+                    params![scope, archive.path],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "无法读取压缩日志游标")?;
+            paths.retain(|(path, _)| path != &archive.path);
+            paths.insert(0, (archive.path.clone(), cursor));
+        }
         let mut batch = Batch::default();
         let began = Instant::now();
         for (path, text) in paths {
@@ -330,18 +422,22 @@ impl Service {
                 batch.more = true;
                 break;
             }
-            let path_ref = Path::new(&path);
-            let meta = match fs::symlink_metadata(path_ref) {
-                Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => meta,
+            let (physical, meta) = match crate::logfiles::resolve(Path::new(&path)) {
+                Ok(file) => file,
                 _ => {
                     tx.execute(
                         "DELETE FROM perf_files WHERE scope=?1 AND path=?2",
                         params![scope, path],
                     )
                     .map_err(|_| "无法更新日志目录索引")?;
+                    if workers.archive.as_ref().is_some_and(|a| a.path == path) {
+                        workers.archive = None;
+                    }
                     continue;
                 }
             };
+            let path_ref = physical.as_path();
+            let compressed = crate::logfiles::compressed(path_ref);
             let mut cursor: Cursor = serde_json::from_str(&text).unwrap_or_default();
             let modified = meta
                 .modified()
@@ -351,12 +447,57 @@ impl Service {
             let identity = identity(&meta);
             let incompatible = cursor.format != PARSER_VERSION;
             let unchanged = !incompatible
+                && cursor.compressed == compressed
                 && cursor.len == meta.len()
                 && cursor.modified == modified
                 && cursor.identity == identity;
             batch.files += 1;
-            if !(unchanged && (cursor.offset >= meta.len() || cursor.pending_line)) {
+            if compressed {
+                if !(unchanged && cursor.complete) {
+                    let mut archive = workers.archive.take().filter(|a| {
+                        unchanged && a.path == path && a.scope == scope && a.offset == cursor.offset
+                    });
+                    if archive.is_none() {
+                        // Replay a newly compressed/replaced archive, or an interrupted import
+                        // after process restart. Stable request IDs preserve prior observations.
+                        cursor = Cursor {
+                            compressed: true,
+                            format: PARSER_VERSION,
+                            ..Default::default()
+                        };
+                        archive = Some(Archive {
+                            scope: scope.clone(),
+                            path: path.clone(),
+                            reader: crate::logfiles::open(path_ref)
+                                .map_err(|_| "无法打开压缩日志")?,
+                            offset: 0,
+                            line: Vec::new(),
+                            skip: false,
+                        });
+                    }
+                    let mut archive = archive.expect("archive initialized");
+                    let mut parser = (source.parser)(cursor.parser.clone());
+                    let read =
+                        archive.read(parser.as_mut(), BATCH_BYTES - batch.bytes, began, cancel)?;
+                    for call in read.calls {
+                        save(&tx, &scope, &call)?;
+                    }
+                    cursor.offset = archive.offset;
+                    cursor.parser = parser.checkpoint();
+                    cursor.complete = read.complete;
+                    cursor.len = meta.len();
+                    cursor.modified = modified;
+                    cursor.identity = identity;
+                    batch.bytes += read.bytes;
+                    batch.skipped += read.skipped;
+                    batch.more |= !read.complete;
+                    if !read.complete {
+                        workers.archive = Some(archive);
+                    }
+                }
+            } else if !(unchanged && (cursor.offset >= meta.len() || cursor.pending_line)) {
                 if incompatible
+                    || cursor.compressed
                     || cursor.offset > meta.len()
                     || cursor.identity != identity
                     || (!unchanged
@@ -447,7 +588,7 @@ impl Service {
             )
             .map_err(|_| "保存日志游标失败")?;
         }
-        batch.more |= !walker.stack.is_empty();
+        batch.more |= discovering;
         // Continue a round-robin pass when a Home has more files than one batch.
         let left: bool = tx
             .query_row(

@@ -267,7 +267,6 @@ pub fn builtin_registry() -> ResourceRegistry {
     api::register::<new_api::Account>(&mut registry);
     api::register::<openai_costs::Costs>(&mut registry);
     provider_usage::register(&mut registry);
-    crate::plugins::adapters::register(&mut registry);
     registry
 }
 
@@ -331,6 +330,8 @@ pub(crate) async fn collect_with_deadline(
     collect_with_updates(readers, timeout, |_, _| {}).await
 }
 
+const MAX_CONCURRENT_QUERIES: usize = 8;
+
 /// Publish completed queries immediately while retaining configuration order in the result.
 /// Dropping this future cancels the entire query set, including slow readers.
 pub(crate) async fn collect_with_updates(
@@ -340,20 +341,29 @@ pub(crate) async fn collect_with_updates(
 ) -> Vec<ResourceSnapshot> {
     let mut tasks = tokio::task::JoinSet::new();
     let mut indices = std::collections::HashMap::new();
-    for (index, reader) in readers.iter().enumerate() {
-        let reader = Arc::clone(reader);
-        let task = tasks.spawn(
-            async move { tokio::time::timeout(timeout, reader.read()).await }.in_current_span(),
-        );
-        indices.insert(task.id(), index);
-    }
+    let mut waiting = readers.iter().enumerate();
     let mut snapshots = Vec::with_capacity(readers.len());
-    while let Some(result) = tasks.join_next_with_id().await {
+    loop {
+        // Bound both executing queries and spawned tasks. A queued reader gets its
+        // full timeout after admission, regardless of how many accounts are configured.
+        while tasks.len() < MAX_CONCURRENT_QUERIES {
+            let Some((index, reader)) = waiting.next() else {
+                break;
+            };
+            let reader = Arc::clone(reader);
+            let task = tasks.spawn(
+                async move { tokio::time::timeout(timeout, reader.read()).await }.in_current_span(),
+            );
+            indices.insert(task.id(), index);
+        }
+        let Some(result) = tasks.join_next_with_id().await else {
+            break;
+        };
         let (id, result) = match result {
             Ok((id, snapshot)) => (id, snapshot.map_err(|_| "资源查询超时")),
             Err(error) => (error.id(), Err("资源查询任务中断")),
         };
-        let index = indices[&id];
+        let index = indices.remove(&id).expect("registered query task");
         let snapshot = result.unwrap_or_else(|message| {
                 let reader = &readers[index];
                 tracing::warn!(event = "resource_query_failed", service = reader.service(),
@@ -510,6 +520,89 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    struct GatedReader {
+        binding: ResourceBinding,
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+    #[async_trait]
+    impl ResourceReader for GatedReader {
+        fn service(&self) -> &str {
+            "synthetic"
+        }
+        fn binding(&self) -> &ResourceBinding {
+            &self.binding
+        }
+        async fn read(&self) -> ResourceSnapshot {
+            self.started.send(()).unwrap();
+            self.gate.acquire().await.unwrap().forget();
+            ResourceSnapshot {
+                binding: self.binding.clone(),
+                service: self.service().into(),
+                scope: ResourceScope::Account,
+                state: ResourceState::Ready,
+                metrics: Vec::new(),
+                queried_at: None,
+                message: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_query_sets_bound_concurrency_without_losing_order() {
+        use std::time::Duration;
+        let count = MAX_CONCURRENT_QUERIES * 2 + 1;
+        let (started, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let readers: Vec<Arc<dyn ResourceReader>> = (0..count)
+            .map(|index| {
+                Arc::new(GatedReader {
+                    binding: ResourceBinding {
+                        account: index.to_string(),
+                        revision: String::new(),
+                    },
+                    started: started.clone(),
+                    gate: gate.clone(),
+                }) as Arc<dyn ResourceReader>
+            })
+            .collect();
+        let task =
+            tokio::spawn(
+                async move { collect_with_deadline(&readers, Duration::from_secs(5)).await },
+            );
+        for _ in 0..MAX_CONCURRENT_QUERIES {
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err()
+        );
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx.recv())
+                .await
+                .is_err()
+        );
+        gate.add_permits(count - 1);
+        let snapshots = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshots.len(), count);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(snapshot.binding.account, index.to_string());
+            assert_eq!(snapshot.state, ResourceState::Ready);
+        }
     }
 
     #[tokio::test]

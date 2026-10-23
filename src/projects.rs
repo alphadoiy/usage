@@ -175,6 +175,7 @@ impl Store {
     }
 
     fn upsert(&self, path: &Path, assignments: &str) -> Result<(), String> {
+        let path = crate::config::resolved_data_path(path);
         let key = path.to_str().ok_or("项目路径不是有效的 UTF-8")?;
         let mut db = self.open()?;
         let tx = db.transaction().map_err(|_| "项目库写入失败")?;
@@ -208,11 +209,6 @@ pub enum ProjectCommand {
     Pin { path: PathBuf },
     /// 取消置顶
     Unpin { path: PathBuf },
-}
-
-/// Relative paths resolve against the current directory; a missing directory is kept as written.
-fn resolve(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn execute(command: ProjectCommand, config: Option<&Path>) -> Result<(), String> {
@@ -257,9 +253,9 @@ pub fn execute(command: ProjectCommand, config: Option<&Path>) -> Result<(), Str
         ProjectCommand::Add { path } => {
             println!("已添加：{}", store.add(&path)?.display());
         }
-        ProjectCommand::Remove { path } => store.remove(&resolve(&path))?,
-        ProjectCommand::Pin { path } => store.set_pinned(&resolve(&path), true)?,
-        ProjectCommand::Unpin { path } => store.set_pinned(&resolve(&path), false)?,
+        ProjectCommand::Remove { path } => store.remove(&path)?,
+        ProjectCommand::Pin { path } => store.set_pinned(&path, true)?,
+        ProjectCommand::Unpin { path } => store.set_pinned(&path, false)?,
     }
     Ok(())
 }
@@ -319,6 +315,27 @@ mod tests {
             "derived projects are not stored"
         );
         assert!(store.add(&f.0.join("missing")).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removing_a_deleted_project_by_relative_path_keeps_its_original_identity() {
+        let f = Fixture::new();
+        let store = f.store();
+        let path = store.add(&f.dir("deleted")).unwrap();
+        fs::remove_dir(&path).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.ancestors().skip(1) {
+            relative.push("..");
+        }
+        relative.push(path.strip_prefix("/").unwrap());
+        store.remove(&relative).unwrap();
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, path);
+        assert!(records[0].hidden);
+        assert!(catalog(&records, []).is_empty());
     }
 
     #[test]

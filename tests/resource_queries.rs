@@ -29,7 +29,7 @@ fn response(status: u16, body: &str) -> Result<HttpResponse, TransportError> {
 }
 fn service(http: Arc<FakeHttp>) -> ResourceService {
     ResourceService::new(
-        usage::resources::builtin_registry(),
+        std::sync::Arc::new(usage::resources::builtin_registry()),
         http,
         Arc::new(|reference| {
             assert_eq!(reference, "env:FIXTURE_KEY");
@@ -62,7 +62,7 @@ async fn queries_isolate_two_connections_and_keep_large_raw_quotas_exact() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
     let service = ResourceService::new(
-        usage::resources::builtin_registry(),
+        std::sync::Arc::new(usage::resources::builtin_registry()),
         http.clone(),
         Arc::new(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -246,7 +246,7 @@ async fn maps_auth_transient_configuration_and_missing_credentials_without_echoi
     }
     let http = Arc::new(FakeHttp::new());
     let missing = ResourceService::new(
-        usage::resources::builtin_registry(),
+        std::sync::Arc::new(usage::resources::builtin_registry()),
         http.clone(),
         Arc::new(|_| Err("secret-error-do-not-echo".into())),
         Arc::new(Utc::now),
@@ -344,7 +344,7 @@ async fn costs_discard_partial_totals_on_failed_or_repeated_pages() {
 fn connection_validation_and_selection_do_not_resolve_secrets_or_guess_protocols() {
     let http = Arc::new(FakeHttp::new());
     let service = ResourceService::new(
-        usage::resources::builtin_registry(),
+        std::sync::Arc::new(usage::resources::builtin_registry()),
         http.clone(),
         Arc::new(|_| panic!("unexpected credential lookup")),
         Arc::new(Utc::now),

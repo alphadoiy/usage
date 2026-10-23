@@ -86,7 +86,8 @@ struct Adapter {
     methods: Vec<AuthMethod>,
 }
 pub fn adapter(plugin: &str, provider: &str, descriptors: &Value) -> Result<Arc<dyn AuthAdapter>> {
-    let mut registry = builtin_registry();
+    // Only this plugin's factory is needed; the built-in backends are not.
+    let mut registry = crate::auth::AuthRegistry::new();
     register(&mut registry, plugin, descriptors)?;
     registry
         .create(

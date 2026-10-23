@@ -320,7 +320,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 )
             };
             let mut service =
-                ResourceService::from_environment(crate::hub::Hub::default().resources);
+                ResourceService::from_environment(crate::hub::shared().resources.clone());
             if let Some(credentials) = credentials {
                 service = service.with_credentials(credentials);
             }

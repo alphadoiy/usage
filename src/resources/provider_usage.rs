@@ -269,7 +269,7 @@ mod tests {
             inference: None,
         };
         ResourceService::new(
-            builtin_registry(),
+            Arc::new(builtin_registry()),
             http,
             Arc::new(|_| Ok("synthetic-only".into())),
             Arc::new(chrono::Utc::now),

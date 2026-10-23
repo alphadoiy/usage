@@ -27,14 +27,15 @@ pub(crate) struct Host {
 }
 type HostSlots = HashMap<String, Arc<Mutex<Option<Arc<Host>>>>>;
 type Capabilities = HashMap<String, (String, std::sync::Weak<Host>)>;
+type AccountLocks = Mutex<HashMap<String, Arc<Mutex<()>>>>;
 const LOGIN_TTL: Duration = Duration::from_secs(600);
 #[derive(Clone)]
 pub(crate) struct Runtime {
     store: store::Store,
     hosts: Arc<Mutex<HostSlots>>,
     capabilities: Arc<Mutex<Capabilities>>,
-    accounts: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    action_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    accounts: Arc<AccountLocks>,
+    action_locks: Arc<AccountLocks>,
     client: reqwest::Client,
     pub active: Arc<AtomicUsize>,
     broker: String,
@@ -114,14 +115,15 @@ impl Runtime {
         Active(self.active.clone())
     }
     async fn lock_account(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        self.accounts
-            .lock()
-            .await
-            .entry(id.into())
-            .or_default()
-            .clone()
-            .lock_owned()
-            .await
+        Self::lock_for(&self.accounts, id).await
+    }
+    async fn lock_action(&self, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        Self::lock_for(&self.action_locks, id).await
+    }
+    async fn lock_for(locks: &AccountLocks, id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        // Release the map before waiting: one account's queue must not lock out others.
+        let account = locks.lock().await.entry(id.into()).or_default().clone();
+        account.lock_owned().await
     }
     async fn host(&self, id: &str) -> Result<Arc<Host>> {
         let plugin = self.store.plugin(id)?;
@@ -338,16 +340,7 @@ impl Runtime {
         // Serialize mutating actions across every CLI/TUI sharing this gateway/account.
         let _action_lock = if operation == "action" && x["phase"] == "execute" {
             let id = account.as_ref().ok_or("账号操作需要绑定账号")?;
-            Some(
-                self.action_locks
-                    .lock()
-                    .await
-                    .entry(id.into())
-                    .or_default()
-                    .clone()
-                    .lock_owned()
-                    .await,
-            )
+            Some(self.lock_action(id).await)
         } else {
             None
         };
@@ -584,6 +577,32 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn queued_account_work_does_not_block_another_account() {
+        let runtime = Runtime::new(PathBuf::new(), 0);
+        for actions in [false, true] {
+            let runtime = &runtime;
+            let lock = |id| async move {
+                if actions {
+                    runtime.lock_action(id).await
+                } else {
+                    runtime.lock_account(id).await
+                }
+            };
+            let held = lock("a").await;
+            let queued = lock("a");
+            tokio::pin!(queued);
+            // Poll A's second request until it is actually queued, without timing assumptions.
+            assert!(futures_util::poll!(queued.as_mut()).is_pending());
+            let other = tokio::time::timeout(Duration::from_millis(200), lock("b")).await;
+            drop(held);
+            queued.await;
+            assert!(
+                other.is_ok(),
+                "account B was blocked by account A's queue; actions={actions}"
+            );
+        }
+    }
     #[test]
     fn log_codes_accept_known_failures_and_exclude_arbitrary_plugin_prose() {
         assert_eq!(
