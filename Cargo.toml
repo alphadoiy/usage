@@ -1,6 +1,6 @@
 [package]
 name = "usage"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "在终端里查看 Claude Code、Codex 和 Grok 的官方用量"
 publish = false
