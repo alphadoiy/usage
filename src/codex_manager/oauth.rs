@@ -306,12 +306,27 @@ impl Manager {
                 continue;
             }
             let home = entry.path().join("r1");
-            if !recovery_needed(&home)? {
+            let needed = match recovery_needed(&home) {
+                Ok(needed) => needed,
+                Err(_) => {
+                    tracing::error!(event = "oauth_recovery_blocked", profile_id = %id, stage = "journal_discover");
+                    continue;
+                }
+            };
+            if !needed {
                 continue;
             }
-            // An active save holds this lease; do not disturb it or block unrelated accounts.
-            if let Ok(_lease) = acquire_lease(&self.root, &id, true) {
-                recover_home(&self.conn, &home)?;
+            // A damaged account stays fenced at its credential lease. Other accounts
+            // and provider inventory remain available; startup never uses its credentials.
+            match acquire_lease(&self.root, &id, true) {
+                Ok(_lease) => {
+                    if recover_home(&self.conn, &home).is_err() {
+                        tracing::error!(event = "oauth_recovery_blocked", profile_id = %id, stage = "account_recover");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(event = "oauth_recovery_deferred", profile_id = %id, stage = "lease_acquire")
+                }
             }
         }
         Ok(())
@@ -915,7 +930,16 @@ mod recovery_tests {
         fs::write(journal.join("config.toml"), "corrupted").unwrap();
         let auth = fs::read(home.join("auth.json")).unwrap();
         assert!(manager.oauth_run_lease(&profile.id).is_err());
-        assert!(Manager::open(manager.root().to_path_buf()).is_err());
+        let mut reopened = Manager::open(manager.root().to_path_buf()).unwrap();
+        assert!(reopened.oauth_run_lease(&profile.id).is_err());
+        assert!(reopened.model_catalog_query(&profile).is_err());
+        assert!(reopened.materialize(&profile.id, profile.revision).is_err());
+        let healthy_source = oauth_source(&fixture, "healthy", "healthy-refresh");
+        let healthy = reopened
+            .import_oauth(None, None, &healthy_source, None)
+            .unwrap();
+        assert!(reopened.oauth_run_lease(&healthy.id).is_ok());
+        assert_eq!(reopened.list().unwrap().len(), 2);
         assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
         assert!(journal.exists());
     }
@@ -951,5 +975,53 @@ mod recovery_tests {
         drop(lease);
         assert!(reader.oauth_run_lease(&profile.id).is_ok());
         assert!(pending_journals(&home).unwrap().is_empty());
+    }
+    #[test]
+    fn recovery_diagnostics_identify_failed_stage_without_logging_credential_contents() {
+        // Isolate tracing callsite state from other tests' scoped subscribers.
+        if std::env::var_os("USAGE_TEST_RECOVERY_LOG_CAPTURE").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap()).args(["--exact", "codex_manager::oauth::recovery_tests::recovery_diagnostics_identify_failed_stage_without_logging_credential_contents", "--nocapture"])
+                .env("USAGE_TEST_RECOVERY_LOG_CAPTURE", "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use tracing_subscriber::prelude::*;
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager();
+        let source = oauth_source(&fixture, "log-fixture", "private-original-refresh");
+        let profile = manager.import_oauth(None, None, &source, None).unwrap();
+        let home = manager.home(&profile.id, 1).unwrap();
+        let source = oauth_source(&fixture, "log-fixture", "private-new-refresh");
+        crash(manager.root(), &source, Some(&profile.id), "files_written");
+        let journal = pending_journals(&home).unwrap().remove(0);
+        fs::write(journal.join("config.toml"), "corrupted-private-config").unwrap();
+        let log = fixture.path.join("diagnostics.jsonl");
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(std::sync::Mutex::new(File::create(&log).unwrap())),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(manager.oauth_run_lease(&profile.id).is_err());
+        });
+        let text = fs::read_to_string(log).unwrap();
+        assert!(text.contains("codex.oauth_recovery"));
+        assert!(text.contains("backup_validate"));
+        assert!(text.contains("operation_failed"));
+        assert!(text.contains(&profile.id));
+        for private in [
+            "private-original-refresh",
+            "private-new-refresh",
+            "corrupted-private-config",
+            "fixture@example.test",
+            "log-fixture",
+        ] {
+            assert!(!text.contains(private), "diagnostics included {private}");
+        }
+        assert!(journal.exists());
     }
 }

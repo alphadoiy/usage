@@ -628,17 +628,6 @@ fn cancelled(key: KeyEvent) -> bool {
     key.code == KeyCode::Esc
         || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
 }
-struct Pending {
-    task: tokio::task::JoinHandle<()>,
-    cancellable: bool,
-}
-impl Drop for Pending {
-    fn drop(&mut self) {
-        if self.cancellable {
-            self.task.abort();
-        }
-    }
-}
 fn wait<T: Send + 'static>(
     terminal: &mut Setup<'_>,
     handle: &Handle,
@@ -647,10 +636,21 @@ fn wait<T: Send + 'static>(
     future: impl Future<Output = plugins::Result<T>> + Send + 'static,
 ) -> io::Result<Option<T>> {
     let (tx, rx) = mpsc::sync_channel(1);
-    let task = handle.spawn(async move {
-        let _ = tx.send(future.await);
-    });
-    let _pending = Pending { task, cancellable };
+    let _pending = if cancellable {
+        Some(crate::background::Task::query(
+            handle,
+            future,
+            move |result| {
+                let _ = tx.send(result);
+            },
+        ))
+    } else {
+        // An accepted save/install must finish even if terminal rendering fails.
+        handle.spawn(async move {
+            let _ = tx.send(future.await);
+        });
+        None
+    };
     loop {
         match rx.try_recv() {
             Ok(Ok(value)) => return Ok(Some(value)),

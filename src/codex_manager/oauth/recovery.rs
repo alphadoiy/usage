@@ -119,7 +119,13 @@ impl SaveFiles {
     pub(super) fn commit(mut self) -> bool {
         self.armed = false;
         self.preserve = true;
-        self.cleanup().is_ok()
+        match self.cleanup() {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(event = "oauth_cleanup_deferred");
+                false
+            }
+        }
     }
     fn cleanup(&self) -> Result<()> {
         // Never leave a discoverable journal with partially deleted backups.
@@ -174,12 +180,30 @@ fn recovery_directories(home: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
     Ok(journals)
 }
 pub(super) fn recover_home(conn: &rusqlite::Connection, home: &Path) -> Result<()> {
+    logging::operation("codex.oauth_recovery", |op| {
+        if let Some(id) = home
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|id| id.to_str())
+        {
+            op.account(id, 0, "oauth");
+        }
+        op.begin("journal_discover");
+        recover_home_inner(conn, home, op)
+    })
+}
+fn recover_home_inner(
+    conn: &rusqlite::Connection,
+    home: &Path,
+    op: &mut crate::logging::Operation,
+) -> Result<()> {
     for directory in pending_journals(home)? {
         let operation = directory
             .file_name()
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        op.begin("commit_decision");
         let committed = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM oauth_save_commits WHERE operation=?1)",
             [&operation],
@@ -192,6 +216,7 @@ pub(super) fn recover_home(conn: &rusqlite::Connection, home: &Path) -> Result<(
             preserve: true,
         };
         if !committed {
+            op.begin("backup_validate");
             let manifest = saved.directory.join("manifest.json");
             let bytes = match fs::read(&manifest) {
                 Ok(bytes) => Some(bytes),
@@ -232,9 +257,15 @@ pub(super) fn recover_home(conn: &rusqlite::Connection, home: &Path) -> Result<(
                         backup,
                     });
                 }
+                op.begin("backup_restore");
                 saved.restore()?;
+                tracing::info!(event = "oauth_recovery_restored");
             }
         }
+        if committed {
+            tracing::info!(event = "oauth_recovery_committed");
+        }
+        op.begin("journal_cleanup");
         saved.cleanup()?;
         // The tombstone rename is durable before removing the commit decision.
         conn.execute(
@@ -242,6 +273,7 @@ pub(super) fn recover_home(conn: &rusqlite::Connection, home: &Path) -> Result<(
             [&operation],
         )?;
     }
+    op.begin("cleanup_resume");
     for tombstone in recovery_directories(home, ".usage-oauth-cleanup-")? {
         let operation = tombstone.file_name().unwrap().to_string_lossy().replacen(
             ".usage-oauth-cleanup-",

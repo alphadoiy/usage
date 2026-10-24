@@ -8,14 +8,7 @@ struct Entry {
     day: chrono::NaiveDate,
     epoch: u64,
     result: Option<Result<Report, String>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-impl Drop for Entry {
-    fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
+    task: Option<crate::background::Task>,
 }
 pub(crate) struct Statuses {
     entries: HashMap<String, Entry>,
@@ -69,12 +62,17 @@ impl Statuses {
         let tx = self.tx.clone();
         let action = operation.clone();
         let target = key.clone();
-        let task = handle.spawn(async move {
-            let result = tokio::time::timeout(Duration::from_secs(30), action.0.preview())
-                .await
-                .unwrap_or_else(|_| Err("签到状态查询超时".into()));
-            let _ = tx.send((target, epoch, result));
-        });
+        let task = crate::background::Task::query(
+            handle,
+            async move {
+                tokio::time::timeout(Duration::from_secs(30), action.0.preview())
+                    .await
+                    .unwrap_or_else(|_| Err("签到状态查询超时".into()))
+            },
+            move |result| {
+                let _ = tx.send((target, epoch, result));
+            },
+        );
         self.entries.insert(
             key,
             Entry {
@@ -305,5 +303,54 @@ mod tests {
                 .summary(&action, time() + chrono::Duration::days(1))
                 .contains("手动操作")
         );
+    }
+    #[tokio::test]
+    async fn a_panicking_status_query_finishes_and_uses_failure_retry_ttl() {
+        // A dedicated automatically-queryable adapter delegates to the panic fixture.
+        struct Automatic;
+        #[async_trait]
+        impl AccountOperation for Automatic {
+            fn id(&self) -> &str {
+                "checkin"
+            }
+            fn label(&self) -> &str {
+                "签到"
+            }
+            fn cache_key(&self) -> String {
+                "panic-status".into()
+            }
+            fn automatic_status(&self) -> bool {
+                true
+            }
+            async fn preview(&self) -> Result<Report, String> {
+                panic!("private-status-sentinel")
+            }
+            async fn execute(&self) -> Result<Report, String> {
+                panic!("never execute")
+            }
+        }
+        let operation = OperationHandle(Arc::new(Automatic));
+        let mut statuses = Statuses::default();
+        assert!(statuses.ensure(&operation, time(), &Handle::current()));
+        poll(&mut statuses).await;
+        assert!(statuses.summary(&operation, time()).contains("查询失败"));
+        assert!(statuses.entries["panic-status"].task.is_none());
+        assert!(!statuses.ensure(
+            &operation,
+            time() + chrono::Duration::seconds(59),
+            &Handle::current()
+        ));
+        assert!(statuses.ensure(
+            &operation,
+            time() + chrono::Duration::seconds(60),
+            &Handle::current()
+        ));
+        let cancel = statuses.entries["panic-status"]
+            .task
+            .as_ref()
+            .unwrap()
+            .cancellation();
+        statuses.invalidate(&operation);
+        assert!(cancel.is_cancelled());
     }
 }

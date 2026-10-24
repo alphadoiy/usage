@@ -2,6 +2,7 @@
 mod status;
 use super::confirmation::{Confirmation, Decision};
 use crate::provider_actions::{OperationHandle, Outcome, Report};
+use futures_util::FutureExt;
 use ratatui::{
     Frame,
     crossterm::event::KeyCode,
@@ -19,19 +20,10 @@ pub(super) struct Panel {
     stage: Stage,
     tx: mpsc::Sender<Result<Report, String>>,
     rx: mpsc::Receiver<Result<Report, String>>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    preview: Option<crate::background::Task>,
     refresh: bool,
     started_at: chrono::DateTime<chrono::Utc>,
     status_update: Option<Result<Report, String>>,
-}
-impl Drop for Panel {
-    fn drop(&mut self) {
-        if matches!(self.stage, Stage::Loading)
-            && let Some(task) = &self.task
-        {
-            task.abort();
-        }
-    }
 }
 impl Panel {
     pub fn open(name: String, operation: OperationHandle, handle: &Handle) -> Self {
@@ -42,7 +34,7 @@ impl Panel {
             stage: Stage::Loading,
             tx,
             rx,
-            task: None,
+            preview: None,
             refresh: false,
             started_at: chrono::Utc::now(),
             status_update: None,
@@ -54,25 +46,41 @@ impl Panel {
         self.started_at = chrono::Utc::now();
         let operation = self.operation.clone();
         let tx = self.tx.clone();
-        self.task = Some(handle.spawn(async move {
-            let future = async {
+        let future = async move {
+            let action = async {
                 if execute {
                     operation.0.execute().await
                 } else {
                     operation.0.preview().await
                 }
             };
-            let result = tokio::time::timeout(Duration::from_secs(30), future)
+            std::panic::AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(30), action))
+                .catch_unwind()
                 .await
-                .unwrap_or_else(|_| Err("签到操作超时，结果尚未确认；请重新查询状态".into()));
-            let _ = tx.send(result);
-        }));
+                .map_err(|_| "签到任务异常结束，结果尚未确认；请重新查询状态".to_string())?
+                .unwrap_or_else(|_| Err("签到操作超时，结果尚未确认；请重新查询状态".into()))
+        };
+        if execute {
+            self.preview = None;
+            // Confirmed mutations finish even if their view is dropped.
+            handle.spawn(async move {
+                let _ = tx.send(future.await);
+            });
+        } else {
+            self.preview = Some(crate::background::Task::query(
+                handle,
+                future,
+                move |result| {
+                    let _ = tx.send(result);
+                },
+            ));
+        }
     }
     pub fn poll(&mut self) -> bool {
         let Ok(result) = self.rx.try_recv() else {
             return false;
         };
-        self.task = None;
+        self.preview = None;
         if self.operation.0.automatic_status() || matches!(self.stage, Stage::Executing) {
             self.status_update = Some(result.clone());
         }
@@ -236,5 +244,80 @@ mod tests {
             assert!(text.contains("10.00Credits"));
         }
         assert!(panel.key(KeyCode::Enter, &Handle::current()));
+    }
+    struct Panicking(bool);
+    #[async_trait::async_trait]
+    impl crate::provider_actions::AccountOperation for Panicking {
+        fn id(&self) -> &str {
+            "checkin"
+        }
+        fn label(&self) -> &str {
+            "签到"
+        }
+        fn cache_key(&self) -> String {
+            "panic-fixture".into()
+        }
+        async fn preview(&self) -> Result<Report, String> {
+            if !self.0 {
+                panic!("private-preview-sentinel");
+            }
+            Ok(Report {
+                outcome: Outcome::Ready,
+                credit: None,
+                streak: None,
+                delayed: false,
+            })
+        }
+        async fn execute(&self) -> Result<Report, String> {
+            panic!("private-execute-sentinel")
+        }
+    }
+    #[tokio::test]
+    async fn panicking_previews_and_confirmed_actions_leave_loading_with_safe_errors() {
+        for execute in [false, true] {
+            let mut panel = Panel::open(
+                "fixture".into(),
+                OperationHandle(Arc::new(Panicking(execute))),
+                &Handle::current(),
+            );
+            poll(&mut panel).await;
+            if execute {
+                panel.key(KeyCode::Char('y'), &Handle::current());
+                poll(&mut panel).await;
+            }
+            let Stage::Result(message) = &panel.stage else {
+                panic!("operation remained in flight")
+            };
+            assert!(message.contains("异常结束"));
+            assert!(!message.contains("sentinel"));
+        }
+    }
+    #[tokio::test]
+    async fn closing_preview_cancels_it_but_confirmed_execution_finishes() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let operation = OperationHandle(Arc::new(Operation(count.clone())));
+        let panel = Panel::open("fixture".into(), operation.clone(), &Handle::current());
+        let cancel = panel.preview.as_ref().unwrap().cancellation();
+        drop(panel);
+        assert!(cancel.is_cancelled());
+        let mut panel = Panel::open("fixture".into(), operation, &Handle::current());
+        poll(&mut panel).await;
+        panel.key(KeyCode::Char('y'), &Handle::current());
+        // Keep the reply channel to verify the mutation really completes after the UI closes.
+        let (_, dummy) = mpsc::channel();
+        let result = std::mem::replace(&mut panel.rx, dummy);
+        drop(panel);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(report) = result.try_recv() {
+                    assert_eq!(report.unwrap().outcome, Outcome::Claimed);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

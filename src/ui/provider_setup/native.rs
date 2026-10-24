@@ -240,7 +240,7 @@ fn run_inner(
     };
     loop {
         if let (Some(rx), Some(f)) = (&models_rx, &mut form)
-            && let Ok(models) = rx.try_recv()
+            && let Ok(models) = rx.receiver.try_recv()
         {
             f.models_arrived(models);
             models_rx = None;
@@ -306,8 +306,21 @@ fn run_inner(
             let fields = edit.fields();
             let index = fields[edit.selected].0;
             let choosable = index == edit.model_field() || index == edit.effort_field();
+            if edit.auth_mode == AuthMode::Byok
+                && !edit.plugin
+                && matches!(index, 1 | 4)
+                && (matches!(key.code, KeyCode::Backspace)
+                    || matches!(key.code, KeyCode::Char(_) if !control)
+                    || (control && key.code == KeyCode::Char('u')))
+            {
+                models_rx = None;
+                edit.models = None;
+            }
             match key.code {
-                KeyCode::Esc => form = None,
+                KeyCode::Esc => {
+                    form = None;
+                    models_rx = None;
+                }
                 KeyCode::Tab | KeyCode::Down => edit.selected = (edit.selected + 1) % fields.len(),
                 KeyCode::BackTab | KeyCode::Up => {
                     edit.selected = (edit.selected + fields.len() - 1) % fields.len()
@@ -540,7 +553,30 @@ fn byok_form() -> Form {
         false,
     )
 }
-fn fetch_models(handle: &Handle, form: &mut Form) -> Option<mpsc::Receiver<Models>> {
+struct PendingModels {
+    receiver: mpsc::Receiver<Models>,
+    _task: crate::background::Task,
+}
+impl PendingModels {
+    fn start(
+        handle: &Handle,
+        future: impl std::future::Future<Output = Models> + Send + 'static,
+    ) -> Self {
+        let (tx, receiver) = mpsc::channel();
+        let task = crate::background::Task::query(
+            handle,
+            async move { Ok(future.await) },
+            move |result| {
+                let _ = tx.send(result.unwrap_or_else(Models::Unavailable));
+            },
+        );
+        Self {
+            receiver,
+            _task: task,
+        }
+    }
+}
+fn fetch_models(handle: &Handle, form: &mut Form) -> Option<PendingModels> {
     let Some(source) = form.model_source() else {
         form.models_arrived(Models::Unavailable(
             "填写 Base URL 和 API Key 后可获取".into(),
@@ -548,12 +584,10 @@ fn fetch_models(handle: &Handle, form: &mut Form) -> Option<mpsc::Receiver<Model
         return None;
     };
     form.models_arrived(Models::Loading);
-    let (tx, rx) = mpsc::channel();
     let service = Arc::new(CatalogService::from_environment());
-    handle.spawn(async move {
-        let _ = tx.send(service.models(source).await);
-    });
-    Some(rx)
+    Some(PendingModels::start(handle, async move {
+        service.models(source).await
+    }))
 }
 
 fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
@@ -913,5 +947,26 @@ mod tests {
                 assert!(text.contains("••••"));
             }
         }
+    }
+    #[tokio::test]
+    async fn model_query_panic_produces_unavailable_and_replacement_cancels_previous_query() {
+        let pending = PendingModels::start(&Handle::current(), async {
+            panic!("private-model-sentinel")
+        });
+        let models = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(models) = pending.receiver.try_recv() {
+                    break models;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(models, Models::Unavailable(message) if message == "后台任务异常结束"));
+        let pending = PendingModels::start(&Handle::current(), std::future::pending());
+        let cancel = pending._task.cancellation();
+        drop(pending);
+        assert!(cancel.is_cancelled());
     }
 }

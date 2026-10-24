@@ -189,29 +189,59 @@ impl History {
         if query == &HistoryQuery::default() {
             return self.report(year, sources);
         }
-        let filtered = self.filtered(query);
+        // Aggregate into day/account buckets directly. A report never needs its own
+        // copy of the matching records (which can be the entire ledger).
+        let mut filtered = Self {
+            warnings: self.warnings.clone(),
+            synced_at: self.synced_at,
+            scanned_files: self.scanned_files,
+            read_bytes: self.read_bytes,
+            ..Self::default()
+        };
+        let from = query.from.or_else(|| NaiveDate::from_ymd_opt(year, 1, 1));
+        let to = query.to.or_else(|| NaiveDate::from_ymd_opt(year, 12, 31));
+        let mut by_instance = BTreeMap::<String, Tokens>::new();
+        if self.records.is_empty()
+            && query.project.is_none()
+            && query.model.is_none()
+            && query.instance.is_none()
+        {
+            filtered.days = self
+                .days
+                .iter()
+                .filter(|(day, _)| query.contains_date(**day))
+                .map(|(day, totals)| (*day, totals.clone()))
+                .collect();
+        }
+        for record in self
+            .records
+            .iter()
+            .filter(|record| sources.contains(&record.source) && query.matches(record))
+        {
+            let day = record.time.with_timezone(&Local).date_naive();
+            if from.is_none_or(|from| day < from) || to.is_none_or(|to| day > to) {
+                continue;
+            }
+            filtered
+                .days
+                .entry(day)
+                .or_default()
+                .entry(record.source.clone())
+                .or_default()
+                .add(record.tokens);
+            by_instance
+                .entry(record.instance.clone())
+                .or_default()
+                .add(record.tokens);
+        }
         let mut report = filtered.report(year, sources);
+        report.by_instance = by_instance;
         report.from = query.from;
         report.to = query.to;
         if query.from.is_some() || query.to.is_some() {
-            let from = query
-                .from
-                .unwrap_or_else(|| NaiveDate::from_ymd_opt(year, 1, 1).unwrap());
-            let to = query
-                .to
-                .unwrap_or_else(|| NaiveDate::from_ymd_opt(year, 12, 31).unwrap());
-            report.by_instance.clear();
-            for record in filtered
-                .records
-                .iter()
-                .filter(|r| sources.contains(&r.source))
-            {
-                report
-                    .by_instance
-                    .entry(record.instance.clone())
-                    .or_default()
-                    .add(record.tokens);
-            }
+            let (Some(from), Some(to)) = (from, to) else {
+                return report;
+            };
             report.daily.clear();
             report.monthly.clear();
             report.totals = Tokens::default();
@@ -497,7 +527,10 @@ impl HistoryCache {
                                 entry.records.clear();
                                 entry.split = true;
                             }
-                            Err(e) => history.warnings.push(format!("保存历史账本失败：{e}")),
+                            Err(e) => {
+                                entry = fallback.clone();
+                                history.warnings.push(format!("保存历史账本失败：{e}"));
+                            }
                         }
                     }
                 }
@@ -1819,7 +1852,14 @@ mod tests {
                 codex(300, 100, 30, None, "codex", "2026-09-01T12:00:00Z"),
             ],
         );
-        let failed = HistoryCache::at(database.clone()).load(&config);
+        let mut failed_cache = HistoryCache::at(database.clone());
+        let failed = failed_cache.load(&config);
+        assert!(
+            failed_cache
+                .files
+                .values()
+                .all(|entry| entry.records.is_empty())
+        );
         assert!(
             failed
                 .warnings
@@ -1916,6 +1956,58 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+    #[test]
+    fn report_aggregation_matches_materialized_filter_across_dimensions_and_sources() {
+        let fixture = Fixture::new();
+        let config = fixture.config(&["claude"]);
+        let rows: Vec<_> = (0..600).map(|i| json!({"type":"assistant", "sessionId":"session", "cwd":if i%2==0 {"/project/A"} else {"/project/B"}, "timestamp":format!("{}-{:02}-15T12:00:00Z", 2025+i/300, 1+i%12), "message":{"id":format!("m{i}"),"model":if i%3==0 {"Model-A"} else {"Model-B"}, "usage":{"input_tokens":10,"output_tokens":2}}})).collect();
+        fixture.write("claude/projects/p/s.jsonl", &rows);
+        let history = HistoryCache::memory().load(&config);
+        for sources in [vec!["claude".into()], vec!["codex".into()]] {
+            for query in [
+                HistoryQuery {
+                    project: Some("PROJECT/a".into()),
+                    ..Default::default()
+                },
+                HistoryQuery {
+                    model: Some("model-A".into()),
+                    ..Default::default()
+                },
+                HistoryQuery {
+                    instance: Some("claude".into()),
+                    ..Default::default()
+                },
+                HistoryQuery {
+                    project: Some("missing".into()),
+                    ..Default::default()
+                },
+            ] {
+                let expected = history.filtered(&query).report(2026, &sources);
+                let actual = history.report_query(2026, &sources, &query);
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+            }
+        }
+        // An open date bound defaults to the selected year's edge for both totals and accounts.
+        let query = HistoryQuery {
+            from: NaiveDate::from_ymd_opt(2025, 11, 1),
+            ..Default::default()
+        };
+        let report = history.report_query(2025, &config.providers, &query);
+        let expected = history
+            .records
+            .iter()
+            .filter(|r| query.matches(r) && r.time.with_timezone(&Local).year() == 2025)
+            .map(|r| r.tokens.total())
+            .sum::<u64>();
+        assert_eq!(report.totals.total(), expected);
+        assert_eq!(
+            report.by_instance.values().map(|t| t.total()).sum::<u64>(),
+            expected
         );
     }
 }

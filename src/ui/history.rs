@@ -56,6 +56,16 @@ impl DimensionPicker {
         options
     }
 }
+// A small query cache, keyed by snapshot identity and effective dates. Weak keeps
+// yesterday's large ledger out of memory after the Dashboard publishes a new one.
+struct CachedReport {
+    history: std::sync::Weak<History>,
+    year: i32,
+    sources: Vec<String>,
+    query: HistoryQuery,
+    timezone: String,
+    report: std::sync::Arc<HistoryReport>,
+}
 pub struct HistoryPanel {
     pub history: std::sync::Arc<History>,
     pub loading: bool,
@@ -66,6 +76,7 @@ pub struct HistoryPanel {
     pub query: HistoryQuery,
     pub range: TimeRange,
     picker: Option<DimensionPicker>,
+    reports: std::cell::RefCell<Vec<CachedReport>>,
 }
 impl HistoryPanel {
     pub fn new(allowed: Vec<String>, year: i32, monthly: bool) -> Self {
@@ -85,6 +96,7 @@ impl HistoryPanel {
             query: HistoryQuery::default(),
             range: TimeRange::Year,
             picker: None,
+            reports: std::cell::RefCell::new(Vec::new()),
         }
     }
     pub fn sources(&self) -> Vec<String> {
@@ -136,9 +148,36 @@ impl HistoryPanel {
         }
         query
     }
-    fn report(&self, year: i32, sources: &[String]) -> HistoryReport {
-        self.history
-            .report_query(year, sources, &self.effective_query())
+    fn report(&self, year: i32, sources: &[String]) -> std::sync::Arc<HistoryReport> {
+        let query = self.effective_query();
+        let timezone = Local::now().format("%Z %:z").to_string();
+        let snapshot = std::sync::Arc::downgrade(&self.history);
+        let mut reports = self.reports.borrow_mut();
+        reports.retain(|entry| entry.history.ptr_eq(&snapshot));
+        if let Some(index) = reports.iter().position(|entry| {
+            entry.year == year
+                && entry.sources == sources
+                && entry.query == query
+                && entry.timezone == timezone
+        }) {
+            let entry = reports.remove(index);
+            let report = entry.report.clone();
+            reports.push(entry);
+            return report;
+        }
+        let report = std::sync::Arc::new(self.history.report_query(year, sources, &query));
+        if reports.len() == 8 {
+            reports.remove(0);
+        }
+        reports.push(CachedReport {
+            history: snapshot,
+            year,
+            sources: sources.to_vec(),
+            query,
+            timezone,
+            report: report.clone(),
+        });
+        report
     }
     fn open_picker(&mut self, dimension: Dimension) {
         let mut options: Vec<String> = self
@@ -1223,5 +1262,33 @@ mod tests {
         assert_eq!(p.query.instance.as_deref(), Some("work"));
         p.key(KeyCode::Char('c'));
         assert!(p.query.instance.is_none());
+    }
+    #[test]
+    fn repeated_draw_queries_reuse_reports_and_invalidate_on_filter_or_snapshot_change() {
+        use std::sync::Arc;
+        let mut panel = panel(false);
+        let sources = panel.sources();
+        let first = panel.report(2024, &sources);
+        assert!(Arc::ptr_eq(&first, &panel.report(2024, &sources)));
+        // Day navigation within the year does not rescan the ledger.
+        panel.selected = panel.selected.succ_opt().unwrap();
+        assert!(Arc::ptr_eq(&first, &panel.report(2024, &sources)));
+        panel.query.model = Some("other".into());
+        let filtered = panel.report(2024, &sources);
+        assert!(!Arc::ptr_eq(&first, &filtered));
+        panel.query = HistoryQuery::default();
+        assert!(Arc::ptr_eq(&first, &panel.report(2024, &sources)));
+        let old = Arc::downgrade(&panel.history);
+        panel.history = Arc::new((*panel.history).clone());
+        assert!(
+            old.upgrade().is_none(),
+            "the cache must not retain old ledger snapshots"
+        );
+        assert!(!Arc::ptr_eq(&first, &panel.report(2024, &sources)));
+        assert_eq!(panel.reports.borrow().len(), 1);
+        for year in 2000..2020 {
+            panel.report(year, &sources);
+        }
+        assert_eq!(panel.reports.borrow().len(), 8);
     }
 }

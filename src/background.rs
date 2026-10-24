@@ -57,6 +57,24 @@ impl Task {
         Self { cancel, task }
     }
 
+    /// Async reads always produce a terminal result, including unwinding adapters.
+    pub(crate) fn query<T: Send + 'static>(
+        handle: &Handle,
+        future: impl Future<Output = Result<T, String>> + Send + 'static,
+        complete: impl FnOnce(Result<T, String>) + Send + 'static,
+    ) -> Self {
+        use futures_util::FutureExt;
+        Self::spawn(handle, move |cancel| async move {
+            let result = std::panic::AssertUnwindSafe(future)
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err("后台任务异常结束".into()));
+            if !cancel.is_cancelled() {
+                complete(result);
+            }
+        })
+    }
+
     /// Always report errors (including a panicked reader) while the owner is live.
     /// Suppress results when the owner has cancelled or been dropped.
     pub(crate) fn blocking<T: Send + 'static>(
