@@ -19,8 +19,8 @@ jobs:
     timeout-minutes: 20
     env:
       USAGE_LOG: "off"
-      USAGE_CODEX_DIR: ${{ runner.temp }}/usage-ci/accounts
-      USAGE_PLUGIN_DIR: ${{ runner.temp }}/usage-ci/plugins
+      USAGE_CODEX_DIR: /tmp/usage-ci/accounts
+      USAGE_PLUGIN_DIR: /tmp/usage-ci/plugins
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
