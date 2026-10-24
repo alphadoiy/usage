@@ -1,8 +1,10 @@
 //! Provider inventory with independent model, quota and balance capabilities.
 mod codex;
 pub mod presets;
+mod refresh;
 mod sources;
 mod usage;
+pub use refresh::{RefreshRequest, RefreshUpdate};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -340,7 +342,7 @@ fn kind(base: &str) -> ProviderKind {
 
 pub struct CatalogService {
     root: PathBuf,
-    pub(crate) http: Arc<dyn HttpClient>,
+    http: Arc<dyn HttpClient>,
     credentials: Arc<CredentialResolver>,
     plugins: crate::plugins::store::Store,
     resources: Arc<crate::resources::ResourceRegistry>,

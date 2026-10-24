@@ -24,11 +24,11 @@ def function(repo, name, signature, replacement):
 
 
 def bypass_hub(repo):
-    function(repo, "src/hub.rs", "pub fn spawn_managed_codex(", """
-pub fn spawn_managed_codex(root: &std::path::Path, account: &str, revision: Option<i64>, request: &SpawnRequest) -> Result<SpawnOutcome, String> {
+    function(repo, "src/codex_manager/managed.rs", "pub fn start(", """
+pub fn start(root: &std::path::Path, account: &str, revision: Option<i64>, request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String> {
     crate::codex_manager::Manager::open(root.to_path_buf()).and_then(|mut manager|
-        manager.run_recorded(account, &request.cwd, revision, request.resume.as_deref(), &request.program, &request.args))
-        .map(|(status, run)| SpawnOutcome { status, run: Some(run) }).map_err(|error| error.to_string())
+        manager.start_recorded_with_config(account, &request.cwd, revision, request.resume.as_deref(), &request.program, &request.args, request.usage_config.as_deref()))
+        .map(|handle| Box::new(handle) as Box<dyn RunningAgent>).map_err(|error| error.to_string())
 }
 """.strip())
 
@@ -109,7 +109,7 @@ VARIANTS = {
     "ignore_bark_source_gate": lambda repo: replace(repo, "src/codex_manager/bark.rs",
         "if origin != source::Origin::User {", "if false && origin != source::Origin::User {"),
     "disable_history_incremental": lambda repo: replace(repo, "src/history.rs",
-        "let incremental = entry.offset <= metadata.len()", "let incremental = false && entry.offset <= metadata.len()"),
+        "let incremental = !compressed", "let incremental = false && !compressed"),
 }
 
 

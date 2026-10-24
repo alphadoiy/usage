@@ -38,3 +38,7 @@ jobs:
         run: node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
       - name: Experiment runner tests
         run: python3 -m unittest discover -s scripts/ablation -p 'test_*.py'
+      - name: Ablation anchors
+        run: |
+          python3 scripts/ablate-provider-stage1.py --output /private/tmp/usage-ci-provider-anchors --check-anchors
+          python3 scripts/ablate-run-bindings.py --output /private/tmp/usage-ci-run-anchors --check-anchors

@@ -101,6 +101,201 @@ fn complete() -> String {
     )
 }
 
+fn load_request(f: &Fixture) -> LoadRequest {
+    LoadRequest {
+        binding: f.binding.clone(),
+        period: Period::Month,
+        model: None,
+        page: 0,
+        now: at(30),
+        rediscover: false,
+    }
+}
+
+async fn load_update(rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoadUpdate>) -> LoadUpdate {
+    tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn loader_publishes_cached_then_updated_data_for_one_fixed_query() {
+    let f = Fixture::new("codex");
+    let path = f.file("a.jsonl", &codex_session("a", "model-a"));
+    f.update();
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(complete().as_bytes())
+        .unwrap();
+    let service = std::sync::Arc::new(Service::at(f.root.join("index/performance.sqlite3")));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _task = service.start_load(
+        &tokio::runtime::Handle::current(),
+        load_request(&f),
+        move |update| tx.send(update).is_ok(),
+    );
+    let cached = load_update(&mut rx).await;
+    assert!(cached.loading);
+    assert_eq!(cached.result.unwrap().models[0].timed_samples, 0);
+    let complete_update = load_update(&mut rx).await;
+    assert!(!complete_update.loading);
+    let snapshot = complete_update.result.unwrap();
+    assert_eq!(snapshot.models[0].timed_samples, 1);
+    assert_eq!(snapshot.read_bytes, complete().len() as u64);
+    assert!(!snapshot.partial);
+    assert!(rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn closing_loader_consumer_after_cached_data_prevents_log_import() {
+    let f = Fixture::new("codex");
+    f.file("a.jsonl", &codex_session("a", "model-a"));
+    let path = f.root.join("index/performance.sqlite3");
+    let service = std::sync::Arc::new(Service::at(path.clone()));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _task = service.start_load(
+        &tokio::runtime::Handle::current(),
+        load_request(&f),
+        move |update| {
+            tx.send(update).unwrap();
+            false
+        },
+    );
+    assert!(load_update(&mut rx).await.loading);
+    assert!(rx.recv().await.is_none());
+    let db = rusqlite::Connection::open(path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM perf_files", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn dropping_loader_before_first_poll_never_starts_disk_work() {
+    let f = Fixture::new("codex");
+    let path = f.root.join("index/performance.sqlite3");
+    let service = std::sync::Arc::new(Service::at(path.clone()));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = service.start_load(
+        &tokio::runtime::Handle::current(),
+        load_request(&f),
+        move |update| tx.send(update).is_ok(),
+    );
+    let cancel = task.cancellation();
+    drop(task);
+    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn loader_storage_errors_and_parser_panics_both_finish_loading() {
+    for panic in [false, true] {
+        let mut f = Fixture::new("codex");
+        f.file("a.jsonl", &codex_session("a", "model-a"));
+        if panic {
+            f.binding.source.parser = |_| panic!("synthetic parser panic");
+        } else {
+            fs::write(f.root.join("index"), b"block index").unwrap();
+        }
+        let service = std::sync::Arc::new(Service::at(f.root.join("index/performance.sqlite3")));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _task = service.start_load(
+            &tokio::runtime::Handle::current(),
+            load_request(&f),
+            move |update| tx.send(update).is_ok(),
+        );
+        assert!(load_update(&mut rx).await.loading);
+        let final_update = load_update(&mut rx).await;
+        assert!(!final_update.loading);
+        assert!(final_update.result.is_err());
+        assert!(rx.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn dropping_loader_cancels_an_in_flight_blocking_batch() {
+    struct PausedParser(Option<PathBuf>);
+    impl RequestParser for PausedParser {
+        fn feed(&mut self, line: &[u8]) -> Result<Vec<Observation>, String> {
+            let paths: Vec<PathBuf> = serde_json::from_slice(line).unwrap();
+            self.0 = Some(paths[2].clone());
+            writeln!(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&paths[0])
+                    .unwrap(),
+                "read"
+            )
+            .unwrap();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !paths[1].exists() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(Vec::new())
+        }
+        fn checkpoint(&self) -> serde_json::Value {
+            serde_json::Value::Null
+        }
+    }
+    impl Drop for PausedParser {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                let _ = fs::write(path, b"finished");
+            }
+        }
+    }
+    let mut f = Fixture::new("codex");
+    f.binding.source.parser = |_| Box::new(PausedParser(None));
+    let paths = [
+        f.root.join("started"),
+        f.root.join("release"),
+        f.root.join("finished"),
+    ];
+    let text = serde_json::to_string(&paths).unwrap() + "\n";
+    f.file("a.jsonl", &text.repeat(3));
+    let service = std::sync::Arc::new(Service::at(f.root.join("index/performance.sqlite3")));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = service.start_load(
+        &tokio::runtime::Handle::current(),
+        load_request(&f),
+        move |update| tx.send(update).is_ok(),
+    );
+    assert!(load_update(&mut rx).await.loading);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !paths[0].exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(task);
+    fs::write(&paths[1], b"release worker").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !paths[2].exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fs::read_to_string(&paths[0]).unwrap().lines().count(), 1);
+    assert!(
+        rx.recv().await.is_none(),
+        "no progress is published after cancellation"
+    );
+}
+
 #[test]
 fn codex_incremental_native_timing_restart_and_archive_copy_count_once() {
     let f = Fixture::new("codex");

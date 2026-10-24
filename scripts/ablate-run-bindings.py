@@ -24,7 +24,7 @@ VARIANTS = {
     "remove_token_key_match": [("src/runs.rs", """&& (scope != Some(crate::resources::ResourceScope::Token)
                                     || query == key)""", "")],
     "remove_revision_check": [("src/runs.rs", "|| config.binding() != link.binding", "")],
-    "remove_inference_from_revision": [("src/resources/connections.rs", "            self.inference,", "")],
+    "remove_inference_from_revision": [("src/resources/connections.rs", "            inference,", "")],
     "remove_profile_recheck": [("src/runs.rs", "|| !config.profile_ids.iter().any(|id| id == profile_id)", "")],
     "remove_query_credential_proof": [("src/runs.rs", '|| proof(run_id, "query", &query_key) != expected.query', "")],
     "remove_inference_credential_proof": [("src/runs.rs", """if proof(run_id, "inference", &inference_key) != expected.inference
@@ -38,7 +38,7 @@ VARIANTS = {
         })""", """std::sync::Arc::new(move |reference| {
             std::env::var(reference.strip_prefix("env:").ok_or("invalid ref")?).map_err(|_| "missing env".into())
         })""")],
-    "remove_child_env_pinning": [("src/codex_manager/mod.rs", "                    command.env(env, key);", "                    let _ = (env, key);")],
+    "remove_child_env_pinning": [("src/codex_manager/launch.rs", "            prepared.command.env(env, key);", "            let _ = (env, key);")],
     "reverse_model_precedence": [("src/codex_manager/effective.rs", """let selected_model = model
             .or_else(|| {
                 document
@@ -58,14 +58,14 @@ VARIANTS = {
     "ignore_project_layer": [("src/codex_manager/effective.rs", 'if directory.join(".codex/config.toml").exists() {', 'if false && directory.join(".codex/config.toml").exists() {')],
     "ignore_resume_gate": [("src/codex_manager/effective.rs", "        if resume {", "        if false && resume {")],
     "ignore_resource_factory_validation": [("src/runs.rs", "} else if scope.is_none() {", "} else if false && scope.is_none() {")],
-    "remove_run_transaction": [("src/codex_manager/mod.rs", """                let tx = self.conn.transaction()?;
-                tx.execute("INSERT INTO runs""", """                let tx = &self.conn;
-                tx.execute("INSERT INTO runs"""), ("src/codex_manager/mod.rs", """                runtime::record_started(&tx, &run_id)?;
-                tx.commit()?;""", """                runtime::record_started(tx, &run_id)?;""")],
+    "remove_run_transaction": [("src/codex_manager/launch.rs", """            let tx = self.conn.transaction()?;
+            tx.execute("INSERT INTO runs""", """            let tx = &self.conn;
+            tx.execute("INSERT INTO runs"""), ("src/codex_manager/launch.rs", """            runtime::record_started(&tx, &run_id)?;
+            tx.commit()?;""", """            runtime::record_started(tx, &run_id)?;""")],
     "remove_redundant_service_guard": [("src/runs.rs", """if config.service != link.service
                 || config.binding() != link.binding""", "if config.binding() != link.binding")],
     "remove_select_identity_guard": [("src/runs.rs", "if self.context.identity.state != IdentityState::Resolved {", "if false && self.context.identity.state != IdentityState::Resolved {")],
-    "duplicate_context_read": [("src/codex_manager/mod.rs", """        let (profile_id, text): (String, Option<String>) = self
+    "duplicate_context_read": [("src/codex_manager/run_store.rs", """        let (profile_id, text): (String, Option<String>) = self
             .conn
             .query_row(
                 "SELECT r.profile_id,c.context_json FROM runs r
@@ -77,8 +77,21 @@ VARIANTS = {
             .ok_or_else(|| Error::message("找不到运行记录"))?;""", """        let run = self.run_record(id)?.ok_or_else(|| Error::message("找不到运行记录"))?;
         let text: Option<String> = self.conn.query_row(
             "SELECT context_json FROM run_contexts WHERE run_id=?1", [id], |row| row.get(0),
-        ).optional()?;"""), ("src/codex_manager/mod.rs", '.select(id, &profile_id, configs, ids, credentials)', '.select(id, &run.profile_id, configs, ids, credentials)')],
-    "eager_resource_service": [("src/codex_manager/mod.rs", "let resources = std::cell::OnceCell::new();", "let resources = crate::resources::connections::ResourceService::from_environment(crate::resources::builtin_registry());"), ("src/codex_manager/mod.rs", "&|config| resources.get_or_init(|| crate::resources::connections::ResourceService::from_environment(crate::resources::builtin_registry())).prepare(config).ok().map(|reader| reader.scope()),", "&|config| resources.prepare(config).ok().map(|reader| reader.scope()),")],
+        ).optional()?;"""), ("src/codex_manager/run_store.rs", '.select(id, &profile_id, configs, ids, credentials)', '.select(id, &run.profile_id, configs, ids, credentials)')],
+    "eager_resource_service": [
+        ("src/codex_manager/launch.rs", "let resources = std::cell::OnceCell::new();", "let resources = crate::resources::connections::ResourceService::from_environment(crate::hub::shared().resources.clone());"),
+        ("src/codex_manager/launch.rs", """            &|config| {
+                resources
+                    .get_or_init(|| {
+                        crate::resources::connections::ResourceService::from_environment(
+                            crate::hub::shared().resources.clone(),
+                        )
+                    })
+                    .prepare(config)
+                    .ok()
+                    .map(|reader| reader.scope())
+            },""", "&|config| resources.prepare(config).ok().map(|reader| reader.scope()),"),
+    ],
     "ignore_nested_exec_subcommands": [("src/codex_manager/effective.rs", "CommandPosition::Exec\n                    }", "CommandPosition::Prompt\n                    }")],
 }
 

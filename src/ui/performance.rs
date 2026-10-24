@@ -7,10 +7,6 @@ use ratatui::{
     style::{Style, Stylize},
     widgets::{Block, Clear, Paragraph},
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 
 pub(super) const HOME_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 pub(super) struct CachedSummary {
@@ -73,8 +69,7 @@ pub(super) struct Panel {
     pub detail: Option<String>,
     pub page: u32,
     pub scroll: u16,
-    pub cancel: Arc<AtomicBool>,
-    pub task: Option<tokio::task::JoinHandle<()>>,
+    pub task: Option<crate::performance::LoadTask>,
     pub refreshed: std::time::Instant,
 }
 impl Panel {
@@ -91,16 +86,12 @@ impl Panel {
             detail: None,
             page: 0,
             scroll: 0,
-            cancel: Arc::new(AtomicBool::new(false)),
             task: None,
             refreshed: std::time::Instant::now(),
         }
     }
     pub fn stop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        self.task = None;
     }
     pub fn key(&mut self, key: KeyCode) -> Action {
         match key {

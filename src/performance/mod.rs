@@ -1,9 +1,11 @@
 //! Unified performance queries over explicitly bound CLI logs and gateway observations.
+mod loader;
 mod parser;
 mod store;
 #[cfg(test)]
 mod tests;
 
+pub use loader::{LoadRequest, LoadTask, LoadUpdate};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

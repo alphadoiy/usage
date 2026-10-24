@@ -69,6 +69,8 @@ performance_instance = "work-claude"
 
 `AgentAdapter::request_source()` 提供可选的 `RequestSource` 工厂，负责目录范围、事件解析和有限检查点；`performance::Service` 负责增量采集与查询。`Hub::Provider::performance_binding()` 和首页目录使用同一绑定模型；`Provider::performance()` 读取已建立的索引。读取和刷新均为同步存储操作，调用者应像会话扫描一样在后台执行。新增来源不需要修改首页按键或指标聚合逻辑。
 
+交互式加载使用 `Service::start_load`：调用者传入固定的 `LoadRequest`，接收缓存、进度和结束结果，并持有 `LoadTask` 管理取消。批次调度、进度节流、异常收尾和取消检查由服务层负责；弹窗关闭、翻页或更换时间范围时丢弃旧任务，并用界面代次拒绝迟到结果。
+
 测试使用合成日志和临时数据库，覆盖追加、重启、归档复制、文件替换、尾行、大行、派生会话、提供方隔离、片段合并、缺失时序、首字均值、生成速度与速度下限的独立加权、Magpie 边界案例、旧游标升级、万条请求，以及弹窗后台加载和过期结果丢弃。没有主动发送真实模型请求校准日志估算。
 
 参考实现：Magpie `internal/usage/usage.go` 的 `DecodeWindow`、`MeanTTFT`，`internal/usage/ledger.go` 的 `Row.Decode` / `Row.Floor`，以及 `internal/usage/speed_count_test.go` 的本地 Codex / Claude 样例。本项目将同一套 SQL 计量规则用于首页、模型汇总和请求明细，直接重新聚合原有索引；旧索引中的推算首字不再作为有效首字样本。
