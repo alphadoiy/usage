@@ -17,6 +17,7 @@ pub const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 pub const GROK_OIDC_PREFIX: &str = "https://auth.x.ai::";
 pub const GROK_LEGACY_SCOPE: &str = "https://accounts.x.ai/sign-in";
 const CODEX_STALE_SECONDS: i64 = 8 * 24 * 3600;
+const CODEX_REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type CredentialRead = (Option<String>, CredentialStatus, Option<String>);
@@ -46,6 +47,19 @@ fn email_from_jwt(token: &str) -> Option<String> {
     let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
     let claims: Value = serde_json::from_slice(&decoded).ok()?;
     claims.get("email")?.as_str().and_then(clean_email)
+}
+
+fn codex_access_exp(token: &str) -> Option<i64> {
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() || payload.len() > 8192 {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    claims.get("exp")?.as_i64().filter(|exp| *exp > 0)
 }
 
 pub fn codex_email_from_credentials(content: &str) -> Option<String> {
@@ -348,16 +362,29 @@ pub fn parse_codex_credentials(
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if root
-        .get("last_refresh")
-        .and_then(Value::as_str)
-        .is_some_and(|text| codex_refresh_is_stale(text, now))
-    {
+    // JWT claims are timing hints only; they do not prove that a refresh grant is valid.
+    // Codex uses the refresh age only when the access token has no usable exp claim.
+    let refresh_hint = match codex_access_exp(token) {
+        Some(exp) if exp <= now.timestamp() => Some("Codex 访问令牌已到期，等待官方客户端刷新"),
+        Some(exp) if exp - now.timestamp() <= CODEX_REFRESH_WINDOW_SECONDS => {
+            Some("Codex 访问令牌即将到期，等待官方客户端刷新")
+        }
+        Some(_) => None,
+        None if root
+            .get("last_refresh")
+            .and_then(Value::as_str)
+            .is_some_and(|text| codex_refresh_is_stale(text, now)) =>
+        {
+            Some("Codex 令牌距上次刷新已超过 8 天，等待官方客户端检查刷新")
+        }
+        None => None,
+    };
+    if let Some(hint) = refresh_hint {
         return (
             Some(token.to_string()),
             account,
-            CredentialStatus::Expired,
-            Some("Codex 令牌距上次刷新已超过 8 天".into()),
+            CredentialStatus::RefreshRequired,
+            Some(hint.into()),
         );
     }
     (
@@ -474,6 +501,33 @@ mod tests {
         let api_key = content.replace("chatgpt", "apikey");
         assert_eq!(codex_email_from_credentials(&api_key), None);
         assert_eq!(codex_email_from_credentials("{}"), None);
+    }
+
+    #[test]
+    fn codex_access_expiry_only_requests_refresh_not_reauthentication() {
+        let now = chrono::TimeZone::timestamp_opt(&Utc, 1_800_000_000, 0)
+            .single()
+            .unwrap();
+        let token = |exp| {
+            let payload = URL_SAFE_NO_PAD.encode(json!({ "exp": exp }).to_string());
+            format!("header.{payload}.signature")
+        };
+        let credential = |access_token: String| {
+            json!({"auth_mode":"chatgpt", "last_refresh":"2020-01-01T00:00:00Z",
+                "tokens":{"access_token":access_token,"account_id":"workspace"}})
+            .to_string()
+        };
+        let (_, _, fresh, _) =
+            parse_codex_credentials(&credential(token(now.timestamp() + 3600)), now);
+        assert_eq!(fresh, CredentialStatus::Valid);
+        for exp in [now.timestamp() - 1, now.timestamp() + 60] {
+            let (_, _, status, message) = parse_codex_credentials(&credential(token(exp)), now);
+            assert_eq!(status, CredentialStatus::RefreshRequired);
+            assert!(message.unwrap().contains("官方客户端刷新"));
+        }
+        let (_, _, status, message) = parse_codex_credentials(&credential("opaque".into()), now);
+        assert_eq!(status, CredentialStatus::RefreshRequired);
+        assert!(message.unwrap().contains("8 天"));
     }
 
     #[test]

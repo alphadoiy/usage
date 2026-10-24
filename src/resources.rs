@@ -196,6 +196,7 @@ impl ResourceReader for SubscriptionResource {
             match snapshot.credential_status {
                 CredentialStatus::NotFound => ResourceState::NeedsConfiguration,
                 CredentialStatus::Expired => ResourceState::AuthenticationFailed,
+                CredentialStatus::RefreshRequired => ResourceState::Failure,
                 _ => ResourceState::Failure,
             }
         };

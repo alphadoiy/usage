@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 #[serde(rename_all = "snake_case")]
 pub enum CredentialStatus {
     Valid,
+    /// The access token needs renewal; the OAuth grant may still be usable.
+    RefreshRequired,
     Expired,
     NotFound,
     ParseError,

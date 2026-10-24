@@ -365,6 +365,7 @@ pub fn render(
         if !snapshot.success {
             let state = match snapshot.credential_status {
                 CredentialStatus::NotFound => "未登录",
+                CredentialStatus::RefreshRequired => "令牌待刷新",
                 CredentialStatus::Expired => "登录过期",
                 CredentialStatus::ParseError => "凭据无效",
                 CredentialStatus::Valid if snapshot.transient => "暂不可用",

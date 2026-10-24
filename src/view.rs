@@ -302,6 +302,7 @@ fn badge(snapshot: &UsageSnapshot) -> (String, BadgeKind) {
     }
     match snapshot.credential_status {
         CredentialStatus::NotFound => ("未登录".into(), BadgeKind::Muted),
+        CredentialStatus::RefreshRequired => ("令牌待刷新".into(), BadgeKind::Warn),
         CredentialStatus::Expired => ("登录已过期".into(), BadgeKind::Error),
         CredentialStatus::ParseError => ("凭据无效".into(), BadgeKind::Error),
         CredentialStatus::Valid => ("查询失败".into(), BadgeKind::Error),

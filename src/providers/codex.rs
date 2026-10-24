@@ -51,7 +51,7 @@ impl UsageProvider for CodexProvider {
     async fn query(&self) -> UsageSnapshot {
         let now = (self.ctx.now)();
         let ctx = Arc::clone(&self.ctx);
-        let (token, account_id, status, message, email) =
+        let (token, account_id, status, message, mut email) =
             match crate::background::blocking(move || read_credentials(&ctx, now)).await {
                 Ok(credentials) => credentials,
                 Err(error) => {
@@ -71,7 +71,9 @@ impl UsageProvider for CodexProvider {
                 message.unwrap_or_else(|| "无法解析 Codex 凭据".into()),
                 now,
             ),
-            CredentialStatus::Expired | CredentialStatus::Valid => {
+            CredentialStatus::Expired
+            | CredentialStatus::RefreshRequired
+            | CredentialStatus::Valid => {
                 let Some(token) = token else {
                     return snapshot_error(
                         Self::ID,
@@ -81,18 +83,46 @@ impl UsageProvider for CodexProvider {
                         now,
                     );
                 };
-                let result = query_usage(&self.ctx, &token, account_id.as_deref(), now).await;
-                if status == CredentialStatus::Expired && !result.success {
-                    snapshot_error(
-                        Self::ID,
-                        Self::NAME,
-                        CredentialStatus::Expired,
-                        message.unwrap_or_else(|| "Codex 登录已过期，请重新登录".into()),
-                        now,
-                    )
-                } else {
-                    result
+                let (mut result, unauthorized) = query_usage(
+                    &self.ctx,
+                    &token,
+                    account_id.as_deref(),
+                    status == CredentialStatus::RefreshRequired,
+                    now,
+                )
+                .await;
+                // Codex can rotate auth.json while this request is in flight.
+                // Retry one 401 only with a newer token for the same account.
+                if unauthorized {
+                    let ctx = Arc::clone(&self.ctx);
+                    if let Ok((Some(current), current_account, current_status, _, current_email)) =
+                        crate::background::blocking(move || read_credentials(&ctx, now)).await
+                        && current != token
+                    {
+                        if current_account == account_id && current_account.is_some() {
+                            result = query_usage(
+                                &self.ctx,
+                                &current,
+                                current_account.as_deref(),
+                                current_status == CredentialStatus::RefreshRequired,
+                                now,
+                            )
+                            .await
+                            .0;
+                            email = current_email;
+                        } else {
+                            email = None;
+                            result = snapshot_error(
+                                Self::ID,
+                                Self::NAME,
+                                CredentialStatus::Valid,
+                                "Codex 登录账号在查询期间已切换，请刷新后重试",
+                                now,
+                            );
+                        }
+                    }
                 }
+                result
             }
         };
         result.account_email = email;
@@ -151,7 +181,10 @@ impl CodexProvider {
             tokio::task::spawn_blocking(move || read_credentials(&ctx, now))
                 .await
                 .map_err(|error| ProviderError(format!("凭据读取中断: {error}")))?;
-        if !matches!(status, CredentialStatus::Valid | CredentialStatus::Expired) {
+        if !matches!(
+            status,
+            CredentialStatus::Valid | CredentialStatus::RefreshRequired
+        ) {
             return Err(ProviderError(
                 message.unwrap_or_else(|| "请先登录 Codex".into()),
             ));
@@ -226,7 +259,7 @@ fn check_reset_response(
 ) -> Result<(), ProviderError> {
     match response.status {
         200..=299 => Ok(()),
-        401 | 403 => Err(ProviderError("Codex 登录已过期，请重新登录".into())),
+        401 | 403 => Err(ProviderError(auth_failure(response).1.into())),
         status => Err(ProviderError(format!(
             "{action}失败 (HTTP {status}): {}",
             body_excerpt(&response.body)
@@ -409,8 +442,9 @@ async fn query_usage(
     ctx: &ProviderContext,
     token: &str,
     account_id: Option<&str>,
+    refresh_required: bool,
     now: DateTime<Utc>,
-) -> UsageSnapshot {
+) -> (UsageSnapshot, bool) {
     let mut headers = vec![
         ("Authorization", format!("Bearer {token}")),
         ("User-Agent", "codex-cli".into()),
@@ -422,55 +456,117 @@ async fn query_usage(
     let response = match ctx.http.request("GET", USAGE_URL, &headers, None).await {
         Ok(response) => response,
         Err(TransportError(error)) => {
-            return snapshot_transient(
-                CodexProvider::ID,
-                CodexProvider::NAME,
-                format!("网络错误: {error}"),
+            return (
+                snapshot_transient(
+                    CodexProvider::ID,
+                    CodexProvider::NAME,
+                    format!("网络错误: {error}"),
+                ),
+                false,
             );
         }
     };
     if response.status == 401 || response.status == 403 {
-        return snapshot_error(
-            CodexProvider::ID,
-            CodexProvider::NAME,
-            CredentialStatus::Expired,
-            format!("鉴权失败 (HTTP {})，请重新登录 Codex", response.status),
-            now,
+        let (status, message) = auth_failure(&response);
+        return (
+            snapshot_error(
+                CodexProvider::ID,
+                CodexProvider::NAME,
+                if status == CredentialStatus::Valid && response.status == 401 && refresh_required {
+                    CredentialStatus::RefreshRequired
+                } else {
+                    status
+                },
+                if status == CredentialStatus::Valid && response.status == 401 && refresh_required {
+                    "访问令牌待刷新；请打开 Codex 完成刷新后重试"
+                } else {
+                    message
+                },
+                now,
+            ),
+            response.status == 401,
         );
     }
     if is_transient_status(response.status) {
-        return snapshot_transient(
-            CodexProvider::ID,
-            CodexProvider::NAME,
-            format!("服务暂时不可用 (HTTP {})", response.status),
+        return (
+            snapshot_transient(
+                CodexProvider::ID,
+                CodexProvider::NAME,
+                format!("服务暂时不可用 (HTTP {})", response.status),
+            ),
+            false,
         );
     }
     if !(200..300).contains(&response.status) {
-        return snapshot_error(
-            CodexProvider::ID,
-            CodexProvider::NAME,
-            CredentialStatus::Valid,
-            format!(
-                "接口错误 (HTTP {}): {}",
-                response.status,
-                body_excerpt(&response.body)
+        return (
+            snapshot_error(
+                CodexProvider::ID,
+                CodexProvider::NAME,
+                CredentialStatus::Valid,
+                format!(
+                    "接口错误 (HTTP {}): {}",
+                    response.status,
+                    body_excerpt(&response.body)
+                ),
+                now,
             ),
-            now,
+            false,
         );
     }
     let payload: Value = match serde_json::from_slice(&response.body) {
         Ok(value) => value,
         Err(error) => {
-            return snapshot_error(
-                CodexProvider::ID,
-                CodexProvider::NAME,
-                CredentialStatus::Valid,
-                format!("用量响应无法解析: {error}"),
-                now,
+            return (
+                snapshot_error(
+                    CodexProvider::ID,
+                    CodexProvider::NAME,
+                    CredentialStatus::Valid,
+                    format!("用量响应无法解析: {error}"),
+                    now,
+                ),
+                false,
             );
         }
     };
-    parse_codex_usage(&payload, now)
+    (parse_codex_usage(&payload, now), false)
+}
+
+/// Only an explicit revocation code establishes that this credential generation
+/// needs a new sign-in. A plain 401 can mean an expired access token.
+fn auth_failure(response: &crate::http::HttpResponse) -> (CredentialStatus, &'static str) {
+    let code = (response.body.len() <= 32 * 1024)
+        .then(|| serde_json::from_slice::<Value>(&response.body).ok())
+        .flatten()
+        .and_then(|body| {
+            body.pointer("/error/code")
+                .or_else(|| body.pointer("/error/error_reason"))
+                .or_else(|| body.get("code"))
+                .or_else(|| body.get("error_reason"))
+                .or_else(|| body.get("error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    match code.as_deref() {
+        Some(
+            "token_revoked"
+            | "invalid_grant"
+            | "refresh_token_expired"
+            | "refresh_token_invalidated"
+            | "refresh_token_reused",
+        ) => (CredentialStatus::Expired, "Codex 登录已失效，请重新登录"),
+        Some("token_expired") => (
+            CredentialStatus::RefreshRequired,
+            "Codex 访问令牌已到期；请打开 Codex 完成刷新后重试",
+        ),
+        _ if response.status == 403 => (
+            CredentialStatus::Valid,
+            "Codex 账号无权访问此接口 (HTTP 403)",
+        ),
+        _ => (
+            CredentialStatus::Valid,
+            "Codex 认证未通过 (HTTP 401)；请打开 Codex 验证登录后重试",
+        ),
+    }
 }
 
 fn window_tier(value: Option<&Value>) -> Option<QuotaTier> {
@@ -599,6 +695,118 @@ mod tests {
             status,
             headers: Default::default(),
             body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_hint_never_turns_network_failure_into_expired_login() {
+        let http = Arc::new(FakeHttp::new());
+        http.route(USAGE_URL, Err(TransportError("offline".into())));
+        let credentials = json!({
+            "auth_mode":"chatgpt", "last_refresh":"2020-01-01T00:00:00Z",
+            "tokens":{"access_token":"opaque-token", "account_id":"workspace"}
+        })
+        .to_string();
+        let provider = CodexProvider::new(Arc::new(ProviderContext {
+            claude_dir: "/nonexistent/usage-test-claude".into(),
+            codex_dir: "/nonexistent/usage-test-codex".into(),
+            grok_dir: "/nonexistent/usage-test-grok".into(),
+            http,
+            keychain: Arc::new(move |_, _| Some(credentials.clone())),
+            now: Arc::new(now),
+        }));
+        let snapshot = provider.query().await;
+        assert!(snapshot.transient);
+        assert_eq!(snapshot.credential_status, CredentialStatus::Valid);
+        assert!(snapshot.error.unwrap().contains("网络错误"));
+    }
+
+    #[tokio::test]
+    async fn oauth_401_distinguishes_access_expiry_revocation_and_permission() {
+        for (http_status, code, expected) in [
+            (401, "token_expired", CredentialStatus::RefreshRequired),
+            (401, "refresh_token_invalidated", CredentialStatus::Expired),
+            (401, "refresh_token_reused", CredentialStatus::Expired),
+            (401, "unknown", CredentialStatus::Valid),
+            (403, "unknown", CredentialStatus::Valid),
+        ] {
+            let http = Arc::new(FakeHttp::new());
+            http.route(
+                USAGE_URL,
+                Ok(response(http_status, json!({"error":{"code":code}}))),
+            );
+            let provider = reset_test_provider(http);
+            let snapshot = provider.query().await;
+            assert_eq!(snapshot.credential_status, expected, "{http_status} {code}");
+            assert!(!snapshot.transient);
+            assert!(!snapshot.success);
+        }
+        let response = response(401, json!({"error":"invalid_grant"}));
+        assert_eq!(auth_failure(&response).0, CredentialStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn oauth_401_retries_only_a_rotated_token_for_the_same_account() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TokenHttp {
+            calls: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl crate::http::HttpClient for TokenHttp {
+            async fn request(
+                &self,
+                _: &str,
+                _: &str,
+                headers: &[(&str, String)],
+                _: Option<Vec<u8>>,
+            ) -> Result<HttpResponse, TransportError> {
+                let token = headers
+                    .iter()
+                    .find(|(name, _)| *name == "Authorization")
+                    .unwrap()
+                    .1
+                    .clone();
+                self.calls.lock().unwrap().push(token.clone());
+                Ok(if token == "Bearer old" {
+                    response(401, json!({"error":{"code":"unknown"}}))
+                } else {
+                    response(200, json!({"rate_limit":{}}))
+                })
+            }
+        }
+        for (next_account, expected_calls, success) in
+            [("workspace-a", 2, true), ("workspace-b", 1, false)]
+        {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let keychain_reads = Arc::clone(&reads);
+            let http = Arc::new(TokenHttp {
+                calls: std::sync::Mutex::new(Vec::new()),
+            });
+            let provider = CodexProvider::new(Arc::new(ProviderContext {
+                claude_dir: "/nonexistent/usage-test-claude".into(),
+                codex_dir: "/nonexistent/usage-test-codex".into(),
+                grok_dir: "/nonexistent/usage-test-grok".into(),
+                http: Arc::clone(&http) as Arc<dyn crate::http::HttpClient>,
+                keychain: Arc::new(move |_, _| {
+                    let first = keychain_reads.fetch_add(1, Ordering::SeqCst) == 0;
+                    Some(
+                        json!({"auth_mode":"chatgpt", "tokens": {
+                            "access_token": if first {"old"} else {"new"},
+                            "account_id": if first {"workspace-a"} else {next_account}
+                        }})
+                        .to_string(),
+                    )
+                }),
+                now: Arc::new(now),
+            }));
+            let snapshot = provider.query().await;
+            assert_eq!(snapshot.success, success);
+            assert_eq!(http.calls.lock().unwrap().len(), expected_calls);
+            if !success {
+                assert_eq!(snapshot.credential_status, CredentialStatus::Valid);
+                assert!(snapshot.error.unwrap().contains("账号在查询期间已切换"));
+            }
         }
     }
 

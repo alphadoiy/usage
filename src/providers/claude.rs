@@ -73,7 +73,9 @@ impl UsageProvider for ClaudeProvider {
                 message.unwrap_or_else(|| "无法解析 Claude 凭据".into()),
                 now,
             ),
-            CredentialStatus::Expired | CredentialStatus::Valid => {
+            CredentialStatus::Expired
+            | CredentialStatus::RefreshRequired
+            | CredentialStatus::Valid => {
                 let Some(token) = token else {
                     return snapshot_error(
                         Self::ID,
