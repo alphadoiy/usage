@@ -326,7 +326,7 @@ fn checkin_reuses_health_capabilities_and_refuses_old_gateways_before_posting() 
                                     .push(format!("{} {path}", request.method()));
                                 let value = if path == "/_usage/status" {
                                     let mut value =
-                                        serde_json::json!({"service":"usage-gateway","protocol":9});
+                                        serde_json::json!({"service":"usage-gateway","protocol":10});
                                     if let Some(version) = capability {
                                         value["plugin_actions"] = version.into();
                                     }
@@ -346,7 +346,7 @@ fn checkin_reuses_health_capabilities_and_refuses_old_gateways_before_posting() 
                         .unwrap();
                 });
         });
-        let directory = f.path.join("manager/gateway");
+        let directory = f.path.join("manager/gateway-v10");
         fs::create_dir_all(&directory).unwrap();
         let state = directory.join("state.json");
         fs::write(

@@ -1,4 +1,5 @@
 //! Process-independent, loopback-only HTTP observation for Usage-owned launches.
+mod catalog;
 mod metrics;
 mod server;
 #[cfg(test)]
@@ -131,7 +132,8 @@ pub(crate) struct Attachment {
 }
 
 fn directory(root: &Path) -> PathBuf {
-    root.join("gateway")
+    // Keep older gateway processes alive for sessions launched before the catalog upgrade.
+    root.join(format!("gateway-v{PROTOCOL_VERSION}"))
 }
 fn private_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|_| "无法创建网关运行目录")?;
@@ -160,7 +162,7 @@ fn private_file(path: &Path) -> Result<File, String> {
     }
     Ok(file)
 }
-const PROTOCOL_VERSION: u32 = 9;
+const PROTOCOL_VERSION: u32 = 10;
 const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(150);
 

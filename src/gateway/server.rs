@@ -366,6 +366,7 @@ async fn forward(
     }
     if !(inference || (upgrading && method == Method::GET && path == "responses"))
         && !(method == Method::GET && path == "models")
+        && !(method == Method::GET && path == "codex/models")
         && !(method == Method::POST && path == "responses/compact")
     {
         return error(StatusCode::NOT_FOUND, "Unsupported upstream path");
@@ -423,15 +424,22 @@ async fn forward(
         endpoint = path
     );
     let response = if let RouteAuth::Plugin { account } = &route.registration.auth {
-        if path == "models" {
+        if path == "models" || path == "codex/models" {
             match state
                 .plugins
                 .call(serde_json::json!({"operation":"models","account":account}))
                 .await
             {
-                Ok(models) => {
+                Ok(models) if path == "models" => {
                     axum::Json(serde_json::json!({"object":"list","data":models})).into_response()
                 }
+                Ok(models) => match super::catalog::plugin_models(&models) {
+                    Ok(catalog) => axum::Json(catalog).into_response(),
+                    Err(reason) => {
+                        tracing::warn!(event = "plugin_model_catalog_invalid", reason);
+                        error(StatusCode::BAD_GATEWAY, "Plugin model catalog is invalid")
+                    }
+                },
                 Err(_) => error(StatusCode::BAD_GATEWAY, "Plugin model discovery failed"),
             }
         } else if inference {
@@ -443,6 +451,9 @@ async fn forward(
             )
         }
     } else {
+        if path == "codex/models" {
+            return error(StatusCode::NOT_FOUND, "Unsupported upstream path");
+        }
         match tokio::time::timeout(
             state.idle_timeout,
             state

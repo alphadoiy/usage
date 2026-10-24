@@ -425,9 +425,14 @@ impl Manager {
         );
         command.args(["-c", &format!("{base_url_key}={base}")]);
         if plugin_account.is_some() {
+            let catalog_key = launcher::provider_override(provider, "model_catalog_url")
+                .expect("validated provider id");
+            let catalog_url = toml::Value::String(format!("{}/codex/models", attached.base));
             command.args([
                 "-c",
                 &format!("model_provider={}", toml::Value::String(provider.into())),
+                "-c",
+                &format!("{catalog_key}={catalog_url}"),
             ]);
         }
         for variable in ["NO_PROXY", "no_proxy"] {

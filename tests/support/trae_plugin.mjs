@@ -158,13 +158,24 @@ try {
   assert.equal(calls.filter(c => c.path.endsWith('/claim')).length, 1);
   const mock = join(root, 'codex');
   await writeFile(mock, `#!/usr/bin/env python3
-import os, sys, json, pathlib, tomllib, urllib.request
+import os, sys, json, pathlib, tomllib, urllib.request, urllib.error
 if '--help' in sys.argv: print('--no-daemon --profile'); sys.exit(0)
 if '--version' in sys.argv: print('codex-cli 0.159.3'); sys.exit(0)
 c=tomllib.loads((pathlib.Path(os.environ['CODEX_HOME'])/'config.toml').read_text())
 p=c['model_provider']; base=c['model_providers'][p]['base_url']
+catalog=None
 for i,arg in enumerate(sys.argv[:-1]):
  if arg=='-c' and '.base_url=' in sys.argv[i+1]: base=tomllib.loads(sys.argv[i+1])['model_providers'][p]['base_url']
+ if arg=='-c' and '.model_catalog_url=' in sys.argv[i+1]: catalog=tomllib.loads(sys.argv[i+1])['model_providers'][p]['model_catalog_url']
+assert catalog and catalog.startswith(base+'/codex/models'), catalog
+try:
+ urllib.request.urlopen(catalog,timeout=10)
+ raise AssertionError('catalog must reject requests without the run token')
+except urllib.error.HTTPError as error: assert error.code==401
+catalog_request=urllib.request.Request(catalog,headers={'authorization':'Bearer '+os.environ['USAGE_CODEX_API_KEY']})
+with urllib.request.urlopen(catalog_request,timeout=10) as r: listed=json.load(r)['models']
+assert [x['slug'] for x in listed]==[c['model']], listed
+assert listed[0]['visibility']=='list' and listed[0]['base_instructions'], listed
 body=json.dumps({'model':c['model'],'input':'hello','stream':True,'tools':[{'type':'namespace','name':'functions','tools':[{'type':'function','name':'read','parameters':{'type':'object','properties':{'path':{'type':'string'}}}},{'type':'custom','name':'exec'}]}]}).encode()
 req=urllib.request.Request(base+'/responses',data=body,headers={'authorization':'Bearer '+os.environ['USAGE_CODEX_API_KEY'],'content-type':'application/json'})
 with urllib.request.urlopen(req,timeout=10) as r: result=r.read().decode()
@@ -181,7 +192,7 @@ print('trae-inference-ok')
   }
   assert.equal(calls.filter(c => c.path.endsWith('/llm_utils_chat')).length, 3);
   assert.deepEqual(errors, []);
-  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models, Credits/USD, explicit check-in, namespaced function/custom tool round-trip');
+  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models and Codex catalog, Credits/USD, explicit check-in, namespaced function/custom tool round-trip');
 } finally {
   try { const status = await json('gateway', 'status'); if (status.pid) process.kill(status.pid, 'SIGTERM'); } catch {}
   server.closeAllConnections(); await new Promise(r => server.close(r));
