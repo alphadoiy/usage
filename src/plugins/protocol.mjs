@@ -23,6 +23,89 @@ function content(parts) {
     return unsupported(`unsupported content: ${p.type}`);
   });
 }
+const customSchema = {
+  type: "object",
+  properties: {
+    input: {
+      type: "string",
+      description: "The complete free-form tool input, passed through as written.",
+    },
+  },
+  required: ["input"],
+  additionalProperties: false,
+};
+const flatName = (namespace, name) =>
+  namespace ? `${namespace}__${name}` : name;
+function customDescription(tool) {
+  let description = tool.description?.trim() ?? "";
+  if (description) description += "\n\n";
+  description += "Put the complete free-form tool input in the `input` string. It is passed through as written.";
+  if (tool.format?.type === "grammar" && tool.format.definition) {
+    description += `\n\nThe input follows this ${tool.format.syntax || "specified"} grammar:\n${tool.format.definition.trim()}`;
+  }
+  return description;
+}
+function customInput(argumentsText) {
+  try {
+    const value = JSON.parse(argumentsText);
+    if (typeof value?.input === "string") return value.input;
+    if (typeof value === "string") return value;
+  } catch {}
+  return argumentsText;
+}
+function discoveredTools(input) {
+  return input.flatMap((item) =>
+    item.type === "tool_search_output" && Array.isArray(item.tools)
+      ? item.tools
+      : [],
+  );
+}
+function toolRegistry(declarations = [], discovered = []) {
+  const byName = new Map();
+  const chatTools = [];
+  function add(tool, namespace = "", alreadyOffered = false) {
+    if (tool?.type === "tool_search") {
+      if (tool.execution !== "client")
+        unsupported("only client-executed tool_search can be converted");
+      tool = { ...tool, name: "tool_search" };
+    }
+    if (!tool?.name || !["function", "custom", "tool_search"].includes(tool.type))
+      return unsupported(`unsupported built-in tool: ${tool?.type}`);
+    const name = flatName(namespace, tool.name);
+    const previous = byName.get(name);
+    if (alreadyOffered && previous?.name === tool.name &&
+        previous.namespace === namespace && previous.type === tool.type)
+      return;
+    if (previous)
+      return unsupported(`tool name collision after namespace conversion: ${name}`);
+    byName.set(name, { name: tool.name, namespace, type: tool.type });
+    chatTools.push({
+      type: "function",
+      function: {
+        name,
+        description: tool.type === "custom" ? customDescription(tool) : tool.description,
+        parameters: tool.type === "custom"
+          ? customSchema
+          : (tool.parameters ?? { type: "object", properties: {} }),
+        ...(tool.type === "function" && tool.strict !== undefined
+          ? { strict: tool.strict }
+          : {}),
+      },
+    });
+  }
+  function offer(tool, alreadyOffered) {
+    if (!tool || typeof tool !== "object")
+      unsupported("invalid tool declaration");
+    if (tool.type === "namespace") {
+      if (!tool.name || !Array.isArray(tool.tools))
+        unsupported("invalid namespace tool declaration");
+      for (const nested of tool.tools) add(nested, tool.name, alreadyOffered);
+    } else add(tool, "", alreadyOffered);
+  }
+  for (const tool of declarations) offer(tool, false);
+  for (const tool of discovered) offer(tool, true);
+  return { byName, chatTools };
+}
 export function translateRequest(from, to, b) {
   if (from === to) return b;
   if (from !== "responses" || to !== "chat")
@@ -31,30 +114,50 @@ export function translateRequest(from, to, b) {
     return unsupported(
       "previous_response_id requires server-side conversation storage; send full input",
     );
-  const messages = [];
-  if (b.instructions)
-    messages.push({ role: "system", content: b.instructions });
   const input =
     typeof b.input === "string"
       ? [{ type: "message", role: "user", content: b.input }]
       : (b.input ?? []);
+  const found = discoveredTools(input);
+  const registry = toolRegistry(b.tools, found);
+  const messages = [];
+  if (b.instructions)
+    messages.push({ role: "system", content: b.instructions });
   for (const item of input) {
-    if (item.type === "function_call") {
+    if (["function_call", "custom_tool_call", "tool_search_call"].includes(item.type)) {
       const call = {
         id: item.call_id,
         type: "function",
-        function: { name: item.name, arguments: item.arguments ?? "" },
+        function: {
+          name: item.type === "tool_search_call"
+            ? "tool_search"
+            : flatName(item.namespace, item.name),
+          arguments: item.type === "tool_search_call"
+            ? JSON.stringify(item.arguments ?? {})
+            : item.type === "custom_tool_call"
+              ? JSON.stringify({ input: item.input ?? "" })
+              : (item.arguments ?? ""),
+        },
       };
       const previous = messages.at(-1);
       if (previous?.role === "assistant" && previous.tool_calls)
         previous.tool_calls.push(call);
       else
         messages.push({ role: "assistant", content: null, tool_calls: [call] });
-    } else if (item.type === "function_call_output") {
+    } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
       messages.push({
         role: "tool",
         tool_call_id: item.call_id,
         content: content(item.output),
+      });
+    } else if (item.type === "tool_search_output") {
+      const names = toolRegistry([], item.tools ?? []).chatTools.map((t) => t.function.name);
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: names.length
+          ? `These tools are now available to call: ${names.join(", ")}`
+          : "No tools matched the search.",
       });
     } else if (item.type === "reasoning") {
       // Responses reasoning items are history metadata; chat carries actual messages separately.
@@ -70,22 +173,24 @@ export function translateRequest(from, to, b) {
       messages.push({ role: item.role, content: content(item.content) });
     } else unsupported(`unsupported input item: ${item.type}`);
   }
-  const tools = b.tools?.map((t) => {
-    if (t.type !== "function")
-      return unsupported(`unsupported built-in tool: ${t.type}`);
-    return {
-      type: "function",
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters ?? { type: "object", properties: {} },
-        strict: t.strict,
-      },
-    };
-  });
+  let tools = b.tools === undefined && !found.length
+    ? undefined
+    : registry.chatTools;
   let tool_choice = b.tool_choice;
-  if (tool_choice?.type === "function")
-    tool_choice = { type: "function", function: { name: tool_choice.name } };
+  if (["function", "custom"].includes(tool_choice?.type)) {
+    const name = flatName(tool_choice.namespace, tool_choice.name);
+    if (!registry.byName.has(name)) unsupported(`unknown tool choice: ${name}`);
+    tool_choice = { type: "function", function: { name } };
+  } else if (tool_choice?.type === "allowed_tools") {
+    if (!["auto", "required"].includes(tool_choice.mode))
+      unsupported(`unsupported allowed_tools mode: ${tool_choice.mode}`);
+    const allowed = new Set(tool_choice.tools?.map((t) => flatName(t.namespace, t.name)));
+    for (const name of allowed)
+      if (!registry.byName.has(name)) unsupported(`unknown allowed tool: ${name}`);
+    tools = registry.chatTools.filter((t) => allowed.has(t.function.name));
+    tool_choice = tool_choice.mode;
+  } else if (tool_choice && typeof tool_choice !== "string")
+    unsupported(`unsupported tool choice: ${tool_choice.type}`);
   const out = {
     model: b.model,
     messages,
@@ -157,6 +262,8 @@ export async function translateResponse(from, to, res, request) {
     return unsupported("unsupported response conversion");
   if (!res.headers.get("content-type")?.includes("text/event-stream"))
     throw new ProtocolError("expected streamed chat response");
+  const requestInput = Array.isArray(request.input) ? request.input : [];
+  const declaredTools = toolRegistry(request.tools, discoveredTools(requestInput)).byName;
   const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
   const created_at = Math.floor(Date.now() / 1000),
     output = [];
@@ -182,7 +289,7 @@ export async function translateResponse(from, to, res, request) {
   });
   let textItem = null,
     reasoningItem = null;
-  const tools = new Map();
+  const toolCalls = new Map();
   const state = { reader: null };
   async function* converted() {
     yield emit("response.created", {
@@ -195,6 +302,55 @@ export async function translateResponse(from, to, res, request) {
       if (raw === "[DONE]") {
         if (!finish)
           throw new ProtocolError("upstream ended without finish reason");
+        // Chat can split a function name across chunks. Wait for the full name
+        // before emitting an item so Codex sees the original namespace and type.
+        for (const call of toolCalls.values()) {
+          if (!call.name) throw new ProtocolError("upstream tool call has no name");
+          const declared = declaredTools.get(call.name);
+          const custom = declared?.type === "custom";
+          const search = declared?.type === "tool_search";
+          let searchArguments;
+          if (search) {
+            try {
+              searchArguments = JSON.parse(call.arguments || "{}");
+            } catch {
+              throw new ProtocolError("upstream tool_search arguments are not JSON");
+            }
+            if (!searchArguments || typeof searchArguments !== "object" || Array.isArray(searchArguments))
+              throw new ProtocolError("upstream tool_search arguments must be an object");
+          }
+          const item = {
+            id: `${search ? "tsc" : custom ? "ctc" : "fc"}_${crypto.randomUUID()}`,
+            type: search ? "tool_search_call" : custom ? "custom_tool_call" : "function_call",
+            status: "in_progress",
+            call_id: call.call_id ?? `call_${crypto.randomUUID()}`,
+            ...(!search ? { name: declared?.name ?? call.name } : {}),
+            ...(declared?.namespace ? { namespace: declared.namespace } : {}),
+            ...(search
+              ? { execution: "client", arguments: searchArguments }
+              : custom
+              ? { input: customInput(call.arguments) }
+              : { arguments: call.arguments }),
+          };
+          output.push(item);
+          const output_index = output.length - 1;
+          yield emit("response.output_item.added", {
+            output_index,
+            item: search ? { ...item } : { ...item, [custom ? "input" : "arguments"]: "" },
+          });
+          if (custom && item.input)
+            yield emit("response.custom_tool_call_input.delta", {
+              item_id: item.id,
+              output_index,
+              delta: item.input,
+            });
+          else if (!custom && item.arguments)
+            yield emit("response.function_call_arguments.delta", {
+              item_id: item.id,
+              output_index,
+              delta: item.arguments,
+            });
+        }
         for (let index = 0; index < output.length; index++) {
           const item = output[index];
           if (item.type === "message") {
@@ -216,6 +372,15 @@ export async function translateResponse(from, to, res, request) {
               output_index: index,
               arguments: item.arguments,
             });
+          else if (item.type === "custom_tool_call")
+            yield emit("response.custom_tool_call_input.done", {
+              item_id: item.id,
+              output_index: index,
+              input: item.input,
+            });
+          else if (item.type === "tool_search_call") {
+            // Tool search has no argument delta event; the completed item carries it.
+          }
           else
             yield emit("response.reasoning_summary_text.done", {
               item_id: item.id,
@@ -333,31 +498,23 @@ export async function translateResponse(from, to, res, request) {
       }
       for (const call of d.tool_calls ?? []) {
         const key = call.index ?? 0;
-        let item = tools.get(key);
+        let item = toolCalls.get(key);
         if (!item) {
           item = {
-            id: `fc_${crypto.randomUUID()}`,
-            type: "function_call",
-            status: "in_progress",
-            call_id: call.id ?? `call_${crypto.randomUUID()}`,
-            name: call.function?.name ?? "",
+            call_id: call.id ?? null,
+            name: "",
             arguments: "",
           };
-          tools.set(key, item);
-          output.push(item);
-          yield emit("response.output_item.added", {
-            output_index: output.length - 1,
-            item: structuredClone(item),
-          });
-        } else if (call.function?.name) item.name += call.function.name;
+          toolCalls.set(key, item);
+        }
+        if (call.id) item.call_id = call.id;
+        if (call.function?.name) {
+          item.name += call.function.name;
+          total += call.function.name.length;
+        }
         if (call.function?.arguments) {
           item.arguments += call.function.arguments;
           total += call.function.arguments.length;
-          yield emit("response.function_call_arguments.delta", {
-            item_id: item.id,
-            output_index: output.indexOf(item),
-            delta: call.function.arguments,
-          });
         }
       }
       if (total > 16 * 1024 * 1024)

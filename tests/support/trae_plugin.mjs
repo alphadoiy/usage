@@ -65,8 +65,14 @@ const server = createServer(async (req, res) => {
         answer = { credits: 100, extra_credits: 10 };
       } else if (path.endsWith('/llm_utils_chat')) {
         assert.equal(body.model, `model-${realm}`);
+        assert.deepEqual(body.tools.map(t => t.function.name), ['functions__read', 'functions__exec']);
         res.writeHead(200, { 'content-type': 'text/event-stream' });
-        return res.end(`event: output\ndata: {"response":"hello-${realm}"}\n\nevent: token_usage\ndata: {"prompt_tokens":10,"completion_tokens":5}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n`);
+        const response = realm === 'cn'
+          ? '<tool_call>{"name":"functions__exec","arguments":{"input":"print(1)"}}</tool_call>'
+          : realm === 'sg'
+            ? '<tool_call>{"name":"functions__read","arguments":{"path":"a"}}</tool_call>'
+            : `hello-${realm}`;
+        return res.end(`event: output\ndata: ${JSON.stringify({ response })}\n\nevent: token_usage\ndata: {"prompt_tokens":10,"completion_tokens":5}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n`);
       } else throw new Error(`unexpected path ${path}`);
     }
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(answer));
@@ -159,10 +165,15 @@ c=tomllib.loads((pathlib.Path(os.environ['CODEX_HOME'])/'config.toml').read_text
 p=c['model_provider']; base=c['model_providers'][p]['base_url']
 for i,arg in enumerate(sys.argv[:-1]):
  if arg=='-c' and '.base_url=' in sys.argv[i+1]: base=tomllib.loads(sys.argv[i+1])['model_providers'][p]['base_url']
-body=json.dumps({'model':c['model'],'input':'hello','stream':True}).encode()
+body=json.dumps({'model':c['model'],'input':'hello','stream':True,'tools':[{'type':'namespace','name':'functions','tools':[{'type':'function','name':'read','parameters':{'type':'object','properties':{'path':{'type':'string'}}}},{'type':'custom','name':'exec'}]}]}).encode()
 req=urllib.request.Request(base+'/responses',data=body,headers={'authorization':'Bearer '+os.environ['USAGE_CODEX_API_KEY'],'content-type':'application/json'})
 with urllib.request.urlopen(req,timeout=10) as r: result=r.read().decode()
-assert 'response.completed' in result and 'hello-' in result, result
+completed=[json.loads(line[6:])['response'] for line in result.splitlines() if line.startswith('data: ') and json.loads(line[6:]).get('type')=='response.completed']
+assert len(completed)==1, result
+items=completed[0]['output']
+if c['model'].endswith('-cn'): assert any(x.get('type')=='custom_tool_call' and x.get('namespace')=='functions' and x.get('name')=='exec' and x.get('input')=='print(1)' for x in items), result
+elif c['model'].endswith('-sg'): assert any(x.get('type')=='function_call' and x.get('namespace')=='functions' and x.get('name')=='read' and json.loads(x.get('arguments','{}')).get('path')=='a' for x in items), result
+else: assert any(x.get('type')=='message' and 'hello-us' in str(x.get('content')) for x in items), result
 print('trae-inference-ok')
 `, { mode: 0o700 });
   for (const realm of ['cn', 'sg', 'us']) {
@@ -170,7 +181,7 @@ print('trae-inference-ok')
   }
   assert.equal(calls.filter(c => c.path.endsWith('/llm_utils_chat')).length, 3);
   assert.deepEqual(errors, []);
-  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models, Credits/USD, explicit check-in, managed Codex Responses/SSE forwarding');
+  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models, Credits/USD, explicit check-in, namespaced function/custom tool round-trip');
 } finally {
   try { const status = await json('gateway', 'status'); if (status.pid) process.kill(status.pid, 'SIGTERM'); } catch {}
   server.closeAllConnections(); await new Promise(r => server.close(r));
