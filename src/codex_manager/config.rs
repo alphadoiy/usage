@@ -5,10 +5,28 @@ pub const KEY_ENV: &str = "USAGE_CODEX_API_KEY";
 /// Known `model_reasoning_effort` values; a model may accept only some, and others pass through.
 pub const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "minimal"];
 
-/// Saved revisions are immutable; the CLI persists trust and onboarding state in its Home.
+/// Saved revisions are immutable; the CLI persists trust, onboarding, and model effort in its Home.
 /// Ignore only known, correctly typed runtime state, not arbitrary settings or auth overrides.
 fn managed_settings(text: &str) -> Option<toml::Value> {
     let mut doc: toml::Value = toml::from_str(text).ok()?;
+    // /model persists the chosen reasoning effort in config.toml. It can
+    // change independently of the versioned model and provider route.
+    if doc
+        .get("model_reasoning_effort")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|effort| {
+            !effort.is_empty()
+                && effort.len() <= 32
+                && effort.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'
+                        || byte == b'-'
+                })
+        })
+    {
+        doc.as_table_mut()?.remove("model_reasoning_effort");
+    }
     if let Some(projects) = doc.get_mut("projects") {
         let projects = projects.as_table_mut()?;
         for (_, project) in projects.iter_mut() {

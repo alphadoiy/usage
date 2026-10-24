@@ -407,6 +407,37 @@ fn manual_home_edits_are_preserved_and_require_explicit_import() {
 }
 
 #[test]
+fn codex_reasoning_choice_survives_relaunch_without_changing_the_saved_revision() {
+    let f = Fixture::new();
+    let mut manager = f.manager();
+    let profile = manager
+        .add(
+            "Reasoning",
+            &native("https://example.com/v1", "m1"),
+            "fixture-key",
+        )
+        .unwrap();
+    let home = manager.materialize(&profile.id, 1).unwrap();
+    let saved = manager.revision(&profile.id, 1).unwrap().config;
+    let runtime = config::patch(&saved, None, None, Some("none")).unwrap();
+    fs::write(home.join("config.toml"), &runtime).unwrap();
+    assert_eq!(manager.materialize(&profile.id, 1).unwrap(), home);
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        runtime
+    );
+    assert_eq!(manager.revision(&profile.id, 1).unwrap().config, saved);
+    assert!(!config::matches_runtime_config(
+        "model='m1'\nmodel_reasoning_effort=true",
+        "model='m1'"
+    ));
+    assert!(!config::matches_runtime_config(
+        "model='other'\nmodel_reasoning_effort='none'",
+        "model='m1'"
+    ));
+}
+
+#[test]
 fn stale_editor_cannot_overwrite_another_process_update() {
     let f = Fixture::new();
     let mut m = f.manager();
