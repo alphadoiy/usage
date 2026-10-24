@@ -130,6 +130,11 @@ pub struct ServiceStatus {
 }
 
 impl ServiceStatus {
+    pub(crate) fn failed(source: Source, error: &str) -> Self {
+        let mut status = Self::new(source);
+        status.error = Some(error.into());
+        status
+    }
     fn new(source: Source) -> Self {
         Self {
             provider: source.id.into(),

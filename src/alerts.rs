@@ -92,9 +92,18 @@ impl QuotaMonitor {
 
 /// Optional local OS notification. Arguments stay separate from AppleScript/shell source.
 pub fn notify_desktop(message: &str) -> Result<(), String> {
-    use std::process::{Command, Stdio};
+    notify_desktop_controlled(message, &crate::background::Cancellation::new())
+}
+pub fn notify_desktop_controlled(
+    message: &str,
+    cancel: &crate::background::Cancellation,
+) -> Result<(), String> {
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    use std::process::Command;
     #[cfg(target_os = "macos")]
-    let mut command = {
+    let command = {
         let mut c = Command::new("osascript");
         c.args([
             "-e",
@@ -104,11 +113,21 @@ pub fn notify_desktop(message: &str) -> Result<(), String> {
         c
     };
     #[cfg(not(target_os = "macos"))]
-    let mut command = {
+    let command = {
         let mut c = Command::new("notify-send");
         c.arg("--").arg("usage").arg(message);
         c
     };
+    notify_command(command, cancel)
+}
+fn notify_command(
+    mut command: std::process::Command,
+    cancel: &crate::background::Cancellation,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -117,6 +136,11 @@ pub fn notify_desktop(message: &str) -> Result<(), String> {
         .map_err(|e| format!("系统通知不可用：{e}"))?;
     let started = std::time::Instant::now();
     loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 return if status.success() {
@@ -335,5 +359,47 @@ mod tests {
         assert!(monitor.observe("local", &s, &config, now).is_empty());
         s.tiers[0].utilization = 90.0;
         assert_eq!(monitor.observe("local", &s, &config, now).len(), 1);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_reaps_an_already_running_notification_process() {
+        let directory = std::env::temp_dir().join(format!(
+            "usage-notification-cancel-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let pid_file = directory.join("pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"echo $$ > "$1"; exec sleep 30"#,
+                "notification-test",
+            ])
+            .arg(&pid_file);
+        let cancel = crate::background::Cancellation::new();
+        let token = cancel.clone();
+        let task = std::thread::spawn(move || notify_command(command, &token));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "notification helper did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        cancel.cancel();
+        assert!(task.join().unwrap().is_ok());
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

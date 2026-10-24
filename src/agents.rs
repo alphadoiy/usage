@@ -175,6 +175,17 @@ pub trait AgentAdapter: Send + Sync {
     fn session_source(&self) -> Option<SessionSource> {
         None
     }
+    fn load_sessions(
+        &self,
+        home: &Path,
+        cancel: &crate::background::Cancellation,
+    ) -> Result<Vec<SessionRecord>, String> {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        self.session_source()
+            .map_or_else(|| Ok(Vec::new()), |source| (source.load)(home))
+    }
     fn request_source(&self) -> Option<crate::performance::RequestSource> {
         None
     }
@@ -195,11 +206,25 @@ struct LocalAgent {
     context: AgentContext,
     load: fn(&Path) -> Result<Vec<SessionRecord>, String>,
     hooks: LocalHooks,
+    controlled: Option<ControlledSessionLoader>,
 }
 
 impl AgentAdapter for LocalAgent {
     fn kind(&self) -> AgentKind {
         self.kind
+    }
+    fn load_sessions(
+        &self,
+        home: &Path,
+        cancel: &crate::background::Cancellation,
+    ) -> Result<Vec<SessionRecord>, String> {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        match self.controlled {
+            Some(load) => load(home, cancel),
+            None => (self.load)(home),
+        }
     }
     fn request_source(&self) -> Option<crate::performance::RequestSource> {
         crate::performance::source(self.kind.id())
@@ -266,6 +291,16 @@ pub fn local(
     load: fn(&Path) -> Result<Vec<SessionRecord>, String>,
     hooks: LocalHooks,
 ) -> impl Fn(AgentContext) -> Result<Arc<dyn AgentAdapter>, RegistryError> + Send + Sync + 'static {
+    local_controlled(kind, load, hooks, None)
+}
+pub type ControlledSessionLoader =
+    fn(&Path, &crate::background::Cancellation) -> Result<Vec<SessionRecord>, String>;
+pub(crate) fn local_controlled(
+    kind: AgentKind,
+    load: fn(&Path) -> Result<Vec<SessionRecord>, String>,
+    hooks: LocalHooks,
+    controlled: Option<ControlledSessionLoader>,
+) -> impl Fn(AgentContext) -> Result<Arc<dyn AgentAdapter>, RegistryError> + Send + Sync + 'static {
     move |context| {
         if let AgentContext::Managed(instance) = &context
             && instance.agent() != kind.id()
@@ -281,6 +316,7 @@ pub fn local(
             context,
             load,
             hooks,
+            controlled,
         }) as Arc<dyn AgentAdapter>)
     }
 }

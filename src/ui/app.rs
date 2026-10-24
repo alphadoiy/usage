@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use tracing::Instrument;
+use crate::background::{Task, Tasks};
+use futures_util::FutureExt;
 
 use chrono::Utc;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -78,6 +79,7 @@ enum AppEvent {
         snapshot: ServiceStatus,
     },
     Notice(String),
+    HistoryFailed(String),
     HistoryCached(crate::history::History),
     HistoryLoaded {
         history: crate::history::History,
@@ -234,13 +236,23 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
             }
             if app.history_config.alerts.desktop {
                 let tx = app.tx.clone();
-                handle.spawn_blocking(move || {
-                    for alert in alerts {
-                        if let Err(e) = crate::alerts::notify_desktop(&alert.message) {
-                            let _ = tx.send(AppEvent::Notice(e));
+                app.background_tasks.push(Task::blocking(
+                    &handle,
+                    move |cancel| {
+                        for alert in alerts {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            crate::alerts::notify_desktop_controlled(&alert.message, &cancel)?;
                         }
-                    }
-                });
+                        Ok(())
+                    },
+                    move |result| {
+                        if let Err(error) = result {
+                            let _ = tx.send(AppEvent::Notice(error));
+                        }
+                    },
+                ));
             }
         }
         if reset_consumed {
@@ -483,11 +495,11 @@ struct Dashboard {
     subscription_tests: super::subscription_tests::Tests,
     home_subscription_details: bool,
     fingerprint_service: Arc<crate::codex_manager::fingerprint::FingerprintService>,
-    fingerprint_task: Option<tokio::task::JoinHandle<()>>,
+    fingerprint_task: Option<Task>,
     fingerprint_generation: u64,
     fingerprint_last_poll: Option<std::time::Instant>,
     home_performance: HashMap<String, super::performance::CachedSummary>,
-    home_performance_task: Option<tokio::task::JoinHandle<()>>,
+    home_performance_task: Option<Task>,
     home_performance_pending: bool,
     home_performance_generation: u64,
     performance: Option<super::performance::Panel>,
@@ -495,7 +507,7 @@ struct Dashboard {
     performance_generation: u64,
     home_activity: HashMap<sessions::SessionKey, crate::runs::SessionRuntime>,
     home_activity_error: Option<String>,
-    home_activity_task: Option<tokio::task::JoinHandle<()>>,
+    home_activity_task: Option<Task>,
     home_activity_pending: bool,
     home_activity_dirty: bool,
     home_activity_generation: u64,
@@ -508,7 +520,7 @@ struct Dashboard {
     home_sessions_loading: bool,
     home_sessions_generation: u64,
     home_sessions_warning: Option<String>,
-    home_sessions_task: Option<tokio::task::JoinHandle<()>>,
+    home_sessions_task: Option<Task>,
     status_history: super::home::StatusHistory,
     overview: Option<crate::provider_catalog::Catalog>,
     overview_error: Option<String>,
@@ -516,7 +528,7 @@ struct Dashboard {
     overview_pending: usize,
     overview_generation: u64,
     overview_service: Arc<crate::provider_catalog::CatalogService>,
-    overview_task: Option<tokio::task::JoinHandle<()>>,
+    overview_task: Option<Task>,
     home_scroll: u16,
     home_models_expanded: bool,
     home_provider: Option<String>,
@@ -528,7 +540,10 @@ struct Dashboard {
     history: Option<HistoryPanel>,
     saved_history: Option<HistoryPanel>,
     saved_browser: Option<SessionBrowser>,
-    loaded_history: crate::history::History,
+    loaded_history: Arc<crate::history::History>,
+    history_task: Option<Task>,
+    browser_task: Option<Task>,
+    background_tasks: Tasks,
     browser_filter: Option<(Vec<String>, crate::history::HistoryQuery)>,
     history_return: bool,
     last_history_refresh: std::time::Instant,
@@ -554,31 +569,12 @@ struct Dashboard {
     operation_statuses: super::provider_actions::Statuses,
     reset: Option<ResetFlow>,
     reset_generation: u64,
+    reset_preview_task: Option<Task>,
     session_homes: sessions::SessionHomes,
     session_registry: sessions::SessionRegistry,
     browser: Option<SessionBrowser>,
     browser_generation: u64,
     browser_loading: bool,
-}
-
-impl Drop for Dashboard {
-    fn drop(&mut self) {
-        if let Some(task) = self.fingerprint_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.home_performance_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.home_activity_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.overview_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.home_sessions_task.take() {
-            task.abort();
-        }
-    }
 }
 
 struct CardSlot {
@@ -677,7 +673,10 @@ impl Dashboard {
             history: None,
             saved_history: None,
             saved_browser: None,
-            loaded_history: crate::history::History::default(),
+            loaded_history: Arc::default(),
+            history_task: None,
+            browser_task: None,
+            background_tasks: Tasks::default(),
             browser_filter: None,
             history_return: false,
             last_history_refresh: std::time::Instant::now(),
@@ -703,6 +702,7 @@ impl Dashboard {
             operation_statuses: super::provider_actions::Statuses::default(),
             reset: None,
             reset_generation: 0,
+            reset_preview_task: None,
             session_homes,
             session_registry,
             browser: None,
@@ -770,6 +770,7 @@ impl Dashboard {
         }
         self.browser_generation = self.browser_generation.wrapping_add(1);
         self.browser_loading = false;
+        self.browser_task = None;
         self.notice = None;
         if return_history && self.history_return {
             self.history = self.saved_history.take();
@@ -844,12 +845,25 @@ impl Dashboard {
         let config = self.history_config.clone();
         let mut cache = self.history_cache.take().unwrap_or_default();
         let tx = self.tx.clone();
-        handle.spawn_blocking(move || {
-            let history = cache.load_with_cached(&config, |history| {
-                let _ = tx.send(AppEvent::HistoryCached(history));
-            });
-            let _ = tx.send(AppEvent::HistoryLoaded { history, cache });
-        });
+        let cached_tx = tx.clone();
+        self.history_task = Some(Task::blocking(
+            handle,
+            move |cancel| {
+                let history = cache.load_with_cached_controlled(&config, &cancel, |history| {
+                    if !cancel.is_cancelled() {
+                        let _ = cached_tx.send(AppEvent::HistoryCached(history));
+                    }
+                });
+                Ok((history, cache))
+            },
+            move |result| {
+                let event = match result {
+                    Ok((history, cache)) => AppEvent::HistoryLoaded { history, cache },
+                    Err(error) => AppEvent::HistoryFailed(error),
+                };
+                let _ = tx.send(event);
+            },
+        ));
     }
 
     fn open_browser(&mut self, handle: &Handle) {
@@ -884,13 +898,20 @@ impl Dashboard {
         let tx = self.tx.clone();
         self.browser_loading = true;
         self.notice = None;
-        handle.spawn_blocking(move || {
-            let catalog = registry.load_all(&homes);
-            let _ = tx.send(AppEvent::SessionsLoaded {
-                generation,
-                catalog,
-            });
-        });
+        self.browser_task = Some(Task::blocking(
+            handle,
+            move |cancel| Ok(registry.load_all_controlled(&homes, &cancel)),
+            move |result| {
+                let catalog = result.unwrap_or_else(|error| sessions::SessionCatalog {
+                    warnings: vec![error],
+                    ..Default::default()
+                });
+                let _ = tx.send(AppEvent::SessionsLoaded {
+                    generation,
+                    catalog,
+                });
+            },
+        ));
     }
 
     fn handle_browser_key(&mut self, key: KeyCode, handle: &Handle) {
@@ -947,6 +968,7 @@ impl Dashboard {
                     .cloned()
                 {
                     let tx = self.tx.clone();
+                    // An accepted clipboard write completes independently of the view.
                     handle.spawn_blocking(move || {
                         let result = sessions::copy_resume_command(&session)
                             .map(|_| "已复制恢复命令（含项目及实例目录）".into())
@@ -1037,12 +1059,17 @@ impl Dashboard {
         let generation = self.fingerprint_generation;
         let service = self.fingerprint_service.clone();
         let tx = self.tx.clone();
-        self.fingerprint_task = Some(handle.spawn_blocking(move || {
-            let result = service
-                .snapshots()
-                .map_err(|_| "本机测试记录读取失败".to_owned());
-            let _ = tx.send(AppEvent::FingerprintLoaded { generation, result });
-        }));
+        self.fingerprint_task = Some(Task::blocking(
+            handle,
+            move |_| {
+                service
+                    .snapshots()
+                    .map_err(|_| "本机测试记录读取失败".to_owned())
+            },
+            move |result| {
+                let _ = tx.send(AppEvent::FingerprintLoaded { generation, result });
+            },
+        ));
     }
 
     fn maybe_refresh_home_activity(&mut self, handle: &Handle) {
@@ -1065,8 +1092,9 @@ impl Dashboard {
         let root = self.home_activity_root.clone();
         let sessions = self.home_sessions.sessions.clone();
         let tx = self.tx.clone();
-        self.home_activity_task = Some(handle.spawn_blocking(move || {
-            let result = (|| {
+        self.home_activity_task = Some(Task::blocking(
+            handle,
+            move |_| {
                 let Some(manager) = crate::codex_manager::Manager::open_read_only(root)
                     .map_err(|_| "运行状态读取失败".to_string())?
                 else {
@@ -1075,9 +1103,11 @@ impl Dashboard {
                 manager
                     .session_activity(&sessions)
                     .map_err(|_| "运行状态读取失败".to_string())
-            })();
-            let _ = tx.send(AppEvent::HomeActivityLoaded { generation, result });
-        }));
+            },
+            move |result| {
+                let _ = tx.send(AppEvent::HomeActivityLoaded { generation, result });
+            },
+        ));
     }
 
     fn start_home_sessions_load(&mut self, handle: &Handle) {
@@ -1091,20 +1121,38 @@ impl Dashboard {
         let registry = self.session_registry.clone();
         let store = self.project_store.clone();
         let tx = self.tx.clone();
-        self.home_sessions_task = Some(handle.spawn_blocking(move || {
-            // Discover newly materialized managed homes without blocking terminal input.
-            if let Ok(instances) = crate::codex_manager::managed_instances() {
-                for instance in instances {
-                    homes = homes.with_instance(&instance.id, &instance.provider, &instance.path);
+        self.home_sessions_task = Some(Task::blocking(
+            handle,
+            move |cancel| {
+                if let Ok(instances) = crate::codex_manager::managed_instances() {
+                    for instance in instances {
+                        if cancel.is_cancelled() {
+                            return Err("已取消".into());
+                        }
+                        homes =
+                            homes.with_instance(&instance.id, &instance.provider, &instance.path);
+                    }
                 }
-            }
-            let catalog = registry.load_all(&homes);
-            let _ = tx.send(AppEvent::HomeSessionsLoaded {
-                generation,
-                catalog,
-                projects: store.list(),
-            });
-        }));
+                let catalog = registry.load_all_controlled(&homes, &cancel);
+                Ok((catalog, store.list()))
+            },
+            move |result| {
+                let (catalog, projects) = result.unwrap_or_else(|error| {
+                    (
+                        sessions::SessionCatalog {
+                            warnings: vec![error.clone()],
+                            ..Default::default()
+                        },
+                        Err(error),
+                    )
+                });
+                let _ = tx.send(AppEvent::HomeSessionsLoaded {
+                    generation,
+                    catalog,
+                    projects,
+                });
+            },
+        ));
     }
 
     fn launch_session(
@@ -1125,6 +1173,7 @@ impl Dashboard {
         } else {
             self.browser_generation
         };
+        // Accepted launches must not be cancelled when their source view closes.
         handle.spawn_blocking(move || {
             let result = sessions::resume_in_ghostty(&session);
             let event = if home {
@@ -1375,19 +1424,16 @@ impl Dashboard {
         for provider in &self.providers {
             let provider = Arc::clone(provider);
             let tx = self.tx.clone();
-            handle.spawn(
-                async move {
+            self.background_tasks
+                .push(Task::spawn(handle, move |_| async move {
                     let target = provider.cache_key();
-                    // A panicking provider still answers, as in the CLI: otherwise `pending`
-                    // never reaches zero and every later refresh is skipped.
-                    let query = {
-                        let provider = Arc::clone(&provider);
-                        tokio::spawn(
-                            async move { query_with_timeout(provider.as_ref(), QUERY_TIMEOUT).await }
-                                .in_current_span(),
-                        )
-                    };
-                    let snapshot = query.await.unwrap_or_else(|_| {
+                    let snapshot = std::panic::AssertUnwindSafe(query_with_timeout(
+                        provider.as_ref(),
+                        QUERY_TIMEOUT,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
                         crate::model::snapshot_transient(
                             provider.id(),
                             provider.display_name(),
@@ -1399,9 +1445,7 @@ impl Dashboard {
                         target,
                         snapshot,
                     })));
-                }
-                .in_current_span(),
-            );
+                }));
         }
     }
 
@@ -1428,34 +1472,32 @@ impl Dashboard {
             refresh_models,
         };
         let tx = self.tx.clone();
-        self.overview_task = Some(
-            handle.spawn(
-                service
-                    .refresh(request, move |update| {
-                        use crate::provider_catalog::RefreshUpdate;
-                        let event = match update {
-                            RefreshUpdate::Loaded(result) => {
-                                AppEvent::OverviewLoaded { generation, result }
-                            }
-                            RefreshUpdate::Models { target, models } => AppEvent::ProviderModels {
+        self.overview_task = Some(Task::spawn(handle, move |_| async move {
+            service
+                .refresh(request, move |update| {
+                    use crate::provider_catalog::RefreshUpdate;
+                    let event = match update {
+                        RefreshUpdate::Loaded(result) => {
+                            AppEvent::OverviewLoaded { generation, result }
+                        }
+                        RefreshUpdate::Models { target, models } => AppEvent::ProviderModels {
+                            generation,
+                            target,
+                            models,
+                        },
+                        RefreshUpdate::Resource { target, snapshot } => {
+                            AppEvent::ProviderResource {
                                 generation,
                                 target,
-                                models,
-                            },
-                            RefreshUpdate::Resource { target, snapshot } => {
-                                AppEvent::ProviderResource {
-                                    generation,
-                                    target,
-                                    snapshot,
-                                }
+                                snapshot,
                             }
-                            RefreshUpdate::Finished => AppEvent::OverviewFinished { generation },
-                        };
-                        tx.send(event).is_ok()
-                    })
-                    .in_current_span(),
-            ),
-        );
+                        }
+                        RefreshUpdate::Finished => AppEvent::OverviewFinished { generation },
+                    };
+                    tx.send(event).is_ok()
+                })
+                .await;
+        }));
     }
 
     fn refresh_service_statuses(&mut self, handle: &Handle) {
@@ -1469,13 +1511,18 @@ impl Dashboard {
         for source in sources {
             let http = Arc::clone(&self.service_http);
             let tx = self.tx.clone();
-            handle.spawn(async move {
-                let snapshot = service_status::query(http.as_ref(), source).await;
-                let _ = tx.send(AppEvent::ServiceStatus {
-                    generation,
-                    snapshot,
-                });
-            });
+            self.background_tasks
+                .push(Task::spawn(handle, move |_| async move {
+                    let snapshot =
+                        std::panic::AssertUnwindSafe(service_status::query(http.as_ref(), source))
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| ServiceStatus::failed(source, "状态查询任务中断"));
+                    let _ = tx.send(AppEvent::ServiceStatus {
+                        generation,
+                        snapshot,
+                    });
+                }));
         }
     }
 
@@ -1502,22 +1549,23 @@ impl Dashboard {
         self.home_performance_pending = true;
         let service = self.performance_service.clone();
         let tx = self.tx.clone();
-        self.home_performance_task = Some(handle.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
+        self.home_performance_task = Some(Task::blocking(
+            handle,
+            move |_| {
                 service.summary(
                     &binding,
                     crate::performance::Period::Day,
                     Utc::now().timestamp_millis(),
                 )
-            })
-            .await
-            .unwrap_or_else(|_| Err("性能摘要读取中断".into()));
-            let _ = tx.send(AppEvent::HomePerformance {
-                generation,
-                key,
-                result,
-            });
-        }));
+            },
+            move |result| {
+                let _ = tx.send(AppEvent::HomePerformance {
+                    generation,
+                    key,
+                    result,
+                });
+            },
+        ));
         true
     }
 
@@ -1608,15 +1656,20 @@ impl Dashboard {
             stage: ResetStage::Loading,
         });
         let tx = self.tx.clone();
-        handle.spawn(async move {
-            let result = match provider.reset() {
-                Some(reset) => tokio::time::timeout(QUERY_TIMEOUT, reset.preview_reset())
-                    .await
-                    .unwrap_or_else(|_| Err(ProviderError("查询主动重置次数超时".into()))),
-                None => Err(ProviderError("工具不支持主动重置".into())),
-            };
+        self.reset_preview_task = Some(Task::spawn(handle, move |_| async move {
+            let result = std::panic::AssertUnwindSafe(async {
+                match provider.reset() {
+                    Some(reset) => tokio::time::timeout(QUERY_TIMEOUT, reset.preview_reset())
+                        .await
+                        .unwrap_or_else(|_| Err(ProviderError("查询主动重置次数超时".into()))),
+                    None => Err(ProviderError("工具不支持主动重置".into())),
+                }
+            })
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(ProviderError("主动重置预览任务中断".into())));
             let _ = tx.send(AppEvent::ResetPreview { generation, result });
-        });
+        }));
     }
 
     fn handle_reset_key(&mut self, key: KeyCode, handle: &Handle) -> bool {
@@ -1626,6 +1679,7 @@ impl Dashboard {
         match flow.stage.key(key) {
             super::confirmation::Decision::Cancel => {
                 self.reset = None;
+                self.reset_preview_task = None;
                 self.reset_generation = self.reset_generation.wrapping_add(1);
             }
             super::confirmation::Decision::Execute => self.consume_reset(handle),
@@ -1641,6 +1695,7 @@ impl Dashboard {
         let provider = flow.provider.clone();
         let generation = flow.generation;
         let tx = self.tx.clone();
+        // This mutation has already been confirmed; closing the view does not undo it.
         handle.spawn(async move {
             let result = match provider.reset() {
                 Some(reset) => reset.consume_reset().await,
@@ -1947,7 +2002,18 @@ impl Dashboard {
                     changed = true;
                     continue;
                 }
+                AppEvent::HistoryFailed(error) => {
+                    self.history_loading = false;
+                    self.history_task = None;
+                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
+                        panel.loading = false;
+                    }
+                    self.notice = Some(error);
+                    changed = true;
+                    continue;
+                }
                 AppEvent::HistoryCached(history) => {
+                    let history = Arc::new(history);
                     self.loaded_history = history.clone();
                     if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
                         panel.history = history;
@@ -1958,7 +2024,15 @@ impl Dashboard {
                 }
                 AppEvent::HistoryLoaded { history, cache } => {
                     self.history_loading = false;
+                    self.history_task = None;
                     self.history_cache = Some(cache);
+                    let history =
+                        if history.synced_at.is_none() && self.loaded_history.synced_at.is_some() {
+                            self.notice = history.warnings.first().cloned();
+                            self.loaded_history.clone()
+                        } else {
+                            Arc::new(history)
+                        };
                     self.loaded_history = history.clone();
                     if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
                         panel.history = history;
@@ -1975,6 +2049,7 @@ impl Dashboard {
                         .as_ref()
                         .is_some_and(|flow| flow.generation == generation)
                     {
+                        self.reset_preview_task = None;
                         changed = true;
                         if let Ok(preview) = &result
                             && let Some(flow) = &self.reset

@@ -1,5 +1,10 @@
 //! One mutable credential Home per OAuth account; configuration revisions use native profiles.
 //! Authentication and refresh are delegated to the installed official Codex CLI.
+mod recovery;
+use recovery::{SaveFiles, recover_home, recovery_needed};
+#[cfg(test)]
+use recovery::{pending_journals, saved_names};
+
 use super::{
     AuthMode, Error, HomeBinding, Manager, Profile, Result, clear_auth_env, now, private_dir,
     private_write, validate_name,
@@ -283,108 +288,33 @@ impl Drop for Stage {
     }
 }
 
-/// Filesystem compensation for a live OAuth save. The account's exclusive lease
-/// must cover this guard. This handles returned errors, not power loss or SIGKILL
-/// between the filesystem changes and SQLite commit.
-struct SaveFiles {
-    directory: PathBuf,
-    files: Vec<SavedFile>,
-    armed: bool,
-    preserve: bool,
-}
-
-struct SavedFile {
-    path: PathBuf,
-    backup: Option<PathBuf>,
-    restored: bool,
-}
-
-impl SaveFiles {
-    fn capture(home: &Path, revision: i64) -> Result<Self> {
-        let directory = home.join(format!(".usage-oauth-recovery-{}", uuid::Uuid::new_v4()));
-        private_dir(&directory)?;
-        let mut saved = Self {
-            directory,
-            files: Vec::new(),
-            armed: false,
-            preserve: false,
+impl Manager {
+    pub(super) fn recover_oauth_saves(&self) -> Result<()> {
+        let homes = self.root.join("homes");
+        let entries = match fs::read_dir(&homes) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
-        for name in [
-            "auth.json".into(),
-            "config.toml".into(),
-            "usage-binding.json".into(),
-            format!("usage-r{revision}.config.toml"),
-        ] {
-            let path = home.join(&name);
-            let backup = match fs::symlink_metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    let backup = saved.directory.join(&name);
-                    fs::copy(&path, &backup)?;
-                    File::open(&backup)?.sync_all()?;
-                    Some(backup)
-                }
-                Ok(_) => return Err(Error::message("OAuth 账号文件必须是普通文件")),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            saved.files.push(SavedFile {
-                path,
-                backup,
-                restored: false,
-            });
-        }
-        saved.armed = true;
-        Ok(saved)
-    }
-
-    fn restore(&mut self) -> Result<()> {
-        let mut failed = false;
-        for file in self.files.iter_mut().filter(|file| !file.restored) {
-            let result = match &file.backup {
-                Some(backup) => fs::rename(backup, &file.path),
-                None => match fs::remove_file(&file.path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    result => result,
-                },
-            };
-            if result.is_ok() {
-                file.restored = true;
-            } else {
-                failed = true;
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if uuid::Uuid::parse_str(&id).is_err() {
+                continue;
+            }
+            let home = entry.path().join("r1");
+            if !recovery_needed(&home)? {
+                continue;
+            }
+            // An active save holds this lease; do not disturb it or block unrelated accounts.
+            if let Ok(_lease) = acquire_lease(&self.root, &id, true) {
+                recover_home(&self.conn, &home)?;
             }
         }
-        if failed {
-            Err(Error::message(format!(
-                "部分 OAuth 账号文件恢复失败；恢复副本保留在 {}，请恢复后重试登录",
-                self.directory.display()
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn rollback(mut self) -> Result<()> {
-        let result = self.restore();
-        self.armed = false;
-        self.preserve = result.is_err();
-        result
-    }
-
-    fn commit(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for SaveFiles {
-    fn drop(&mut self) {
-        if self.armed && self.restore().is_err() {
-            self.preserve = true;
-            tracing::error!(event = "oauth_save_restore_failed", recovery = %self.directory.display());
-        }
-        if !self.preserve && fs::remove_dir_all(&self.directory).is_err() {
-            // Cleanup cannot turn a committed save into an apparent failure.
-            tracing::warn!(event = "oauth_save_recovery_cleanup_failed", recovery = %self.directory.display());
-        }
+        Ok(())
     }
 }
 
@@ -456,12 +386,23 @@ fn acquire_lease(root: &Path, id: &str, exclusive: bool) -> Result<File> {
 impl Manager {
     /// Credential replacement excludes all runs. Refresh remains owned by Codex itself.
     pub(crate) fn oauth_lease(&self, id: &str) -> Result<File> {
-        acquire_lease(&self.root, id, true)
+        let lease = acquire_lease(&self.root, id, true)?;
+        recover_home(&self.conn, &self.root.join("homes").join(id).join("r1"))?;
+        Ok(lease)
     }
 
     /// Runs share the same account Home and may coexist; only login replacement is blocked.
     pub(crate) fn oauth_run_lease(&self, id: &str) -> Result<File> {
-        acquire_lease(&self.root, id, false)
+        let home = self.root.join("homes").join(id).join("r1");
+        if recovery_needed(&home)? {
+            let _lease = acquire_lease(&self.root, id, true)?;
+            recover_home(&self.conn, &home)?;
+        }
+        let lease = acquire_lease(&self.root, id, false)?;
+        if recovery_needed(&home)? {
+            return Err(Error::message("OAuth 登录需要恢复，请重试"));
+        }
+        Ok(lease)
     }
 
     pub fn import_oauth(
@@ -551,6 +492,7 @@ impl Manager {
                 Some(file) => file,
                 None => acquire_lease(&self.root, &id, true)?,
             };
+            recover_home(&tx, &self.root.join("homes").join(&id).join("r1"))?;
             let old: Option<(String, i64)> = tx
                 .query_row(
                     "SELECT name,revision FROM profiles WHERE id=?1",
@@ -596,6 +538,12 @@ impl Manager {
             let home = self.root.join("homes").join(&id).join("r1");
             private_dir(&home)?;
             let files = SaveFiles::capture(&home, p.revision)?;
+            #[cfg(test)]
+            save_checkpoint("captured");
+            tx.execute(
+                "INSERT INTO oauth_save_commits(operation) VALUES(?1)",
+                [files.operation()],
+            )?;
             let result = (|| -> Result<()> {
                 op.step("home_materialize", || {
                     materialize_home(&tx, &home, &id, p.revision, &saved)
@@ -603,7 +551,11 @@ impl Manager {
                 op.step("auth_write", || {
                     private_write(&home.join("auth.json"), &auth.bytes)
                 })?;
+                #[cfg(test)]
+                save_checkpoint("files_written");
                 op.step("database_commit", || tx.commit())?;
+                #[cfg(test)]
+                save_checkpoint("committed");
                 Ok(())
             })();
             if let Err(error) = result {
@@ -613,7 +565,13 @@ impl Manager {
                 }
                 return Err(error);
             }
-            files.commit();
+            let operation = files.operation().to_string();
+            if files.commit() {
+                let _ = self.conn.execute(
+                    "DELETE FROM oauth_save_commits WHERE operation=?1",
+                    [&operation],
+                );
+            }
             op.account(&id, p.revision, "oauth");
             Ok(p)
         })
@@ -756,6 +714,7 @@ impl Manager {
     }
 
     pub(crate) fn materialize_oauth(&self, id: &str, revision: i64) -> Result<PathBuf> {
+        let _lease = self.oauth_run_lease(id)?;
         let saved = self.revision(id, revision)?;
         let home = self.home(id, revision)?;
         materialize_home(&self.conn, &home, id, revision, &saved.config)?;
@@ -806,4 +765,191 @@ fn materialize_home(
         )?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+fn save_checkpoint(phase: &str) {
+    if std::env::var("USAGE_TEST_OAUTH_CRASH_PHASE").as_deref() == Ok(phase) {
+        // Only the dedicated test subprocess sets this; skip every Rust destructor.
+        std::process::exit(86);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::codex_manager::tests::{Fixture, oauth_source};
+
+    #[test]
+    fn crash_child() {
+        let Ok(root) = std::env::var("USAGE_TEST_OAUTH_CRASH_ROOT") else {
+            return;
+        };
+        let mut manager = Manager::open(root.into()).unwrap();
+        if std::env::var("USAGE_TEST_OAUTH_CRASH_PHASE").as_deref() == Ok("restoring") {
+            panic!("recovery did not reach checkpoint");
+        }
+        let source = PathBuf::from(std::env::var("USAGE_TEST_OAUTH_CRASH_SOURCE").unwrap());
+        let account = std::env::var("USAGE_TEST_OAUTH_CRASH_ACCOUNT").ok();
+        manager
+            .import_oauth(
+                Some("Replacement"),
+                Some("model='replacement-model'"),
+                &source,
+                account.as_deref(),
+            )
+            .unwrap();
+        panic!("save did not reach checkpoint");
+    }
+    fn crash(root: &Path, source: &Path, account: Option<&str>, phase: &str) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "codex_manager::oauth::recovery_tests::crash_child",
+                "--nocapture",
+            ])
+            .env("USAGE_TEST_OAUTH_CRASH_ROOT", root)
+            .env("USAGE_TEST_OAUTH_CRASH_SOURCE", source)
+            .env("USAGE_TEST_OAUTH_CRASH_PHASE", phase)
+            .env_remove("USAGE_TEST_OAUTH_CRASH_ACCOUNT")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(account) = account {
+            command.env("USAGE_TEST_OAUTH_CRASH_ACCOUNT", account);
+        }
+        assert_eq!(command.status().unwrap().code(), Some(86), "{phase}");
+    }
+    #[test]
+    fn interrupted_saves_and_interrupted_recovery_restore_one_consistent_revision() {
+        for phase in [
+            "capturing",
+            "captured",
+            "files_written",
+            "committed",
+            "cleaning",
+        ] {
+            let fixture = Fixture::new();
+            let mut manager = fixture.manager();
+            let source = oauth_source(&fixture, "crash", "original-refresh");
+            let profile = manager
+                .import_oauth(Some("Original"), None, &source, None)
+                .unwrap();
+            let home = manager.home(&profile.id, 1).unwrap();
+            let old: Vec<_> = saved_names(1)
+                .iter()
+                .map(|name| (name.clone(), fs::read(home.join(name)).unwrap()))
+                .collect();
+            let source = oauth_source(&fixture, "crash", "replacement-refresh");
+            crash(manager.root(), &source, Some(&profile.id), phase);
+            if phase == "files_written" {
+                // The first backup is restored, then recovery itself is interrupted.
+                crash(manager.root(), &source, Some(&profile.id), "restoring");
+            }
+            // Exercise an already-open manager as well as startup recovery.
+            let lease = manager.oauth_run_lease(&profile.id).unwrap();
+            drop(lease);
+            let recovered = Manager::open(manager.root().to_path_buf()).unwrap();
+            let current = recovered.resolve(&profile.id).unwrap();
+            if matches!(phase, "committed" | "cleaning") {
+                assert_eq!(current.name, "Replacement");
+                assert_eq!(current.revision, 2);
+                assert!(
+                    String::from_utf8(fs::read(home.join("auth.json")).unwrap())
+                        .unwrap()
+                        .contains("replacement-refresh")
+                );
+                assert!(home.join("usage-r2.config.toml").is_file());
+            } else {
+                assert_eq!(current.name, "Original");
+                assert_eq!(current.revision, 1);
+                for (name, bytes) in &old {
+                    assert_eq!(
+                        &fs::read(home.join(name)).unwrap(),
+                        bytes,
+                        "{phase}: {name}"
+                    );
+                }
+                assert!(!home.join("usage-r2.config.toml").exists());
+            }
+            assert!(pending_journals(&home).unwrap().is_empty());
+            assert_eq!(
+                recovered
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM oauth_save_commits", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn interrupted_new_account_removes_uncommitted_files_and_retains_committed_login() {
+        for phase in ["capturing", "files_written", "committed"] {
+            let fixture = Fixture::new();
+            let manager = fixture.manager();
+            let source = oauth_source(&fixture, "new-crash", "new-refresh");
+            crash(manager.root(), &source, None, phase);
+            let recovered = Manager::open(manager.root().to_path_buf()).unwrap();
+            assert_eq!(
+                recovered.list().unwrap().len(),
+                usize::from(phase == "committed")
+            );
+            for entry in fs::read_dir(manager.root().join("homes")).unwrap() {
+                let home = entry.unwrap().path().join("r1");
+                assert_eq!(home.join("auth.json").exists(), phase == "committed");
+                assert!(pending_journals(&home).unwrap().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn corrupt_backup_fails_closed_without_partially_restoring_files() {
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager();
+        let source = oauth_source(&fixture, "corrupt", "original");
+        let profile = manager.import_oauth(None, None, &source, None).unwrap();
+        let home = manager.home(&profile.id, 1).unwrap();
+        let source = oauth_source(&fixture, "corrupt", "replacement");
+        crash(manager.root(), &source, Some(&profile.id), "files_written");
+        let journal = pending_journals(&home).unwrap().remove(0);
+        fs::write(journal.join("config.toml"), "corrupted").unwrap();
+        let auth = fs::read(home.join("auth.json")).unwrap();
+        assert!(manager.oauth_run_lease(&profile.id).is_err());
+        assert!(Manager::open(manager.root().to_path_buf()).is_err());
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+        assert!(journal.exists());
+    }
+    #[test]
+    fn legacy_recovery_without_a_commit_manifest_is_preserved() {
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager();
+        let source = oauth_source(&fixture, "legacy-recovery", "original");
+        let profile = manager.import_oauth(None, None, &source, None).unwrap();
+        let home = manager.home(&profile.id, 1).unwrap();
+        let journal = home.join(format!(".usage-oauth-recovery-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&journal).unwrap();
+        fs::write(journal.join("auth.json"), "legacy-backup").unwrap();
+        assert!(manager.oauth_run_lease(&profile.id).is_err());
+        assert_eq!(
+            fs::read_to_string(journal.join("auth.json")).unwrap(),
+            "legacy-backup"
+        );
+    }
+    #[test]
+    fn an_active_save_is_not_recovered_and_readers_wait_for_its_lease() {
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager();
+        let source = oauth_source(&fixture, "active-save", "original");
+        let profile = manager.import_oauth(None, None, &source, None).unwrap();
+        let home = manager.home(&profile.id, 1).unwrap();
+        let lease = manager.oauth_lease(&profile.id).unwrap();
+        let journal = SaveFiles::capture(&home, 1).unwrap();
+        let reader = Manager::open(manager.root().to_path_buf()).unwrap();
+        assert_eq!(pending_journals(&home).unwrap().len(), 1);
+        assert!(reader.oauth_run_lease(&profile.id).is_err());
+        journal.rollback().unwrap();
+        drop(lease);
+        assert!(reader.oauth_run_lease(&profile.id).is_ok());
+        assert!(pending_journals(&home).unwrap().is_empty());
+    }
 }

@@ -654,6 +654,7 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
             let p = manager.resolve(&profile)?;
             let saved = manager.revision(&p.id, p.revision)?;
             if p.auth_mode == AuthMode::Oauth {
+                let _lease = manager.oauth_run_lease(&p.id)?;
                 oauth::normalize_config(&saved.config)?;
                 let auth = oauth::read_auth(&manager.home(&p.id, p.revision)?.join("auth.json"))?;
                 if p.oauth.as_ref().is_none_or(|o| {

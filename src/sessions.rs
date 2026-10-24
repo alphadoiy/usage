@@ -8,6 +8,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+use crate::background::Cancellation;
 use serde_json::Value;
 
 const CODEX_QUERY: &str = "SELECT id, cwd, COALESCE(NULLIF(name,''), NULLIF(title,''), NULLIF(preview,''), id) AS title, recency_at_ms FROM threads WHERE archived=0 AND cwd<>'' AND COALESCE(thread_source,'user')='user' AND source<>'exec' ORDER BY recency_at_ms DESC;";
@@ -154,15 +155,31 @@ impl SessionRegistry {
     }
 
     pub fn load_all(&self, homes: &SessionHomes) -> SessionCatalog {
+        self.load_all_controlled(homes, &Cancellation::new())
+    }
+    pub fn load_all_controlled(
+        &self,
+        homes: &SessionHomes,
+        cancel: &Cancellation,
+    ) -> SessionCatalog {
         let mut catalog = SessionCatalog::default();
+        if cancel.is_cancelled() {
+            return catalog;
+        }
         for source in &self.sources {
             for (instance, home) in homes.all(source.kind.id()) {
-                load_source(&mut catalog, *source, instance, home, None);
+                if cancel.is_cancelled() {
+                    return SessionCatalog::default();
+                }
+                load_source(&mut catalog, *source, instance, home, None, cancel);
             }
         }
         if let Some(agents) = &self.agents {
             for id in agents.ids() {
                 for (instance, home) in homes.all(&id) {
+                    if cancel.is_cancelled() {
+                        return SessionCatalog::default();
+                    }
                     if !home.is_dir() {
                         continue;
                     }
@@ -183,6 +200,7 @@ impl SessionRegistry {
                                     instance,
                                     home,
                                     Some(agent.clone()),
+                                    cancel,
                                 );
                             }
                         }
@@ -215,7 +233,11 @@ fn load_source(
     instance: &str,
     home: &Path,
     agent: Option<Arc<dyn crate::agents::AgentAdapter>>,
+    cancel: &Cancellation,
 ) {
+    if cancel.is_cancelled() {
+        return;
+    }
     if !home.is_dir() {
         return;
     }
@@ -230,7 +252,17 @@ fn load_source(
         return;
     }
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    match (source.load)(&home) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        agent.as_ref().map_or_else(
+            || (source.load)(&home),
+            |agent| agent.load_sessions(&home, cancel),
+        )
+    }))
+    .unwrap_or_else(|_| Err("会话读取任务异常结束".into()));
+    if cancel.is_cancelled() {
+        return;
+    }
+    match result {
         Ok(records) => catalog.sessions.extend(
             records
                 .into_iter()
@@ -277,6 +309,15 @@ fn open_rollout(path: &Path) -> Option<Box<dyn BufRead + Send>> {
 }
 
 pub(crate) fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
+    load_codex_controlled(home, &Cancellation::new())
+}
+pub(crate) fn load_codex_controlled(
+    home: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SessionRecord>, String> {
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     // A Home Codex has never run in (e.g. it exited at startup) has no sessions yet; not a failure.
     let index = codex_index(home)?;
     if index.is_none() && !home.join("sessions").is_dir() {
@@ -284,10 +325,10 @@ pub(crate) fn load_codex(home: &Path) -> Result<Vec<SessionRecord>, String> {
     }
     match index
         .ok_or_else(|| "未找到 Codex 会话索引".to_string())
-        .and_then(|database| load_codex_index(&database))
+        .and_then(|database| load_codex_index_controlled(&database, cancel))
     {
         Ok(sessions) => Ok(sessions),
-        Err(index_error) => match load_codex_rollouts(home) {
+        Err(index_error) => match load_codex_rollouts_controlled(home, cancel) {
             Ok(sessions) if sessions.iter().any(is_local_record) => Ok(sessions),
             _ => Err(index_error),
         },
@@ -398,7 +439,14 @@ fn codex_index(home: &Path) -> Result<Option<PathBuf>, String> {
         .map(|(_, path)| path))
 }
 
+#[cfg(test)]
 fn load_codex_index(database: &Path) -> Result<Vec<SessionRecord>, String> {
+    load_codex_index_controlled(database, &Cancellation::new())
+}
+fn load_codex_index_controlled(
+    database: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SessionRecord>, String> {
     let db = rusqlite::Connection::open_with_flags(
         database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -419,7 +467,10 @@ fn load_codex_index(database: &Path) -> Result<Vec<SessionRecord>, String> {
                 recency_at_ms: row.get(3)?,
             })
         })
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .and_then(|rows| {
+            rows.take_while(|_| !cancel.is_cancelled())
+                .collect::<Result<Vec<_>, _>>()
+        })
         .map_err(|e| format!("索引格式不兼容：{e}"))?;
     Ok(rows
         .into_iter()
@@ -438,7 +489,10 @@ fn load_codex_index(database: &Path) -> Result<Vec<SessionRecord>, String> {
         .collect())
 }
 
-fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
+fn load_codex_rollouts_controlled(
+    home: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SessionRecord>, String> {
     let root = home.join("sessions");
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -446,6 +500,9 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
     let mut titles = HashMap::new();
     if let Ok(file) = File::open(home.join("session_index.jsonl")) {
         for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if cancel.is_cancelled() {
+                return Ok(Vec::new());
+            }
             if let Ok(row) = serde_json::from_str::<Value>(&line)
                 && let (Some(id), Some(title)) = (
                     row.get("id").and_then(Value::as_str),
@@ -458,10 +515,13 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
         }
     }
     let mut directories = vec![root];
-    let archived = archived_codex_ids(home);
+    let archived = archived_codex_ids_controlled(home, cancel);
     let mut sessions = HashMap::<String, SessionRecord>::new();
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(directory).map_err(|e| e.to_string())? {
+            if cancel.is_cancelled() {
+                return Ok(Vec::new());
+            }
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
             if path.is_dir() {
@@ -489,11 +549,12 @@ fn load_codex_rollouts(home: &Path) -> Result<Vec<SessionRecord>, String> {
     Ok(sessions.into_values().collect())
 }
 
-fn archived_codex_ids(home: &Path) -> HashSet<String> {
+fn archived_codex_ids_controlled(home: &Path, cancel: &Cancellation) -> HashSet<String> {
     let Ok(entries) = fs::read_dir(home.join("archived_sessions")) else {
         return HashSet::new();
     };
     entries
+        .take_while(|_| !cancel.is_cancelled())
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
@@ -570,17 +631,32 @@ fn codex_rollout_metadata(path: &Path, titles: &HashMap<String, String>) -> Opti
 }
 
 pub(crate) fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
+    load_claude_controlled(home, &Cancellation::new())
+}
+pub(crate) fn load_claude_controlled(
+    home: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SessionRecord>, String> {
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     let root = home.join("projects");
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut sessions = Vec::new();
     for project in fs::read_dir(root).map_err(|e| e.to_string())? {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
         let project = project.map_err(|e| e.to_string())?;
         if !project.path().is_dir() {
             continue;
         }
         for file in fs::read_dir(project.path()).map_err(|e| e.to_string())? {
+            if cancel.is_cancelled() {
+                return Ok(Vec::new());
+            }
             let path = file.map_err(|e| e.to_string())?.path();
             if path.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
@@ -591,7 +667,7 @@ pub(crate) fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
             if uuid::Uuid::parse_str(id).is_err() {
                 continue;
             }
-            if let Some((cwd, title)) = claude_metadata(&path) {
+            if let Some((cwd, title)) = claude_metadata_controlled(&path, cancel) {
                 sessions.push(SessionRecord {
                     id: id.into(),
                     cwd,
@@ -604,12 +680,17 @@ pub(crate) fn load_claude(home: &Path) -> Result<Vec<SessionRecord>, String> {
     Ok(sessions)
 }
 
+#[cfg(test)]
 fn claude_metadata(path: &Path) -> Option<(PathBuf, String)> {
+    claude_metadata_controlled(path, &Cancellation::new())
+}
+fn claude_metadata_controlled(path: &Path, cancel: &Cancellation) -> Option<(PathBuf, String)> {
     let mut cwd = None;
     let mut named = None;
     for line in BufReader::new(File::open(path).ok()?)
         .lines()
         .map_while(Result::ok)
+        .take_while(|_| !cancel.is_cancelled())
     {
         let Ok(row) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -663,18 +744,33 @@ fn claude_metadata(path: &Path) -> Option<(PathBuf, String)> {
 }
 
 pub(crate) fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
+    load_grok_controlled(home, &Cancellation::new())
+}
+pub(crate) fn load_grok_controlled(
+    home: &Path,
+    cancel: &Cancellation,
+) -> Result<Vec<SessionRecord>, String> {
+    if cancel.is_cancelled() {
+        return Ok(Vec::new());
+    }
     let root = home.join("sessions");
     if !root.is_dir() {
         return Ok(Vec::new());
     }
     let mut sessions = Vec::new();
     for project in fs::read_dir(root).map_err(|e| e.to_string())? {
+        if cancel.is_cancelled() {
+            return Ok(Vec::new());
+        }
         let project = project.map_err(|e| e.to_string())?;
         if !project.path().is_dir() {
             continue;
         }
-        let subagent_ids = grok_subagent_ids(&project.path());
+        let subagent_ids = grok_subagent_ids_controlled(&project.path(), cancel);
         for entry in fs::read_dir(project.path()).map_err(|e| e.to_string())? {
+            if cancel.is_cancelled() {
+                return Ok(Vec::new());
+            }
             let session_dir = entry.map_err(|e| e.to_string())?.path();
             let summary_path = session_dir.join("summary.json");
             let Ok(contents) = fs::read(&summary_path) else {
@@ -741,16 +837,16 @@ pub(crate) fn load_grok(home: &Path) -> Result<Vec<SessionRecord>, String> {
     Ok(sessions)
 }
 
-fn grok_subagent_ids(project_dir: &Path) -> HashSet<String> {
+fn grok_subagent_ids_controlled(project_dir: &Path, cancel: &Cancellation) -> HashSet<String> {
     let mut ids = HashSet::new();
     let Ok(sessions) = fs::read_dir(project_dir) else {
         return ids;
     };
-    for session in sessions.flatten() {
+    for session in sessions.flatten().take_while(|_| !cancel.is_cancelled()) {
         let Ok(markers) = fs::read_dir(session.path().join("subagents")) else {
             continue;
         };
-        for marker in markers.flatten() {
+        for marker in markers.flatten().take_while(|_| !cancel.is_cancelled()) {
             if let Some(id) = marker.path().file_stem().and_then(|name| name.to_str()) {
                 ids.insert(id.to_string());
             }
@@ -1624,6 +1720,100 @@ mod tests {
         let mut invalid = session;
         invalid.id = "$(touch bad)".into();
         assert!(resume_shell_command(&invalid).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn panicking_source_is_isolated_and_precancelled_catalog_never_reads_sources() {
+        let root =
+            std::env::temp_dir().join(format!("usage-session-cancel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        let mut registry = SessionRegistry::new();
+        registry
+            .register(SessionSource {
+                kind: AgentKind::CODEX,
+                load: |_| panic!("private-reader-detail"),
+            })
+            .unwrap();
+        registry
+            .register(SessionSource {
+                kind: AgentKind::CLAUDE,
+                load: custom_source,
+            })
+            .unwrap();
+        let homes = SessionHomes::new()
+            .with("codex", &root)
+            .with("claude", &root);
+        let catalog = registry.load_all(&homes);
+        assert_eq!(catalog.sessions.len(), 1);
+        assert_eq!(catalog.warnings.len(), 1);
+        assert!(!catalog.warnings[0].contains("private-reader-detail"));
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        let catalog = registry.load_all_controlled(&homes, &cancel);
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.warnings.is_empty());
+        for load in [
+            load_codex_controlled,
+            load_claude_controlled,
+            load_grok_controlled,
+        ] {
+            assert!(load(&root, &cancel).unwrap().is_empty());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn registry_forwards_cancellation_to_an_inflight_agent_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Reader(Arc<AtomicBool>);
+        impl crate::agents::AgentAdapter for Reader {
+            fn kind(&self) -> AgentKind {
+                AgentKind::CODEX
+            }
+            fn session_source(&self) -> Option<SessionSource> {
+                Some(SessionSource {
+                    kind: self.kind(),
+                    load: custom_source,
+                })
+            }
+            fn load_sessions(
+                &self,
+                home: &Path,
+                cancel: &Cancellation,
+            ) -> Result<Vec<SessionRecord>, String> {
+                self.0.store(true, Ordering::Release);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancel.is_cancelled() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(cancel.is_cancelled());
+                custom_source(home)
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("usage-agent-cancel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("project")).unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let observed = started.clone();
+        let mut agents = crate::agents::AgentRegistry::new();
+        agents
+            .register("codex", move |_| {
+                Ok(Arc::new(Reader(observed.clone())) as Arc<dyn crate::agents::AgentAdapter>)
+            })
+            .unwrap();
+        let registry = SessionRegistry::from_agents(Arc::new(agents));
+        let homes = SessionHomes::new().with("codex", &root);
+        let cancel = Cancellation::new();
+        let token = cancel.clone();
+        let task = std::thread::spawn(move || registry.load_all_controlled(&homes, &token));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cancel.cancel();
+        let catalog = task.join().unwrap();
+        assert!(catalog.sessions.is_empty());
+        assert!(catalog.warnings.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 }

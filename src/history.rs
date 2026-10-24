@@ -1,4 +1,7 @@
 //! Local token history. Quota percentages cannot reconstruct daily consumption.
+mod ledger;
+use ledger::{aggregate_database, open_database, read_database, read_file_row, store_file};
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufRead, Read, Seek, SeekFrom};
@@ -314,6 +317,8 @@ struct CachedFile {
     fingerprint: Vec<u8>,
     state: ParserState,
     records: Vec<Record>,
+    /// Records live in separate rows; `records` only contains the pending append.
+    split: bool,
     malformed: usize,
 }
 pub struct HistoryCache {
@@ -355,13 +360,27 @@ impl HistoryCache {
         config: &AppConfig,
         cached: impl FnOnce(History),
     ) -> History {
+        self.load_with_cached_controlled(config, &crate::background::Cancellation::new(), cached)
+    }
+    pub fn load_with_cached_controlled(
+        &mut self,
+        config: &AppConfig,
+        cancel: &crate::background::Cancellation,
+        cached: impl FnOnce(History),
+    ) -> History {
         let mut history = History::default();
+        if cancel.is_cancelled() {
+            return history;
+        }
         let roots = history_roots(config);
         let database = self.database.as_ref().map(|path| open_database(path));
         if let Some(Ok(db)) = &database {
             match read_database(db) {
                 Ok(files) => self.files = files,
-                Err(e) => history.warnings.push(format!("读取历史账本失败：{e}")),
+                Err(e) => {
+                    history.warnings.push(format!("读取历史账本失败：{e}"));
+                    return history;
+                }
             }
             let synced: Option<String> = db
                 .query_row(
@@ -370,18 +389,22 @@ impl HistoryCache {
                     |r| r.get(0),
                 )
                 .ok();
-            let mut previous = aggregate(&self.files, &roots, History::default());
-            previous.synced_at = synced
-                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-                .map(|t| t.with_timezone(&Utc));
+            let previous = History {
+                synced_at: synced
+                    .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|t| t.with_timezone(&Utc)),
+                ..History::default()
+            };
+            let previous = aggregate_database(db, &self.files, &roots, previous, cancel);
             if previous.synced_at.is_some() {
                 cached(previous);
             }
         }
         if let Some(Err(e)) = &database {
-            history
-                .warnings
-                .push(format!("历史账本不可用，本次使用内存：{e}"));
+            history.warnings.push(format!("历史账本不可用：{e}"));
+        }
+        if matches!(database, Some(Err(_))) || cancel.is_cancelled() {
+            return history;
         }
         // Return the persisted view before walking or decoding potentially large logs.
         let mut paths = Vec::new();
@@ -392,6 +415,7 @@ impl HistoryCache {
                 (source == "grok").then_some("updates.jsonl"),
                 &mut paths,
                 &mut history.warnings,
+                cancel,
             );
             if !root.exists() && config.instances.iter().any(|i| i.id == *id) {
                 history.warnings.push(format!("实例 {id}: 数据目录不存在"));
@@ -411,6 +435,9 @@ impl HistoryCache {
         paths.sort();
         paths.dedup();
         for (path, source) in paths {
+            if cancel.is_cancelled() {
+                return History::default();
+            }
             history.scanned_files += 1;
             let (physical, metadata) = match crate::logfiles::resolve(&path) {
                 Ok(file) => file,
@@ -456,7 +483,7 @@ impl HistoryCache {
             }
             entry.compressed = compressed;
             let start = entry.offset;
-            match append_file(&physical, &source, &mut entry) {
+            match append_file(&physical, &source, &mut entry, cancel) {
                 Ok(()) => {
                     history.read_bytes += entry.offset.saturating_sub(start);
                     entry.len = metadata.len();
@@ -466,7 +493,10 @@ impl HistoryCache {
                     {
                         match store_file(db, &path, expected, &entry) {
                             Ok(Some(winner)) => entry = winner,
-                            Ok(None) => {}
+                            Ok(None) => {
+                                entry.records.clear();
+                                entry.split = true;
+                            }
                             Err(e) => history.warnings.push(format!("保存历史账本失败：{e}")),
                         }
                     }
@@ -480,6 +510,9 @@ impl HistoryCache {
             }
             self.files.insert(path, entry);
         }
+        if cancel.is_cancelled() {
+            return History::default();
+        }
         history.synced_at = Some(Utc::now());
         if let Some(Ok(db)) = &database {
             let result = db.execute("INSERT INTO history_meta(key,value) VALUES('synced_at',?1) ON CONFLICT(key) DO UPDATE SET value=MAX(history_meta.value,excluded.value)", [history.synced_at.unwrap().to_rfc3339()]);
@@ -487,49 +520,38 @@ impl HistoryCache {
                 history.warnings.push(format!("保存同步时间失败：{e}"));
             }
         }
-        aggregate(&self.files, &roots, history)
+        if let Some(Ok(db)) = &database {
+            aggregate_database(db, &self.files, &roots, history, cancel)
+        } else {
+            aggregate(&self.files, &roots, history)
+        }
     }
 }
-fn read_file_row(db: &rusqlite::Connection, path: &Path) -> Result<Option<String>, String> {
-    db.query_row(
-        "SELECT data FROM history_files WHERE path=?1",
-        [path.to_string_lossy()],
-        |r| r.get(0),
-    )
-    .optional()
-    .map_err(|e| e.to_string())
-}
-
-/// Parse and serialize before taking SQLite's write lock. Compare-and-swap prevents
-/// a slower refresh from replacing a row another process advanced in the meantime.
-fn store_file(
-    db: &rusqlite::Connection,
-    path: &Path,
-    expected: Option<&str>,
-    entry: &CachedFile,
-) -> Result<Option<CachedFile>, String> {
-    let data = serde_json::to_string(entry).map_err(|e| e.to_string())?;
-    let changed = db.execute(
-        "INSERT INTO history_files(path,data) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET data=excluded.data WHERE history_files.data=?3",
-        rusqlite::params![path.to_string_lossy(), data, expected],
-    ).map_err(|e| e.to_string())?;
-    if changed == 0 {
-        read_file_row(db, path)?
-            .map(|data| serde_json::from_str(&data).map_err(|e| e.to_string()))
-            .transpose()
-    } else {
-        Ok(None)
-    }
+fn merge_record(unique: &mut HashMap<(String, String, String), Record>, record: Record) {
+    unique
+        .entry((
+            record.instance.clone(),
+            record.source.clone(),
+            record.id.clone(),
+        ))
+        .and_modify(|r| {
+            r.tokens.merge(record.tokens);
+            r.time = r.time.min(record.time);
+            if r.project.is_empty() {
+                r.project.clone_from(&record.project);
+            }
+            if r.model.is_empty() {
+                r.model.clone_from(&record.model);
+            }
+        })
+        .or_insert(record);
 }
 // Missing logs remain in the ledger. Configured roots isolate data directories.
 fn aggregate(
     files: &HashMap<PathBuf, CachedFile>,
     roots: &[(String, String, PathBuf)],
-    mut history: History,
+    history: History,
 ) -> History {
-    history.instances = roots.iter().map(|(_, id, _)| id.clone()).collect();
-    history.instances.sort();
-    history.instances.dedup();
     let mut unique: HashMap<(String, String, String), Record> = HashMap::new();
     let mut malformed = 0;
     for (path, entry) in files {
@@ -543,25 +565,20 @@ fn aggregate(
         for record in &entry.records {
             let mut record = record.clone();
             record.instance.clone_from(instance);
-            unique
-                .entry((
-                    record.instance.clone(),
-                    record.source.clone(),
-                    record.id.clone(),
-                ))
-                .and_modify(|r| {
-                    r.tokens.merge(record.tokens);
-                    r.time = r.time.min(record.time);
-                    if r.project.is_empty() {
-                        r.project.clone_from(&record.project);
-                    }
-                    if r.model.is_empty() {
-                        r.model.clone_from(&record.model);
-                    }
-                })
-                .or_insert_with(|| record.clone());
+            merge_record(&mut unique, record);
         }
     }
+    finish_aggregate(unique, roots, malformed, history)
+}
+fn finish_aggregate(
+    unique: HashMap<(String, String, String), Record>,
+    roots: &[(String, String, PathBuf)],
+    malformed: usize,
+    mut history: History,
+) -> History {
+    history.instances = roots.iter().map(|(_, id, _)| id.clone()).collect();
+    history.instances.sort();
+    history.instances.dedup();
     if malformed > 0 {
         history
             .warnings
@@ -608,82 +625,13 @@ fn history_roots(config: &AppConfig) -> Vec<(String, String, PathBuf)> {
     }
     roots
 }
-fn open_database(path: &Path) -> Result<rusqlite::Connection, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let db = rusqlite::Connection::open(path).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    }
-    db.busy_timeout(std::time::Duration::from_secs(20))
-        .map_err(|e| e.to_string())?;
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS history_files(path TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS history_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(db)
-}
-fn read_database(db: &rusqlite::Connection) -> Result<HashMap<PathBuf, CachedFile>, String> {
-    let mut stmt = db
-        .prepare("SELECT path,data FROM history_files")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?;
-    let mut files = HashMap::new();
-    let mut scrubbed = Vec::new();
-    for row in rows {
-        let (raw_path, data) = row.map_err(|e| e.to_string())?;
-        // One undecodable row must not disable the whole ledger; it is left in place and skipped.
-        let mut entry: CachedFile = match serde_json::from_str(&data) {
-            Ok(entry) => entry,
-            Err(_) => {
-                tracing::warn!(event = "history_row_skipped", reason = "undecodable");
-                continue;
-            }
-        };
-        // Older ledgers kept raw log bytes, which may include conversation text. Their digest
-        // equals what `fingerprint` now computes, so the file needs no reparse.
-        if entry.fingerprint.len() != FINGERPRINT_LEN {
-            entry.fingerprint = Sha256::digest(&entry.fingerprint).to_vec();
-            scrubbed.push((raw_path.clone(), data, entry.clone()));
-        }
-        let path = crate::config::resolved_data_path(Path::new(&raw_path));
-        files
-            .entry(path)
-            .and_modify(|existing: &mut CachedFile| {
-                if entry.modified >= existing.modified {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert(entry);
-    }
-    drop(stmt);
-    let rewrite = !scrubbed.is_empty();
-    for (path, expected, entry) in scrubbed {
-        if let Ok(data) = serde_json::to_string(&entry) {
-            // Best effort: retry later without replacing a concurrent refresh.
-            let _ = db.execute(
-                "UPDATE history_files SET data=?1 WHERE path=?2 AND data=?3",
-                rusqlite::params![data, path, expected],
-            );
-        }
-    }
-    // Freed pages would still hold the old bytes; compact once, outside any transaction.
-    if rewrite && db.is_autocommit() {
-        let _ = db.execute_batch("VACUUM");
-    }
-    Ok(files)
-}
 fn collect_files(
     root: &Path,
     source: &str,
     name: Option<&str>,
     out: &mut Vec<(PathBuf, String)>,
     warnings: &mut Vec<String>,
+    cancel: &crate::background::Cancellation,
 ) {
     let entries = match fs::read_dir(root) {
         Ok(e) => e,
@@ -694,6 +642,9 @@ fn collect_files(
         }
     };
     for entry in entries {
+        if cancel.is_cancelled() {
+            return;
+        }
         let Ok(entry) = entry else {
             warnings.push(format!("{source}: 无法读取目录项"));
             continue;
@@ -702,7 +653,7 @@ fn collect_files(
             continue;
         };
         if kind.is_dir() {
-            collect_files(&entry.path(), source, name, out, warnings);
+            collect_files(&entry.path(), source, name, out, warnings, cancel);
         } else if kind.is_file()
             && let Some(path) = crate::logfiles::discovered(&entry.path())
             && name.is_none_or(|n| path.file_name().is_some_and(|file| file == n))
@@ -783,6 +734,7 @@ fn fresh_file(path: &Path, source: &str) -> CachedFile {
         fingerprint: Vec::new(),
         state,
         records: Vec::new(),
+        split: false,
         malformed: 0,
     }
 }
@@ -799,7 +751,12 @@ fn fingerprint(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     file.take(offset.min(2048)).read_to_end(&mut bytes)?;
     Ok(Sha256::digest(&bytes).to_vec())
 }
-fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Result<()> {
+fn append_file(
+    path: &Path,
+    source: &str,
+    entry: &mut CachedFile,
+    cancel: &crate::background::Cancellation,
+) -> std::io::Result<()> {
     let mut reader = crate::logfiles::open_at(path, entry.offset)?;
     let ParserState {
         high,
@@ -815,6 +772,9 @@ fn append_file(path: &Path, source: &str, entry: &mut CachedFile) -> std::io::Re
     let records = &mut entry.records;
     let malformed = &mut entry.malformed;
     loop {
+        if cancel.is_cancelled() {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
         let mut line = String::new();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 || !line.ends_with('\n') {
@@ -1708,6 +1668,15 @@ mod tests {
         assert_eq!(rows.len(), 2);
         for (path, data) in rows {
             let mut value: Value = serde_json::from_str(&data).unwrap();
+            value["split"] = json!(false);
+            value["records"] = serde_json::Value::Array(
+                db.prepare("SELECT data FROM history_records WHERE path=?1 ORDER BY sequence")
+                    .unwrap()
+                    .query_map([&path], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+                    .collect(),
+            );
             let records = value["records"].as_array_mut().unwrap();
             assert!(!records.is_empty());
             for record in records {
@@ -1780,6 +1749,173 @@ mod tests {
                 .totals
                 .total(),
             110
+        );
+    }
+    #[test]
+    fn large_ledger_keeps_only_cursors_and_appends_without_rewriting_old_records() {
+        use std::io::Write;
+        let fixture = Fixture::new();
+        let config = fixture.config(&["claude"]);
+        let row = |id| json!({"type":"assistant","sessionId":"large","timestamp":"2026-09-01T12:00:00Z","message":{"id":format!("message-{id}"),"usage":{"input_tokens":1,"output_tokens":1}}});
+        let lines: Vec<_> = (0..10_000).map(row).collect();
+        let path = fixture.write("claude/projects/p/large.jsonl", &lines);
+        let database = fixture.0.join("ledger.sqlite3");
+        let mut cache = HistoryCache::at(database.clone());
+        let first = cache.load(&config);
+        assert_eq!(first.records.len(), 10_000);
+        assert!(cache.files.values().all(|entry| entry.records.is_empty()));
+        let db = open_database(&database).unwrap();
+        let cursor_bytes: i64 = db
+            .query_row("SELECT SUM(length(data)) FROM history_files", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            cursor_bytes < 4096,
+            "cursor should not grow with the ledger: {cursor_bytes}"
+        );
+        db.execute_batch("CREATE TRIGGER no_old_record_update BEFORE UPDATE ON history_records BEGIN SELECT RAISE(ABORT,'old row updated'); END;
+        CREATE TRIGGER no_old_record_delete BEFORE DELETE ON history_records BEGIN SELECT RAISE(ABORT,'old row deleted'); END;").unwrap();
+        writeln!(
+            fs::OpenOptions::new().append(true).open(path).unwrap(),
+            "{}",
+            row(10_000)
+        )
+        .unwrap();
+        let second = cache.load(&config);
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_eq!(second.records.len(), 10_001);
+        assert_eq!(second.read_bytes, row(10_000).to_string().len() as u64 + 1);
+        assert!(cache.files.values().all(|entry| entry.records.is_empty()));
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM history_records", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            10_001
+        );
+    }
+    #[test]
+    fn failed_record_insert_rolls_back_cursor_and_rows_together() {
+        let fixture = Fixture::new();
+        let config = fixture.config(&["codex"]);
+        let path = fixture.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let database = fixture.0.join("ledger.sqlite3");
+        let original = HistoryCache::at(database.clone()).load(&config);
+        let db = open_database(&database).unwrap();
+        let cursor: String = db
+            .query_row("SELECT data FROM history_files", [], |r| r.get(0))
+            .unwrap();
+        db.execute_batch("CREATE TRIGGER reject_record BEFORE INSERT ON history_records BEGIN SELECT RAISE(ABORT,'synthetic write failure'); END;").unwrap();
+        fixture.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(300, 100, 30, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let failed = HistoryCache::at(database.clone()).load(&config);
+        assert!(
+            failed
+                .warnings
+                .iter()
+                .any(|w| w.contains("保存历史账本失败"))
+        );
+        assert_eq!(
+            failed.records[0].tokens.total(),
+            original.records[0].tokens.total()
+        );
+        assert_eq!(
+            read_file_row(&db, &crate::config::resolved_data_path(&path))
+                .unwrap()
+                .unwrap(),
+            cursor
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM history_records", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        db.execute_batch("DROP TRIGGER reject_record").unwrap();
+        let retried = HistoryCache::at(database).load(&config);
+        assert_eq!(retried.records[0].tokens.total(), 330);
+    }
+    #[test]
+    fn cancelled_history_load_does_not_create_a_ledger_or_publish_data() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("cancelled.sqlite3");
+        let token = crate::background::Cancellation::new();
+        token.cancel();
+        let history = HistoryCache::at(path.clone()).load_with_cached_controlled(
+            &fixture.config(&["codex"]),
+            &token,
+            |_| panic!("cancelled consumer"),
+        );
+        assert!(history.synced_at.is_none());
+        assert!(!path.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn aliased_ledger_cursor_and_records_move_together_before_append_and_rewrite() {
+        use std::io::Write;
+        let fixture = Fixture::new();
+        let config = fixture.config(&["codex"]);
+        let path = fixture.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("a"),
+                codex(100, 80, 10, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let database = fixture.0.join("ledger.sqlite3");
+        HistoryCache::at(database.clone()).load(&config);
+        let alias = fixture.0.join("alias");
+        std::os::unix::fs::symlink(fixture.0.join("codex"), &alias).unwrap();
+        let db = open_database(&database).unwrap();
+        let alias = alias.join("sessions/a.jsonl");
+        for table in ["history_files", "history_records"] {
+            db.execute(
+                &format!("UPDATE {table} SET path=?1"),
+                [alias.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            codex(150, 90, 20, None, "codex", "2026-09-01T12:01:00Z")
+        )
+        .unwrap();
+        let appended = HistoryCache::at(database.clone()).load(&config);
+        assert_eq!(
+            appended
+                .records
+                .iter()
+                .map(|r| r.tokens.total())
+                .sum::<u64>(),
+            170
+        );
+        fixture.write(
+            "codex/sessions/a.jsonl",
+            &[
+                meta("replacement"),
+                codex(30, 0, 3, None, "codex", "2026-09-01T12:00:00Z"),
+            ],
+        );
+        let rewritten = HistoryCache::at(database).load(&config);
+        assert_eq!(rewritten.records.len(), 1);
+        assert_eq!(rewritten.records[0].tokens.total(), 33);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM history_files", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 }

@@ -281,28 +281,34 @@ pub fn builtin_resources() -> ResourceRegistry {
 /// The built-in Agents. Agent-specific local behavior is supplied here, at composition, so the
 /// Agent layer itself never depends on a concrete account store.
 pub fn builtin_agents() -> AgentRegistry {
-    use crate::agents::{AgentKind, LocalHooks, local};
+    use crate::agents::{AgentKind, ControlledSessionLoader, LocalHooks, local_controlled};
     type Loader = fn(&std::path::Path) -> Result<Vec<crate::sessions::SessionRecord>, String>;
     let mut registry = AgentRegistry::new();
-    for (kind, load, hooks) in [
+    for (kind, load, controlled, hooks) in [
         (
             AgentKind::CLAUDE,
             crate::sessions::load_claude as Loader,
+            crate::sessions::load_claude_controlled as ControlledSessionLoader,
             LocalHooks::default(),
         ),
         (
             AgentKind::CODEX,
             crate::sessions::load_codex as Loader,
+            crate::sessions::load_codex_controlled as ControlledSessionLoader,
             crate::codex_manager::managed::LOCAL_HOOKS,
         ),
         (
             AgentKind::GROK,
             crate::sessions::load_grok as Loader,
+            crate::sessions::load_grok_controlled as ControlledSessionLoader,
             LocalHooks::default(),
         ),
     ] {
         registry
-            .register(kind.id(), local(kind, load, hooks))
+            .register(
+                kind.id(),
+                local_controlled(kind, load, hooks, Some(controlled)),
+            )
             .expect("内置 Agent ID 唯一");
     }
     registry

@@ -1,11 +1,9 @@
 //! Background loading policy shared by consumers; no terminal or UI state lives here.
-use super::{Binding, Period, Service, Snapshot, cancelled};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use super::{Binding, Period, Service, Snapshot};
+use crate::background::{Cancellation, Task};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::runtime::Handle;
 
 /// One immutable query, including its time window, across all import batches.
 pub struct LoadRequest {
@@ -25,29 +23,15 @@ pub struct LoadUpdate {
 /// Owns both the async coordinator and cancellation of an already-running disk batch.
 /// Dropping a plain JoinHandle would detach it, and abort alone cannot stop spawn_blocking.
 pub struct LoadTask {
-    cancel: Arc<AtomicBool>,
-    task: JoinHandle<()>,
+    task: Task,
 }
 impl LoadTask {
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
         self.task.abort();
     }
     #[cfg(test)]
-    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
-        self.cancel.clone()
-    }
-}
-impl Drop for LoadTask {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-struct CancelOnDrop(Arc<AtomicBool>);
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+    pub(crate) fn cancellation(&self) -> Cancellation {
+        self.task.cancellation()
     }
 }
 
@@ -60,21 +44,18 @@ impl Service {
         request: LoadRequest,
         publish: impl FnMut(LoadUpdate) -> bool + Send + 'static,
     ) -> LoadTask {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
         let service = self.clone();
-        let task = handle.spawn(async move {
-            let _cancel = CancelOnDrop(flag.clone());
-            load(service, request, flag, publish).await;
+        let task = Task::spawn(handle, move |cancel| async move {
+            load(service, request, cancel, publish).await;
         });
-        LoadTask { cancel, task }
+        LoadTask { task }
     }
 }
 
 async fn snapshot(
     service: Arc<Service>,
     request: &LoadRequest,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancellation,
 ) -> Result<Snapshot, String> {
     let (binding, period, model, page, now) = (
         request.binding.clone(),
@@ -84,7 +65,7 @@ async fn snapshot(
         request.now,
     );
     tokio::task::spawn_blocking(move || {
-        if cancelled(&cancel) {
+        if cancel.is_cancelled() {
             return Err("已取消".into());
         }
         service.snapshot(&binding, period, model.as_deref(), page, now)
@@ -96,11 +77,11 @@ async fn snapshot(
 async fn load(
     service: Arc<Service>,
     request: LoadRequest,
-    cancel: Arc<AtomicBool>,
+    cancel: Cancellation,
     mut publish: impl FnMut(LoadUpdate) -> bool,
 ) {
     let cached = snapshot(service.clone(), &request, cancel.clone()).await;
-    if cancelled(&cancel)
+    if cancel.is_cancelled()
         || !publish(LoadUpdate {
             result: cached,
             loading: true,
@@ -114,16 +95,16 @@ async fn load(
     let (mut bytes, mut files, mut skipped) = (0, 0, 0);
     let mut reported = Instant::now();
     loop {
-        if cancelled(&cancel) {
+        if cancel.is_cancelled() {
             return;
         }
         let (svc, binding, flag) = (service.clone(), request.binding.clone(), cancel.clone());
         let batch =
-            tokio::task::spawn_blocking(move || svc.refresh(&binding, binding.source, &flag))
+            tokio::task::spawn_blocking(move || svc.refresh(&binding, binding.source, flag.flag()))
                 .await
                 .unwrap_or_else(|_| Err("性能采集任务中断".into()));
         // A cancelled blocking batch may still return an error. It must not publish late data.
-        if cancelled(&cancel) {
+        if cancel.is_cancelled() {
             return;
         }
         let batch = match batch {
@@ -141,7 +122,7 @@ async fn load(
         skipped += batch.skipped;
         if !batch.more || reported.elapsed() >= Duration::from_millis(250) {
             let mut result = snapshot(service.clone(), &request, cancel.clone()).await;
-            if cancelled(&cancel) {
+            if cancel.is_cancelled() {
                 return;
             }
             if let Ok(snapshot) = &mut result {

@@ -188,7 +188,7 @@ async fn dropping_loader_before_first_poll_never_starts_disk_work() {
     );
     let cancel = task.cancellation();
     drop(task);
-    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(cancel.is_cancelled());
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await

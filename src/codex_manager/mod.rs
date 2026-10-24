@@ -108,6 +108,7 @@ fn private_write_impl(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> 
                 Err(error) => return Err(error.into()),
             }
         }
+        fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
     let _ = fs::remove_file(&temp);
@@ -269,7 +270,8 @@ impl Manager {
             conn.busy_timeout(Duration::from_secs(5))?;
             op.begin("database_schema");
             // WAL keeps the TUI's polling reads and launch-time syncs from blocking hook writes.
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+            CREATE TABLE IF NOT EXISTS oauth_save_commits(operation TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS profiles (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL,
                 source_path TEXT, source_provider TEXT, source_hash TEXT, source_revision INTEGER,
@@ -312,7 +314,9 @@ impl Manager {
                     fs::Permissions::from_mode(0o600),
                 )?;
             }
-            Ok(Self { root, conn })
+            let manager = Self { root, conn };
+            manager.recover_oauth_saves()?;
+            Ok(manager)
         })
     }
 
@@ -393,6 +397,7 @@ impl Manager {
         profile: &Profile,
     ) -> Result<crate::provider_catalog::ModelQuery> {
         if profile.auth_mode == AuthMode::Oauth {
+            let _lease = self.oauth_run_lease(&profile.id)?;
             let home = self.home(&profile.id, profile.revision)?;
             let auth = oauth::read_auth(&home.join("auth.json"))?;
             if profile.oauth.as_ref().is_none_or(|identity| {

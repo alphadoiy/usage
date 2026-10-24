@@ -11,7 +11,7 @@ async fn old_refresh_completion_cannot_clear_current_work() {
     app.overview_generation = 4;
     app.overview_pending = 2;
     app.overview_loading = true;
-    let current = tokio::spawn(std::future::pending::<()>());
+    let current = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let abort = current.abort_handle();
     app.overview_task = Some(current);
     app.tx
@@ -615,14 +615,14 @@ async fn provider_switch_keeps_identity_on_refresh_and_recovers_when_removed() {
 #[tokio::test]
 async fn overview_refresh_cancels_previous_task_and_drop_cancels_current_task() {
     let mut app = dashboard();
-    let previous = Handle::current().spawn(std::future::pending::<()>());
+    let previous = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let previous_abort = previous.abort_handle();
     app.overview_task = Some(previous);
     app.refresh_overview(&Handle::current());
     tokio::task::yield_now().await;
     assert!(previous_abort.is_finished());
     app.overview_task.take().unwrap().abort();
-    let current = Handle::current().spawn(std::future::pending::<()>());
+    let current = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let current_abort = current.abort_handle();
     app.overview_task = Some(current);
     drop(app);

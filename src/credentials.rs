@@ -160,6 +160,30 @@ pub(crate) fn output_with_cancel(
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::fd::AsRawFd;
+                                    let mut ready = libc::pollfd {
+                                        fd: stdout.as_raw_fd(),
+                                        events: libc::POLLIN,
+                                        revents: 0,
+                                    };
+                                    let wait = timeout
+                                        .saturating_sub(started.elapsed())
+                                        .as_millis()
+                                        .min(20)
+                                        as i32;
+                                    // SAFETY: stdout owns the descriptor and ready is a valid
+                                    // single-element poll array. Wait for readiness instead
+                                    // of adding a scheduling delay to every pipe-sized chunk.
+                                    if unsafe { libc::poll(&mut ready, 1, wait) } < 0
+                                        && std::io::Error::last_os_error().kind()
+                                            != std::io::ErrorKind::Interrupted
+                                    {
+                                        return None;
+                                    }
+                                }
+                                #[cfg(not(unix))]
                                 std::thread::sleep(Duration::from_millis(5));
                             }
                             _ => return None,

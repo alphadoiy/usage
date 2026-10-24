@@ -190,7 +190,7 @@ async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_c
         .unwrap()
         .cancellation();
     app.handle_performance_key(KeyCode::Esc, &handle);
-    assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(cancel.is_cancelled());
     assert!(app.performance.is_none());
     drop(app);
     std::fs::remove_dir_all(root).unwrap();

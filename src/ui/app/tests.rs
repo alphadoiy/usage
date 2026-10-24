@@ -799,7 +799,7 @@ fn drilldown_returns_to_saved_history_and_uses_selected_day_usage() {
             ..Default::default()
         },
     };
-    app.loaded_history.records.push(record);
+    Arc::make_mut(&mut app.loaded_history).records.push(record);
     app.browser_filter = Some((panel.sources(), panel.session_query()));
     app.saved_history = Some(panel);
     app.history_return = true;

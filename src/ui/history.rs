@@ -57,7 +57,7 @@ impl DimensionPicker {
     }
 }
 pub struct HistoryPanel {
-    pub history: History,
+    pub history: std::sync::Arc<History>,
     pub loading: bool,
     pub selected: NaiveDate,
     pub monthly: bool,
@@ -76,7 +76,7 @@ impl HistoryPanel {
             NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(today)
         };
         Self {
-            history: History::default(),
+            history: std::sync::Arc::default(),
             loading: true,
             selected,
             monthly,
@@ -990,15 +990,19 @@ mod tests {
         for day in 1..=20 {
             let date = NaiveDate::from_ymd_opt(2024, 9, day).unwrap();
             for source in &p.allowed {
-                p.history.days.entry(date).or_default().insert(
-                    source.clone(),
-                    Tokens {
-                        input: 900 * day as u64,
-                        output: 100 * day as u64,
-                        cached: 300 * day as u64,
-                        calls: day as u64,
-                    },
-                );
+                std::sync::Arc::make_mut(&mut p.history)
+                    .days
+                    .entry(date)
+                    .or_default()
+                    .insert(
+                        source.clone(),
+                        Tokens {
+                            input: 900 * day as u64,
+                            output: 100 * day as u64,
+                            cached: 300 * day as u64,
+                            calls: day as u64,
+                        },
+                    );
             }
         }
         p
@@ -1153,7 +1157,7 @@ mod tests {
     fn searchable_picker_applies_and_cancels_without_changing_date() {
         let mut p = panel(false);
         let date = p.selected;
-        p.history.records = vec![crate::history::Record {
+        std::sync::Arc::make_mut(&mut p.history).records = vec![crate::history::Record {
             source: "codex".into(),
             instance: "codex".into(),
             id: "event".into(),
@@ -1209,7 +1213,7 @@ mod tests {
     #[test]
     fn instance_picker_includes_configured_empty_homes_and_clears_filter() {
         let mut p = panel(false);
-        p.history.instances = vec!["codex".into(), "work".into()];
+        std::sync::Arc::make_mut(&mut p.history).instances = vec!["codex".into(), "work".into()];
         p.key(KeyCode::Char('i'));
         for ch in "work".chars() {
             p.key(KeyCode::Char(ch));

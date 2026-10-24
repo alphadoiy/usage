@@ -4,6 +4,7 @@ pub mod agents;
 pub mod alerts;
 mod app_runtime;
 pub mod auth;
+pub mod background;
 pub mod cli;
 pub mod codex_manager;
 pub mod config;
