@@ -36,6 +36,8 @@ const customSchema = {
 };
 const flatName = (namespace, name) =>
   namespace ? `${namespace}__${name}` : name;
+const isWebSearch = (tool) =>
+  typeof tool?.type === "string" && tool.type.startsWith("web_search");
 function customDescription(tool) {
   let description = tool.description?.trim() ?? "";
   if (description) description += "\n\n";
@@ -96,6 +98,9 @@ function toolRegistry(declarations = [], discovered = []) {
   function offer(tool, alreadyOffered) {
     if (!tool || typeof tool !== "object")
       unsupported("invalid tool declaration");
+    // Codex offers its hosted search on ordinary turns. Chat-only plugins
+    // cannot execute it, so do not advertise it as a client function.
+    if (isWebSearch(tool)) return;
     if (tool.type === "namespace") {
       if (!tool.name || !Array.isArray(tool.tools))
         unsupported("invalid namespace tool declaration");
@@ -159,6 +164,9 @@ export function translateRequest(from, to, b) {
           ? `These tools are now available to call: ${names.join(", ")}`
           : "No tools matched the search.",
       });
+    } else if (item.type === "web_search_call") {
+      // A hosted search in prior Responses history has no Chat tool result.
+      // The following assistant message carries the answer and citations.
     } else if (item.type === "reasoning") {
       // Responses reasoning items are history metadata; chat carries actual messages separately.
       if (item.summary?.length)
@@ -184,13 +192,23 @@ export function translateRequest(from, to, b) {
   } else if (tool_choice?.type === "allowed_tools") {
     if (!["auto", "required"].includes(tool_choice.mode))
       unsupported(`unsupported allowed_tools mode: ${tool_choice.mode}`);
-    const allowed = new Set(tool_choice.tools?.map((t) => flatName(t.namespace, t.name)));
+    const allowed = new Set(tool_choice.tools
+      ?.filter((tool) => !isWebSearch(tool))
+      .map((t) => flatName(t.namespace, t.name)));
     for (const name of allowed)
       if (!registry.byName.has(name)) unsupported(`unknown allowed tool: ${name}`);
     tools = registry.chatTools.filter((t) => allowed.has(t.function.name));
-    tool_choice = tool_choice.mode;
+    if (tool_choice.mode === "required" && !tools.length)
+      unsupported(tool_choice.tools?.some(isWebSearch)
+        ? "required web search is unavailable for this provider"
+        : "required tool choice has no available tools");
+    tool_choice = tools.length ? tool_choice.mode : "none";
+  } else if (isWebSearch(tool_choice)) {
+    unsupported("web search is unavailable for this provider");
   } else if (tool_choice && typeof tool_choice !== "string")
     unsupported(`unsupported tool choice: ${tool_choice.type}`);
+  if (tool_choice === "required" && !tools?.length)
+    unsupported("required tool choice has no available tools");
   const out = {
     model: b.model,
     messages,

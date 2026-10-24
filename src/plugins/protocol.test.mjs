@@ -59,10 +59,10 @@ test("Responses input preserves tool calls/results, images, instructions and tok
   assert.equal(out.stream, true);
   assert.deepEqual(input, copy);
 });
-test("Unsupported protocols, server-side references and built-in tools fail explicitly", () => {
+test("Unsupported protocols, server-side references and unknown built-in tools fail explicitly", () => {
   for (const body of [
     { previous_response_id: "x" },
-    { tools: [{ type: "web_search" }] },
+    { tools: [{ type: "code_interpreter" }] },
     { input: [{ type: "unknown" }] },
   ])
     assert.throws(
@@ -73,6 +73,40 @@ test("Unsupported protocols, server-side references and built-in tools fail expl
     () => translateRequest("responses", "messages", {}),
     ProtocolError,
   );
+});
+test("Codex hosted web search is omitted for Chat-only providers", () => {
+  const request = {
+    model: "m",
+    tools: [
+      { type: "web_search", external_web_access: true },
+      { type: "function", name: "read", parameters: { type: "object" } },
+    ],
+    input: [
+      { type: "message", role: "user", content: "Earlier search" },
+      { type: "web_search_call", action: { type: "search", query: "example" } },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Found a cited page." }] },
+    ],
+    tool_choice: "auto",
+  };
+  const before = structuredClone(request);
+  const converted = translateRequest("responses", "chat", request);
+  assert.deepEqual(converted.tools.map((t) => t.function.name), ["read"]);
+  assert.equal(converted.messages.length, 2);
+  assert.equal(converted.messages[1].content[0].text, "Found a cited page.");
+  assert.deepEqual(request, before);
+  const onlySearch = translateRequest("responses", "chat", {
+    tools: [{ type: "web_search_preview" }],
+    tool_choice: { type: "allowed_tools", mode: "auto", tools: [{ type: "web_search_preview" }] },
+  });
+  assert.deepEqual(onlySearch.tools, []);
+  assert.equal(onlySearch.tool_choice, "none");
+  assert.throws(() => translateRequest("responses", "chat", {
+    tools: [{ type: "web_search" }], tool_choice: { type: "web_search" },
+  }), /web search is unavailable/);
+  assert.throws(() => translateRequest("responses", "chat", {
+    tools: [{ type: "web_search" }],
+    tool_choice: { type: "allowed_tools", mode: "required", tools: [{ type: "web_search" }] },
+  }), /required web search is unavailable/);
 });
 test("Namespaced function and custom tools round-trip through Chat requests", () => {
   const body = {

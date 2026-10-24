@@ -176,7 +176,7 @@ catalog_request=urllib.request.Request(catalog,headers={'authorization':'Bearer 
 with urllib.request.urlopen(catalog_request,timeout=10) as r: listed=json.load(r)['models']
 assert [x['slug'] for x in listed]==[c['model']], listed
 assert listed[0]['visibility']=='list' and listed[0]['base_instructions'], listed
-body=json.dumps({'model':c['model'],'input':'hello','stream':True,'tools':[{'type':'namespace','name':'functions','tools':[{'type':'function','name':'read','parameters':{'type':'object','properties':{'path':{'type':'string'}}}},{'type':'custom','name':'exec'}]}]}).encode()
+body=json.dumps({'model':c['model'],'input':'hello','stream':True,'tools':[{'type':'namespace','name':'functions','tools':[{'type':'function','name':'read','parameters':{'type':'object','properties':{'path':{'type':'string'}}}},{'type':'custom','name':'exec'}]},{'type':'web_search','external_web_access':True}]}).encode()
 req=urllib.request.Request(base+'/responses',data=body,headers={'authorization':'Bearer '+os.environ['USAGE_CODEX_API_KEY'],'content-type':'application/json'})
 with urllib.request.urlopen(req,timeout=10) as r: result=r.read().decode()
 completed=[json.loads(line[6:])['response'] for line in result.splitlines() if line.startswith('data: ') and json.loads(line[6:]).get('type')=='response.completed']
@@ -192,7 +192,7 @@ print('trae-inference-ok')
   }
   assert.equal(calls.filter(c => c.path.endsWith('/llm_utils_chat')).length, 3);
   assert.deepEqual(errors, []);
-  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models and Codex catalog, Credits/USD, explicit check-in, namespaced function/custom tool round-trip');
+  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models and Codex catalog, Credits/USD, explicit check-in, namespaced function/custom tool round-trip beside Codex web_search');
 } finally {
   try { const status = await json('gateway', 'status'); if (status.pid) process.kill(status.pid, 'SIGTERM'); } catch {}
   server.closeAllConnections(); await new Promise(r => server.close(r));
