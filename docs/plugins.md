@@ -83,7 +83,7 @@ node tests/support/trae_plugin.mjs /临时目录/package/index.mjs target/debug/
 | 转换内容 | 文本、图片输入、指令、思考摘要、函数与自由文本工具调用和结果、命名空间工具、客户端工具搜索、用量、流式/非流式 Responses 返回 |
 | 显式不支持 | 未实现的 SDK client、工具/会话执行插件、OpenCode 新版插件契约、额外协议转换、服务端 `previous_response_id` 存储、内置 web search 等无法映射的工具 |
 
-能力通过插件实际 hooks 发现，一个包可以提供多个上游。并非任意 OpenCode 插件都能运行：缺失的宿主接口、未知协议或输入能力会报错，不伪造成功。未知 SDK 协议不会自动当作 Chat 使用。使用 WorkBuddy 上游时发送完整 Responses 输入，不依赖服务端保存上下文。
+能力通过插件实际 hooks 发现，一个包可以提供多个上游。并非任意 OpenCode 插件都能运行：缺失的宿主接口、未知协议或输入能力会报错，不伪造成功。未知 SDK 协议不会自动当作 Chat 使用。WorkBuddy 客户端发送完整 Responses 输入，宿主将其转换为 Chat 请求交给插件，不依赖服务端保存上下文。
 
 协议转换在通用 `protocol.mjs` 中，不包含 WorkBuddy 分支；服务商的认证、工具参数兼容及错误解释由原版插件完成。原版插件可能修改请求文本或参数，转发语义以所安装插件版本为准。流式解析支持跨块 UTF-8、多条合并事件，单个事件最多 1 MiB，累计转换内容最多 16 MiB；断流不能产生完成事件。客户端取消会释放上游读取，慢消费者通过 Node/Bun HTTP 流背压暂停上游。
 
