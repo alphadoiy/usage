@@ -99,6 +99,12 @@ pub(super) struct HistoryState {
     pub config: AppConfig,
     pub cache: Option<crate::history::HistoryCache>,
     pub loading: bool,
+    pub report_task: Option<Task>,
+    pub report_pending: Option<crate::ui::history::ReportRequest>,
+    pub report_generation: u64,
+    pub picker_task: Option<Task>,
+    pub picker_pending: Option<crate::ui::history::PickerRequest>,
+    pub picker_generation: u64,
 }
 
 impl HistoryState {
@@ -112,10 +118,22 @@ impl HistoryState {
             config,
             cache: Some(crate::history::HistoryCache::default()),
             loading: false,
+            report_task: None,
+            report_pending: None,
+            report_generation: 0,
+            picker_task: None,
+            picker_pending: None,
+            picker_generation: 0,
         }
     }
 
     pub fn close_panel(&mut self) {
+        self.report_task = None;
+        self.report_pending = None;
+        self.report_generation = self.report_generation.wrapping_add(1);
+        self.picker_task = None;
+        self.picker_pending = None;
+        self.picker_generation = self.picker_generation.wrapping_add(1);
         if let Some(panel) = self.panel.take() {
             self.saved = Some(panel);
         }
@@ -134,9 +152,15 @@ impl HistoryState {
     }
 
     pub fn show_snapshot(&mut self, history: Arc<crate::history::History>) {
+        self.report_task = None;
+        self.report_pending = None;
+        self.report_generation = self.report_generation.wrapping_add(1);
+        self.picker_task = None;
+        self.picker_pending = None;
+        self.picker_generation = self.picker_generation.wrapping_add(1);
         self.loaded = history.clone();
         if let Some(panel) = self.panel.as_mut().or(self.saved.as_mut()) {
-            panel.history = history;
+            panel.set_history(history);
         }
     }
 
@@ -160,6 +184,13 @@ pub(super) struct BrowserState {
     pub registry: sessions::SessionRegistry,
     pub generation: u64,
     pub loading: bool,
+    pub usage_task: Option<Task>,
+    pub usage_pending: Option<super::BrowserUsageRequest>,
+    pub usage_cache: Option<(
+        super::BrowserUsageRequest,
+        HashMap<sessions::SessionKey, crate::history::SessionUsage>,
+    )>,
+    pub usage_generation: u64,
 }
 
 impl BrowserState {
@@ -175,10 +206,18 @@ impl BrowserState {
             registry,
             generation: 0,
             loading: false,
+            usage_task: None,
+            usage_pending: None,
+            usage_cache: None,
+            usage_generation: 0,
         }
     }
 
     pub fn close(&mut self) -> bool {
+        self.usage_task = None;
+        self.usage_pending = None;
+        self.usage_cache = None;
+        self.usage_generation = self.usage_generation.wrapping_add(1);
         if let Some(browser) = self.panel.take() {
             self.saved = Some(browser);
         }

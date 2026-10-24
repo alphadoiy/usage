@@ -95,6 +95,26 @@ pub struct HistoryReport {
     pub read_bytes: u64,
     pub from: Option<NaiveDate>,
     pub to: Option<NaiveDate>,
+    #[serde(skip)]
+    pub(crate) source_daily: BTreeMap<String, BTreeMap<String, Tokens>>,
+    #[serde(skip)]
+    pub(crate) source_monthly: BTreeMap<String, BTreeMap<String, Tokens>>,
+}
+impl HistoryReport {
+    pub(crate) fn source_day(&self, source: &str, day: &str) -> Tokens {
+        self.source_daily
+            .get(source)
+            .and_then(|days| days.get(day))
+            .copied()
+            .unwrap_or_default()
+    }
+    pub(crate) fn source_month(&self, source: &str, month: &str) -> Tokens {
+        self.source_monthly
+            .get(source)
+            .and_then(|months| months.get(month))
+            .copied()
+            .unwrap_or_default()
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HistoryQuery {
@@ -130,6 +150,45 @@ pub struct SessionUsage {
     pub models: Vec<String>,
 }
 impl History {
+    pub fn is_database_backed(&self) -> bool {
+        self.database.is_some()
+    }
+
+    pub fn report_query_controlled(
+        &self,
+        year: i32,
+        sources: &[String],
+        query: &HistoryQuery,
+        cancel: &crate::background::Cancellation,
+    ) -> HistoryReport {
+        if let Some(database) = &self.database {
+            return self.database_report(database, year, sources, query, Some(cancel));
+        }
+        self.report_query(year, sources, query)
+    }
+
+    fn database_report(
+        &self,
+        database: &HistoryDatabase,
+        year: i32,
+        sources: &[String],
+        query: &HistoryQuery,
+        cancel: Option<&crate::background::Cancellation>,
+    ) -> HistoryReport {
+        database
+            .report(self, year, sources, query, cancel)
+            .unwrap_or_else(|error| {
+                let mut fallback = History {
+                    warnings: self.warnings.clone(),
+                    synced_at: self.synced_at,
+                    scanned_files: self.scanned_files,
+                    read_bytes: self.read_bytes,
+                    ..History::default()
+                };
+                fallback.warnings.push(format!("历史查询失败：{error}"));
+                fallback.report(year, sources)
+            })
+    }
     pub fn filtered(&self, query: &HistoryQuery) -> Self {
         if let Some(database) = &self.database {
             let mut result = Self {
@@ -196,7 +255,7 @@ impl History {
     ) -> HashMap<crate::sessions::SessionKey, SessionUsage> {
         if let Some(database) = &self.database {
             return database
-                .session_usage(sources, query)
+                .session_usage(sources, query, None)
                 .unwrap_or_else(|error| {
                     tracing::warn!(event = "history_query_failed", %error);
                     HashMap::new()
@@ -219,6 +278,18 @@ impl History {
         }
         sessions
     }
+    pub fn session_usage_controlled(
+        &self,
+        sources: &[String],
+        query: &HistoryQuery,
+        cancel: &crate::background::Cancellation,
+    ) -> Result<HashMap<crate::sessions::SessionKey, SessionUsage>, String> {
+        if let Some(database) = &self.database {
+            database.session_usage(sources, query, Some(cancel))
+        } else {
+            Ok(self.session_usage(sources, query))
+        }
+    }
     pub fn report_query(
         &self,
         year: i32,
@@ -226,19 +297,7 @@ impl History {
         query: &HistoryQuery,
     ) -> HistoryReport {
         if let Some(database) = &self.database {
-            return database
-                .report(self, year, sources, query)
-                .unwrap_or_else(|error| {
-                    let mut fallback = History {
-                        warnings: self.warnings.clone(),
-                        synced_at: self.synced_at,
-                        scanned_files: self.scanned_files,
-                        read_bytes: self.read_bytes,
-                        ..History::default()
-                    };
-                    fallback.warnings.push(format!("历史查询失败：{error}"));
-                    fallback.report(year, sources)
-                });
+            return self.database_report(database, year, sources, query, None);
         }
         if query == &HistoryQuery::default() {
             return self.report(year, sources);
@@ -298,11 +357,31 @@ impl History {
             };
             report.daily.clear();
             report.monthly.clear();
+            report.source_daily.clear();
+            report.source_monthly.clear();
             report.totals = Tokens::default();
             let mut date = from;
             while date <= to {
                 let tokens = filtered.day(date, sources);
                 report.daily.insert(date.to_string(), tokens);
+                if let Some(day) = filtered.days.get(&date) {
+                    for source in sources {
+                        if let Some(source_tokens) = day.get(source) {
+                            report
+                                .source_daily
+                                .entry(source.clone())
+                                .or_default()
+                                .insert(date.to_string(), *source_tokens);
+                            report
+                                .source_monthly
+                                .entry(source.clone())
+                                .or_default()
+                                .entry(date.format("%Y-%m").to_string())
+                                .or_default()
+                                .add(*source_tokens);
+                        }
+                    }
+                }
                 report
                     .monthly
                     .entry(date.format("%Y-%m").to_string())
@@ -359,6 +438,8 @@ impl History {
             read_bytes: self.read_bytes,
             from: None,
             to: None,
+            source_daily: BTreeMap::new(),
+            source_monthly: BTreeMap::new(),
         };
         for record in self
             .records
@@ -376,6 +457,24 @@ impl History {
         };
         while date.year() == year {
             let tokens = self.day(date, sources);
+            if let Some(day) = self.days.get(&date) {
+                for source in sources {
+                    if let Some(source_tokens) = day.get(source) {
+                        report
+                            .source_daily
+                            .entry(source.clone())
+                            .or_default()
+                            .insert(date.to_string(), *source_tokens);
+                        report
+                            .source_monthly
+                            .entry(source.clone())
+                            .or_default()
+                            .entry(date.format("%Y-%m").to_string())
+                            .or_default()
+                            .add(*source_tokens);
+                    }
+                }
+            }
             report.totals.add(tokens);
             report.daily.insert(date.to_string(), tokens);
             report
@@ -393,10 +492,12 @@ impl History {
 
     pub fn dimension_values(&self, sources: &[String], field: &str) -> Vec<String> {
         if let Some(database) = &self.database {
-            return database.distinct(sources, field).unwrap_or_else(|error| {
-                tracing::warn!(event = "history_query_failed", %error);
-                Vec::new()
-            });
+            return database
+                .distinct(sources, field, None)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(event = "history_query_failed", %error);
+                    Vec::new()
+                });
         }
         let mut values: Vec<_> = self
             .records
@@ -414,6 +515,19 @@ impl History {
         values.sort();
         values.dedup();
         values
+    }
+
+    pub fn dimension_values_controlled(
+        &self,
+        sources: &[String],
+        field: &str,
+        cancel: &crate::background::Cancellation,
+    ) -> Result<Vec<String>, String> {
+        if let Some(database) = &self.database {
+            database.distinct(sources, field, Some(cancel))
+        } else {
+            Ok(self.dimension_values(sources, field))
+        }
     }
 }
 
@@ -1593,6 +1707,23 @@ mod tests {
             compact.report(2026, &config.providers).totals.total(),
             20_002
         );
+        let cancel = crate::background::Cancellation::new();
+        cancel.cancel();
+        assert!(
+            compact
+                .database
+                .as_ref()
+                .unwrap()
+                .report(
+                    &compact,
+                    2026,
+                    &config.providers,
+                    &HistoryQuery::default(),
+                    Some(&cancel)
+                )
+                .is_err(),
+            "a cancelled SQL aggregate should release its worker promptly"
+        );
     }
     #[test]
     fn failed_record_insert_rolls_back_cursor_and_rows_together() {
@@ -1835,6 +1966,8 @@ mod tests {
             assert_eq!(actual.daily, expected.daily);
             assert_eq!(actual.monthly, expected.monthly);
             assert_eq!(actual.by_instance, expected.by_instance);
+            assert_eq!(actual.source_daily, expected.source_daily);
+            assert_eq!(actual.source_monthly, expected.source_monthly);
             assert_eq!((actual.from, actual.to), (expected.from, expected.to));
             assert_eq!(
                 compact.filtered(&query).records.len(),
@@ -1861,5 +1994,58 @@ mod tests {
                 &config.providers
             )
         );
+    }
+
+    #[test]
+    #[ignore = "manual history query profile"]
+    fn profile_100k_database_report() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.0).unwrap();
+        let database = fixture.0.join("profile.sqlite3");
+        let path = fixture.0.join("claude/projects/profile.jsonl");
+        let mut db = open_database(&database).unwrap();
+        let tx = db.transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO history_records(path,data) VALUES(?1,?2)")
+                .unwrap();
+            for index in 0..100_000 {
+                let record = Record {
+                    source: "claude".into(),
+                    instance: "claude".into(),
+                    id: format!("message-{index}"),
+                    session: format!("session-{}", index / 100),
+                    project: format!("/project/{}", index % 10),
+                    model: "model-a".into(),
+                    time: DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    tokens: Tokens {
+                        input: 10,
+                        output: 2,
+                        cached: 0,
+                        calls: 1,
+                    },
+                };
+                insert
+                    .execute(rusqlite::params![
+                        path.to_string_lossy(),
+                        serde_json::to_string(&record).unwrap()
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        let history = History {
+            database: Some(HistoryDatabase {
+                path: database,
+                scope: vec![(path.to_string_lossy().into_owned(), "claude".into())],
+            }),
+            ..History::default()
+        };
+        let start = std::time::Instant::now();
+        let report = history.report(2026, &["claude".into()]);
+        eprintln!("100k history report: {:?}", start.elapsed());
+        assert_eq!(report.totals.total(), 1_200_000);
     }
 }

@@ -786,6 +786,86 @@ async fn switching_history_preserves_date_source_and_monthly_view() {
     drain_until(&mut app, |a| !a.history_state.loading).await;
     std::fs::remove_dir_all(root).unwrap();
 }
+#[tokio::test]
+async fn database_history_report_and_picker_finish_through_background_events() {
+    let root = std::env::temp_dir().join(format!("usage-ui-query-{}", uuid::Uuid::new_v4()));
+    let mut app = dashboard();
+    app.history_state.config.providers = vec!["codex".into()];
+    app.history_state.config.codex_dir = Some(root.join("codex"));
+    app.history_state.cache = Some(crate::history::HistoryCache::at(
+        root.join("history.sqlite3"),
+    ));
+    app.history_state.panel = Some(HistoryPanel::new(vec!["codex".into()], 2026, false));
+    let handle = Handle::current();
+    app.start_history_load(&handle);
+    drain_until(&mut app, |app| !app.history_state.loading).await;
+    assert!(
+        app.history_state
+            .panel
+            .as_ref()
+            .unwrap()
+            .report_request()
+            .is_some()
+    );
+    let rect = Rect::new(0, 0, 90, 24);
+    super::super::history::render(
+        rect,
+        &mut Buffer::empty(rect),
+        app.history_state.panel.as_ref().unwrap(),
+    );
+    assert!(
+        app.history_state
+            .panel
+            .as_ref()
+            .unwrap()
+            .report_request()
+            .is_some(),
+        "render must not run the SQLite query"
+    );
+    app.ensure_history_report(&handle);
+    drain_until(&mut app, |app| app.history_state.report_task.is_none()).await;
+    assert!(
+        app.history_state
+            .panel
+            .as_ref()
+            .unwrap()
+            .report_request()
+            .is_none()
+    );
+
+    app.history_state
+        .panel
+        .as_mut()
+        .unwrap()
+        .key(KeyCode::Char('f'));
+    assert!(
+        app.history_state
+            .panel
+            .as_ref()
+            .unwrap()
+            .picker_request()
+            .is_some()
+    );
+    app.ensure_history_picker(&handle);
+    drain_until(&mut app, |app| app.history_state.picker_task.is_none()).await;
+    assert!(
+        app.history_state
+            .panel
+            .as_ref()
+            .unwrap()
+            .picker_request()
+            .is_none()
+    );
+    assert!(app.history_state.panel.as_ref().unwrap().is_editing());
+    app.history_state.panel = None;
+    app.browser_state.panel = Some(SessionBrowser::new(Vec::new()));
+    app.apply_browser_usage();
+    app.ensure_browser_usage(&handle);
+    assert!(app.browser_state.usage_pending.is_some());
+    drain_until(&mut app, |app| app.browser_state.usage_task.is_none()).await;
+    assert!(app.browser_state.usage_cache.is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn drilldown_returns_to_saved_history_and_uses_selected_day_usage() {
     let mut app = dashboard();

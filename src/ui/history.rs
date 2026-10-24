@@ -32,7 +32,7 @@ impl TimeRange {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dimension {
     Project,
     Model,
@@ -43,6 +43,8 @@ struct DimensionPicker {
     options: Vec<String>,
     search: String,
     selected: usize,
+    loading: bool,
+    error: Option<String>,
 }
 impl DimensionPicker {
     fn visible(&self) -> Vec<Option<&str>> {
@@ -66,6 +68,53 @@ struct CachedReport {
     timezone: String,
     report: std::sync::Arc<HistoryReport>,
 }
+#[derive(Clone)]
+pub(crate) struct ReportRequest {
+    pub history: std::sync::Arc<History>,
+    pub year: i32,
+    pub sources: Vec<String>,
+    pub query: HistoryQuery,
+    pub timezone: String,
+}
+impl ReportRequest {
+    pub fn same_key(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.history, &other.history)
+            && self.year == other.year
+            && self.sources == other.sources
+            && self.query == other.query
+            && self.timezone == other.timezone
+    }
+    pub fn run(&self, cancel: &crate::background::Cancellation) -> HistoryReport {
+        self.history
+            .report_query_controlled(self.year, &self.sources, &self.query, cancel)
+    }
+}
+#[derive(Clone)]
+pub(crate) struct PickerRequest {
+    history: std::sync::Arc<History>,
+    sources: Vec<String>,
+    dimension: Dimension,
+}
+impl PickerRequest {
+    pub fn same_key(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.history, &other.history)
+            && self.sources == other.sources
+            && self.dimension == other.dimension
+    }
+    pub fn run(&self, cancel: &crate::background::Cancellation) -> Result<Vec<String>, String> {
+        self.history
+            .dimension_values_controlled(&self.sources, self.dimension.field(), cancel)
+    }
+}
+impl Dimension {
+    fn field(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Model => "model",
+            Self::Instance => "instance",
+        }
+    }
+}
 pub struct HistoryPanel {
     pub history: std::sync::Arc<History>,
     pub loading: bool,
@@ -77,6 +126,7 @@ pub struct HistoryPanel {
     pub range: TimeRange,
     picker: Option<DimensionPicker>,
     reports: std::cell::RefCell<Vec<CachedReport>>,
+    report_error: Option<(ReportRequest, String)>,
 }
 impl HistoryPanel {
     pub fn new(allowed: Vec<String>, year: i32, monthly: bool) -> Self {
@@ -97,12 +147,23 @@ impl HistoryPanel {
             range: TimeRange::Year,
             picker: None,
             reports: std::cell::RefCell::new(Vec::new()),
+            report_error: None,
         }
     }
     pub fn sources(&self) -> Vec<String> {
         self.filter
             .as_ref()
             .map_or_else(|| self.allowed.clone(), |s| vec![s.clone()])
+    }
+    pub(crate) fn set_history(&mut self, history: std::sync::Arc<History>) {
+        self.history = history;
+        self.report_error = None;
+        if let Some(picker) = &mut self.picker {
+            picker.loading = self.history.is_database_backed();
+            picker.error = None;
+            picker.options.clear();
+            picker.selected = 0;
+        }
     }
     pub fn set_query(&mut self, query: HistoryQuery) {
         if query.from.is_some() || query.to.is_some() {
@@ -148,7 +209,11 @@ impl HistoryPanel {
         }
         query
     }
-    fn report(&self, year: i32, sources: &[String]) -> std::sync::Arc<HistoryReport> {
+    fn cached_report(
+        &self,
+        year: i32,
+        sources: &[String],
+    ) -> Option<std::sync::Arc<HistoryReport>> {
         let query = self.effective_query();
         let timezone = Local::now().format("%Z %:z").to_string();
         let snapshot = std::sync::Arc::downgrade(&self.history);
@@ -163,31 +228,83 @@ impl HistoryPanel {
             let entry = reports.remove(index);
             let report = entry.report.clone();
             reports.push(entry);
-            return report;
+            return Some(report);
         }
-        let report = std::sync::Arc::new(self.history.report_query(year, sources, &query));
+        None
+    }
+    fn remember_report(&self, request: &ReportRequest, report: std::sync::Arc<HistoryReport>) {
+        let mut reports = self.reports.borrow_mut();
         if reports.len() == 8 {
             reports.remove(0);
         }
         reports.push(CachedReport {
-            history: snapshot,
+            history: std::sync::Arc::downgrade(&request.history),
+            year: request.year,
+            sources: request.sources.clone(),
+            query: request.query.clone(),
+            timezone: request.timezone.clone(),
+            report,
+        });
+    }
+    fn request(&self, year: i32, sources: &[String]) -> ReportRequest {
+        ReportRequest {
+            history: self.history.clone(),
             year,
             sources: sources.to_vec(),
-            query,
-            timezone,
-            report: report.clone(),
-        });
+            query: self.effective_query(),
+            timezone: Local::now().format("%Z %:z").to_string(),
+        }
+    }
+    pub(crate) fn report_request(&self) -> Option<ReportRequest> {
+        if !self.history.is_database_backed() || self.picker.as_ref().is_some_and(|p| p.loading) {
+            return None;
+        }
+        let year = self.selected.year();
+        let sources = self.sources();
+        if self.cached_report(year, &sources).is_some() {
+            return None;
+        }
+        let request = self.request(year, &sources);
+        if self
+            .report_error
+            .as_ref()
+            .is_some_and(|(failed, _)| failed.same_key(&request))
+        {
+            return None;
+        }
+        Some(request)
+    }
+    pub(crate) fn accept_report(&mut self, request: &ReportRequest, report: HistoryReport) -> bool {
+        if !self
+            .request(self.selected.year(), &self.sources())
+            .same_key(request)
+        {
+            return false;
+        }
+        self.report_error = None;
+        self.remember_report(request, std::sync::Arc::new(report));
+        true
+    }
+    pub(crate) fn report_failed(&mut self, request: ReportRequest, error: String) {
+        self.report_error = Some((request, error));
+    }
+    fn report(&self, year: i32, sources: &[String]) -> std::sync::Arc<HistoryReport> {
+        if let Some(report) = self.cached_report(year, sources) {
+            return report;
+        }
+        let request = self.request(year, sources);
+        let report = std::sync::Arc::new(self.history.report_query(year, sources, &request.query));
+        self.remember_report(&request, report.clone());
         report
     }
     fn open_picker(&mut self, dimension: Dimension) {
-        let mut options = self.history.dimension_values(
-            &self.sources(),
-            match dimension {
-                Dimension::Project => "project",
-                Dimension::Model => "model",
-                Dimension::Instance => "instance",
-            },
-        );
+        let loading = self.history.is_database_backed();
+        let mut options = if loading {
+            Vec::new()
+        } else {
+            self.history
+                .dimension_values(&self.sources(), dimension.field())
+        };
         if matches!(dimension, Dimension::Instance) {
             options.extend(self.history.instances.clone());
         }
@@ -207,7 +324,52 @@ impl HistoryPanel {
             options,
             search: String::new(),
             selected,
+            loading,
+            error: None,
         });
+    }
+    pub(crate) fn picker_request(&self) -> Option<PickerRequest> {
+        let picker = self.picker.as_ref().filter(|picker| picker.loading)?;
+        Some(PickerRequest {
+            history: self.history.clone(),
+            sources: self.sources(),
+            dimension: picker.dimension,
+        })
+    }
+    pub(crate) fn accept_picker(
+        &mut self,
+        request: &PickerRequest,
+        result: Result<Vec<String>, String>,
+    ) -> bool {
+        let Some(current) = self.picker_request() else {
+            return false;
+        };
+        if !current.same_key(request) {
+            return false;
+        }
+        let picker = self.picker.as_mut().expect("pending picker exists");
+        picker.loading = false;
+        match result {
+            Ok(mut options) => {
+                if picker.dimension == Dimension::Instance {
+                    options.extend(self.history.instances.clone());
+                }
+                options.sort();
+                options.dedup();
+                let selected = match picker.dimension {
+                    Dimension::Project => &self.query.project,
+                    Dimension::Model => &self.query.model,
+                    Dimension::Instance => &self.query.instance,
+                };
+                picker.selected = selected
+                    .as_ref()
+                    .and_then(|v| options.iter().position(|s| s == v))
+                    .map_or(0, |i| i + 1);
+                picker.options = options;
+            }
+            Err(error) => picker.error = Some(error),
+        }
+        true
     }
     pub fn is_editing(&self) -> bool {
         self.picker.is_some()
@@ -216,6 +378,7 @@ impl HistoryPanel {
         if let Some(picker) = &mut self.picker {
             match key {
                 KeyCode::Esc => self.picker = None,
+                _ if picker.loading => {}
                 KeyCode::Enter => {
                     let value = picker
                         .visible()
@@ -321,19 +484,17 @@ impl HistoryPanel {
             return;
         }
         if matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
-            let report = self.report(self.selected.year(), &self.sources());
-            let dates: Vec<_> = self
-                .history
-                .days
-                .keys()
-                .copied()
-                .filter(|date| {
-                    (self.range != TimeRange::Year || date.year() == self.selected.year())
-                        && report
-                            .daily
-                            .get(&date.to_string())
-                            .is_some_and(|t| t.total() > 0)
-                })
+            let report = if self.history.is_database_backed() {
+                self.cached_report(self.selected.year(), &self.sources())
+            } else {
+                Some(self.report(self.selected.year(), &self.sources()))
+            };
+            let Some(report) = report else { return };
+            let dates: Vec<_> = report
+                .daily
+                .iter()
+                .filter(|(_, tokens)| tokens.total() > 0)
+                .filter_map(|(date, _)| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
                 .collect();
             let next = if key == KeyCode::PageUp {
                 dates
@@ -443,8 +604,28 @@ pub fn render(area: Rect, buf: &mut Buffer, panel: &HistoryPanel) {
         return;
     }
     let sources = panel.sources();
-    let report = panel.report(panel.selected.year(), &sources);
-    let warning_height = u16::from(!panel.history.warnings.is_empty());
+    let report = if panel.history.is_database_backed() {
+        panel.cached_report(panel.selected.year(), &sources)
+    } else {
+        Some(panel.report(panel.selected.year(), &sources))
+    };
+    let Some(report) = report else {
+        let message = panel
+            .report_error
+            .as_ref()
+            .filter(|(request, _)| {
+                request.same_key(&panel.request(panel.selected.year(), &sources))
+            })
+            .map_or("正在汇总历史记录…", |(_, error)| error.as_str());
+        Paragraph::new(message)
+            .style(Style::new().fg(MUTED))
+            .render(content, buf);
+        if let Some(picker) = &panel.picker {
+            render_picker(content, buf, picker);
+        }
+        return;
+    };
+    let warning_height = u16::from(!report.warnings.is_empty());
     let calendar_height =
         if panel.range == TimeRange::Today || (panel.monthly && content.height < 28) {
             0
@@ -494,11 +675,11 @@ pub fn render(area: Rect, buf: &mut Buffer, panel: &HistoryPanel) {
             render_recent(list, buf, panel, &report);
         }
     }
-    if let Some(message) = panel.history.warnings.first() {
+    if let Some(message) = report.warnings.first() {
         Paragraph::new(format!(
             "{message}{}",
-            if panel.history.warnings.len() > 1 {
-                format!(" · 另 {} 条", panel.history.warnings.len() - 1)
+            if report.warnings.len() > 1 {
+                format!(" · 另 {} 条", report.warnings.len() - 1)
             } else {
                 String::new()
             }
@@ -546,14 +727,22 @@ fn render_picker(area: Rect, buf: &mut Buffer, picker: &DimensionPicker) {
         .map(|v| ListItem::new(clean_label(v.unwrap_or("全部"))))
         .collect();
     let mut state = ListState::default().with_selected(Some(picker.selected));
-    StatefulWidget::render(
-        List::new(items)
-            .highlight_symbol("› ")
-            .highlight_style(Style::new().fg(ACCENT).bold()),
-        list,
-        buf,
-        &mut state,
-    );
+    if picker.loading {
+        Paragraph::new("正在读取选项…").render(list, buf);
+    } else if let Some(error) = &picker.error {
+        Paragraph::new(clean_label(error))
+            .style(Style::new().fg(Color::Yellow))
+            .render(list, buf);
+    } else {
+        StatefulWidget::render(
+            List::new(items)
+                .highlight_symbol("› ")
+                .highlight_style(Style::new().fg(ACCENT).bold()),
+            list,
+            buf,
+            &mut state,
+        );
+    }
     Paragraph::new("输入搜索 · ↑/↓ 选择 · Enter 应用 · Esc 取消")
         .style(Style::new().fg(MUTED))
         .render(hint, buf);
@@ -793,19 +982,9 @@ fn render_detail(
     let mut sources = Vec::new();
     for source in panel.sources() {
         let t = if panel.monthly {
-            panel
-                .report(panel.selected.year(), std::slice::from_ref(&source))
-                .monthly
-                .get(&date)
-                .copied()
-                .unwrap_or_default()
+            report.source_month(&source, &date)
         } else {
-            panel
-                .report(panel.selected.year(), std::slice::from_ref(&source))
-                .daily
-                .get(&panel.selected.to_string())
-                .copied()
-                .unwrap_or_default()
+            report.source_day(&source, &panel.selected.to_string())
         };
         sources.push(Span::styled(
             format!("{source} {}  ", compact(t.total())),
@@ -948,10 +1127,6 @@ fn render_months(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &Hi
         .unwrap_or(0)
         .max(1);
     let sources = panel.sources();
-    let reports: Vec<_> = sources
-        .iter()
-        .map(|s| panel.report(panel.selected.year(), std::slice::from_ref(s)))
-        .collect();
     let mut lines = vec![Line::from("月度趋势").bold()];
     for row in 0..rows {
         let mut spans = Vec::new();
@@ -979,15 +1154,8 @@ fn render_months(area: Rect, buf: &mut Buffer, panel: &HistoryPanel, report: &Hi
                 .max(usize::from(t.total() > 0 && bar_width > 0));
             let mut used = 0;
             let mut cumulative = 0u64;
-            for (source, report) in sources.iter().zip(&reports) {
-                cumulative = cumulative.saturating_add(
-                    report
-                        .monthly
-                        .get(&key)
-                        .copied()
-                        .unwrap_or_default()
-                        .total(),
-                );
+            for source in &sources {
+                cumulative = cumulative.saturating_add(report.source_month(source, &key).total());
                 let end = if t.total() == 0 {
                     0
                 } else {
@@ -1286,5 +1454,35 @@ mod tests {
             panel.report(year, &sources);
         }
         assert_eq!(panel.reports.borrow().len(), 8);
+    }
+    #[test]
+    fn compact_history_jumps_to_the_next_day_with_usage() {
+        let root =
+            std::env::temp_dir().join(format!("usage-history-panel-{}", uuid::Uuid::new_v4()));
+        let log = root.join("claude/projects/p/session.jsonl");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, concat!(
+            "{\"type\":\"assistant\",\"sessionId\":\"s\",\"timestamp\":\"2024-02-15T12:00:00Z\",",
+            "\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n"
+        )).unwrap();
+        let config = crate::config::AppConfig {
+            providers: vec!["claude".into()],
+            claude_dir: Some(root.join("claude")),
+            ..Default::default()
+        };
+        let history =
+            crate::history::HistoryCache::at(root.join("history.sqlite3")).load_compact(&config);
+        let mut panel = HistoryPanel::new(config.providers.clone(), 2024, false);
+        panel.history = std::sync::Arc::new(history);
+        let request = panel.report_request().unwrap();
+        let report = request.run(&crate::background::Cancellation::new());
+        assert_eq!(report.totals.total(), 12, "{:?}", report.warnings);
+        assert!(panel.accept_report(&request, report));
+        panel.key(KeyCode::PageUp);
+        assert_eq!(
+            panel.selected,
+            NaiveDate::from_ymd_opt(2024, 2, 15).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -22,7 +22,7 @@ use crate::providers::{
 };
 use crate::service_status::{self, ServiceStatus};
 use crate::sessions;
-use crate::ui::history::HistoryPanel;
+use crate::ui::history::{HistoryPanel, PickerRequest, ReportRequest};
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{Focus, SessionBrowser};
 mod render;
@@ -37,6 +37,27 @@ struct RefreshEvent {
     generation: u64,
     target: String,
     snapshot: UsageSnapshot,
+}
+#[derive(Clone)]
+struct BrowserUsageRequest {
+    history: Arc<crate::history::History>,
+    sources: Vec<String>,
+    query: crate::history::HistoryQuery,
+    label: Option<String>,
+}
+impl BrowserUsageRequest {
+    fn same_key(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.history, &other.history)
+            && self.sources == other.sources
+            && self.query == other.query
+    }
+    fn run(
+        &self,
+        cancel: &crate::background::Cancellation,
+    ) -> Result<HashMap<sessions::SessionKey, crate::history::SessionUsage>, String> {
+        self.history
+            .session_usage_controlled(&self.sources, &self.query, cancel)
+    }
 }
 
 enum AppEvent {
@@ -85,6 +106,21 @@ enum AppEvent {
     HistoryLoaded {
         history: crate::history::History,
         cache: crate::history::HistoryCache,
+    },
+    HistoryReport {
+        generation: u64,
+        request: ReportRequest,
+        result: Result<crate::history::HistoryReport, String>,
+    },
+    HistoryPicker {
+        generation: u64,
+        request: PickerRequest,
+        result: Result<Vec<String>, String>,
+    },
+    BrowserUsage {
+        generation: u64,
+        request: BrowserUsageRequest,
+        result: Result<HashMap<sessions::SessionKey, crate::history::SessionUsage>, String>,
     },
     Quota(Box<RefreshEvent>),
     ResetPreview {
@@ -267,6 +303,9 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
             app.refresh_background(&handle);
         }
         app.maybe_refresh_home_activity(&handle);
+        app.ensure_history_picker(&handle);
+        app.ensure_history_report(&handle);
+        app.ensure_browser_usage(&handle);
         let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
         if received || reset_consumed || refresh_started || status_started {
             redraw.invalidate();
@@ -712,6 +751,27 @@ impl Dashboard {
         self.browser_state.return_to_history = true;
     }
     fn apply_browser_usage(&mut self) {
+        let Some(request) = self.browser_usage_request() else {
+            return;
+        };
+        if request.history.is_database_backed() {
+            if let Some((cached, usage)) = &self.browser_state.usage_cache
+                && cached.same_key(&request)
+                && let Some(browser) = &mut self.browser_state.panel
+            {
+                browser.set_usage(usage.clone(), request.label);
+            }
+            return;
+        }
+        let usage = request
+            .history
+            .session_usage(&request.sources, &request.query);
+        if let Some(browser) = &mut self.browser_state.panel {
+            browser.set_usage(usage, request.label);
+        }
+    }
+    fn browser_usage_request(&self) -> Option<BrowserUsageRequest> {
+        self.browser_state.panel.as_ref()?;
         let (sources, query, label) = self.browser_state.filter.as_ref().map_or_else(
             || {
                 (
@@ -733,10 +793,65 @@ impl Dashboard {
                 )
             },
         );
-        let usage = self.history_state.loaded.session_usage(&sources, &query);
-        if let Some(browser) = &mut self.browser_state.panel {
-            browser.set_usage(usage, label);
+        Some(BrowserUsageRequest {
+            history: self.history_state.loaded.clone(),
+            sources,
+            query,
+            label,
+        })
+    }
+    fn ensure_browser_usage(&mut self, handle: &Handle) {
+        let desired = self
+            .browser_usage_request()
+            .filter(|r| r.history.is_database_backed());
+        if desired.is_none() && self.browser_state.usage_pending.is_none() {
+            return;
         }
+        if let Some(request) = &desired {
+            if self
+                .browser_state
+                .usage_cache
+                .as_ref()
+                .is_some_and(|(cached, _)| cached.same_key(request))
+            {
+                return;
+            }
+            if self
+                .browser_state
+                .usage_pending
+                .as_ref()
+                .is_some_and(|pending| pending.same_key(request))
+            {
+                return;
+            }
+        }
+        self.browser_state.usage_task = None;
+        self.browser_state.usage_pending = None;
+        self.browser_state.usage_generation = self.browser_state.usage_generation.wrapping_add(1);
+        let Some(request) = desired else { return };
+        if let Some(browser) = &mut self.browser_state.panel {
+            let label = request.label.as_ref().map_or_else(
+                || "正在汇总会话用量…".to_string(),
+                |label| format!("{label} · 正在汇总"),
+            );
+            browser.set_usage(HashMap::new(), Some(label));
+        }
+        let generation = self.browser_state.usage_generation;
+        let work_request = request.clone();
+        let event_request = request.clone();
+        let tx = self.tx.clone();
+        self.browser_state.usage_pending = Some(request);
+        self.browser_state.usage_task = Some(Task::blocking(
+            handle,
+            move |cancel| work_request.run(&cancel),
+            move |result| {
+                let _ = tx.send(AppEvent::BrowserUsage {
+                    generation,
+                    request: event_request,
+                    result,
+                });
+            },
+        ));
     }
     fn start_history_load(&mut self, handle: &Handle) {
         let Some(mut cache) = self.history_state.begin_load() else {
@@ -762,6 +877,78 @@ impl Dashboard {
                     Err(error) => AppEvent::HistoryFailed(error),
                 };
                 let _ = tx.send(event);
+            },
+        ));
+    }
+
+    fn ensure_history_report(&mut self, handle: &Handle) {
+        let desired = self
+            .history_state
+            .panel
+            .as_ref()
+            .and_then(HistoryPanel::report_request);
+        if desired.is_none() && self.history_state.report_pending.is_none() {
+            return;
+        }
+        if let (Some(pending), Some(request)) = (&self.history_state.report_pending, &desired)
+            && pending.same_key(request)
+        {
+            return;
+        }
+        self.history_state.report_task = None;
+        self.history_state.report_pending = None;
+        self.history_state.report_generation = self.history_state.report_generation.wrapping_add(1);
+        let Some(request) = desired else { return };
+        let generation = self.history_state.report_generation;
+        let work_request = request.clone();
+        let event_request = request.clone();
+        let tx = self.tx.clone();
+        self.history_state.report_pending = Some(request);
+        self.history_state.report_task = Some(Task::blocking(
+            handle,
+            move |cancel| Ok(work_request.run(&cancel)),
+            move |result| {
+                let _ = tx.send(AppEvent::HistoryReport {
+                    generation,
+                    request: event_request,
+                    result,
+                });
+            },
+        ));
+    }
+
+    fn ensure_history_picker(&mut self, handle: &Handle) {
+        let desired = self
+            .history_state
+            .panel
+            .as_ref()
+            .and_then(HistoryPanel::picker_request);
+        if desired.is_none() && self.history_state.picker_pending.is_none() {
+            return;
+        }
+        if let (Some(pending), Some(request)) = (&self.history_state.picker_pending, &desired)
+            && pending.same_key(request)
+        {
+            return;
+        }
+        self.history_state.picker_task = None;
+        self.history_state.picker_pending = None;
+        self.history_state.picker_generation = self.history_state.picker_generation.wrapping_add(1);
+        let Some(request) = desired else { return };
+        let generation = self.history_state.picker_generation;
+        let work_request = request.clone();
+        let event_request = request.clone();
+        let tx = self.tx.clone();
+        self.history_state.picker_pending = Some(request);
+        self.history_state.picker_task = Some(Task::blocking(
+            handle,
+            move |cancel| work_request.run(&cancel),
+            move |result| {
+                let _ = tx.send(AppEvent::HistoryPicker {
+                    generation,
+                    request: event_request,
+                    result,
+                });
             },
         ));
     }
@@ -1952,6 +2139,71 @@ impl Dashboard {
                     self.history_state.finish_load();
                     self.apply_browser_usage();
                     changed = true;
+                    continue;
+                }
+                AppEvent::HistoryReport {
+                    generation,
+                    request,
+                    result,
+                } => {
+                    if generation == self.history_state.report_generation {
+                        self.history_state.report_task = None;
+                        self.history_state.report_pending = None;
+                        if let Some(panel) = &mut self.history_state.panel {
+                            changed |= match result {
+                                Ok(report) => panel.accept_report(&request, report),
+                                Err(error) => {
+                                    panel.report_failed(request, error);
+                                    true
+                                }
+                            };
+                        }
+                    }
+                    continue;
+                }
+                AppEvent::HistoryPicker {
+                    generation,
+                    request,
+                    result,
+                } => {
+                    if generation == self.history_state.picker_generation {
+                        self.history_state.picker_task = None;
+                        self.history_state.picker_pending = None;
+                        if let Some(panel) = &mut self.history_state.panel {
+                            changed |= panel.accept_picker(&request, result);
+                        }
+                    }
+                    continue;
+                }
+                AppEvent::BrowserUsage {
+                    generation,
+                    request,
+                    result,
+                } => {
+                    if generation == self.browser_state.usage_generation {
+                        self.browser_state.usage_task = None;
+                        self.browser_state.usage_pending = None;
+                        if self
+                            .browser_usage_request()
+                            .as_ref()
+                            .is_some_and(|current| current.same_key(&request))
+                        {
+                            match result {
+                                Ok(usage) => {
+                                    if let Some(browser) = &mut self.browser_state.panel {
+                                        browser.set_usage(usage.clone(), request.label.clone());
+                                    }
+                                    self.browser_state.usage_cache = Some((request, usage));
+                                }
+                                Err(error) => {
+                                    self.notice = Some(format!("会话用量查询失败：{error}"));
+                                    self.browser_state.usage_cache =
+                                        Some((request, HashMap::new()));
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
                     continue;
                 }
                 AppEvent::Quota(event) => event,

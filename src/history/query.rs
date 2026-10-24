@@ -59,9 +59,16 @@ WITH raw AS MATERIALIZED (
 "#;
 
 impl HistoryDatabase {
-    fn connection(&self) -> Result<Connection, String> {
+    fn connection(
+        &self,
+        cancel: Option<&crate::background::Cancellation>,
+    ) -> Result<Connection, String> {
         let db = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())?;
+        if let Some(cancel) = cancel {
+            let cancel = cancel.clone();
+            db.progress_handler(1000, Some(move || cancel.is_cancelled()));
+        }
         db.busy_timeout(std::time::Duration::from_secs(20))
             .map_err(|e| e.to_string())?;
         db.create_scalar_function(
@@ -98,8 +105,9 @@ impl HistoryDatabase {
         year: i32,
         sources: &[String],
         query: &HistoryQuery,
+        cancel: Option<&crate::background::Cancellation>,
     ) -> Result<HistoryReport, String> {
-        let db = self.connection()?;
+        let db = self.connection(cancel)?;
         let from = query
             .from
             .or_else(|| NaiveDate::from_ymd_opt(year, 1, 1))
@@ -170,11 +178,31 @@ impl HistoryDatabase {
         if query.from.is_some() || query.to.is_some() {
             report.daily.clear();
             report.monthly.clear();
+            report.source_daily.clear();
+            report.source_monthly.clear();
             report.totals = Tokens::default();
             let mut date = from;
             while date <= to {
                 let tokens = temporary.day(date, &report.providers);
                 report.daily.insert(date.to_string(), tokens);
+                if let Some(day) = temporary.days.get(&date) {
+                    for source in &report.providers {
+                        if let Some(source_tokens) = day.get(source) {
+                            report
+                                .source_daily
+                                .entry(source.clone())
+                                .or_default()
+                                .insert(date.to_string(), *source_tokens);
+                            report
+                                .source_monthly
+                                .entry(source.clone())
+                                .or_default()
+                                .entry(date.format("%Y-%m").to_string())
+                                .or_default()
+                                .add(*source_tokens);
+                        }
+                    }
+                }
                 report
                     .monthly
                     .entry(date.format("%Y-%m").to_string())
@@ -192,8 +220,9 @@ impl HistoryDatabase {
         &self,
         sources: &[String],
         query: &HistoryQuery,
+        cancel: Option<&crate::background::Cancellation>,
     ) -> Result<HashMap<crate::sessions::SessionKey, SessionUsage>, String> {
-        let db = self.connection()?;
+        let db = self.connection(cancel)?;
         let from = query.from.map(|date| date.to_string());
         let to = query.to.map(|date| date.to_string());
         let sql = format!(
@@ -245,8 +274,13 @@ impl HistoryDatabase {
         Ok(sessions)
     }
 
-    pub(super) fn distinct(&self, sources: &[String], field: &str) -> Result<Vec<String>, String> {
-        let db = self.connection()?;
+    pub(super) fn distinct(
+        &self,
+        sources: &[String],
+        field: &str,
+        cancel: Option<&crate::background::Cancellation>,
+    ) -> Result<Vec<String>, String> {
+        let db = self.connection(cancel)?;
         let field = match field {
             "project" | "model" | "instance" => field,
             _ => return Err("无效的历史维度".into()),
@@ -274,7 +308,7 @@ impl HistoryDatabase {
     }
 
     pub(super) fn records(&self, query: &HistoryQuery) -> Result<Vec<Record>, String> {
-        let db = self.connection()?;
+        let db = self.connection(None)?;
         let sql = format!(
             "{CANONICAL} SELECT source,instance,id,time,input,output,cached,calls,session,project,model \
              FROM filtered ORDER BY time,id"
