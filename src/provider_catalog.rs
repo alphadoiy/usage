@@ -213,11 +213,15 @@ impl ModelQuery {
     }
 
     async fn read(&self, http: &dyn HttpClient) -> Models {
-        let result = tokio::time::timeout(Duration::from_secs(12), self.fetch(http)).await;
+        let result = crate::background::query(async {
+            tokio::time::timeout(Duration::from_secs(12), self.fetch(http)).await
+        })
+        .await;
         match result {
-            Ok(Ok(models)) => Models::Ready(models),
-            Ok(Err(error)) => Models::Unavailable(error.into()),
-            Err(_) => Models::Unavailable("模型列表查询超时".into()),
+            Ok(Ok(Ok(models))) => Models::Ready(models),
+            Ok(Ok(Err(error))) => Models::Unavailable(error.into()),
+            Ok(Err(_)) => Models::Unavailable("模型列表查询超时".into()),
+            Err(error) => Models::Unavailable(error.into()),
         }
     }
 
@@ -441,7 +445,7 @@ impl CatalogService {
     /// The query the home board makes for one Provider, outside a full refresh.
     pub async fn models(self: Arc<Self>, source: ModelSource) -> Models {
         let http = self.http.clone();
-        let query = tokio::task::spawn_blocking(move || match source {
+        let query = crate::background::blocking(move || match source {
             ModelSource::Endpoint { base, key } => ModelQuery::new("form".into(), &base, key)
                 .map_err(|e| Models::Unavailable(e.into())),
             // Only this Provider's credentials are read, through the same construction as `load`.
@@ -479,7 +483,7 @@ impl CatalogService {
         match query {
             Ok(Ok(query)) => query.read(http.as_ref()).await,
             Ok(Err(models)) => models,
-            Err(_) => Models::Unavailable("模型列表查询任务中断".into()),
+            Err(error) => Models::Unavailable(error.into()),
         }
     }
 }

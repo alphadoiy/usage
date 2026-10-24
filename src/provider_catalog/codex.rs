@@ -89,7 +89,7 @@ async fn installed_version() -> Option<Version> {
         return version;
     }
     // Off the UI thread; both successful and failed probes are cached, with bounded output/time.
-    let version = tokio::task::spawn_blocking(|| {
+    let version = crate::background::blocking(|| {
         let mut command = std::process::Command::new("codex");
         crate::codex_manager::clear_auth_env(&mut command);
         command.arg("--version").stdin(std::process::Stdio::null());

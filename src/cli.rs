@@ -467,7 +467,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 let sources = config.providers.clone();
                 let span = tracing::Span::current();
                 let history = tokio::task::spawn_blocking(move || {
-                    span.in_scope(|| crate::history::HistoryCache::default().load(&config))
+                    span.in_scope(|| crate::history::HistoryCache::default().load_compact(&config))
                 })
                 .await
                 .map_err(|e| CliError(format!("历史读取失败: {e}")))?;

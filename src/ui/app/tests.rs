@@ -67,8 +67,8 @@ fn reset_dashboard(available: u32, consumed: Arc<AtomicUsize>) -> Dashboard {
         isolated_config(),
         "/tmp/usage-reset-test.toml".into(),
     );
-    app.overview = Some(reset_catalog(&app.providers));
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
+    app.overview_state.catalog = Some(reset_catalog(&app.providers));
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app
 }
 
@@ -115,7 +115,7 @@ async fn drain_until(app: &mut Dashboard, condition: impl Fn(&Dashboard) -> bool
 fn dashboard() -> Dashboard {
     let now = Utc::now();
     let mut app = Dashboard::new(Vec::new(), isolated_config(), "/tmp/usage-test.toml".into());
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.cards = vec![
         CardSlot {
             target: "claude".into(),
@@ -159,7 +159,7 @@ fn dashboard() -> Dashboard {
 #[tokio::test]
 async fn browser_navigates_projects_and_searches_without_launching() {
     let mut app = dashboard();
-    app.browser = Some(SessionBrowser::new(vec![
+    app.browser_state.panel = Some(SessionBrowser::new(vec![
         Session {
             agent: None,
             provider: AgentKind::CLAUDE,
@@ -182,41 +182,50 @@ async fn browser_navigates_projects_and_searches_without_launching() {
         },
     ]));
     let handle = Handle::current();
-    assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Projects);
+    assert_eq!(
+        app.browser_state.panel.as_ref().unwrap().focus(),
+        Focus::Projects
+    );
     app.handle_browser_key(KeyCode::Enter, &handle);
-    assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Sessions);
+    assert_eq!(
+        app.browser_state.panel.as_ref().unwrap().focus(),
+        Focus::Sessions
+    );
     app.handle_browser_key(KeyCode::Char('/'), &handle);
     app.handle_browser_key(KeyCode::Char('t'), &handle);
-    assert_eq!(app.browser.as_ref().unwrap().visible_count(), 2);
+    assert_eq!(app.browser_state.panel.as_ref().unwrap().visible_count(), 2);
     app.handle_browser_key(KeyCode::Esc, &handle);
-    assert!(!app.browser.as_ref().unwrap().searching);
+    assert!(!app.browser_state.panel.as_ref().unwrap().searching);
     app.handle_browser_key(KeyCode::Esc, &handle);
-    assert_eq!(app.browser.as_ref().unwrap().focus(), Focus::Projects);
+    assert_eq!(
+        app.browser_state.panel.as_ref().unwrap().focus(),
+        Focus::Projects
+    );
     app.handle_browser_key(KeyCode::Esc, &handle);
-    assert!(app.browser.is_none());
+    assert!(app.browser_state.panel.is_none());
 }
 
 #[tokio::test]
 async fn browser_load_runs_in_background_and_reports_empty_result() {
     let mut app = dashboard();
     let missing = std::env::temp_dir().join(format!("usage-missing-{}", uuid::Uuid::new_v4()));
-    app.session_homes = sessions::SessionHomes::new()
+    app.browser_state.homes = sessions::SessionHomes::new()
         .with("claude", missing.join("claude"))
         .with("codex", missing.join("codex"))
         .with("grok", missing.join("grok"));
     let handle = Handle::current();
     app.open_browser(&handle);
-    assert!(app.browser_loading);
-    assert!(app.browser.is_some());
+    assert!(app.browser_state.loading);
+    assert!(app.browser_state.panel.is_some());
     tokio::time::timeout(Duration::from_secs(2), async {
-        while app.browser_loading {
+        while app.browser_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(app.browser.is_none());
+    assert!(app.browser_state.panel.is_none());
     assert_eq!(app.notice.as_deref(), Some("未找到可恢复的本机会话"));
 }
 
@@ -224,18 +233,18 @@ async fn browser_load_runs_in_background_and_reports_empty_result() {
 async fn closing_browser_discards_pending_catalog() {
     let mut app = dashboard();
     let missing = std::env::temp_dir().join(format!("usage-missing-{}", uuid::Uuid::new_v4()));
-    app.session_homes = sessions::SessionHomes::new()
+    app.browser_state.homes = sessions::SessionHomes::new()
         .with("claude", missing.join("claude"))
         .with("codex", missing.join("codex"))
         .with("grok", missing.join("grok"));
     let handle = Handle::current();
     app.open_browser(&handle);
     app.handle_browser_key(KeyCode::Esc, &handle);
-    assert!(!app.browser_loading);
-    assert!(app.browser.is_none());
+    assert!(!app.browser_state.loading);
+    assert!(app.browser_state.panel.is_none());
     tokio::time::sleep(Duration::from_millis(10)).await;
     app.drain_events();
-    assert!(app.browser.is_none());
+    assert!(app.browser_state.panel.is_none());
     assert!(app.notice.is_none());
 }
 
@@ -277,7 +286,7 @@ async fn dashboard_uses_injected_session_registry() {
     let handle = Handle::current();
     app.open_browser(&handle);
     tokio::time::timeout(Duration::from_secs(2), async {
-        while app.browser_loading {
+        while app.browser_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;
         }
@@ -285,7 +294,8 @@ async fn dashboard_uses_injected_session_registry() {
     .await
     .unwrap();
     assert_eq!(
-        app.browser
+        app.browser_state
+            .panel
             .as_ref()
             .unwrap()
             .selected_session()
@@ -391,7 +401,7 @@ async fn reset_consumes_the_confirmed_account_even_when_another_has_the_same_too
         isolated_config(),
         "/tmp/usage-reset-accounts.toml".into(),
     );
-    app.overview = Some(reset_catalog(&app.providers));
+    app.overview_state.catalog = Some(reset_catalog(&app.providers));
     app.home_provider = Some("b".into());
     app.open_reset(&Handle::current());
     drain_until(&mut app, |app| {
@@ -424,7 +434,7 @@ async fn zero_reset_credits_never_open_confirmation() {
 fn reset_never_falls_back_to_default_when_home_provider_is_missing_or_unsupported() {
     let consumed = Arc::new(AtomicUsize::new(0));
     let mut app = reset_dashboard(2, consumed.clone());
-    app.overview = None;
+    app.overview_state.catalog = None;
     // No task is spawned on either rejection path.
     let runtime = tokio::runtime::Runtime::new().unwrap();
     app.open_reset(runtime.handle());
@@ -432,7 +442,7 @@ fn reset_never_falls_back_to_default_when_home_provider_is_missing_or_unsupporte
     assert!(app.notice.as_deref().unwrap().contains("选择首页 Provider"));
     let mut catalog = reset_catalog(&app.providers);
     catalog.providers[0].usage.reset = None;
-    app.overview = Some(catalog);
+    app.overview_state.catalog = Some(catalog);
     app.open_reset(runtime.handle());
     assert!(app.reset.is_none());
     assert!(app.notice.as_deref().unwrap().contains("不支持主动重置"));
@@ -447,7 +457,7 @@ async fn reset_preview_updates_only_its_provider_board_including_zero() {
     };
     for (available, initial) in [(2, 0), (0, 2)] {
         let mut app = reset_dashboard(available, Arc::new(AtomicUsize::new(0)));
-        let catalog = app.overview.as_mut().unwrap();
+        let catalog = app.overview_state.catalog.as_mut().unwrap();
         catalog.providers[0].usage.sources.push(UsageSource {
             target: "codex".into(),
             label: "官方订阅额度".into(),
@@ -475,7 +485,7 @@ async fn reset_preview_updates_only_its_provider_board_including_zero() {
         catalog.providers.push(other);
         let text = |app: &Dashboard| {
             crate::ui::overview::lines(
-                app.overview.as_ref(),
+                app.overview_state.catalog.as_ref(),
                 false,
                 None,
                 true,
@@ -497,8 +507,10 @@ async fn reset_preview_updates_only_its_provider_board_including_zero() {
         })
         .await;
         assert!(text(&app).contains(&format!("主动重置 {available} 次")));
-        let QueryState::Result(other) =
-            &app.overview.as_ref().unwrap().providers[1].usage.sources[0].state
+        let QueryState::Result(other) = &app.overview_state.catalog.as_ref().unwrap().providers[1]
+            .usage
+            .sources[0]
+            .state
         else {
             panic!("other provider lost its snapshot")
         };
@@ -555,7 +567,7 @@ fn provider_add_shortcut_is_scoped_to_the_provider_board() {
     app.home_focus = super::super::home::Focus::Projects;
     assert_eq!(app.handle_navigation_key(KeyCode::Char('a')), None);
     app.home_focus = super::super::home::Focus::Providers;
-    app.history = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
+    app.history_state.panel = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
     assert_eq!(app.handle_navigation_key(KeyCode::Char('a')), None);
 }
 
@@ -582,7 +594,7 @@ fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
         app.handle_navigation_key(KeyCode::F(4)),
         Some(MenuCommand::Activate(MenuAction::Providers))
     );
-    app.history = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
+    app.history_state.panel = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
     assert_eq!(app.handle_navigation_key(KeyCode::Char('m')), None);
     assert_eq!(
         app.handle_navigation_key(KeyCode::F(10)),
@@ -593,7 +605,7 @@ fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
         Some(MenuCommand::Dismiss)
     );
     assert!(app.menu.is_none());
-    assert!(app.history.as_ref().unwrap().monthly);
+    assert!(app.history_state.panel.as_ref().unwrap().monthly);
 }
 
 #[test]
@@ -623,14 +635,14 @@ async fn homepage_status_updates_without_quota_credentials_and_marks_failed_refr
             body: br#"{"status":{"indicator":"none","description":"OK"},"components":[]}"#.to_vec(),
         }),
     );
-    app.service_http = http.clone();
+    app.service_state.http = http.clone();
     app.refresh_service_statuses(&Handle::current());
     app.refresh_service_statuses(&Handle::current());
-    drain_until(&mut app, |a| a.service_pending == 0).await;
+    drain_until(&mut app, |a| a.service_state.pending == 0).await;
     assert_eq!(http.calls.lock().unwrap().len(), 3);
     assert_eq!(app.pending, 0);
     assert!(!app.cards[0].snapshot.as_ref().unwrap().success);
-    let time = app.service_statuses["claude"].fetched_at;
+    let time = app.service_state.statuses["claude"].fetched_at;
     for width in [28, 72, 110] {
         let area = Rect::new(0, 0, width, 32);
         let mut buffer = Buffer::empty(area);
@@ -643,11 +655,11 @@ async fn homepage_status_updates_without_quota_credentials_and_marks_failed_refr
         let compact = text.split_whitespace().collect::<String>();
         assert!(compact.contains("Claude·正常"), "{width}: {text}");
     }
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.refresh_service_statuses(&Handle::current());
-    drain_until(&mut app, |a| a.service_pending == 0).await;
-    assert_eq!(app.service_statuses["claude"].fetched_at, time);
-    assert!(app.service_statuses["claude"].stale);
+    drain_until(&mut app, |a| a.service_state.pending == 0).await;
+    assert_eq!(app.service_state.statuses["claude"].fetched_at, time);
+    assert!(app.service_state.statuses["claude"].stale);
     let area = Rect::new(0, 0, 72, 32);
     let mut buffer = Buffer::empty(area);
     render_home(area, &mut buffer, &app);
@@ -669,8 +681,8 @@ async fn homepage_status_updates_without_quota_credentials_and_marks_failed_refr
 #[tokio::test]
 async fn old_status_events_do_not_replace_the_current_generation() {
     let mut app = dashboard();
-    app.service_generation = 2;
-    app.service_pending = 1;
+    app.service_state.generation = 2;
+    app.service_state.pending = 1;
     let snapshot =
         service_status::query(&crate::http::FakeHttp::new(), service_status::CLAUDE).await;
     app.tx
@@ -680,8 +692,8 @@ async fn old_status_events_do_not_replace_the_current_generation() {
         })
         .unwrap();
     assert_eq!(app.drain_events(), (false, false));
-    assert!(app.service_statuses.is_empty());
-    assert_eq!(app.service_pending, 1);
+    assert!(app.service_state.statuses.is_empty());
+    assert_eq!(app.service_state.pending, 1);
 }
 
 struct CountingQuota(Arc<AtomicUsize>);
@@ -707,7 +719,7 @@ async fn repeated_quota_refresh_joins_pending_work() {
         isolated_config(),
         "/tmp/test-config".into(),
     );
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     let handle = Handle::current();
     app.refresh(&handle);
     app.refresh(&handle);
@@ -735,7 +747,7 @@ async fn a_panicking_quota_query_answers_and_later_refreshes_still_run() {
         isolated_config(),
         "/tmp/test-config".into(),
     );
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     let handle = Handle::current();
     app.refresh(&handle);
     drain_until(&mut app, |a| a.pending == 0).await;
@@ -752,26 +764,26 @@ async fn switching_history_preserves_date_source_and_monthly_view() {
     use chrono::Datelike;
     let root = std::env::temp_dir().join(format!("usage-ui-{}", uuid::Uuid::new_v4()));
     let mut app = dashboard();
-    app.history_config.providers.clear();
-    app.history_cache = Some(crate::history::HistoryCache::at(
+    app.history_state.config.providers.clear();
+    app.history_state.cache = Some(crate::history::HistoryCache::at(
         root.join("history.sqlite3"),
     ));
     let date = chrono::NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
-    app.history = Some(HistoryPanel::new(
+    app.history_state.panel = Some(HistoryPanel::new(
         vec!["codex".into(), "claude".into()],
         date.year(),
         true,
     ));
-    let panel = app.history.as_mut().unwrap();
+    let panel = app.history_state.panel.as_mut().unwrap();
     panel.selected = date;
     panel.key(KeyCode::Char('1'));
     app.close_history();
     app.open_history(&Handle::current());
-    let panel = app.history.as_ref().unwrap();
+    let panel = app.history_state.panel.as_ref().unwrap();
     assert_eq!(panel.selected, date);
     assert!(panel.monthly);
     assert_eq!(panel.sources(), vec!["codex"]);
-    drain_until(&mut app, |a| !a.history_loading).await;
+    drain_until(&mut app, |a| !a.history_state.loading).await;
     std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -799,11 +811,13 @@ fn drilldown_returns_to_saved_history_and_uses_selected_day_usage() {
             ..Default::default()
         },
     };
-    Arc::make_mut(&mut app.loaded_history).records.push(record);
-    app.browser_filter = Some((panel.sources(), panel.session_query()));
-    app.saved_history = Some(panel);
-    app.history_return = true;
-    app.browser = Some(SessionBrowser::new(vec![Session {
+    Arc::make_mut(&mut app.history_state.loaded)
+        .records
+        .push(record);
+    app.browser_state.filter = Some((panel.sources(), panel.session_query()));
+    app.history_state.saved = Some(panel);
+    app.browser_state.return_to_history = true;
+    app.browser_state.panel = Some(SessionBrowser::new(vec![Session {
         agent: None,
         provider: AgentKind::CODEX,
         instance: "codex".into(),
@@ -814,9 +828,9 @@ fn drilldown_returns_to_saved_history_and_uses_selected_day_usage() {
         home: "/tmp".into(),
     }]));
     app.apply_browser_usage();
-    assert_eq!(app.browser.as_ref().unwrap().visible_count(), 1);
+    assert_eq!(app.browser_state.panel.as_ref().unwrap().visible_count(), 1);
     app.close_browser(true);
-    assert_eq!(app.history.as_ref().unwrap().selected, selected);
+    assert_eq!(app.history_state.panel.as_ref().unwrap().selected, selected);
 }
 #[tokio::test]
 async fn history_auto_refresh_scans_locally_and_skips_quota_network() {
@@ -827,26 +841,26 @@ async fn history_auto_refresh_scans_locally_and_skips_quota_network() {
         isolated_config(),
         "/tmp/test-config".into(),
     );
-    app.history_config.providers.clear();
-    app.history_cache = Some(crate::history::HistoryCache::at(
+    app.history_state.config.providers.clear();
+    app.history_state.cache = Some(crate::history::HistoryCache::at(
         root.join("history.sqlite3"),
     ));
-    app.history = Some(HistoryPanel::new(Vec::new(), 2026, false));
+    app.history_state.panel = Some(HistoryPanel::new(Vec::new(), 2026, false));
     app.refresh_seconds = 1;
-    app.last_history_refresh = std::time::Instant::now() - Duration::from_secs(2);
+    app.history_state.last_refresh = std::time::Instant::now() - Duration::from_secs(2);
     assert!(app.maybe_auto_refresh(&Handle::current()));
-    assert!(app.history_loading);
-    drain_until(&mut app, |a| !a.history_loading).await;
+    assert!(app.history_state.loading);
+    drain_until(&mut app, |a| !a.history_state.loading).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     app.refresh_seconds = 0;
-    app.last_history_refresh = std::time::Instant::now() - Duration::from_secs(2);
+    app.history_state.last_refresh = std::time::Instant::now() - Duration::from_secs(2);
     assert!(!app.maybe_auto_refresh(&Handle::current()));
     std::fs::remove_dir_all(root).unwrap();
 }
 #[tokio::test]
 async fn current_resume_is_requested_only_after_session_enter() {
     let mut app = dashboard();
-    app.browser = Some(SessionBrowser::new(vec![sessions::Session {
+    app.browser_state.panel = Some(SessionBrowser::new(vec![sessions::Session {
         agent: None,
         provider: AgentKind::CODEX,
         instance: "work".into(),
@@ -856,17 +870,20 @@ async fn current_resume_is_requested_only_after_session_enter() {
         title: "Work".into(),
         recency_at_ms: 0,
     }]));
-    app.browser.as_mut().unwrap().resume_mode = crate::config::ResumeMode::Current;
+    app.browser_state.panel.as_mut().unwrap().resume_mode = crate::config::ResumeMode::Current;
     app.handle_browser_key(KeyCode::Enter, &Handle::current());
-    assert!(app.resume_request.is_none());
+    assert!(app.browser_state.resume_request.is_none());
     app.handle_browser_key(KeyCode::Enter, &Handle::current());
-    assert_eq!(app.resume_request.as_ref().unwrap().instance, "work");
-    assert!(app.browser.as_ref().unwrap().launching);
+    assert_eq!(
+        app.browser_state.resume_request.as_ref().unwrap().instance,
+        "work"
+    );
+    assert!(app.browser_state.panel.as_ref().unwrap().launching);
 }
 #[test]
 fn quota_events_queue_one_alert_and_failures_do_not_emit_recovery() {
     let mut app = dashboard();
-    app.history_config.alerts.enabled = true;
+    app.history_state.config.alerts.enabled = true;
     let now = Utc::now();
     let snapshot = snapshot_ok(
         "codex",

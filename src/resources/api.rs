@@ -87,7 +87,7 @@ impl ApiClient {
     pub(super) async fn credential(&self) -> QueryResult<String> {
         let resolver = self.connection.credentials.clone();
         let reference = self.connection.credential_ref.clone();
-        let token = tokio::task::spawn_blocking(move || resolver(&reference))
+        let token = crate::background::blocking(move || resolver(&reference))
             .await
             .map_err(|_| QueryFailure(ResourceState::TransientFailure, "资源凭据读取任务中断"))?
             .map_err(|_| {

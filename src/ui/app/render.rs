@@ -20,8 +20,9 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let status = if app.history.is_some() {
-        app.history
+    let status = if app.history_state.panel.is_some() {
+        app.history_state
+            .panel
             .as_ref()
             .and_then(|p| p.history.synced_at)
             .map_or_else(
@@ -30,7 +31,7 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
                     format!(
                         "本地 Token · 更新 {}{}",
                         t.with_timezone(&chrono::Local).format("%H:%M:%S"),
-                        if app.history_loading {
+                        if app.history_state.loading {
                             " · 同步中"
                         } else {
                             ""
@@ -38,14 +39,14 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
                     )
                 },
             )
-    } else if app.browser_loading {
+    } else if app.browser_state.loading {
         "正在读取本机会话…".to_string()
     } else {
         app.notice.clone().unwrap_or_else(|| {
-            app.browser.as_ref().map_or_else(
+            app.browser_state.panel.as_ref().map_or_else(
                 || {
-                    app.overview_error.clone().unwrap_or_else(|| {
-                        if app.overview_loading {
+                    app.overview_state.error.clone().unwrap_or_else(|| {
+                        if app.overview_state.loading {
                             "正在更新 Provider 状态…".into()
                         } else {
                             "Provider · 厂商状态 · 项目与会话".into()
@@ -63,9 +64,9 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             )
         })
     };
-    let header_title = if app.history.is_some() {
+    let header_title = if app.history_state.panel.is_some() {
         " F10 菜单  F1 首页  [F2 历史]  F3 会话  F4 Provider "
-    } else if app.browser.is_some() {
+    } else if app.browser_state.panel.is_some() {
         " F10 菜单  F1 首页  F2 历史  [F3 会话]  F4 Provider "
     } else {
         " F10 菜单  [F1 首页]  F2 历史  F3 会话  F4 Provider "
@@ -77,10 +78,10 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
                 .fg(Color::Rgb(242, 242, 247)),
         )
         .render(header, frame.buffer_mut());
-    if let Some(panel) = &app.history {
+    if let Some(panel) = &app.history_state.panel {
         history::render(body, frame.buffer_mut(), panel);
-    } else if let Some(browser) = &app.browser {
-        if app.browser_loading && browser.sessions.is_empty() {
+    } else if let Some(browser) = &app.browser_state.panel {
+        if app.browser_state.loading && browser.sessions.is_empty() {
             Paragraph::new(" 正在扫描 Claude Code、Codex 和 Grok 的本机会话…")
                 .style(Style::new().fg(Color::Rgb(142, 142, 147)))
                 .render(body, frame.buffer_mut());
@@ -90,14 +91,14 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     } else {
         render_home(body, frame.buffer_mut(), app);
     }
-    let footer_text = if app.history.is_some() {
+    let footer_text = if app.history_state.panel.is_some() {
         if frame.area().width >= 105 {
             " ↑新 ↓旧  ←/→ 周  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  Tab 来源  c 清筛选  r 更新  Esc 返回"
         } else {
             " ↑新 ↓旧  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  r 更新  Esc 返回"
         }
-    } else if let Some(browser) = &app.browser {
-        if app.browser_loading {
+    } else if let Some(browser) = &app.browser_state.panel {
+        if app.browser_state.loading {
             " 正在读取本机会话… Esc 返回"
         } else if browser.launching {
             " 正在 Ghostty 右侧打开会话… 请等待"
@@ -110,11 +111,11 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次   n/Esc 取消",
             Some(ResetStage::Executing) => " 正在提交主动重置，请等待结果…",
             Some(ResetStage::Result(_)) => " Enter / Esc 返回",
-            None if app.home_sessions.launching => " 正在恢复会话，请等待…",
+            None if app.home_sessions_state.browser.launching => " 正在恢复会话，请等待…",
             None => match app.home_focus {
                 crate::ui::home::Focus::Providers => {
                     if crate::ui::overview::selected(
-                        app.overview.as_ref(),
+                        app.overview_state.catalog.as_ref(),
                         app.home_provider.as_deref(),
                     )
                     .is_some_and(|(_, provider)| crate::ui::subscription_tests::supports(provider))
@@ -148,7 +149,7 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     if let Some(panel) = &app.provider_action {
         panel.render(frame);
     }
-    if let Some(panel) = &app.performance {
+    if let Some(panel) = &app.performance.panel {
         crate::ui::performance::draw(frame, panel);
     }
     if let Some(menu) = &app.menu {
@@ -213,21 +214,25 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
 
 pub(super) fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
     if app.home_subscription_details
-        && let Some((_, provider)) =
-            crate::ui::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
+        && let Some((_, provider)) = crate::ui::overview::selected(
+            app.overview_state.catalog.as_ref(),
+            app.home_provider.as_deref(),
+        )
         && crate::ui::subscription_tests::supports(provider)
     {
         return app.subscription_tests.details(provider, width);
     }
-    let summary =
-        crate::ui::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
-            .and_then(|(_, p)| p.performance.as_ref())
-            .and_then(|b| app.home_performance.get(&b.cache_key()));
+    let summary = crate::ui::overview::selected(
+        app.overview_state.catalog.as_ref(),
+        app.home_provider.as_deref(),
+    )
+    .and_then(|(_, p)| p.performance.as_ref())
+    .and_then(|b| app.home_performance.cached.get(&b.cache_key()));
     crate::ui::overview::wrap(
         crate::ui::overview::lines(
-            app.overview.as_ref(),
-            app.overview_loading,
-            app.overview_error.as_deref(),
+            app.overview_state.catalog.as_ref(),
+            app.overview_state.loading,
+            app.overview_state.error.as_deref(),
             app.home_models_expanded,
             app.home_provider.as_deref(),
             summary,
@@ -243,16 +248,18 @@ pub(super) fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
 pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     use crate::ui::home::{self, Focus as HomeFocus};
     let [providers, connections, projects] = home::areas(area);
-    let provider_title =
-        crate::ui::overview::selected(app.overview.as_ref(), app.home_provider.as_deref())
-            .map(|(index, _)| {
-                format!(
-                    "Provider · {} / {}",
-                    index + 1,
-                    app.overview.as_ref().unwrap().providers.len(),
-                )
-            })
-            .unwrap_or_else(|| "Provider".into());
+    let provider_title = crate::ui::overview::selected(
+        app.overview_state.catalog.as_ref(),
+        app.home_provider.as_deref(),
+    )
+    .map(|(index, _)| {
+        format!(
+            "Provider · {} / {}",
+            index + 1,
+            app.overview_state.catalog.as_ref().unwrap().providers.len(),
+        )
+    })
+    .unwrap_or_else(|| "Provider".into());
     let inner = home::board(
         providers,
         buf,
@@ -269,21 +276,21 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     app.home_connections.render(
         inner,
         buf,
-        &app.service_statuses,
-        &app.status_history,
-        app.service_pending > 0,
+        &app.service_state.statuses,
+        &app.service_state.history,
+        app.service_state.pending > 0,
         app.home_focus == HomeFocus::Connections,
     );
-    let mode = if sessions::uses_ghostty(app.home_sessions.resume_mode) {
+    let mode = if sessions::uses_ghostty(app.home_sessions_state.browser.resume_mode) {
         "分屏"
     } else {
         "当前终端"
     };
-    let title = if app.home_sessions.query.is_empty() {
+    let title = if app.home_sessions_state.browser.query.is_empty() {
         format!(
             "项目与会话 · {} 项目 · {mode}{}",
-            app.home_sessions.project_count(),
-            if app.home_sessions_loading {
+            app.home_sessions_state.browser.project_count(),
+            if app.home_sessions_state.loading {
                 " · 更新中"
             } else {
                 ""
@@ -292,14 +299,15 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     } else {
         format!(
             "项目与会话 · 搜索 {}",
-            crate::ui::overview::clean(&app.home_sessions.query)
+            crate::ui::overview::clean(&app.home_sessions_state.browser.query)
         )
     };
     let mut inner = home::board(projects, buf, &title, app.home_focus == HomeFocus::Projects);
     if let Some(warning) = app
-        .home_sessions_warning
+        .home_sessions_state
+        .warning
         .as_ref()
-        .or(app.home_activity_error.as_ref())
+        .or(app.home_activity.error.as_ref())
     {
         Paragraph::new(format!(
             "读取警告 · {}",
@@ -316,8 +324,8 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
         inner.y = inner.y.saturating_add(1);
         inner.height = inner.height.saturating_sub(1);
     }
-    if app.home_sessions.sessions.is_empty() {
-        let message = if app.home_sessions_loading {
+    if app.home_sessions_state.browser.sessions.is_empty() {
+        let message = if app.home_sessions_state.loading {
             "正在读取本地项目与会话…"
         } else {
             "尚无可恢复会话 · F4 启动 Agent · F3 完整会话页"
@@ -327,12 +335,13 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
             .dim()
             .render(inner, buf);
     } else {
-        session_browser::render_compact(inner, buf, &app.home_sessions, &|session| {
+        session_browser::render_compact(inner, buf, &app.home_sessions_state.browser, &|session| {
             let account = if let Some(binding) = session.instance.strip_prefix("managed-") {
                 if let Some((id, revision)) = binding.rsplit_once("-r")
-                    && let Some(account) = app.overview.as_ref().and_then(|snapshot| {
-                        snapshot.providers.iter().find(|account| account.id == id)
-                    })
+                    && let Some(account) =
+                        app.overview_state.catalog.as_ref().and_then(|snapshot| {
+                            snapshot.providers.iter().find(|account| account.id == id)
+                        })
                 {
                     format!("{} · r{revision}", account.name)
                 } else {
@@ -343,7 +352,7 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
             } else {
                 session.instance.clone()
             };
-            match app.home_activity.get(&session.key()) {
+            match app.home_activity.sessions.get(&session.key()) {
                 Some(activity) if !activity.runs.is_empty() => {
                     format!("{account} · {}", activity.label())
                 }

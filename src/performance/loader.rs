@@ -64,7 +64,7 @@ async fn snapshot(
         request.page,
         request.now,
     );
-    tokio::task::spawn_blocking(move || {
+    crate::background::blocking(move || {
         if cancel.is_cancelled() {
             return Err("已取消".into());
         }
@@ -100,7 +100,7 @@ async fn load(
         }
         let (svc, binding, flag) = (service.clone(), request.binding.clone(), cancel.clone());
         let batch =
-            tokio::task::spawn_blocking(move || svc.refresh(&binding, binding.source, flag.flag()))
+            crate::background::blocking(move || svc.refresh(&binding, binding.source, flag.flag()))
                 .await
                 .unwrap_or_else(|_| Err("性能采集任务中断".into()));
         // A cancelled blocking batch may still return an error. It must not publish late data.

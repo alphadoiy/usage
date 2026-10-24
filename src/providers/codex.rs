@@ -52,7 +52,7 @@ impl UsageProvider for CodexProvider {
         let now = (self.ctx.now)();
         let ctx = Arc::clone(&self.ctx);
         let (token, account_id, status, message, email) =
-            match tokio::task::spawn_blocking(move || read_credentials(&ctx, now)).await {
+            match crate::background::blocking(move || read_credentials(&ctx, now)).await {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     return snapshot_transient(

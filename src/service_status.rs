@@ -224,37 +224,44 @@ async fn get(http: &dyn HttpClient, url: &str) -> Result<Vec<u8>, String> {
 
 pub async fn query(http: &dyn HttpClient, source: Source) -> ServiceStatus {
     let mut snapshot = ServiceStatus::new(source);
-    let result = tokio::time::timeout(TIMEOUT, async {
-        let body = get(http, source.endpoint).await?;
-        if source == GROK {
-            parse_rss(&body, &mut snapshot)
-        } else {
-            parse_summary(&body, &mut snapshot)?;
-            // OpenAI's compatibility summary does not contain incidents. Its
-            // incidents endpoint includes history, so filter resolved entries.
-            if source == OPENAI {
-                match get(http, "https://status.openai.com/api/v2/incidents.json").await {
-                    Ok(body) => match serde_json::from_slice::<IncidentFeed>(&body) {
-                        Ok(feed) => apply_incidents(feed.incidents, &mut snapshot),
-                        Err(_) => snapshot.error = Some("故障详情格式异常".into()),
-                    },
-                    Err(error) => snapshot.error = Some(format!("故障详情查询失败：{error}")),
+    let result = crate::background::query(async {
+        tokio::time::timeout(TIMEOUT, async {
+            let body = get(http, source.endpoint).await?;
+            if source == GROK {
+                parse_rss(&body, &mut snapshot)
+            } else {
+                parse_summary(&body, &mut snapshot)?;
+                // OpenAI's compatibility summary does not contain incidents. Its
+                // incidents endpoint includes history, so filter resolved entries.
+                if source == OPENAI {
+                    match get(http, "https://status.openai.com/api/v2/incidents.json").await {
+                        Ok(body) => match serde_json::from_slice::<IncidentFeed>(&body) {
+                            Ok(feed) => apply_incidents(feed.incidents, &mut snapshot),
+                            Err(_) => snapshot.error = Some("故障详情格式异常".into()),
+                        },
+                        Err(error) => snapshot.error = Some(format!("故障详情查询失败：{error}")),
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        }
+        })
+        .await
     })
     .await;
     match result {
-        Ok(Ok(())) => snapshot.fetched_at = Some(Utc::now()),
-        Ok(Err(error)) => {
+        Ok(Ok(Ok(()))) => snapshot.fetched_at = Some(Utc::now()),
+        Ok(Ok(Err(error))) => {
             snapshot = ServiceStatus::new(source);
             snapshot.error = Some(error);
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             // Discard any partial data when the overall query timed out.
             snapshot = ServiceStatus::new(source);
             snapshot.error = Some("状态查询超时".into());
+        }
+        Err(error) => {
+            snapshot = ServiceStatus::new(source);
+            snapshot.error = Some(error.into());
         }
     }
     snapshot.checked_at = Utc::now();

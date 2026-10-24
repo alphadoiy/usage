@@ -33,7 +33,7 @@ impl CatalogService {
         publish: impl Fn(RefreshUpdate) -> bool + Send + Sync,
     ) {
         let service = self.clone();
-        let plan = tokio::task::spawn_blocking(move || {
+        let plan = crate::background::blocking(move || {
             let config = crate::config::load_config(&request.config_path, false)
                 .map_err(|_| "首页配置读取失败，请检查配置文件".to_string())?;
             let mut plan = service.load(&config)?;
@@ -43,7 +43,7 @@ impl CatalogService {
             Ok::<_, String>(plan)
         })
         .await
-        .unwrap_or_else(|_| Err("首页读取任务中断".into()));
+        .unwrap_or_else(|error| Err(error.into()));
         match plan {
             Ok(plan) => collect(plan, self.http.clone(), publish).await,
             Err(error) => {

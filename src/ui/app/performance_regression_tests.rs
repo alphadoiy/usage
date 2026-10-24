@@ -7,12 +7,12 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
     let root =
         std::env::temp_dir().join(format!("usage-home-performance-{}", uuid::Uuid::new_v4()));
     let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config"));
-    app.performance_service = Arc::new(crate::performance::Service::at(root.join("index.sqlite3")));
+    app.performance.service = Arc::new(crate::performance::Service::at(root.join("index.sqlite3")));
     let a = panel().binding.clone();
     let mut b = a.clone();
     b.provider = "provider-b".into();
     b.home = root.join("other-home");
-    app.overview = Some(Catalog {
+    app.overview_state.catalog = Some(Catalog {
         providers: [a.clone(), b.clone()]
             .into_iter()
             .map(|binding| Provider {
@@ -32,7 +32,7 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
     let handle = Handle::current();
     assert!(app.refresh_home_performance(&handle));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while app.home_performance_pending {
+        while app.home_performance.pending {
             app.drain_events();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -44,7 +44,7 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
         "homepage must not create an index or scan directories"
     );
     assert!(!app.refresh_home_performance(&handle));
-    app.home_performance.insert(
+    app.home_performance.cached.insert(
         a.cache_key(),
         super::super::performance::CachedSummary {
             result: Ok(Some(crate::performance::Summary {
@@ -74,7 +74,7 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
     assert!(text(&app).contains("60.0 tok/s"));
     app.home_provider = Some(b.provider.clone());
     assert!(!text(&app).contains("60.0 tok/s"));
-    app.home_performance.insert(
+    app.home_performance.cached.insert(
         b.cache_key(),
         super::super::performance::CachedSummary {
             result: Ok(None),
@@ -85,12 +85,13 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
     app.home_provider = Some(a.provider.clone());
     assert!(!app.refresh_home_performance(&handle));
     app.home_performance
+        .cached
         .get_mut(&a.cache_key())
         .unwrap()
         .updated -= Duration::from_secs(301);
     assert!(app.refresh_home_performance(&handle));
     tokio::time::timeout(Duration::from_secs(5), async {
-        while app.home_performance_pending {
+        while app.home_performance.pending {
             app.drain_events();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -98,20 +99,27 @@ async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minut
     .await
     .unwrap();
     let old = a.cache_key();
-    app.overview.as_mut().unwrap().providers[0]
+    app.overview_state.catalog.as_mut().unwrap().providers[0]
         .performance
         .as_mut()
         .unwrap()
         .revision = "changed".into();
     app.tx
         .send(AppEvent::HomePerformance {
-            generation: app.home_performance_generation,
+            generation: app.home_performance.generation,
             key: old.clone(),
             result: Err("wrong revision".into()),
         })
         .unwrap();
     app.drain_events();
-    assert!(app.home_performance.get(&old).unwrap().result.is_ok());
+    assert!(
+        app.home_performance
+            .cached
+            .get(&old)
+            .unwrap()
+            .result
+            .is_ok()
+    );
     assert!(!text(&app).contains("wrong revision"));
     assert!(
         app.refresh_home_performance(&handle),
@@ -123,7 +131,7 @@ async fn loaded(app: &mut Dashboard) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             app.drain_events();
-            let panel = app.performance.as_ref().unwrap();
+            let panel = app.performance.panel.as_ref().unwrap();
             if !panel.loading {
                 assert!(panel.error.is_none(), "{:?}", panel.error);
                 break;
@@ -151,23 +159,31 @@ async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_c
     ].into_iter().map(|v| v.to_string()+"\n").collect::<String>();
     std::fs::write(home.join("sessions/fixture.jsonl"), &text).unwrap();
     let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config.toml"));
-    app.performance_service = Arc::new(crate::performance::Service::at(
+    app.performance.service = Arc::new(crate::performance::Service::at(
         root.join("index/performance.sqlite3"),
     ));
     let mut p = panel();
     p.binding.home = home;
     p.snapshot = None;
-    app.performance = Some(p);
+    app.performance.panel = Some(p);
     let handle = Handle::current();
     app.load_performance(&handle, false);
     loaded(&mut app).await;
-    let data = app.performance.as_ref().unwrap().snapshot.as_ref().unwrap();
+    let data = app
+        .performance
+        .panel
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .as_ref()
+        .unwrap();
     assert_eq!(data.models[0].model, "fixture-model");
     assert_eq!(data.models[0].mean_ttft_ms, Some(2000.0));
     assert_eq!(data.read_bytes, text.len() as u64);
-    let key = app.performance.as_ref().unwrap().binding.cache_key();
+    let key = app.performance.panel.as_ref().unwrap().binding.cache_key();
     let mean = app
         .home_performance
+        .cached
         .get(&key)
         .unwrap()
         .result
@@ -178,11 +194,19 @@ async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_c
     assert_eq!(mean.mean_ttft_ms, Some(2000.0));
     app.handle_performance_key(KeyCode::Char('r'), &handle);
     loaded(&mut app).await;
-    let data = app.performance.as_ref().unwrap().snapshot.as_ref().unwrap();
+    let data = app
+        .performance
+        .panel
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .as_ref()
+        .unwrap();
     assert_eq!(data.read_bytes, 0);
     assert_eq!(data.models[0].calls, 1);
     let cancel = app
         .performance
+        .panel
         .as_ref()
         .unwrap()
         .task
@@ -191,7 +215,7 @@ async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_c
         .cancellation();
     app.handle_performance_key(KeyCode::Esc, &handle);
     assert!(cancel.is_cancelled());
-    assert!(app.performance.is_none());
+    assert!(app.performance.panel.is_none());
     drop(app);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -233,7 +257,7 @@ fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
         AppConfig::default(),
         "/nonexistent/perf-config".into(),
     );
-    app.performance = Some(panel());
+    app.performance.panel = Some(panel());
     // x, Enter and navigation belong to the modal, never to resets or parent sessions.
     assert!(app.handle_performance_key(KeyCode::Char('x'), runtime.handle()));
     assert!(app.reset.is_none());
@@ -241,7 +265,9 @@ fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 28)).unwrap();
         terminal
-            .draw(|frame| super::super::performance::draw(frame, app.performance.as_ref().unwrap()))
+            .draw(|frame| {
+                super::super::performance::draw(frame, app.performance.panel.as_ref().unwrap())
+            })
             .unwrap();
         let text = terminal
             .backend()
@@ -258,7 +284,7 @@ fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
         assert!(compact.contains("60.0tok/s"), "width={width}: {compact}");
     }
     assert!(app.handle_performance_key(KeyCode::Esc, runtime.handle()));
-    assert!(app.performance.is_none());
+    assert!(app.performance.panel.is_none());
 }
 #[test]
 fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
@@ -267,7 +293,7 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
         AppConfig::default(),
         "/nonexistent/perf-config".into(),
     );
-    app.performance = Some(panel());
+    app.performance.panel = Some(panel());
     app.home_provider = Some("provider-b".into());
     app.tx
         .send(AppEvent::Performance {
@@ -277,9 +303,9 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
         })
         .unwrap();
     app.drain_events();
-    assert!(app.performance.as_ref().unwrap().error.is_none());
+    assert!(app.performance.panel.as_ref().unwrap().error.is_none());
     assert_eq!(
-        app.performance.as_ref().unwrap().binding.provider,
+        app.performance.panel.as_ref().unwrap().binding.provider,
         "provider-a"
     );
     app.tx
@@ -292,6 +318,7 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
     app.drain_events();
     assert!(
         app.performance
+            .panel
             .as_ref()
             .unwrap()
             .snapshot
@@ -300,7 +327,7 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
             .models
             .is_empty()
     );
-    app.performance = None;
+    app.performance.panel = None;
     app.tx
         .send(AppEvent::Performance {
             generation: 7,
@@ -309,7 +336,7 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
         })
         .unwrap();
     app.drain_events();
-    assert!(app.performance.is_none());
+    assert!(app.performance.panel.is_none());
 }
 #[test]
 fn an_unbound_provider_never_scans_default_agent_logs() {
@@ -319,7 +346,7 @@ fn an_unbound_provider_never_scans_default_agent_logs() {
         AppConfig::default(),
         "/nonexistent/perf-config".into(),
     );
-    app.overview = Some(Catalog {
+    app.overview_state.catalog = Some(Catalog {
         providers: vec![Provider {
             operations: Vec::new(),
             id: "api".into(),
@@ -334,6 +361,6 @@ fn an_unbound_provider_never_scans_default_agent_logs() {
         ..Default::default()
     });
     app.open_performance(runtime.handle());
-    assert!(app.performance.is_none());
+    assert!(app.performance.panel.is_none());
     assert!(app.notice.as_deref().unwrap().contains("尚未绑定"));
 }

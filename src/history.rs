@@ -1,6 +1,10 @@
 //! Local token history. Quota percentages cannot reconstruct daily consumption.
 mod ledger;
+mod query;
+mod sources;
 use ledger::{aggregate_database, open_database, read_database, read_file_row, store_file};
+use query::HistoryDatabase;
+use sources::{append_file, collect_files, fresh_file, history_roots};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -74,6 +78,7 @@ pub struct History {
     pub scanned_files: usize,
     pub read_bytes: u64,
     pub synced_at: Option<DateTime<Utc>>,
+    database: Option<HistoryDatabase>,
 }
 #[derive(Serialize)]
 pub struct HistoryReport {
@@ -119,13 +124,39 @@ impl HistoryQuery {
                 .is_none_or(|m| record.model.to_lowercase().contains(&m.to_lowercase()))
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionUsage {
     pub tokens: Tokens,
     pub models: Vec<String>,
 }
 impl History {
     pub fn filtered(&self, query: &HistoryQuery) -> Self {
+        if let Some(database) = &self.database {
+            let mut result = Self {
+                warnings: self.warnings.clone(),
+                instances: self.instances.clone(),
+                scanned_files: self.scanned_files,
+                read_bytes: self.read_bytes,
+                synced_at: self.synced_at,
+                ..Self::default()
+            };
+            match database.records(query) {
+                Ok(records) => {
+                    for record in &records {
+                        result
+                            .days
+                            .entry(record.time.with_timezone(&Local).date_naive())
+                            .or_default()
+                            .entry(record.source.clone())
+                            .or_default()
+                            .add(record.tokens);
+                    }
+                    result.records = records;
+                }
+                Err(error) => result.warnings.push(format!("历史查询失败：{error}")),
+            }
+            return result;
+        }
         let mut result = Self {
             warnings: self.warnings.clone(),
             instances: self.instances.clone(),
@@ -163,6 +194,14 @@ impl History {
         sources: &[String],
         query: &HistoryQuery,
     ) -> HashMap<crate::sessions::SessionKey, SessionUsage> {
+        if let Some(database) = &self.database {
+            return database
+                .session_usage(sources, query)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(event = "history_query_failed", %error);
+                    HashMap::new()
+                });
+        }
         let mut sessions = HashMap::<crate::sessions::SessionKey, SessionUsage>::new();
         for record in self
             .records
@@ -186,6 +225,21 @@ impl History {
         sources: &[String],
         query: &HistoryQuery,
     ) -> HistoryReport {
+        if let Some(database) = &self.database {
+            return database
+                .report(self, year, sources, query)
+                .unwrap_or_else(|error| {
+                    let mut fallback = History {
+                        warnings: self.warnings.clone(),
+                        synced_at: self.synced_at,
+                        scanned_files: self.scanned_files,
+                        read_bytes: self.read_bytes,
+                        ..History::default()
+                    };
+                    fallback.warnings.push(format!("历史查询失败：{error}"));
+                    fallback.report(year, sources)
+                });
+        }
         if query == &HistoryQuery::default() {
             return self.report(year, sources);
         }
@@ -264,6 +318,19 @@ impl History {
         report
     }
     pub fn day(&self, date: NaiveDate, sources: &[String]) -> Tokens {
+        if self.database.is_some() {
+            return self
+                .report_query(
+                    date.year(),
+                    sources,
+                    &HistoryQuery {
+                        from: Some(date),
+                        to: Some(date),
+                        ..HistoryQuery::default()
+                    },
+                )
+                .totals;
+        }
         let mut total = Tokens::default();
         if let Some(day) = self.days.get(&date) {
             for source in sources {
@@ -275,6 +342,9 @@ impl History {
         total
     }
     pub fn report(&self, year: i32, sources: &[String]) -> HistoryReport {
+        if self.database.is_some() {
+            return self.report_query(year, sources, &HistoryQuery::default());
+        }
         let mut report = HistoryReport {
             year,
             providers: sources.to_vec(),
@@ -319,6 +389,31 @@ impl History {
             date = next;
         }
         report
+    }
+
+    pub fn dimension_values(&self, sources: &[String], field: &str) -> Vec<String> {
+        if let Some(database) = &self.database {
+            return database.distinct(sources, field).unwrap_or_else(|error| {
+                tracing::warn!(event = "history_query_failed", %error);
+                Vec::new()
+            });
+        }
+        let mut values: Vec<_> = self
+            .records
+            .iter()
+            .filter(|r| sources.contains(&r.source))
+            .filter_map(|r| match field {
+                "project" => Some(&r.project),
+                "model" => Some(&r.model),
+                "instance" => Some(&r.instance),
+                _ => None,
+            })
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        values.sort();
+        values.dedup();
+        values
     }
 }
 
@@ -385,6 +480,13 @@ impl HistoryCache {
     pub fn load(&mut self, config: &AppConfig) -> History {
         self.load_with_cached(config, |_| {})
     }
+    pub fn load_compact(&mut self, config: &AppConfig) -> History {
+        self.load_compact_with_cached_controlled(
+            config,
+            &crate::background::Cancellation::new(),
+            |_| {},
+        )
+    }
     pub fn load_with_cached(
         &mut self,
         config: &AppConfig,
@@ -397,6 +499,23 @@ impl HistoryCache {
         config: &AppConfig,
         cancel: &crate::background::Cancellation,
         cached: impl FnOnce(History),
+    ) -> History {
+        self.load_internal(config, cancel, cached, false)
+    }
+    pub fn load_compact_with_cached_controlled(
+        &mut self,
+        config: &AppConfig,
+        cancel: &crate::background::Cancellation,
+        cached: impl FnOnce(History),
+    ) -> History {
+        self.load_internal(config, cancel, cached, true)
+    }
+    fn load_internal(
+        &mut self,
+        config: &AppConfig,
+        cancel: &crate::background::Cancellation,
+        cached: impl FnOnce(History),
+        compact: bool,
     ) -> History {
         let mut history = History::default();
         if cancel.is_cancelled() {
@@ -425,7 +544,11 @@ impl HistoryCache {
                     .map(|t| t.with_timezone(&Utc)),
                 ..History::default()
             };
-            let previous = aggregate_database(db, &self.files, &roots, previous, cancel);
+            let previous = if compact {
+                self.compact_snapshot(&roots, previous)
+            } else {
+                aggregate_database(db, &self.files, &roots, previous, cancel)
+            };
             if previous.synced_at.is_some() {
                 cached(previous);
             }
@@ -442,7 +565,7 @@ impl HistoryCache {
             collect_files(
                 root,
                 source,
-                (source == "grok").then_some("updates.jsonl"),
+                sources::file_name(source),
                 &mut paths,
                 &mut history.warnings,
                 cancel,
@@ -452,7 +575,7 @@ impl HistoryCache {
             }
         }
         for source in &config.providers {
-            if !SOURCES.contains(&source.as_str()) {
+            if !sources::supported(source) {
                 history
                     .warnings
                     .push(format!("{source}: 没有历史日志读取器"));
@@ -554,10 +677,48 @@ impl HistoryCache {
             }
         }
         if let Some(Ok(db)) = &database {
-            aggregate_database(db, &self.files, &roots, history, cancel)
+            if compact {
+                self.compact_snapshot(&roots, history)
+            } else {
+                aggregate_database(db, &self.files, &roots, history, cancel)
+            }
         } else {
             aggregate(&self.files, &roots, history)
         }
+    }
+
+    fn compact_snapshot(
+        &self,
+        roots: &[(String, String, PathBuf)],
+        mut history: History,
+    ) -> History {
+        let Some(path) = &self.database else {
+            return history;
+        };
+        history.instances = roots.iter().map(|(_, id, _)| id.clone()).collect();
+        history.instances.sort();
+        history.instances.dedup();
+        let mut malformed = 0;
+        let mut scope = Vec::new();
+        for (file, entry) in &self.files {
+            if let Some((_, instance, _)) = roots
+                .iter()
+                .find(|(source, _, root)| *source == entry.source && file.starts_with(root))
+            {
+                malformed += entry.malformed;
+                scope.push((file.to_string_lossy().into_owned(), instance.clone()));
+            }
+        }
+        if malformed > 0 {
+            history
+                .warnings
+                .push(format!("跳过 {malformed} 条损坏或无有效时间的用量记录"));
+        }
+        history.database = Some(HistoryDatabase {
+            path: path.clone(),
+            scope,
+        });
+        history
     }
 }
 fn merge_record(unique: &mut HashMap<(String, String, String), Record>, record: Record) {
@@ -635,142 +796,6 @@ fn finish_aggregate(
     }
     history
 }
-fn history_roots(config: &AppConfig) -> Vec<(String, String, PathBuf)> {
-    let mut roots = Vec::new();
-    for instance in config
-        .data_instances()
-        .into_iter()
-        .filter(|i| config.providers.contains(&i.provider))
-    {
-        let suffixes: &[&str] = match instance.provider.as_str() {
-            "codex" => &["sessions", "archived_sessions"],
-            "claude" => &["projects"],
-            "grok" => &["sessions"],
-            _ => &[],
-        };
-        for suffix in suffixes {
-            roots.push((
-                instance.provider.clone(),
-                instance.id.clone(),
-                instance.path.join(suffix),
-            ));
-        }
-    }
-    roots
-}
-fn collect_files(
-    root: &Path,
-    source: &str,
-    name: Option<&str>,
-    out: &mut Vec<(PathBuf, String)>,
-    warnings: &mut Vec<String>,
-    cancel: &crate::background::Cancellation,
-) {
-    let entries = match fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(_) => {
-            warnings.push(format!("{source}: 无法读取日志目录"));
-            return;
-        }
-    };
-    for entry in entries {
-        if cancel.is_cancelled() {
-            return;
-        }
-        let Ok(entry) = entry else {
-            warnings.push(format!("{source}: 无法读取目录项"));
-            continue;
-        };
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            collect_files(&entry.path(), source, name, out, warnings, cancel);
-        } else if kind.is_file()
-            && let Some(path) = crate::logfiles::discovered(&entry.path())
-            && name.is_none_or(|n| path.file_name().is_some_and(|file| file == n))
-        {
-            out.push((path, source.into()));
-        }
-    }
-}
-fn number(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or(0)
-}
-fn time(value: &Value) -> Option<DateTime<Utc>> {
-    if let Some(text) = value.as_str() {
-        DateTime::parse_from_rfc3339(text)
-            .ok()
-            .map(|t| t.with_timezone(&Utc))
-    } else {
-        value.as_i64().and_then(|n| {
-            if n.unsigned_abs() > 100_000_000_000 {
-                DateTime::from_timestamp_millis(n)
-            } else {
-                DateTime::from_timestamp(n, 0)
-            }
-        })
-    }
-}
-fn codex_tokens(v: &Value) -> Tokens {
-    let input = number(v, "input_tokens");
-    Tokens {
-        input,
-        output: number(v, "output_tokens"),
-        cached: number(v, "cached_input_tokens").min(input),
-        calls: 1,
-    }
-}
-fn grok_tokens(u: &Value) -> Tokens {
-    let input = number(u, "inputTokens");
-    Tokens {
-        input,
-        output: number(u, "outputTokens"),
-        cached: number(u, "cachedReadTokens").min(input),
-        calls: number(u, "modelCalls").max(1),
-    }
-}
-fn fresh_file(path: &Path, source: &str) -> CachedFile {
-    let session = if source == "grok" {
-        path.parent().and_then(Path::file_name)
-    } else {
-        path.file_stem()
-    }
-    .map(|s| s.to_string_lossy().into_owned())
-    .unwrap_or_default();
-    let mut state = ParserState {
-        session,
-        ..ParserState::default()
-    };
-    if source == "grok"
-        && let Ok(text) = fs::read_to_string(path.with_file_name("summary.json"))
-        && let Ok(v) = serde_json::from_str::<Value>(&text)
-    {
-        state.project = v
-            .pointer("/info/cwd")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .into();
-        state.model = v
-            .pointer("/info/model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .into();
-    }
-    CachedFile {
-        source: source.into(),
-        compressed: false,
-        len: 0,
-        modified: None,
-        offset: 0,
-        fingerprint: Vec::new(),
-        state,
-        records: Vec::new(),
-        split: false,
-        malformed: 0,
-    }
-}
 const FINGERPRINT_LEN: usize = 32;
 /// Identifies the indexed prefix by a digest of its first and last 2 KiB; the bytes themselves
 /// can hold conversation text and are never stored.
@@ -784,270 +809,6 @@ fn fingerprint(path: &Path, offset: u64) -> std::io::Result<Vec<u8>> {
     file.take(offset.min(2048)).read_to_end(&mut bytes)?;
     Ok(Sha256::digest(&bytes).to_vec())
 }
-fn append_file(
-    path: &Path,
-    source: &str,
-    entry: &mut CachedFile,
-    cancel: &crate::background::Cancellation,
-) -> std::io::Result<()> {
-    let mut reader = crate::logfiles::open_at(path, entry.offset)?;
-    let ParserState {
-        high,
-        signatures,
-        previous,
-        session,
-        project,
-        model,
-        fork_time,
-        invalid_fork,
-        line: line_index,
-    } = &mut entry.state;
-    let records = &mut entry.records;
-    let malformed = &mut entry.malformed;
-    loop {
-        if cancel.is_cancelled() {
-            return Err(std::io::ErrorKind::Interrupted.into());
-        }
-        let mut line = String::new();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 || !line.ends_with('\n') {
-            break;
-        }
-        let index = *line_index;
-        *line_index += 1;
-        entry.offset += bytes as u64;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Avoid decoding large conversation/tool payloads unrelated to usage.
-        if source == "codex"
-            && !line.contains("\"token_count\"")
-            && !line.contains("\"session_meta\"")
-            && !line.contains("\"turn_context\"")
-        {
-            continue;
-        }
-        if source == "claude" && !line.contains("\"usage\"") && !line.contains("\"cwd\"") {
-            continue;
-        }
-        if source == "grok" && !line.contains("\"turn_completed\"") {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                *malformed += 1;
-                continue;
-            }
-        };
-        if source == "claude" {
-            if let Some(cwd) = v["cwd"].as_str() {
-                *project = cwd.into();
-            }
-            if let Some(id) = v["sessionId"].as_str() {
-                *session = id.into();
-            }
-            if let Some(name) = v.pointer("/message/model").and_then(Value::as_str) {
-                *model = name.into();
-            }
-        }
-        if source == "codex" && v["type"] == "turn_context" {
-            if let Some(name) = v.pointer("/payload/model").and_then(Value::as_str) {
-                *model = name.into();
-            }
-            if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                *project = cwd.into();
-            }
-            continue;
-        }
-        if source == "grok"
-            && let Some(name) = v.pointer("/params/update/model").and_then(Value::as_str)
-        {
-            *model = name.into();
-        }
-        if source == "codex" && v["type"] == "session_meta" {
-            if let Some(id) = v["payload"]["id"].as_str() {
-                *session = id.into();
-            }
-            if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                *project = cwd.into();
-            }
-            if v["payload"]
-                .get("forked_from_id")
-                .is_some_and(|p| !p.is_null())
-                || v.pointer("/payload/thread_spawn/parent_thread_id")
-                    .is_some()
-            {
-                *fork_time = v.get("timestamp").and_then(time);
-                if fork_time.is_none() {
-                    *malformed += 1;
-                    *invalid_fork = true;
-                }
-            }
-            continue;
-        }
-        if *invalid_fork {
-            continue;
-        }
-        let parsed = match source {
-            "codex" if v["type"] == "event_msg" && v["payload"]["type"] == "token_count" => {
-                let info = &v["payload"]["info"];
-                let total = info
-                    .get("total_token_usage")
-                    .filter(|v| v.is_object())
-                    .map(codex_tokens);
-                let last = info
-                    .get("last_token_usage")
-                    .filter(|v| v.is_object())
-                    .map(codex_tokens);
-                if total.is_none() && last.is_none() {
-                    continue;
-                }
-                let signature = serde_json::to_string(&(
-                    info.get("total_token_usage"),
-                    info.get("last_token_usage"),
-                ))
-                .unwrap_or_default();
-                let key = v
-                    .pointer("/payload/rate_limits/limit_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let duplicate = total.is_some()
-                    && (signatures.get(&key) == Some(&signature)
-                        || previous.as_ref() == Some(&signature));
-                if total.is_some() {
-                    signatures.insert(key, signature.clone());
-                }
-                *previous = Some(signature);
-                let mut tokens = last.unwrap_or_else(|| {
-                    let t = total.unwrap_or_default();
-                    Tokens {
-                        input: t.input.saturating_sub(high.input),
-                        output: t.output.saturating_sub(high.output),
-                        cached: t.cached.saturating_sub(high.cached),
-                        calls: 1,
-                    }
-                });
-                tokens.cached = tokens.cached.min(tokens.input);
-                if let Some(t) = total {
-                    high.merge(t);
-                }
-                if duplicate {
-                    continue;
-                }
-                let timestamp = v.get("timestamp").and_then(time);
-                if fork_time.is_some_and(|cutoff| timestamp.is_some_and(|t| t < cutoff)) {
-                    continue;
-                }
-                // Same rollout copied into sessions/ and archived_sessions/ counts once.
-                Some((format!("{session}:{index}"), timestamp, tokens))
-            }
-            "claude" if v["type"] == "assistant" && v.pointer("/message/usage").is_some() => {
-                let u = &v["message"]["usage"];
-                let cached = number(u, "cache_read_input_tokens");
-                let input = number(u, "input_tokens")
-                    .saturating_add(cached)
-                    .saturating_add(number(u, "cache_creation_input_tokens"));
-                let id = v
-                    .pointer("/message/id")
-                    .and_then(Value::as_str)
-                    .or_else(|| v["uuid"].as_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{session}:{index}"));
-                Some((
-                    id,
-                    v.get("timestamp").and_then(time),
-                    Tokens {
-                        input,
-                        output: number(u, "output_tokens"),
-                        cached,
-                        calls: 1,
-                    },
-                ))
-            }
-            "grok"
-                if v.pointer("/params/update/sessionUpdate")
-                    .and_then(Value::as_str)
-                    == Some("turn_completed") =>
-            {
-                let update = &v["params"]["update"];
-                let u = &update["usage"];
-                if !u.is_object() {
-                    continue;
-                }
-                // turn_completed usage is the aggregate for this prompt, not the session.
-                let id = update["prompt_id"]
-                    .as_str()
-                    .or_else(|| v.pointer("/params/_meta/promptId").and_then(Value::as_str))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{session}:{index}"));
-                let input = number(u, "inputTokens");
-                Some((
-                    format!("{session}:{id}"),
-                    v.get("timestamp").and_then(time),
-                    Tokens {
-                        input,
-                        output: number(u, "outputTokens"),
-                        cached: number(u, "cachedReadTokens").min(input),
-                        calls: number(u, "modelCalls").max(1),
-                    },
-                ))
-            }
-            _ => None,
-        };
-        if let Some((id, timestamp, tokens)) = parsed {
-            if let Some(time) = timestamp {
-                if source == "grok"
-                    && let Some(by_model) = v
-                        .pointer("/params/update/usage/modelUsage")
-                        .and_then(Value::as_object)
-                        .filter(|m| !m.is_empty())
-                {
-                    let mut total = Tokens::default();
-                    for counters in by_model.values() {
-                        total.add(grok_tokens(counters));
-                    }
-                    // Split only complete breakdowns; partial model maps must not inflate totals.
-                    if total == tokens || tokens.total() == 0 {
-                        for (name, counters) in by_model {
-                            records.push(Record {
-                                source: source.into(),
-                                instance: source.into(),
-                                id: format!("{id}:{name}"),
-                                time,
-                                tokens: grok_tokens(counters),
-                                session: session.clone(),
-                                project: project.clone(),
-                                model: name.clone(),
-                            });
-                        }
-                        continue;
-                    }
-                }
-                records.push(Record {
-                    source: source.into(),
-                    instance: source.into(),
-                    id,
-                    time,
-                    tokens,
-                    session: session.clone(),
-                    project: project.clone(),
-                    model: model.clone(),
-                });
-            } else {
-                *malformed += 1;
-            }
-        }
-    }
-    entry.fingerprint = if entry.compressed {
-        Sha256::digest([]).to_vec()
-    } else {
-        fingerprint(path, entry.offset)?
-    };
-    Ok(())
-}
-
 pub fn compact(n: u64) -> String {
     if n >= 1_000_000_000 {
         format!("{:.1}B", n as f64 / 1e9)
@@ -1360,7 +1121,7 @@ mod tests {
         )
         .unwrap();
         let history = HistoryCache::memory().load(&f.config(&["codex"]));
-        let expected = time(&json!("2024-02-29T23:30:00Z"))
+        let expected = sources::time(&json!("2024-02-29T23:30:00Z"))
             .unwrap()
             .with_timezone(&Local)
             .date_naive();
@@ -1826,6 +1587,12 @@ mod tests {
                 .unwrap(),
             10_001
         );
+        let compact = HistoryCache::at(database).load_compact(&config);
+        assert!(compact.records.is_empty());
+        assert_eq!(
+            compact.report(2026, &config.providers).totals.total(),
+            20_002
+        );
     }
     #[test]
     fn failed_record_insert_rolls_back_cursor_and_rows_together() {
@@ -2008,6 +1775,91 @@ mod tests {
         assert_eq!(
             report.by_instance.values().map(|t| t.total()).sum::<u64>(),
             expected
+        );
+    }
+
+    #[test]
+    fn compact_database_queries_match_materialized_history() {
+        let fixture = Fixture::new();
+        let config = fixture.config(&["claude"]);
+        let rows: Vec<_> = (0..120)
+            .map(|i| {
+                json!({
+                    "type":"assistant", "sessionId":format!("session-{}",i%3),
+                    "cwd":if i%2==0 {"/Project/Ä"} else {"/project/B"},
+                    "timestamp":format!("2026-{:02}-15T12:00:00Z",1+i%12),
+                    "message":{"id":format!("m{i}"),"model":if i%3==0 {"Model-A"} else {"Model-B"},
+                        "usage":{"input_tokens":10+i,"output_tokens":2}}
+                })
+            })
+            .collect();
+        fixture.write("claude/projects/p/s.jsonl", &rows);
+        fixture.write("claude/projects/p/t.jsonl", &[json!({
+            "type":"assistant", "sessionId":"other-session", "cwd":"/other",
+            "timestamp":"2026-01-14T11:00:00Z",
+            "message":{"id":"m0","model":"Model-C","usage":{"input_tokens":250,"output_tokens":9}}
+        })]);
+        let path = fixture.0.join("ledger.sqlite3");
+        let materialized = HistoryCache::at(path.clone()).load(&config);
+        let mut cached = None;
+        let compact = HistoryCache::at(path).load_compact_with_cached_controlled(
+            &config,
+            &crate::background::Cancellation::new(),
+            |history| cached = Some(history),
+        );
+        assert!(compact.records.is_empty());
+        assert!(cached.is_some_and(|history| history.records.is_empty()));
+        for query in [
+            HistoryQuery::default(),
+            HistoryQuery {
+                project: Some("/project/ä".into()),
+                ..Default::default()
+            },
+            HistoryQuery {
+                model: Some("model-a".into()),
+                ..Default::default()
+            },
+            HistoryQuery {
+                from: NaiveDate::from_ymd_opt(2026, 3, 1),
+                to: NaiveDate::from_ymd_opt(2026, 5, 31),
+                ..Default::default()
+            },
+            HistoryQuery {
+                instance: Some("claude".into()),
+                ..Default::default()
+            },
+        ] {
+            let expected = materialized.report_query(2026, &config.providers, &query);
+            let actual = compact.report_query(2026, &config.providers, &query);
+            assert_eq!(actual.totals, expected.totals);
+            assert_eq!(actual.daily, expected.daily);
+            assert_eq!(actual.monthly, expected.monthly);
+            assert_eq!(actual.by_instance, expected.by_instance);
+            assert_eq!((actual.from, actual.to), (expected.from, expected.to));
+            assert_eq!(
+                compact.filtered(&query).records.len(),
+                materialized.filtered(&query).records.len()
+            );
+            assert_eq!(
+                compact.session_usage(&config.providers, &query),
+                materialized.session_usage(&config.providers, &query)
+            );
+        }
+        for field in ["project", "model", "instance"] {
+            assert_eq!(
+                compact.dimension_values(&config.providers, field),
+                materialized.dimension_values(&config.providers, field)
+            );
+        }
+        assert_eq!(
+            compact.day(
+                NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                &config.providers
+            ),
+            materialized.day(
+                NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                &config.providers
+            )
         );
     }
 }

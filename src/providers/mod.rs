@@ -64,11 +64,18 @@ pub async fn query_with_timeout(provider: &dyn UsageProvider, timeout: Duration)
             "grok" => "grok",
             _ => "other",
         };
-        let result = tokio::time::timeout(timeout, provider.query()).await;
-        let timed_out = result.is_err();
-        let snapshot = result.unwrap_or_else(|_| {
-            snapshot_transient(provider.id(), provider.display_name(), "用量查询超时")
-        });
+        let result = crate::background::query(async {
+            tokio::time::timeout(timeout, provider.query()).await
+        })
+        .await;
+        let timed_out = matches!(result, Ok(Err(_)));
+        let snapshot = match result {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(_)) => {
+                snapshot_transient(provider.id(), provider.display_name(), "用量查询超时")
+            }
+            Err(error) => snapshot_transient(provider.id(), provider.display_name(), error),
+        };
         if snapshot.success {
             tracing::debug!(
                 event = "provider_query_result", provider = provider_name,

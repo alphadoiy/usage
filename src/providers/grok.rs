@@ -47,7 +47,7 @@ impl UsageProvider for GrokProvider {
     async fn query(&self) -> UsageSnapshot {
         let now = (self.ctx.now)();
         let ctx = Arc::clone(&self.ctx);
-        let (token, status, message, email) = match tokio::task::spawn_blocking(move || {
+        let (token, status, message, email) = match crate::background::blocking(move || {
             read_credentials(&ctx, now)
         })
         .await

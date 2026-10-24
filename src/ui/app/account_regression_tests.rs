@@ -35,8 +35,8 @@ async fn two_accounts_receive_their_own_card_results() {
         isolated_config(),
         "/nonexistent/usage-ablation.toml".into(),
     );
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
-    app.history_config.alerts.enabled = true;
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
+    app.history_state.config.alerts.enabled = true;
     app.refresh(&Handle::current());
     tokio::time::timeout(Duration::from_secs(1), async {
         while app.pending > 0 {

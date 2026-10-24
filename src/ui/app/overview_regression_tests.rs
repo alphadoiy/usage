@@ -8,26 +8,26 @@ async fn old_refresh_completion_cannot_clear_current_work() {
         isolated_config(),
         "/nonexistent/refresh.toml".into(),
     );
-    app.overview_generation = 4;
-    app.overview_pending = 2;
-    app.overview_loading = true;
+    app.overview_state.generation = 4;
+    app.overview_state.pending = 2;
+    app.overview_state.loading = true;
     let current = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let abort = current.abort_handle();
-    app.overview_task = Some(current);
+    app.overview_state.task = Some(current);
     app.tx
         .send(AppEvent::OverviewFinished { generation: 3 })
         .unwrap();
     app.drain_events();
-    assert!(app.overview_loading);
-    assert_eq!(app.overview_pending, 2);
-    assert!(app.overview_task.is_some());
+    assert!(app.overview_state.loading);
+    assert_eq!(app.overview_state.pending, 2);
+    assert!(app.overview_state.task.is_some());
     app.tx
         .send(AppEvent::OverviewFinished { generation: 4 })
         .unwrap();
     app.drain_events();
-    assert!(!app.overview_loading);
-    assert_eq!(app.overview_pending, 0);
-    assert!(app.overview_task.is_none());
+    assert!(!app.overview_state.loading);
+    assert_eq!(app.overview_state.pending, 0);
+    assert!(app.overview_state.task.is_none());
     abort.abort();
 }
 
@@ -115,7 +115,7 @@ async fn automatic_refresh_keeps_content_and_skips_models_while_manual_refresh_r
     }
     async fn settle(app: &mut Dashboard) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while app.overview_loading {
+            while app.overview_state.loading {
                 app.drain_events();
                 tokio::task::yield_now().await;
             }
@@ -156,8 +156,8 @@ inference={base_url="https://relay.invalid/v1",credential_env="FAKE_KEY"}
     });
     let mut app = dashboard();
     app.config_path = path;
-    app.service_http = Arc::new(crate::http::FakeHttp::new());
-    app.overview_service = Arc::new(crate::provider_catalog::CatalogService::new(
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
+    app.overview_state.service = Arc::new(crate::provider_catalog::CatalogService::new(
         root.join("absent-manager"),
         http.clone(),
         Arc::new(|_| Ok("synthetic-key".into())),
@@ -187,9 +187,9 @@ inference={base_url="https://relay.invalid/v1",credential_env="FAKE_KEY"}
     assert_eq!(http.models.load(Ordering::SeqCst), 1);
     assert_eq!(app.home_provider, selected);
     assert!(app.home_models_expanded);
-    let generation = app.overview_generation;
+    let generation = app.overview_state.generation;
     app.refresh_background(&handle);
-    assert_eq!(app.overview_generation, generation);
+    assert_eq!(app.overview_state.generation, generation);
     http.release.add_permits(1);
     settle(&mut app).await;
     assert!(
@@ -216,7 +216,7 @@ inference={base_url="https://relay.invalid/v1",credential_env="FAKE_KEY"}
     assert!(!output.contains("余额10USD"));
     assert!(output.contains("kept-model"));
     assert!(
-        app.overview.as_ref().unwrap().providers[0]
+        app.overview_state.catalog.as_ref().unwrap().providers[0]
             .usage
             .sources
             .iter()
@@ -248,35 +248,42 @@ options={user_id=1}
     let http = Arc::new(crate::http::FakeHttp::new());
     let mut app = dashboard();
     app.config_path = path.clone();
-    app.overview_service = Arc::new(crate::provider_catalog::CatalogService::new(
+    app.overview_state.service = Arc::new(crate::provider_catalog::CatalogService::new(
         root.join("absent-manager"),
         http.clone(),
         Arc::new(|_| panic!("billing-only resource resolved credentials")),
     ));
     app.refresh_overview(&Handle::current());
     tokio::time::timeout(Duration::from_secs(1), async {
-        while app.overview_loading {
+        while app.overview_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(app.overview.as_ref().unwrap().providers.is_empty());
+    assert!(
+        app.overview_state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .providers
+            .is_empty()
+    );
     assert!(http.calls.lock().unwrap().is_empty());
     assert!(!root.join("absent-manager").exists());
     std::fs::write(path, "invalid [ TOML").unwrap();
     app.refresh_overview(&Handle::current());
     tokio::time::timeout(Duration::from_secs(1), async {
-        while app.overview_loading {
+        while app.overview_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert!(app.overview.is_none());
-    assert!(app.overview_error.is_some());
+    assert!(app.overview_state.catalog.is_none());
+    assert!(app.overview_state.error.is_some());
     drop(app);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -284,8 +291,8 @@ options={user_id=1}
 #[test]
 fn model_refresh_rejects_old_generation_duplicate_and_misrouted_results() {
     let mut app = dashboard();
-    app.overview_generation = 2;
-    app.overview_loading = true;
+    app.overview_state.generation = 2;
+    app.overview_state.loading = true;
     app.tx
         .send(AppEvent::OverviewLoaded {
             generation: 1,
@@ -293,7 +300,7 @@ fn model_refresh_rejects_old_generation_duplicate_and_misrouted_results() {
         })
         .unwrap();
     app.drain_events();
-    assert!(app.overview.is_none());
+    assert!(app.overview_state.catalog.is_none());
     app.tx
         .send(AppEvent::OverviewLoaded {
             generation: 2,
@@ -311,7 +318,7 @@ fn model_refresh_rejects_old_generation_duplicate_and_misrouted_results() {
             .unwrap();
     }
     app.drain_events();
-    assert_eq!(app.overview_pending, 1);
+    assert_eq!(app.overview_state.pending, 1);
     for model in ["correct-model", "duplicate-model"] {
         app.tx
             .send(AppEvent::ProviderModels {
@@ -322,10 +329,10 @@ fn model_refresh_rejects_old_generation_duplicate_and_misrouted_results() {
             .unwrap();
     }
     app.drain_events();
-    assert_eq!(app.overview_pending, 0);
-    assert!(!app.overview_loading);
+    assert_eq!(app.overview_state.pending, 0);
+    assert!(!app.overview_state.loading);
     assert_eq!(
-        app.overview.as_ref().unwrap().providers[0].models,
+        app.overview_state.catalog.as_ref().unwrap().providers[0].models,
         Models::Ready(vec!["correct-model".into()])
     );
     app.tx
@@ -335,8 +342,8 @@ fn model_refresh_rejects_old_generation_duplicate_and_misrouted_results() {
         })
         .unwrap();
     app.drain_events();
-    assert!(app.overview.is_none());
-    assert_eq!(app.overview_error.as_deref(), Some("配置读取失败"));
+    assert!(app.overview_state.catalog.is_none());
+    assert_eq!(app.overview_state.error.as_deref(), Some("配置读取失败"));
 }
 
 #[test]
@@ -363,10 +370,10 @@ fn provider_budget_updates_are_scoped_by_generation_and_identity_and_render_abov
         reset: None,
     };
     let mut app = dashboard();
-    app.overview = Some(catalog);
-    app.overview_generation = 2;
-    app.overview_pending = 1;
-    app.overview_loading = true;
+    app.overview_state.catalog = Some(catalog);
+    app.overview_state.generation = 2;
+    app.overview_state.pending = 1;
+    app.overview_state.loading = true;
     let result = ResourceSnapshot {
         binding,
         service: "new_api_token".into(),
@@ -397,7 +404,7 @@ fn provider_budget_updates_are_scoped_by_generation_and_identity_and_render_abov
         })
         .unwrap();
     app.drain_events();
-    assert_eq!(app.overview_pending, 1);
+    assert_eq!(app.overview_state.pending, 1);
     app.tx
         .send(AppEvent::ProviderResource {
             generation: 2,
@@ -406,8 +413,8 @@ fn provider_budget_updates_are_scoped_by_generation_and_identity_and_render_abov
         })
         .unwrap();
     app.drain_events();
-    assert_eq!(app.overview_pending, 0);
-    assert!(!app.overview_loading);
+    assert_eq!(app.overview_state.pending, 0);
+    assert!(!app.overview_state.loading);
     let mut duplicate = result;
     duplicate.metrics.clear();
     app.tx
@@ -452,7 +459,7 @@ async fn provider_board_shows_only_current_provider_and_scrolls_its_details() {
         usage: Default::default(),
         performance: None,
     });
-    app.overview = Some(catalog);
+    app.overview_state.catalog = Some(catalog);
     let initial = rendered(&app, 160, 40)
         .split_whitespace()
         .collect::<String>();
@@ -466,7 +473,7 @@ async fn provider_board_shows_only_current_provider_and_scrolls_its_details() {
     );
     app.handle_home_key(KeyCode::Enter, &Handle::current(), (100, 32));
     assert!(app.home_models_expanded);
-    assert!(app.resume_request.is_none());
+    assert!(app.browser_state.resume_request.is_none());
     app.cards.push(CardSlot {
         target: "hidden-card".into(),
         loading: true,
@@ -537,7 +544,7 @@ async fn provider_board_shows_only_current_provider_and_scrolls_its_details() {
 #[tokio::test]
 async fn provider_switch_keeps_identity_on_refresh_and_recovers_when_removed() {
     let mut app = dashboard();
-    app.overview_generation = 9;
+    app.overview_state.generation = 9;
     let a = overview().providers.remove(0);
     let mut b = a.clone();
     b.id = "provider-b".into();
@@ -609,7 +616,7 @@ async fn provider_switch_keeps_identity_on_refresh_and_recovers_when_removed() {
     for key in [KeyCode::Left, KeyCode::Right] {
         assert!(app.handle_home_key(key, &Handle::current(), (100, 30)));
     }
-    assert!(app.resume_request.is_none());
+    assert!(app.browser_state.resume_request.is_none());
 }
 
 #[tokio::test]
@@ -617,14 +624,14 @@ async fn overview_refresh_cancels_previous_task_and_drop_cancels_current_task() 
     let mut app = dashboard();
     let previous = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let previous_abort = previous.abort_handle();
-    app.overview_task = Some(previous);
+    app.overview_state.task = Some(previous);
     app.refresh_overview(&Handle::current());
     tokio::task::yield_now().await;
     assert!(previous_abort.is_finished());
-    app.overview_task.take().unwrap().abort();
+    app.overview_state.task.take().unwrap().abort();
     let current = Task::spawn(&Handle::current(), |_| std::future::pending::<()>());
     let current_abort = current.abort_handle();
-    app.overview_task = Some(current);
+    app.overview_state.task = Some(current);
     drop(app);
     tokio::task::yield_now().await;
     assert!(current_abort.is_finished());

@@ -26,6 +26,7 @@ use crate::ui::history::HistoryPanel;
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{Focus, SessionBrowser};
 mod render;
+mod state;
 #[cfg(test)]
 use ratatui::{buffer::Buffer, style::Color};
 use render::{draw, home_lines};
@@ -200,12 +201,12 @@ pub fn run_history_with_query(
     query: crate::history::HistoryQuery,
 ) -> io::Result<()> {
     let mut app = Dashboard::new(Vec::new(), config, config_path);
-    app.history = Some(HistoryPanel::new(
-        app.history_config.providers.clone(),
+    app.history_state.panel = Some(HistoryPanel::new(
+        app.history_state.config.providers.clone(),
         year,
         monthly,
     ));
-    if let Some(panel) = &mut app.history {
+    if let Some(panel) = &mut app.history_state.panel {
         panel.set_query(query);
     }
     app.start_history_load(&handle);
@@ -229,12 +230,12 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         }
         if !app.alerts_queue.is_empty() {
             let alerts = std::mem::take(&mut app.alerts_queue);
-            if app.history_config.alerts.bell {
+            if app.history_state.config.alerts.bell {
                 use std::io::Write;
                 let _ = write!(io::stdout(), "\x07");
                 let _ = io::stdout().flush();
             }
-            if app.history_config.alerts.desktop {
+            if app.history_state.config.alerts.desktop {
                 let tx = app.tx.clone();
                 app.background_tasks.push(Task::blocking(
                     &handle,
@@ -308,7 +309,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                             }
                             MenuCommand::Activate(MenuAction::History) => app.open_history(&handle),
                             MenuCommand::Activate(MenuAction::Sessions) => {
-                                app.browser_filter = None;
+                                app.browser_state.filter = None;
                                 app.open_browser(&handle);
                             }
                             MenuCommand::Activate(MenuAction::Providers) => {
@@ -317,21 +318,26 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                     handle.clone(),
                                     Some(app.config_path.clone()),
                                     // Reuse the home board's sessions once loaded rather than scanning again.
-                                    if app.home_sessions_generation > 0
-                                        && !app.home_sessions_loading
+                                    if app.home_sessions_state.generation > 0
+                                        && !app.home_sessions_state.loading
                                     {
                                         crate::ui::ProjectSessions::from_sessions(
-                                            &app.home_sessions.sessions,
+                                            &app.home_sessions_state.browser.sessions,
                                         )
                                     } else {
                                         crate::ui::ProjectSessions::Scan(
-                                            app.session_registry.clone(),
-                                            app.session_homes.clone(),
+                                            app.browser_state.registry.clone(),
+                                            app.browser_state.homes.clone(),
                                         )
                                     },
                                     // The project picked on the home board becomes the launch default.
                                     (app.home_focus == super::home::Focus::Projects)
-                                        .then(|| app.home_sessions.selected_project().cloned())
+                                        .then(|| {
+                                            app.home_sessions_state
+                                                .browser
+                                                .selected_project()
+                                                .cloned()
+                                        })
                                         .flatten(),
                                 );
                                 terminal = match crate::ui::terminal::enter() {
@@ -340,15 +346,16 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                 };
                                 app.refresh_background(&handle);
                                 app.notice = result.err().map(|e| e.to_string());
-                                for instance in app.history_config.data_instances() {
+                                for instance in app.history_state.config.data_instances() {
                                     if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
                                         continue;
                                     }
-                                    app.session_homes = app.session_homes.clone().with_instance(
-                                        &instance.id,
-                                        &instance.provider,
-                                        &instance.path,
-                                    );
+                                    app.browser_state.homes =
+                                        app.browser_state.homes.clone().with_instance(
+                                            &instance.id,
+                                            &instance.provider,
+                                            &instance.path,
+                                        );
                                 }
                             }
                             MenuCommand::Activate(MenuAction::AddProvider) => {
@@ -374,8 +381,8 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
-                    if app.history.is_some() {
-                        if let Some(panel) = &mut app.history
+                    if app.history_state.panel.is_some() {
+                        if let Some(panel) = &mut app.history_state.panel
                             && panel.is_editing()
                         {
                             panel.key(key.code);
@@ -392,7 +399,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                             KeyCode::Char('r') => app.start_history_load(&handle),
                             KeyCode::Enter => app.open_history_sessions(&handle),
                             code => {
-                                if let Some(panel) = &mut app.history {
+                                if let Some(panel) = &mut app.history_state.panel {
                                     panel.key(code);
                                 }
                             }
@@ -400,7 +407,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
-                    if app.browser.is_some() {
+                    if app.browser_state.panel.is_some() {
                         app.handle_browser_key(key.code, &handle);
                         if let Err(error) = fulfill_resume_request(&mut app, &handle, &mut terminal)
                         {
@@ -429,7 +436,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         KeyCode::Char('r') => app.refresh(&handle),
                         KeyCode::Char('x') => app.open_reset(&handle),
                         KeyCode::Char('p') => {
-                            app.browser_filter = None;
+                            app.browser_state.filter = None;
                             app.open_browser(&handle);
                         }
                         KeyCode::Char('h') => app.open_history(&handle),
@@ -470,17 +477,17 @@ fn fulfill_resume_request(
     handle: &Handle,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<()> {
-    let Some(session) = app.resume_request.take() else {
+    let Some(session) = app.browser_state.resume_request.take() else {
         return Ok(());
     };
     crate::ui::terminal::leave();
     let result = resume_in_terminal(handle, &session);
     *terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
-    if let Some(browser) = &mut app.browser {
+    if let Some(browser) = &mut app.browser_state.panel {
         browser.launching = false;
     }
-    app.home_sessions.launching = false;
-    if app.history.is_none() && app.browser.is_none() {
+    app.home_sessions_state.browser.launching = false;
+    if app.history_state.panel.is_none() && app.browser_state.panel.is_none() {
         app.refresh_background(handle);
     }
     app.notice = Some(match result {
@@ -494,66 +501,25 @@ fn fulfill_resume_request(
 struct Dashboard {
     subscription_tests: super::subscription_tests::Tests,
     home_subscription_details: bool,
-    fingerprint_service: Arc<crate::codex_manager::fingerprint::FingerprintService>,
-    fingerprint_task: Option<Task>,
-    fingerprint_generation: u64,
-    fingerprint_last_poll: Option<std::time::Instant>,
-    home_performance: HashMap<String, super::performance::CachedSummary>,
-    home_performance_task: Option<Task>,
-    home_performance_pending: bool,
-    home_performance_generation: u64,
-    performance: Option<super::performance::Panel>,
-    performance_service: Arc<crate::performance::Service>,
-    performance_generation: u64,
-    home_activity: HashMap<sessions::SessionKey, crate::runs::SessionRuntime>,
-    home_activity_error: Option<String>,
-    home_activity_task: Option<Task>,
-    home_activity_pending: bool,
-    home_activity_dirty: bool,
-    home_activity_generation: u64,
-    home_activity_last_poll: std::time::Instant,
-    home_activity_root: PathBuf,
-    project_store: Arc<crate::projects::Store>,
+    fingerprint: state::FingerprintState,
+    home_performance: state::HomePerformanceState,
+    performance: state::PerformanceState,
+    home_activity: state::HomeActivityState,
     home_focus: super::home::Focus,
     home_connections: super::home::Connections,
-    home_sessions: SessionBrowser,
-    home_sessions_loading: bool,
-    home_sessions_generation: u64,
-    home_sessions_warning: Option<String>,
-    home_sessions_task: Option<Task>,
-    status_history: super::home::StatusHistory,
-    overview: Option<crate::provider_catalog::Catalog>,
-    overview_error: Option<String>,
-    overview_loading: bool,
-    overview_pending: usize,
-    overview_generation: u64,
-    overview_service: Arc<crate::provider_catalog::CatalogService>,
-    overview_task: Option<Task>,
+    home_sessions_state: state::HomeSessionsState,
+    overview_state: state::OverviewState,
+    service_state: state::ServiceState,
     home_scroll: u16,
     home_models_expanded: bool,
     home_provider: Option<String>,
-    service_statuses: HashMap<String, ServiceStatus>,
-    service_generation: u64,
-    service_pending: usize,
-    service_http: Arc<dyn crate::http::HttpClient>,
     menu: Option<menu::Menu>,
-    history: Option<HistoryPanel>,
-    saved_history: Option<HistoryPanel>,
-    saved_browser: Option<SessionBrowser>,
-    loaded_history: Arc<crate::history::History>,
-    history_task: Option<Task>,
-    browser_task: Option<Task>,
+    history_state: state::HistoryState,
+    browser_state: state::BrowserState,
     background_tasks: Tasks,
-    browser_filter: Option<(Vec<String>, crate::history::HistoryQuery)>,
-    history_return: bool,
-    last_history_refresh: std::time::Instant,
-    history_config: AppConfig,
-    history_cache: Option<crate::history::HistoryCache>,
-    history_loading: bool,
     quota_refresh_due: bool,
     monitor: crate::alerts::QuotaMonitor,
     alerts_queue: Vec<crate::alerts::Alert>,
-    resume_request: Option<sessions::Session>,
     providers: Vec<Arc<dyn UsageProvider>>,
     cards: Vec<CardSlot>,
     refresh_seconds: u64,
@@ -570,11 +536,6 @@ struct Dashboard {
     reset: Option<ResetFlow>,
     reset_generation: u64,
     reset_preview_task: Option<Task>,
-    session_homes: sessions::SessionHomes,
-    session_registry: sessions::SessionRegistry,
-    browser: Option<SessionBrowser>,
-    browser_generation: u64,
-    browser_loading: bool,
 }
 
 struct CardSlot {
@@ -621,72 +582,25 @@ impl Dashboard {
         Self {
             subscription_tests: super::subscription_tests::Tests::default(),
             home_subscription_details: false,
-            fingerprint_service: Arc::new(
-                crate::codex_manager::fingerprint::FingerprintService::from_environment(),
-            ),
-            fingerprint_task: None,
-            fingerprint_generation: 0,
-            fingerprint_last_poll: None,
-            home_activity: HashMap::new(),
-            home_performance: HashMap::new(),
-            home_performance_task: None,
-            home_performance_pending: false,
-            home_performance_generation: 0,
-            performance: None,
-            performance_service: Arc::new(crate::performance::Service::from_environment()),
-            performance_generation: 0,
-            home_activity_error: None,
-            home_activity_task: None,
-            home_activity_pending: false,
-            home_activity_dirty: true,
-            home_activity_generation: 0,
-            home_activity_last_poll: std::time::Instant::now(),
-            home_activity_root: crate::codex_manager::default_root(),
-            project_store: Arc::new(crate::projects::Store::from_environment()),
+            fingerprint: state::FingerprintState::new(),
+            home_performance: state::HomePerformanceState::new(),
+            performance: state::PerformanceState::new(),
+            home_activity: state::HomeActivityState::new(),
             home_focus: super::home::Focus::Providers,
             home_connections: super::home::Connections::default(),
-            home_sessions: {
-                let mut browser = SessionBrowser::new(Vec::new());
-                browser.resume_mode = config.resume;
-                browser
-            },
-            home_sessions_loading: false,
-            home_sessions_generation: 0,
-            home_sessions_warning: None,
-            home_sessions_task: None,
-            status_history: super::home::StatusHistory::default(),
-            overview: None,
-            overview_error: None,
-            overview_loading: false,
-            overview_pending: 0,
-            overview_generation: 0,
-            overview_service: Arc::new(crate::provider_catalog::CatalogService::from_environment()),
-            overview_task: None,
+            home_sessions_state: state::HomeSessionsState::new(config.resume),
+            overview_state: state::OverviewState::new(),
+            service_state: state::ServiceState::new(),
             home_scroll: 0,
             home_models_expanded: false,
             home_provider: None,
-            service_statuses: HashMap::new(),
-            service_generation: 0,
-            service_pending: 0,
-            service_http: Arc::new(crate::http::ReqwestClient::new()),
             menu: None,
-            history: None,
-            saved_history: None,
-            saved_browser: None,
-            loaded_history: Arc::default(),
-            history_task: None,
-            browser_task: None,
+            history_state: state::HistoryState::new(config.clone()),
+            browser_state: state::BrowserState::new(session_homes, session_registry),
             background_tasks: Tasks::default(),
-            browser_filter: None,
-            history_return: false,
-            last_history_refresh: std::time::Instant::now(),
-            history_config: config.clone(),
-            history_cache: Some(crate::history::HistoryCache::default()),
-            history_loading: false,
             quota_refresh_due: false,
             monitor: crate::alerts::QuotaMonitor::default(),
             alerts_queue: Vec::new(),
-            resume_request: None,
             providers,
             cards,
             status: "Provider · 厂商状态 · 项目会话".into(),
@@ -703,19 +617,18 @@ impl Dashboard {
             reset: None,
             reset_generation: 0,
             reset_preview_task: None,
-            session_homes,
-            session_registry,
-            browser: None,
-            browser_generation: 0,
-            browser_loading: false,
         }
     }
 
     /// Menu navigation is handled before page keys, so Enter cannot launch a session beneath it.
     fn handle_navigation_key(&mut self, key: KeyCode) -> Option<MenuCommand> {
         if self.reset.is_some()
-            || self.browser.as_ref().is_some_and(|b| b.launching)
-            || self.home_sessions.launching
+            || self
+                .browser_state
+                .panel
+                .as_ref()
+                .is_some_and(|b| b.launching)
+            || self.home_sessions_state.browser.launching
         {
             return None;
         }
@@ -728,13 +641,13 @@ impl Dashboard {
         }
         if key == KeyCode::F(10)
             || (key == KeyCode::Char('m')
-                && self.history.is_none()
-                && self.browser.is_none()
-                && !self.home_sessions.searching)
+                && self.history_state.panel.is_none()
+                && self.browser_state.panel.is_none()
+                && !self.home_sessions_state.browser.searching)
         {
-            let current = if self.history.is_some() {
+            let current = if self.history_state.panel.is_some() {
                 MenuAction::History
-            } else if self.browser.is_some() {
+            } else if self.browser_state.panel.is_some() {
                 MenuAction::Sessions
             } else {
                 MenuAction::Home
@@ -749,8 +662,8 @@ impl Dashboard {
             KeyCode::F(4) => Some(MenuCommand::Activate(MenuAction::Providers)),
             KeyCode::F(5) => Some(MenuCommand::Activate(MenuAction::AddProvider)),
             KeyCode::Char('a')
-                if self.history.is_none()
-                    && self.browser.is_none()
+                if self.history_state.panel.is_none()
+                    && self.browser_state.panel.is_none()
                     && self.home_focus == super::home::Focus::Providers =>
             {
                 Some(MenuCommand::Activate(MenuAction::AddProvider))
@@ -760,32 +673,24 @@ impl Dashboard {
     }
 
     fn close_history(&mut self) {
-        if let Some(panel) = self.history.take() {
-            self.saved_history = Some(panel);
-        }
+        self.history_state.close_panel();
     }
     fn close_browser(&mut self, return_history: bool) {
-        if let Some(browser) = self.browser.take() {
-            self.saved_browser = Some(browser);
-        }
-        self.browser_generation = self.browser_generation.wrapping_add(1);
-        self.browser_loading = false;
-        self.browser_task = None;
+        let was_returning = self.browser_state.close();
         self.notice = None;
-        if return_history && self.history_return {
-            self.history = self.saved_history.take();
+        if return_history && was_returning {
+            self.history_state.panel = self.history_state.saved.take();
         }
-        self.history_return = false;
     }
     fn open_history(&mut self, handle: &Handle) {
         use chrono::Datelike;
-        if self.history.is_some() {
+        if self.history_state.panel.is_some() {
             return;
         }
         self.close_browser(false);
-        self.history = Some(self.saved_history.take().unwrap_or_else(|| {
+        self.history_state.panel = Some(self.history_state.saved.take().unwrap_or_else(|| {
             HistoryPanel::new(
-                self.history_config.providers.clone(),
+                self.history_state.config.providers.clone(),
                 chrono::Local::now().year(),
                 false,
             )
@@ -793,7 +698,7 @@ impl Dashboard {
         self.start_history_load(handle);
     }
     fn open_history_sessions(&mut self, handle: &Handle) {
-        let Some(panel) = &self.history else {
+        let Some(panel) = &self.history_state.panel else {
             return;
         };
         if panel.loading {
@@ -801,16 +706,16 @@ impl Dashboard {
         }
         let filter = (panel.sources(), panel.session_query());
         self.close_history();
-        self.saved_browser = None;
-        self.browser_filter = Some(filter);
+        self.browser_state.saved = None;
+        self.browser_state.filter = Some(filter);
         self.open_browser(handle);
-        self.history_return = true;
+        self.browser_state.return_to_history = true;
     }
     fn apply_browser_usage(&mut self) {
-        let (sources, query, label) = self.browser_filter.as_ref().map_or_else(
+        let (sources, query, label) = self.browser_state.filter.as_ref().map_or_else(
             || {
                 (
-                    self.history_config.providers.clone(),
+                    self.history_state.config.providers.clone(),
                     crate::history::HistoryQuery::default(),
                     None,
                 )
@@ -828,32 +733,27 @@ impl Dashboard {
                 )
             },
         );
-        let usage = self.loaded_history.session_usage(&sources, &query);
-        if let Some(browser) = &mut self.browser {
+        let usage = self.history_state.loaded.session_usage(&sources, &query);
+        if let Some(browser) = &mut self.browser_state.panel {
             browser.set_usage(usage, label);
         }
     }
     fn start_history_load(&mut self, handle: &Handle) {
-        if self.history_loading {
+        let Some(mut cache) = self.history_state.begin_load() else {
             return;
-        }
-        self.history_loading = true;
-        self.last_history_refresh = std::time::Instant::now();
-        if let Some(panel) = &mut self.history {
-            panel.loading = true;
-        }
-        let config = self.history_config.clone();
-        let mut cache = self.history_cache.take().unwrap_or_default();
+        };
+        let config = self.history_state.config.clone();
         let tx = self.tx.clone();
         let cached_tx = tx.clone();
-        self.history_task = Some(Task::blocking(
+        self.history_state.task = Some(Task::blocking(
             handle,
             move |cancel| {
-                let history = cache.load_with_cached_controlled(&config, &cancel, |history| {
-                    if !cancel.is_cancelled() {
-                        let _ = cached_tx.send(AppEvent::HistoryCached(history));
-                    }
-                });
+                let history =
+                    cache.load_compact_with_cached_controlled(&config, &cancel, |history| {
+                        if !cancel.is_cancelled() {
+                            let _ = cached_tx.send(AppEvent::HistoryCached(history));
+                        }
+                    });
                 Ok((history, cache))
             },
             move |result| {
@@ -867,38 +767,35 @@ impl Dashboard {
     }
 
     fn open_browser(&mut self, handle: &Handle) {
-        if self.browser.is_some() {
+        if self.browser_state.panel.is_some() {
             self.apply_browser_usage();
             return;
         }
         self.close_history();
-        if self.providers.is_empty() && self.saved_history.is_some() {
-            self.history_return = true;
+        if self.providers.is_empty() && self.history_state.saved.is_some() {
+            self.browser_state.return_to_history = true;
         }
-        self.browser = Some(self.saved_browser.take().unwrap_or_else(|| {
+        self.browser_state.panel = Some(self.browser_state.saved.take().unwrap_or_else(|| {
             let mut browser = SessionBrowser::new(Vec::new());
-            browser.resume_mode = self.history_config.resume;
+            browser.resume_mode = self.history_state.config.resume;
             browser
         }));
         self.apply_browser_usage();
         self.start_browser_load(handle);
-        if self.loaded_history.synced_at.is_none() {
+        if self.history_state.loaded.synced_at.is_none() {
             self.start_history_load(handle);
         }
     }
 
     fn start_browser_load(&mut self, handle: &Handle) {
-        if self.browser_loading {
+        let Some(generation) = self.browser_state.begin_load() else {
             return;
-        }
-        self.browser_generation = self.browser_generation.wrapping_add(1);
-        let generation = self.browser_generation;
-        let homes = self.session_homes.clone();
-        let registry = self.session_registry.clone();
+        };
+        let homes = self.browser_state.homes.clone();
+        let registry = self.browser_state.registry.clone();
         let tx = self.tx.clone();
-        self.browser_loading = true;
         self.notice = None;
-        self.browser_task = Some(Task::blocking(
+        self.browser_state.task = Some(Task::blocking(
             handle,
             move |cancel| Ok(registry.load_all_controlled(&homes, &cancel)),
             move |result| {
@@ -916,18 +813,20 @@ impl Dashboard {
 
     fn handle_browser_key(&mut self, key: KeyCode, handle: &Handle) {
         if self
-            .browser
+            .browser_state
+            .panel
             .as_ref()
             .is_some_and(|browser| browser.launching)
         {
             return;
         }
         if self
-            .browser
+            .browser_state
+            .panel
             .as_ref()
             .is_some_and(|browser| browser.searching)
         {
-            if let Some(browser) = &mut self.browser {
+            if let Some(browser) = &mut self.browser_state.panel {
                 match key {
                     KeyCode::Esc | KeyCode::Enter => browser.searching = false,
                     KeyCode::Backspace => browser.backspace(),
@@ -940,11 +839,12 @@ impl Dashboard {
         match key {
             KeyCode::Esc
                 if self
-                    .browser
+                    .browser_state
+                    .panel
                     .as_ref()
                     .is_some_and(|b| b.focus() == Focus::Sessions) =>
             {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.focus_projects();
                 }
             }
@@ -956,13 +856,14 @@ impl Dashboard {
                 self.start_history_load(handle);
             }
             KeyCode::Char('R') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.resume_mode = browser.resume_mode.next();
                 }
             }
             KeyCode::Char('y') => {
                 if let Some(session) = self
-                    .browser
+                    .browser_state
+                    .panel
                     .as_ref()
                     .and_then(|b| b.selected_session())
                     .cloned()
@@ -978,55 +879,55 @@ impl Dashboard {
                 }
             }
             KeyCode::Char('o') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.toggle_sort();
                 }
             }
             KeyCode::Tab => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.toggle_focus();
                 }
             }
             KeyCode::Left | KeyCode::BackTab => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.focus_projects();
                 }
             }
             KeyCode::Right => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.focus_sessions();
                 }
             }
             KeyCode::Char('/') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.searching = true;
                 }
             }
             KeyCode::Char('c') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.clear_search();
                 }
             }
             KeyCode::Backspace => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.backspace();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.move_by(-1);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(browser) = &mut self.browser {
+                if let Some(browser) = &mut self.browser_state.panel {
                     browser.move_by(1);
                 }
             }
             KeyCode::Enter => {
-                if self.browser_loading {
+                if self.browser_state.loading {
                     return;
                 }
-                let Some(browser) = &mut self.browser else {
+                let Some(browser) = &mut self.browser_state.panel else {
                     return;
                 };
                 if browser.focus() == Focus::Projects {
@@ -1045,21 +946,22 @@ impl Dashboard {
     }
 
     fn maybe_refresh_fingerprint(&mut self, handle: &Handle) {
-        if self.history.is_some()
-            || self.browser.is_some()
-            || self.fingerprint_task.is_some()
+        if self.history_state.panel.is_some()
+            || self.browser_state.panel.is_some()
+            || self.fingerprint.task.is_some()
             || self
-                .fingerprint_last_poll
+                .fingerprint
+                .last_poll
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(5))
         {
             return;
         }
-        self.fingerprint_last_poll = Some(std::time::Instant::now());
-        self.fingerprint_generation = self.fingerprint_generation.wrapping_add(1);
-        let generation = self.fingerprint_generation;
-        let service = self.fingerprint_service.clone();
+        self.fingerprint.last_poll = Some(std::time::Instant::now());
+        self.fingerprint.generation = self.fingerprint.generation.wrapping_add(1);
+        let generation = self.fingerprint.generation;
+        let service = self.fingerprint.service.clone();
         let tx = self.tx.clone();
-        self.fingerprint_task = Some(Task::blocking(
+        self.fingerprint.task = Some(Task::blocking(
             handle,
             move |_| {
                 service
@@ -1073,26 +975,26 @@ impl Dashboard {
     }
 
     fn maybe_refresh_home_activity(&mut self, handle: &Handle) {
-        if self.history.is_some()
-            || self.browser.is_some()
-            || self.home_activity_pending
-            || self.home_sessions_loading
-            || self.home_sessions.sessions.is_empty()
-            || (!self.home_activity_dirty
+        if self.history_state.panel.is_some()
+            || self.browser_state.panel.is_some()
+            || self.home_activity.pending
+            || self.home_sessions_state.loading
+            || self.home_sessions_state.browser.sessions.is_empty()
+            || (!self.home_activity.dirty
                 && (self.refresh_seconds == 0
-                    || self.home_activity_last_poll.elapsed() < Duration::from_secs(2)))
+                    || self.home_activity.last_poll.elapsed() < Duration::from_secs(2)))
         {
             return;
         }
-        self.home_activity_dirty = false;
-        self.home_activity_pending = true;
-        self.home_activity_generation = self.home_activity_generation.wrapping_add(1);
-        let generation = self.home_activity_generation;
-        self.home_activity_last_poll = std::time::Instant::now();
-        let root = self.home_activity_root.clone();
-        let sessions = self.home_sessions.sessions.clone();
+        self.home_activity.dirty = false;
+        self.home_activity.pending = true;
+        self.home_activity.generation = self.home_activity.generation.wrapping_add(1);
+        let generation = self.home_activity.generation;
+        self.home_activity.last_poll = std::time::Instant::now();
+        let root = self.home_activity.root.clone();
+        let sessions = self.home_sessions_state.browser.sessions.clone();
         let tx = self.tx.clone();
-        self.home_activity_task = Some(Task::blocking(
+        self.home_activity.task = Some(Task::blocking(
             handle,
             move |_| {
                 let Some(manager) = crate::codex_manager::Manager::open_read_only(root)
@@ -1111,17 +1013,17 @@ impl Dashboard {
     }
 
     fn start_home_sessions_load(&mut self, handle: &Handle) {
-        if self.home_sessions_loading || self.home_sessions.launching {
+        if self.home_sessions_state.loading || self.home_sessions_state.browser.launching {
             return;
         }
-        self.home_sessions_loading = true;
-        self.home_sessions_generation = self.home_sessions_generation.wrapping_add(1);
-        let generation = self.home_sessions_generation;
-        let mut homes = self.session_homes.clone();
-        let registry = self.session_registry.clone();
-        let store = self.project_store.clone();
+        self.home_sessions_state.loading = true;
+        self.home_sessions_state.generation = self.home_sessions_state.generation.wrapping_add(1);
+        let generation = self.home_sessions_state.generation;
+        let mut homes = self.browser_state.homes.clone();
+        let registry = self.browser_state.registry.clone();
+        let store = self.home_sessions_state.project_store.clone();
         let tx = self.tx.clone();
-        self.home_sessions_task = Some(Task::blocking(
+        self.home_sessions_state.task = Some(Task::blocking(
             handle,
             move |cancel| {
                 if let Ok(instances) = crate::codex_manager::managed_instances() {
@@ -1163,15 +1065,15 @@ impl Dashboard {
         handle: &Handle,
     ) {
         if !sessions::uses_ghostty(mode) {
-            self.resume_request = Some(session);
+            self.browser_state.resume_request = Some(session);
             return;
         }
         self.notice = Some("正在 Ghostty 右侧打开会话…".into());
         let tx = self.tx.clone();
         let generation = if home {
-            self.home_sessions_generation
+            self.home_sessions_state.generation
         } else {
-            self.browser_generation
+            self.browser_state.generation
         };
         // Accepted launches must not be cancelled when their source view closes.
         handle.spawn_blocking(move || {
@@ -1192,14 +1094,14 @@ impl Dashboard {
         (width, height): (u16, u16),
     ) -> bool {
         use super::home::Focus as HomeFocus;
-        if self.home_sessions.launching {
+        if self.home_sessions_state.browser.launching {
             return true;
         }
-        if self.home_focus == HomeFocus::Projects && self.home_sessions.searching {
+        if self.home_focus == HomeFocus::Projects && self.home_sessions_state.browser.searching {
             match key {
-                KeyCode::Esc | KeyCode::Enter => self.home_sessions.searching = false,
-                KeyCode::Backspace => self.home_sessions.backspace(),
-                KeyCode::Char(ch) => self.home_sessions.type_char(ch),
+                KeyCode::Esc | KeyCode::Enter => self.home_sessions_state.browser.searching = false,
+                KeyCode::Backspace => self.home_sessions_state.browser.backspace(),
+                KeyCode::Char(ch) => self.home_sessions_state.browser.type_char(ch),
                 _ => {}
             }
             return true;
@@ -1209,9 +1111,10 @@ impl Dashboard {
                 self.open_performance(handle)
             }
             KeyCode::Char('c') if self.home_focus == HomeFocus::Providers => {
-                if let Some((_, provider)) =
-                    super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-                {
+                if let Some((_, provider)) = super::overview::selected(
+                    self.overview_state.catalog.as_ref(),
+                    self.home_provider.as_deref(),
+                ) {
                     if let Some(operation) =
                         provider.operations.iter().find(|op| op.0.id() == "checkin")
                     {
@@ -1226,8 +1129,11 @@ impl Dashboard {
                 }
             }
             KeyCode::Char('t') if self.home_focus == HomeFocus::Providers => {
-                if super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-                    .is_some_and(|(_, p)| super::subscription_tests::supports(p))
+                if super::overview::selected(
+                    self.overview_state.catalog.as_ref(),
+                    self.home_provider.as_deref(),
+                )
+                .is_some_and(|(_, p)| super::subscription_tests::supports(p))
                 {
                     self.home_subscription_details = !self.home_subscription_details;
                     self.home_scroll = 0;
@@ -1262,12 +1168,12 @@ impl Dashboard {
                         self.home_connections.move_by(
                             delta,
                             inner,
-                            &self.service_statuses,
-                            &self.status_history,
-                            self.service_pending > 0,
+                            &self.service_state.statuses,
+                            &self.service_state.history,
+                            self.service_state.pending > 0,
                         );
                     }
-                    HomeFocus::Projects => self.home_sessions.move_by(delta as isize),
+                    HomeFocus::Projects => self.home_sessions_state.browser.move_by(delta as isize),
                 }
             }
             KeyCode::Left | KeyCode::Right if self.home_focus == HomeFocus::Providers => {
@@ -1299,37 +1205,44 @@ impl Dashboard {
                 self.home_scroll = 0;
             }
             KeyCode::Left if self.home_focus == HomeFocus::Projects => {
-                self.home_sessions.focus_projects()
+                self.home_sessions_state.browser.focus_projects()
             }
             KeyCode::Right if self.home_focus == HomeFocus::Projects => {
-                self.home_sessions.focus_sessions()
+                self.home_sessions_state.browser.focus_sessions()
             }
             KeyCode::Esc
                 if self.home_focus == HomeFocus::Projects
-                    && self.home_sessions.focus() == Focus::Sessions =>
+                    && self.home_sessions_state.browser.focus() == Focus::Sessions =>
             {
-                self.home_sessions.focus_projects()
+                self.home_sessions_state.browser.focus_projects()
             }
             KeyCode::Char('/') if self.home_focus == HomeFocus::Projects => {
-                self.home_sessions.searching = true
+                self.home_sessions_state.browser.searching = true
             }
             KeyCode::Char('c') if self.home_focus == HomeFocus::Projects => {
-                self.home_sessions.clear_search()
+                self.home_sessions_state.browser.clear_search()
             }
             KeyCode::Char('R') if self.home_focus == HomeFocus::Projects => {
-                self.home_sessions.resume_mode = self.home_sessions.resume_mode.next()
+                self.home_sessions_state.browser.resume_mode =
+                    self.home_sessions_state.browser.resume_mode.next()
             }
             KeyCode::Enter => {
-                if self.home_sessions_loading {
+                if self.home_sessions_state.loading {
                     return true;
                 }
-                if self.home_sessions.focus() == Focus::Projects {
-                    self.home_sessions.focus_sessions();
+                if self.home_sessions_state.browser.focus() == Focus::Projects {
+                    self.home_sessions_state.browser.focus_sessions();
                     return true;
                 }
-                if let Some(session) = self.home_sessions.selected_session().cloned() {
-                    self.home_sessions.launching = true;
-                    self.launch_session(session, self.home_sessions.resume_mode, true, handle);
+                if let Some(session) = self.home_sessions_state.browser.selected_session().cloned()
+                {
+                    self.home_sessions_state.browser.launching = true;
+                    self.launch_session(
+                        session,
+                        self.home_sessions_state.browser.resume_mode,
+                        true,
+                        handle,
+                    );
                 }
             }
             _ => return false,
@@ -1338,7 +1251,12 @@ impl Dashboard {
     }
 
     fn cycle_home_provider(&mut self, reverse: bool) {
-        let Some(catalog) = self.overview.as_ref().filter(|c| c.providers.len() > 1) else {
+        let Some(catalog) = self
+            .overview_state
+            .catalog
+            .as_ref()
+            .filter(|c| c.providers.len() > 1)
+        else {
             return;
         };
         let index = super::overview::selected(Some(catalog), self.home_provider.as_deref())
@@ -1365,17 +1283,18 @@ impl Dashboard {
     }
 
     fn maybe_refresh_operation_status(&mut self, handle: &Handle) -> bool {
-        if self.history.is_some()
-            || self.browser.is_some()
+        if self.history_state.panel.is_some()
+            || self.browser_state.panel.is_some()
             || self.provider_action.is_some()
             || self.reset.is_some()
             || self.home_subscription_details
         {
             return false;
         }
-        let Some((_, provider)) =
-            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-        else {
+        let Some((_, provider)) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        ) else {
             return false;
         };
         let mut started = false;
@@ -1388,9 +1307,10 @@ impl Dashboard {
     }
 
     fn refresh(&mut self, handle: &Handle) {
-        if let Some((_, provider)) =
-            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-        {
+        if let Some((_, provider)) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        ) {
             for operation in &provider.operations {
                 self.operation_statuses.invalidate(operation);
             }
@@ -1403,7 +1323,7 @@ impl Dashboard {
     }
 
     fn refresh_with_models(&mut self, handle: &Handle, refresh_models: bool) {
-        if self.history.is_none() && self.browser.is_none() {
+        if self.history_state.panel.is_none() && self.browser_state.panel.is_none() {
             if refresh_models {
                 self.refresh_overview(handle);
             } else {
@@ -1454,25 +1374,25 @@ impl Dashboard {
     }
 
     fn refresh_overview_with_models(&mut self, handle: &Handle, refresh_models: bool) {
-        if !refresh_models && self.overview_loading {
+        if !refresh_models && self.overview_state.loading {
             return;
         }
-        if let Some(task) = self.overview_task.take() {
+        if let Some(task) = self.overview_state.task.take() {
             task.abort();
         }
-        self.overview_generation = self.overview_generation.wrapping_add(1);
-        let generation = self.overview_generation;
-        self.overview_loading = true;
-        self.overview_error = None;
-        let previous = self.overview.clone();
-        let service = self.overview_service.clone();
+        self.overview_state.generation = self.overview_state.generation.wrapping_add(1);
+        let generation = self.overview_state.generation;
+        self.overview_state.loading = true;
+        self.overview_state.error = None;
+        let previous = self.overview_state.catalog.clone();
+        let service = self.overview_state.service.clone();
         let request = crate::provider_catalog::RefreshRequest {
             config_path: self.config_path.clone(),
             previous,
             refresh_models,
         };
         let tx = self.tx.clone();
-        self.overview_task = Some(Task::spawn(handle, move |_| async move {
+        self.overview_state.task = Some(Task::spawn(handle, move |_| async move {
             service
                 .refresh(request, move |update| {
                     use crate::provider_catalog::RefreshUpdate;
@@ -1501,15 +1421,15 @@ impl Dashboard {
     }
 
     fn refresh_service_statuses(&mut self, handle: &Handle) {
-        if self.service_pending > 0 {
+        if self.service_state.pending > 0 {
             return;
         }
         let sources = super::home::SOURCES;
-        self.service_generation = self.service_generation.wrapping_add(1);
-        let generation = self.service_generation;
-        self.service_pending = sources.len();
+        self.service_state.generation = self.service_state.generation.wrapping_add(1);
+        let generation = self.service_state.generation;
+        self.service_state.pending = sources.len();
         for source in sources {
-            let http = Arc::clone(&self.service_http);
+            let http = Arc::clone(&self.service_state.http);
             let tx = self.tx.clone();
             self.background_tasks
                 .push(Task::spawn(handle, move |_| async move {
@@ -1527,29 +1447,31 @@ impl Dashboard {
     }
 
     fn refresh_home_performance(&mut self, handle: &Handle) -> bool {
-        if self.home_performance_pending {
+        if self.home_performance.pending {
             return false;
         }
-        let Some(binding) =
-            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-                .and_then(|(_, p)| p.performance.clone())
-        else {
+        let Some(binding) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        )
+        .and_then(|(_, p)| p.performance.clone()) else {
             return false;
         };
         let key = binding.cache_key();
         if self
             .home_performance
+            .cached
             .get(&key)
             .is_some_and(|s| s.updated.elapsed() < super::performance::HOME_TTL)
         {
             return false;
         }
-        self.home_performance_generation = self.home_performance_generation.wrapping_add(1);
-        let generation = self.home_performance_generation;
-        self.home_performance_pending = true;
-        let service = self.performance_service.clone();
+        self.home_performance.generation = self.home_performance.generation.wrapping_add(1);
+        let generation = self.home_performance.generation;
+        self.home_performance.pending = true;
+        let service = self.performance.service.clone();
         let tx = self.tx.clone();
-        self.home_performance_task = Some(Task::blocking(
+        self.home_performance.task = Some(Task::blocking(
             handle,
             move |_| {
                 service.summary(
@@ -1570,9 +1492,10 @@ impl Dashboard {
     }
 
     fn open_performance(&mut self, handle: &Handle) {
-        let Some((_, provider)) =
-            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-        else {
+        let Some((_, provider)) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        ) else {
             self.notice = Some("请先选择首页 Provider".into());
             return;
         };
@@ -1580,7 +1503,7 @@ impl Dashboard {
             self.notice = Some("此 Provider 尚未绑定本地请求日志".into());
             return;
         };
-        self.performance = Some(super::performance::Panel::new(
+        self.performance.panel = Some(super::performance::Panel::new(
             binding,
             provider.name.clone(),
         ));
@@ -1588,11 +1511,11 @@ impl Dashboard {
     }
 
     fn handle_performance_key(&mut self, key: KeyCode, handle: &Handle) -> bool {
-        let Some(panel) = &mut self.performance else {
+        let Some(panel) = &mut self.performance.panel else {
             return false;
         };
         match panel.key(key) {
-            super::performance::Action::Close => self.performance = None,
+            super::performance::Action::Close => self.performance.panel = None,
             super::performance::Action::Reload => self.load_performance(handle, false),
             super::performance::Action::Rescan => self.load_performance(handle, true),
             super::performance::Action::Stay => {}
@@ -1601,12 +1524,12 @@ impl Dashboard {
     }
 
     fn load_performance(&mut self, handle: &Handle, rescan: bool) {
-        let Some(panel) = &mut self.performance else {
+        let Some(panel) = &mut self.performance.panel else {
             return;
         };
         panel.stop();
-        self.performance_generation = self.performance_generation.wrapping_add(1);
-        panel.generation = self.performance_generation;
+        self.performance.generation = self.performance.generation.wrapping_add(1);
+        panel.generation = self.performance.generation;
         panel.loading = true;
         let generation = panel.generation;
         let request = crate::performance::LoadRequest {
@@ -1619,7 +1542,8 @@ impl Dashboard {
         };
         let tx = self.tx.clone();
         panel.task = Some(
-            self.performance_service
+            self.performance
+                .service
                 .start_load(handle, request, move |update| {
                     tx.send(AppEvent::Performance {
                         generation,
@@ -1632,9 +1556,10 @@ impl Dashboard {
     }
 
     fn open_reset(&mut self, handle: &Handle) {
-        let Some((_, selected)) =
-            super::overview::selected(self.overview.as_ref(), self.home_provider.as_deref())
-        else {
+        let Some((_, selected)) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        ) else {
             self.notice = Some("请先选择首页 Provider".into());
             return;
         };
@@ -1706,22 +1631,28 @@ impl Dashboard {
     }
 
     fn maybe_auto_refresh(&mut self, handle: &Handle) -> bool {
-        if let Some(panel) = &self.performance {
+        if let Some(panel) = &self.performance.panel {
             if !panel.loading && panel.refreshed.elapsed() >= Duration::from_secs(5) {
                 self.load_performance(handle, false);
                 return true;
             }
             return false;
         }
-        if self.history.is_some() || self.browser.is_some() {
-            if self.browser.as_ref().is_some_and(|b| b.launching) {
+        if self.history_state.panel.is_some() || self.browser_state.panel.is_some() {
+            if self
+                .browser_state
+                .panel
+                .as_ref()
+                .is_some_and(|b| b.launching)
+            {
                 return false;
             }
             if self.refresh_seconds > 0
-                && !self.history_loading
-                && self.last_history_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds)
+                && !self.history_state.loading
+                && self.history_state.last_refresh.elapsed()
+                    >= Duration::from_secs(self.refresh_seconds)
             {
-                if self.browser.is_some() {
+                if self.browser_state.panel.is_some() {
                     self.start_browser_load(handle);
                 }
                 self.start_history_load(handle);
@@ -1732,9 +1663,9 @@ impl Dashboard {
         let summary_started = self.refresh_home_performance(handle);
         if self.refresh_seconds == 0
             || self.pending > 0
-            || self.overview_loading
+            || self.overview_state.loading
             || self.reset.is_some()
-            || self.browser.is_some()
+            || self.browser_state.panel.is_some()
         {
             return summary_started;
         }
@@ -1758,8 +1689,8 @@ impl Dashboard {
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
                 AppEvent::FingerprintLoaded { generation, result } => {
-                    if generation == self.fingerprint_generation {
-                        self.fingerprint_task = None;
+                    if generation == self.fingerprint.generation {
+                        self.fingerprint.task = None;
                         changed |= self.subscription_tests.set(result);
                     }
                     continue;
@@ -1769,15 +1700,15 @@ impl Dashboard {
                     key,
                     result,
                 } => {
-                    if generation == self.home_performance_generation {
-                        self.home_performance_pending = false;
-                        self.home_performance_task = None;
-                        if self.overview.as_ref().is_some_and(|c| {
+                    if generation == self.home_performance.generation {
+                        self.home_performance.pending = false;
+                        self.home_performance.task = None;
+                        if self.overview_state.catalog.as_ref().is_some_and(|c| {
                             c.providers.iter().any(|p| {
                                 p.performance.as_ref().is_some_and(|b| b.cache_key() == key)
                             })
                         }) {
-                            self.home_performance.insert(
+                            self.home_performance.cached.insert(
                                 key,
                                 super::performance::CachedSummary {
                                     result,
@@ -1795,7 +1726,7 @@ impl Dashboard {
                     loading,
                 } => {
                     let mut home_update = None;
-                    if let Some(panel) = &mut self.performance
+                    if let Some(panel) = &mut self.performance.panel
                         && panel.generation == generation
                     {
                         panel.loading = loading;
@@ -1819,14 +1750,14 @@ impl Dashboard {
                         changed = true;
                     }
                     if let Some((key, summary)) = home_update {
-                        self.home_performance_generation =
-                            self.home_performance_generation.wrapping_add(1);
-                        if let Some(task) = self.home_performance_task.take() {
+                        self.home_performance.generation =
+                            self.home_performance.generation.wrapping_add(1);
+                        if let Some(task) = self.home_performance.task.take() {
                             task.abort();
                         }
-                        self.home_performance_pending = false;
+                        self.home_performance.pending = false;
                         if let Some(summary) = summary {
-                            self.home_performance.insert(
+                            self.home_performance.cached.insert(
                                 key,
                                 super::performance::CachedSummary {
                                     result: Ok(Some(summary)),
@@ -1834,26 +1765,26 @@ impl Dashboard {
                                 },
                             );
                         } else {
-                            self.home_performance.remove(&key);
+                            self.home_performance.cached.remove(&key);
                         }
                     }
                     continue;
                 }
                 AppEvent::HomeActivityLoaded { generation, result } => {
-                    if generation == self.home_activity_generation {
-                        self.home_activity_pending = false;
+                    if generation == self.home_activity.generation {
+                        self.home_activity.pending = false;
                         match result {
                             Ok(activity) => {
-                                changed |= self.home_activity != activity
-                                    || self.home_activity_error.is_some();
-                                self.home_activity = activity;
-                                self.home_activity_error = None;
+                                changed |= self.home_activity.sessions != activity
+                                    || self.home_activity.error.is_some();
+                                self.home_activity.sessions = activity;
+                                self.home_activity.error = None;
                             }
                             Err(error) => {
-                                changed |= !self.home_activity.is_empty()
-                                    || self.home_activity_error.as_ref() != Some(&error);
-                                self.home_activity.clear();
-                                self.home_activity_error = Some(error);
+                                changed |= !self.home_activity.sessions.is_empty()
+                                    || self.home_activity.error.as_ref() != Some(&error);
+                                self.home_activity.sessions.clear();
+                                self.home_activity.error = Some(error);
                             }
                         }
                     }
@@ -1864,36 +1795,34 @@ impl Dashboard {
                     catalog,
                     projects,
                 } => {
-                    if generation == self.home_sessions_generation {
-                        self.home_sessions_loading = false;
+                    if generation == self.home_sessions_state.generation {
+                        self.home_sessions_state.loading = false;
                         let mut warnings = catalog.warnings;
                         // A failed read keeps the last project records rather than dropping manual projects.
                         let records = projects.map_err(|error| warnings.push(error)).ok();
-                        self.home_sessions_warning =
+                        self.home_sessions_state.warning =
                             (!warnings.is_empty()).then(|| warnings.join(" · "));
-                        self.home_sessions
+                        self.home_sessions_state
+                            .browser
                             .refresh_with_projects(catalog.sessions, records);
-                        if let Some(task) = self.home_activity_task.take() {
-                            task.abort();
-                        }
-                        self.home_activity_generation =
-                            self.home_activity_generation.wrapping_add(1);
-                        self.home_activity_pending = false;
-                        self.home_activity_dirty = true;
+                        self.home_activity.invalidate();
                         let keys: HashSet<_> = self
-                            .home_sessions
+                            .home_sessions_state
+                            .browser
                             .sessions
                             .iter()
                             .map(sessions::Session::key)
                             .collect();
-                        self.home_activity.retain(|key, _| keys.contains(key));
+                        self.home_activity
+                            .sessions
+                            .retain(|key, _| keys.contains(key));
                         changed = true;
                     }
                     continue;
                 }
                 AppEvent::HomeSessionLaunched { generation, result } => {
-                    if generation == self.home_sessions_generation {
-                        self.home_sessions.launching = false;
+                    if generation == self.home_sessions_state.generation {
+                        self.home_sessions_state.browser.launching = false;
                         self.notice = Some(match result {
                             Ok(()) => "已在 Ghostty 右侧恢复会话".into(),
                             Err(error) => error,
@@ -1903,7 +1832,7 @@ impl Dashboard {
                     continue;
                 }
                 AppEvent::OverviewLoaded { generation, result } => {
-                    if generation == self.overview_generation {
+                    if generation == self.overview_state.generation {
                         match result {
                             Ok((snapshot, pending)) => {
                                 let selected = super::overview::selected(
@@ -1923,16 +1852,16 @@ impl Dashboard {
                                         .iter()
                                         .flat_map(|p| p.operations.iter().cloned()),
                                 );
-                                self.overview = Some(snapshot);
-                                self.overview_pending = pending;
-                                self.overview_loading = pending > 0;
-                                self.overview_error = None;
+                                self.overview_state.catalog = Some(snapshot);
+                                self.overview_state.pending = pending;
+                                self.overview_state.loading = pending > 0;
+                                self.overview_state.error = None;
                             }
                             Err(message) => {
-                                self.overview = None;
-                                self.overview_error = Some(message);
-                                self.overview_pending = 0;
-                                self.overview_loading = false;
+                                self.overview_state.catalog = None;
+                                self.overview_state.error = Some(message);
+                                self.overview_state.pending = 0;
+                                self.overview_state.loading = false;
                             }
                         }
                         changed = true;
@@ -1940,11 +1869,11 @@ impl Dashboard {
                     continue;
                 }
                 AppEvent::OverviewFinished { generation } => {
-                    if generation == self.overview_generation {
-                        changed |= self.overview_loading;
-                        self.overview_loading = false;
-                        self.overview_pending = 0;
-                        self.overview_task = None;
+                    if generation == self.overview_state.generation {
+                        changed |= self.overview_state.loading;
+                        self.overview_state.loading = false;
+                        self.overview_state.pending = 0;
+                        self.overview_state.task = None;
                     }
                     continue;
                 }
@@ -1953,14 +1882,14 @@ impl Dashboard {
                     target,
                     models,
                 } => {
-                    if generation == self.overview_generation
+                    if generation == self.overview_state.generation
                         && self
-                            .overview
+                            .overview_state
+                            .catalog
                             .as_mut()
                             .is_some_and(|catalog| catalog.apply_models(&target, models))
                     {
-                        self.overview_pending = self.overview_pending.saturating_sub(1);
-                        self.overview_loading = self.overview_pending > 0;
+                        self.overview_state.complete_one();
                         changed = true;
                     }
                     continue;
@@ -1970,14 +1899,14 @@ impl Dashboard {
                     target,
                     snapshot,
                 } => {
-                    if generation == self.overview_generation
+                    if generation == self.overview_state.generation
                         && self
-                            .overview
+                            .overview_state
+                            .catalog
                             .as_mut()
                             .is_some_and(|catalog| catalog.apply_resource(&target, snapshot))
                     {
-                        self.overview_pending = self.overview_pending.saturating_sub(1);
-                        self.overview_loading = self.overview_pending > 0;
+                        self.overview_state.complete_one();
                         changed = true;
                     }
                     continue;
@@ -1986,13 +1915,8 @@ impl Dashboard {
                     generation,
                     snapshot,
                 } => {
-                    if generation == self.service_generation {
-                        self.service_pending = self.service_pending.saturating_sub(1);
-                        let id = snapshot.provider.clone();
-                        self.status_history.record(&snapshot);
-                        let previous = self.service_statuses.remove(&id);
-                        self.service_statuses
-                            .insert(id, ServiceStatus::merge(previous, snapshot));
+                    if generation == self.service_state.generation {
+                        self.service_state.accept(snapshot);
                         changed = true;
                     }
                     continue;
@@ -2003,41 +1927,29 @@ impl Dashboard {
                     continue;
                 }
                 AppEvent::HistoryFailed(error) => {
-                    self.history_loading = false;
-                    self.history_task = None;
-                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
-                        panel.loading = false;
-                    }
+                    self.history_state.finish_load();
                     self.notice = Some(error);
                     changed = true;
                     continue;
                 }
                 AppEvent::HistoryCached(history) => {
-                    let history = Arc::new(history);
-                    self.loaded_history = history.clone();
-                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
-                        panel.history = history;
-                    }
+                    self.history_state.show_snapshot(Arc::new(history));
                     self.apply_browser_usage();
                     changed = true;
                     continue;
                 }
                 AppEvent::HistoryLoaded { history, cache } => {
-                    self.history_loading = false;
-                    self.history_task = None;
-                    self.history_cache = Some(cache);
-                    let history =
-                        if history.synced_at.is_none() && self.loaded_history.synced_at.is_some() {
-                            self.notice = history.warnings.first().cloned();
-                            self.loaded_history.clone()
-                        } else {
-                            Arc::new(history)
-                        };
-                    self.loaded_history = history.clone();
-                    if let Some(panel) = self.history.as_mut().or(self.saved_history.as_mut()) {
-                        panel.history = history;
-                        panel.loading = false;
-                    }
+                    self.history_state.cache = Some(cache);
+                    let history = if history.synced_at.is_none()
+                        && self.history_state.loaded.synced_at.is_some()
+                    {
+                        self.notice = history.warnings.first().cloned();
+                        self.history_state.loaded.clone()
+                    } else {
+                        Arc::new(history)
+                    };
+                    self.history_state.show_snapshot(history);
+                    self.history_state.finish_load();
                     self.apply_browser_usage();
                     changed = true;
                     continue;
@@ -2053,7 +1965,7 @@ impl Dashboard {
                         changed = true;
                         if let Ok(preview) = &result
                             && let Some(flow) = &self.reset
-                            && let Some(catalog) = &mut self.overview
+                            && let Some(catalog) = &mut self.overview_state.catalog
                         {
                             catalog.apply_reset_credits(&flow.target, preview.available);
                         }
@@ -2093,18 +2005,20 @@ impl Dashboard {
                     continue;
                 }
                 AppEvent::SessionLaunched { generation, result } => {
-                    if generation == self.browser_generation && self.browser.is_some() {
+                    if generation == self.browser_state.generation
+                        && self.browser_state.panel.is_some()
+                    {
                         changed = true;
                         match result {
                             Ok(()) => {
-                                if let Some(browser) = &mut self.browser {
+                                if let Some(browser) = &mut self.browser_state.panel {
                                     browser.launching = false;
                                 }
                                 self.close_browser(true);
                                 self.notice = Some("已在 Ghostty 右侧恢复会话".into());
                             }
                             Err(error) => {
-                                if let Some(browser) = &mut self.browser {
+                                if let Some(browser) = &mut self.browser_state.panel {
                                     browser.launching = false;
                                 }
                                 self.notice = Some(error);
@@ -2117,34 +2031,43 @@ impl Dashboard {
                     generation,
                     catalog,
                 } => {
-                    if generation == self.browser_generation && self.browser.is_some() {
+                    if generation == self.browser_state.generation
+                        && self.browser_state.panel.is_some()
+                    {
                         changed = true;
-                        self.browser_loading = false;
+                        self.browser_state.loading = false;
                         let message = if catalog.warnings.is_empty() {
                             "未找到可恢复的本机会话".to_string()
                         } else {
                             catalog.warnings.join(" · ")
                         };
                         if catalog.sessions.is_empty()
-                            && self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
+                            && self
+                                .browser_state
+                                .panel
+                                .as_ref()
+                                .is_some_and(|b| b.sessions.is_empty())
                         {
-                            if self.browser_filter.is_none() {
+                            if self.browser_state.filter.is_none() {
                                 self.close_browser(true);
                             }
                             self.notice = Some(message);
                         } else {
-                            if let Some(browser) = &mut self.browser {
+                            if let Some(browser) = &mut self.browser_state.panel {
                                 browser.refresh(catalog.sessions);
                             }
                             self.apply_browser_usage();
-                            self.notice =
-                                if self.browser.as_ref().is_some_and(|b| b.sessions.is_empty())
-                                    || !catalog.warnings.is_empty()
-                                {
-                                    Some(message)
-                                } else {
-                                    None
-                                };
+                            self.notice = if self
+                                .browser_state
+                                .panel
+                                .as_ref()
+                                .is_some_and(|b| b.sessions.is_empty())
+                                || !catalog.warnings.is_empty()
+                            {
+                                Some(message)
+                            } else {
+                                None
+                            };
                         }
                     }
                     continue;
@@ -2165,7 +2088,7 @@ impl Dashboard {
             let alerts = self.monitor.observe(
                 &event.target,
                 &event.snapshot,
-                &self.history_config.alerts,
+                &self.history_state.config.alerts,
                 Utc::now(),
             );
             if !alerts.is_empty() {

@@ -30,7 +30,7 @@ async fn fingerprint_events_and_provider_switches_keep_account_identity() {
         isolated_config(),
         PathBuf::from("/tmp/config.toml"),
     );
-    app.overview = Some(Catalog {
+    app.overview_state.catalog = Some(Catalog {
         providers: vec![
             provider("account-a", ProviderKind::Subscription),
             provider("account-b", ProviderKind::Subscription),
@@ -39,7 +39,7 @@ async fn fingerprint_events_and_provider_switches_keep_account_identity() {
         ..Default::default()
     });
     app.home_provider = Some("account-a".into());
-    app.fingerprint_generation = 2;
+    app.fingerprint.generation = 2;
     app.tx
         .send(AppEvent::FingerprintLoaded {
             generation: 1,

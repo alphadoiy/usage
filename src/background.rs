@@ -1,10 +1,14 @@
 //! Owned background work with cooperative cancellation across async and blocking boundaries.
 use std::future::Future;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use tracing::Instrument;
 
 #[derive(Clone, Debug, Default)]
@@ -29,6 +33,84 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+/// One admission queue and one execution limit for each kind of background work.
+/// A dropped waiter releases its queue slot, and a running task releases its slot
+/// when it finishes or is cancelled. Queue wait is outside the operation timeout.
+struct Budget {
+    running: Arc<Semaphore>,
+    queue: Arc<Semaphore>,
+}
+
+const QUERY_CONCURRENCY: usize = 8;
+const QUERY_QUEUE: usize = 64;
+const BLOCKING_CONCURRENCY: usize = 4;
+const BLOCKING_QUEUE: usize = 32;
+
+impl Budget {
+    fn new(running: usize, queued: usize) -> Self {
+        Self {
+            running: Arc::new(Semaphore::new(running)),
+            queue: Arc::new(Semaphore::new(queued)),
+        }
+    }
+
+    async fn admit(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        let queued = self
+            .queue
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "后台任务排队已满")?;
+        let running = self
+            .running
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "后台任务队列已关闭")?;
+        drop(queued);
+        Ok(running)
+    }
+
+    async fn run<T>(&self, work: impl Future<Output = T>) -> Result<T, &'static str> {
+        let _permit = self.admit().await?;
+        Ok(work.await)
+    }
+}
+
+fn query_budget() -> &'static Budget {
+    static BUDGET: OnceLock<Budget> = OnceLock::new();
+    BUDGET.get_or_init(|| Budget::new(QUERY_CONCURRENCY, QUERY_QUEUE))
+}
+
+fn blocking_budget() -> &'static Budget {
+    static BUDGET: OnceLock<Budget> = OnceLock::new();
+    BUDGET.get_or_init(|| Budget::new(BLOCKING_CONCURRENCY, BLOCKING_QUEUE))
+}
+
+pub(crate) async fn query<T>(work: impl Future<Output = T>) -> Result<T, &'static str> {
+    query_budget().run(work).await
+}
+
+pub(crate) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, &'static str> {
+    blocking_with(blocking_budget(), work).await
+}
+
+async fn blocking_with<T: Send + 'static>(
+    budget: &Budget,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, &'static str> {
+    let permit = budget.admit().await?;
+    tokio::task::spawn_blocking(move || {
+        // The worker owns the permit so aborting its async coordinator cannot
+        // free capacity while non-interruptible disk work is still running.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| "后台任务异常结束")
 }
 
 /// Keep this handle for as long as its result is needed. Disk work already running
@@ -84,14 +166,14 @@ impl Task {
     ) -> Self {
         Self::spawn(handle, move |cancel| async move {
             let flag = cancel.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = blocking(move || {
                 if flag.is_cancelled() {
                     return Err("已取消".into());
                 }
                 work(flag)
             })
             .await
-            .unwrap_or_else(|_| Err("后台任务异常结束".into()));
+            .unwrap_or_else(|error| Err(error.into()));
             if !cancel.is_cancelled() {
                 complete(result);
             }
@@ -132,6 +214,71 @@ impl Tasks {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn budget_limits_running_and_waiting_work() {
+        let budget = Budget::new(1, 1);
+        let running = budget.admit().await.unwrap();
+        let mut waiting = Box::pin(budget.admit());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(matches!(budget.admit().await, Err("后台任务排队已满")));
+        drop(running);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(admitted);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_frees_queue_slot() {
+        let budget = Budget::new(1, 1);
+        let running = budget.admit().await.unwrap();
+        let mut waiting = Box::pin(budget.admit());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(waiting);
+        drop(running);
+        assert!(budget.admit().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn aborted_coordinator_keeps_blocking_worker_in_budget() {
+        let budget = Arc::new(Budget::new(1, 1));
+        let worker_budget = budget.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let coordinator = tokio::spawn(async move {
+            blocking_with(&worker_budget, move || {
+                let _ = started.send(());
+                let _ = released.blocking_recv();
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        coordinator.abort();
+        let mut next = Box::pin(budget.admit());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut next)
+                .await
+                .is_err()
+        );
+        let _ = release.send(());
+        let _permit = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn queued_work_is_cancelled_before_it_starts() {

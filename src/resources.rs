@@ -352,7 +352,13 @@ pub(crate) async fn collect_with_updates(
             };
             let reader = Arc::clone(reader);
             let task = tasks.spawn(
-                async move { tokio::time::timeout(timeout, reader.read()).await }.in_current_span(),
+                async move {
+                    crate::background::query(async {
+                        tokio::time::timeout(timeout, reader.read()).await
+                    })
+                    .await
+                }
+                .in_current_span(),
             );
             indices.insert(task.id(), index);
         }
@@ -360,7 +366,8 @@ pub(crate) async fn collect_with_updates(
             break;
         };
         let (id, result) = match result {
-            Ok((id, snapshot)) => (id, snapshot.map_err(|_| "资源查询超时")),
+            Ok((id, Ok(snapshot))) => (id, snapshot.map_err(|_| "资源查询超时")),
+            Ok((id, Err(error))) => (id, Err(error)),
             Err(error) => (error.id(), Err("资源查询任务中断")),
         };
         let index = indices.remove(&id).expect("registered query task");

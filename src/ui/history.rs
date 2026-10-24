@@ -180,18 +180,14 @@ impl HistoryPanel {
         report
     }
     fn open_picker(&mut self, dimension: Dimension) {
-        let mut options: Vec<String> = self
-            .history
-            .records
-            .iter()
-            .filter(|r| self.sources().contains(&r.source))
-            .map(|r| match dimension {
-                Dimension::Project => r.project.clone(),
-                Dimension::Model => r.model.clone(),
-                Dimension::Instance => r.instance.clone(),
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mut options = self.history.dimension_values(
+            &self.sources(),
+            match dimension {
+                Dimension::Project => "project",
+                Dimension::Model => "model",
+                Dimension::Instance => "instance",
+            },
+        );
         if matches!(dimension, Dimension::Instance) {
             options.extend(self.history.instances.clone());
         }
