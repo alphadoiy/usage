@@ -10,12 +10,12 @@
 
 ## 安装与运行
 
-需要 Node.js 22+；已核对版本 `lmfpd@0.0.1792242250521`，对应上游提交 `50a364bc686279094265f34f18f5501eac1d73f4`。只安装本地引擎，不在运行时执行 `npx latest`：
+需要 Node.js 22+；当前已核对版本为 `lmfpd@0.0.1792852997176`。只安装本地引擎，不在运行时执行 `npx latest`：
 
 ```sh
 # 默认数据根目录；设置了 USAGE_CODEX_DIR / XDG_DATA_HOME 时请使用实际根目录。
 npm install --prefix "$HOME/.local/share/usage/codex/fingerprint/tools" \
-  --ignore-scripts --no-audit --no-fund lmfpd@0.0.1792242250521
+  --ignore-scripts --no-audit --no-fund lmfpd@0.0.1792852997176
 
 usage codex list
 usage codex fingerprint run <OAuth账号名称或ID>
