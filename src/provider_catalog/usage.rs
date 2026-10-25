@@ -7,7 +7,10 @@ use super::{Catalog, CatalogService, ModelQuery, Plan};
 use crate::codex_manager::{AuthMode, Manager, Profile, ccswitch};
 use crate::config::AppConfig;
 use crate::resources::connections::{ConnectionConfig, ResourceService};
-use crate::resources::{CredentialResolver, ResourceBinding, ResourceReader, ResourceSnapshot};
+use crate::resources::{
+    CredentialResolver, ResourceBinding, ResourceReader, ResourceScope, ResourceSnapshot,
+    ResourceState,
+};
 
 /// Account-scoped reset capability. Holds a credential reader, never a captured token.
 #[derive(Clone)]
@@ -191,7 +194,7 @@ impl CatalogService {
             usage.sources.push(source);
             return;
         }
-        // Explicit Usage configuration wins over imported CC Switch parameters.
+        // Explicit Usage configuration wins over imported CC Switch parameters and detection.
         // OAuth's own subscription/reset capability remains independent of extra billing sources.
         if config
             .resources
@@ -231,7 +234,7 @@ impl CatalogService {
         })();
         match result {
             Ok(Some((connection, reader))) => attach(plan, &profile.id, &connection, Ok(reader)),
-            Ok(None) => {}
+            Ok(None) => self.add_detected_usage(plan, manager, profile),
             Err(message) => {
                 plan.catalog
                     .providers
@@ -242,6 +245,152 @@ impl CatalogService {
                     .hint = Some(message)
             }
         }
+    }
+
+    /// Same-origin protocol detection for BYOK relays that have no Usage resource yet.
+    fn add_detected_usage(&self, plan: &mut Plan, manager: &Manager, profile: &Profile) {
+        if profile.auth_mode != AuthMode::Byok
+            || crate::plugins::endpoint_account(&profile.base_url).is_some()
+        {
+            return;
+        }
+        let query = match manager.model_catalog_query(profile) {
+            Ok(query) => query,
+            Err(_) => return,
+        };
+        let key = query.key;
+        let credentials: Arc<CredentialResolver> = Arc::new(move |_| Ok(key.clone()));
+        let candidates: Vec<(String, String)> =
+            match crate::resources::provider_usage::balance_endpoint(&profile.base_url) {
+                // Known vendor endpoints resolve to one unambiguous protocol; no probing.
+                Some((service, base)) => vec![(service.to_owned(), base)],
+                None => {
+                    let Some(root) = site_root(&profile.base_url)
+                        .ok()
+                        .filter(|root| crate::resources::api::validate_base_url(root).is_ok())
+                    else {
+                        return;
+                    };
+                    vec![
+                        ("new_api_token".to_owned(), root.clone()),
+                        ("sub2api_usage".to_owned(), root),
+                    ]
+                }
+            };
+        let mut readers: Vec<Arc<dyn ResourceReader>> = Vec::new();
+        for (service, base_url) in candidates {
+            let connection = ConnectionConfig {
+                id: format!("auto:{}", profile.id),
+                label: Some("自动识别".into()),
+                service,
+                base_url,
+                credential_env: "USAGE_INFERENCE_KEY".into(),
+                revision: profile.revision.to_string(),
+                options: serde_json::Value::Null,
+                profile_ids: vec![profile.id.clone()],
+                inference: None,
+            };
+            if let Ok(reader) = self
+                .usage_service()
+                .prepare_with_credentials(&connection, credentials.clone())
+            {
+                readers.push(reader);
+            }
+        }
+        if readers.is_empty() {
+            return;
+        }
+        let binding = ResourceBinding {
+            account: profile.id.clone(),
+            revision: profile.revision.to_string(),
+        };
+        // Vendor protocols resolve to one reader; relays get sequential same-origin probing.
+        if readers.len() == 1 {
+            attach_reader(plan, &profile.id, "自动识别".into(), readers.pop().unwrap());
+        } else {
+            let reader = Arc::new(DetectedUsage {
+                binding,
+                readers,
+                outcome: Default::default(),
+            });
+            attach_reader(plan, &profile.id, "自动识别".into(), reader);
+        }
+    }
+}
+
+/// Same-origin sequential detection: the first protocol returning usable metrics wins.
+struct DetectedUsage {
+    binding: ResourceBinding,
+    readers: Vec<Arc<dyn ResourceReader>>,
+    outcome: std::sync::Mutex<Option<usize>>,
+}
+impl DetectedUsage {
+    fn classification(&self) -> String {
+        match self.outcome.lock().unwrap().as_ref() {
+            Some(index) => self.readers[*index].service().to_owned(),
+            None => "auto_detect".into(),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl ResourceReader for DetectedUsage {
+    fn service(&self) -> &str {
+        "auto_detect"
+    }
+    fn binding(&self) -> &ResourceBinding {
+        &self.binding
+    }
+    fn scope(&self) -> ResourceScope {
+        self.outcome
+            .lock()
+            .unwrap()
+            .and_then(|index| self.readers.get(index))
+            .map(|reader| reader.scope())
+            .unwrap_or(ResourceScope::Token)
+    }
+    async fn read(&self) -> ResourceSnapshot {
+        let order: Vec<usize> = self
+            .outcome
+            .lock()
+            .unwrap()
+            .map(|index| vec![index])
+            .unwrap_or_else(|| (0..self.readers.len()).collect());
+        let mut fallback = None;
+        for index in order {
+            let snapshot = self.readers[index].read().await;
+            match snapshot.state {
+                ResourceState::Ready => {
+                    *self.outcome.lock().unwrap() = Some(index);
+                    let mut snapshot = snapshot;
+                    snapshot.service = self.service().to_owned();
+                    snapshot.message = Some(format!("已识别协议：{}", self.classification()));
+                    return snapshot;
+                }
+                ResourceState::AuthenticationFailed => {
+                    let mut snapshot = snapshot;
+                    snapshot.service = self.service().to_owned();
+                    snapshot.message = Some(format!(
+                        "自动识别到 {}，但凭据被拒绝",
+                        self.readers[index].service()
+                    ));
+                    return snapshot;
+                }
+                ResourceState::TransientFailure => fallback = Some(snapshot),
+                _ => {}
+            }
+        }
+        let mut snapshot = fallback.unwrap_or_else(|| ResourceSnapshot {
+            binding: self.binding.clone(),
+            service: self.service().to_owned(),
+            scope: ResourceScope::Token,
+            state: ResourceState::NeedsConfiguration,
+            metrics: Vec::new(),
+            queried_at: Some((chrono::Utc::now)()),
+            message: None,
+        });
+        snapshot.service = self.service().to_owned();
+        snapshot.message = Some("未识别同源余额协议，可显式配置 resources".into());
+        snapshot
     }
 }
 
@@ -659,6 +808,138 @@ mod tests {
                 .contains(&("New-Api-User".into(), "42".into()))
         );
         assert!(!format!("{:?}", plan.catalog).contains("fixture-account-key"));
+    }
+
+    struct ManualFixture {
+        root: std::path::PathBuf,
+        manager: Manager,
+    }
+    impl ManualFixture {
+        fn new(base_url: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("usage-provider-auto-{}", uuid::Uuid::new_v4()));
+            let mut manager = Manager::open(root.join("manager")).unwrap();
+            let config =
+                crate::codex_manager::config::new_config(base_url, "fixture-model", None).unwrap();
+            manager
+                .add("Relay", &config, "relay-inference-key")
+                .unwrap();
+            Self { root, manager }
+        }
+        fn service(&self, http: Arc<FakeHttp>) -> CatalogService {
+            CatalogService::new(
+                self.manager.root().into(),
+                http,
+                Arc::new(|_| panic!("detection must use the saved inference key")),
+            )
+        }
+    }
+    impl Drop for ManualFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[tokio::test]
+    async fn byok_relay_detects_new_api_token_usage_from_the_same_origin() {
+        let f = ManualFixture::new("https://relay.invalid/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            "https://relay.invalid/api/usage/token",
+            reply(r#"{"success":true,"data":{"object":"token_usage","total_used":10,"total_available":90,"unlimited_quota":false}}"#),
+        );
+        let plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+        assert_eq!(plan.resources.len(), 1);
+        assert_eq!(plan.resources[0].service(), "auto_detect");
+        let snapshot = plan.resources[0].read().await;
+        assert_eq!(snapshot.state, ResourceState::Ready);
+        assert_eq!(snapshot.scope, ResourceScope::Token);
+        assert!(
+            snapshot
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("new_api_token")
+        );
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url.starts_with("https://relay.invalid/"));
+        assert!(
+            calls[0]
+                .headers
+                .contains(&("Authorization".into(), "Bearer relay-inference-key".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn detection_falls_back_to_sub2api_and_remembers_the_protocol() {
+        let f = ManualFixture::new("https://sub.invalid/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            "https://sub.invalid/api/usage/token",
+            reply(r#"{"success":false,"message":"not new api"}"#),
+        );
+        http.route(
+            "https://sub.invalid/v1/usage",
+            reply(r#"{"quota":{"limit":100,"used":25},"unit":"USD"}"#),
+        );
+        let plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+        let reader = plan.resources[0].clone();
+        let first = reader.read().await;
+        assert_eq!(first.state, ResourceState::Ready);
+        assert!(first.message.as_deref().unwrap().contains("sub2api_usage"));
+        let second = reader.read().await;
+        assert_eq!(second.state, ResourceState::Ready);
+        let calls = http.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .filter(|c| c.url == "https://sub.invalid/api/usage/token")
+                .count()
+                == 1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.url == "https://sub.invalid/v1/usage")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn known_vendor_balance_endpoints_skip_relay_detection() {
+        let f = ManualFixture::new("https://api.deepseek.com/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            "https://api.deepseek.com/user/balance",
+            reply(r#"{"balance_infos":[{"total_balance":"12.5","currency":"CNY"}]}"#),
+        );
+        let plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+        let snapshot = plan.resources[0].read().await;
+        assert_eq!(snapshot.state, ResourceState::Ready);
+        assert_eq!(snapshot.service, "deepseek_balance");
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unidentified_protocol_reports_explicitly_without_inventing_balance() {
+        let f = ManualFixture::new("https://unknown.invalid/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            "https://unknown.invalid/api/usage/token",
+            reply(r#"{"unexpected":true}"#),
+        );
+        http.route(
+            "https://unknown.invalid/v1/usage",
+            reply(r#"{"unexpected":true}"#),
+        );
+        let plan = f.service(http).load(&AppConfig::default()).unwrap();
+        let snapshot = plan.resources[0].read().await;
+        assert_eq!(snapshot.state, ResourceState::NeedsConfiguration);
+        assert!(snapshot.metrics.is_empty());
+        assert!(snapshot.message.as_deref().unwrap().contains("未识别"));
     }
 
     #[test]

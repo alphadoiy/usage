@@ -12,7 +12,7 @@ pub(super) fn invalid() -> QueryFailure {
     QueryFailure(ResourceState::Failure, "资源接口返回的数据格式无效")
 }
 
-pub(super) fn validate_base_url(value: &str) -> Result<reqwest::Url, RegistryError> {
+pub(crate) fn validate_base_url(value: &str) -> Result<reqwest::Url, RegistryError> {
     let mut url = crate::http::validate_api_base_url(value).map_err(|error| {
         RegistryError::Factory(match error {
             crate::http::BaseUrlError::Invalid => "资源 base_url 必须为绝对 HTTP(S) URL".into(),
@@ -87,8 +87,8 @@ impl ApiClient {
     pub(super) async fn credential(&self) -> QueryResult<String> {
         let resolver = self.connection.credentials.clone();
         let reference = self.connection.credential_ref.clone();
-        let token = crate::background::blocking(move || resolver(&reference))
-            .await
+        let resolved = crate::background::blocking(move || resolver(&reference)).await;
+        let token = resolved
             .map_err(|_| QueryFailure(ResourceState::TransientFailure, "资源凭据读取任务中断"))?
             .map_err(|_| {
                 QueryFailure(

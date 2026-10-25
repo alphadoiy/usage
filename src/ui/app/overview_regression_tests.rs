@@ -651,10 +651,18 @@ async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
         async fn request(
             &self,
             _: &str,
-            _: &str,
+            url: &str,
             _: &[(&str, String)],
             _: Option<Vec<u8>>,
         ) -> Result<HttpResponse, TransportError> {
+            if !url.contains("/v1/models") {
+                // Balance probes finish immediately; only model requests are gated.
+                return Ok(HttpResponse {
+                    status: 404,
+                    headers: Default::default(),
+                    body: Vec::new(),
+                });
+            }
             if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
                 self.release.acquire().await.unwrap().forget();
             }
@@ -673,6 +681,7 @@ async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
                     break;
                 }
                 tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -727,7 +736,8 @@ async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
     .await;
     assert!(
         app.overview_state.loading,
-        "new Provider must appear before model queries finish"
+        "new Provider must appear before model queries finish; loading={} pending={}",
+        app.overview_state.loading, app.overview_state.pending
     );
     assert_eq!(app.home_provider.as_deref(), Some(added.id.as_str()));
     assert_eq!(app.notice.as_deref(), Some("已添加 Provider"));

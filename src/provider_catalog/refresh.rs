@@ -63,9 +63,12 @@ async fn collect(
         queries,
         resources,
     } = plan;
+    // Every reader still emits exactly one terminal update, including cached sources
+    // whose results were reused; the first Loaded count must match those emissions.
+    let resource_updates = resources.len();
     if !publish(RefreshUpdate::Loaded(Ok((
         catalog,
-        queries.len() + resources.len(),
+        queries.len() + resource_updates,
     )))) {
         return;
     }

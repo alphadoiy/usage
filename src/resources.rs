@@ -1,11 +1,11 @@
 //! Billing/resource adapters are independent of the agent that consumes them.
 //! Legacy subscription readers remain behind a compatibility capability.
 
-mod api;
+pub(crate) mod api;
 pub mod connections;
 mod new_api;
 mod openai_costs;
-mod provider_usage;
+pub(crate) mod provider_usage;
 pub(crate) use provider_usage::balance_endpoint;
 
 use std::sync::Arc;
