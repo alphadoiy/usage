@@ -21,6 +21,8 @@ bash scripts/publish-github.sh
 
 Release 工作流在 [GitHub 的 macOS runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 分别测试并构建 Apple Silicon 与 Intel 二进制。部署目标是 macOS 15。两种架构都成功后生成 SHA-256 校验文件和 Formula，再发布 Release。运行时只安装预编译二进制，无需 Rust。tap 更新使用本机已有 GitHub 登录，不需要向 Actions 另存跨仓库 token。
 
+`main` 的 CI 会并行为两种架构预热测试和 release 依赖缓存，标签构建使用相同的缓存键读取它们。GitHub 标签之间的缓存互相隔离，因此缓存写入默认分支，发布任务只读取；首次预热仍需完整编译。缓存按 Rust 工具链、目标架构、依赖及编译环境区分，业务源码会重新编译，完整测试仍在发布时运行。常规 CI 另外缓存自身的检查和测试依赖。
+
 ## 后续更新
 
 修改 `Cargo.toml` 的版本号，运行 `cargo check --locked` 前先用 `cargo check --offline` 更新 `Cargo.lock` 的本包版本，然后提交代码，运行：

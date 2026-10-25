@@ -28,6 +28,10 @@ jobs:
           node-version: "22"
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo +stable fmt --all -- --check
       - name: Lint
@@ -42,3 +46,32 @@ jobs:
         run: |
           python3 scripts/ablate-provider-stage1.py --output /private/tmp/usage-ci-provider-anchors --check-anchors
           python3 scripts/ablate-run-bindings.py --output /private/tmp/usage-ci-run-anchors --check-anchors
+
+  release-cache:
+    # Tag caches are isolated from other tags. Warm both native targets on main
+    # so future releases can restore debug and release dependencies from it.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+      - name: Compile test dependencies
+        run: cargo +stable test --locked --no-run
+      - name: Compile release dependencies
+        run: cargo +stable build --release --locked --target ${{ matrix.target }}
