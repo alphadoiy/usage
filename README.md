@@ -12,7 +12,7 @@
 
 终端够宽时，Claude Code、Codex 和 Grok 三张卡片并排显示；较窄时自动改为两列或一列。Braille 进度条会随卡片宽度延伸；窄卡片会把额度信息和进度条分成两行，避免截断。
 
-官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。统一的 Provider 管理入口支持 BYOK、OAuth、WorkBuddy 和 Trae，可保存配置和登录、导入 CC Switch 供应商并配置 Agent 启动。
+官方订阅额度查询对齐 cc-switch：只读取本机已有登录凭据，不负责登录，也不把订阅令牌写回磁盘。统一的 Provider 管理入口支持 BYOK、OAuth、WorkBuddy、Trae 和 ZCode，可保存配置和登录、导入 CC Switch 供应商并配置 Agent 启动。
 
 | 工具 | 凭据 | 接口 |
 | --- | --- | --- |
@@ -159,7 +159,7 @@ Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板�
 
 ## Provider 管理与 Codex 多开
 
-运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`Enter` 先选择项目再启动，`o` 只更改默认项目。项目列表合并独立的项目库与本机会话所在目录：置顶项在前，其余按会话活动、从 Usage 启动的时间排序；输入可筛选，也可输入 `/` 或 `~` 开头的完整路径。选择框中 `Ctrl+A` 添加输入的路径（或选中项）、`Ctrl+T` 置顶、`Ctrl+D` 移出列表（会话保留）；在未收录的目录启动后自动加入项目库。从首页项目看板进入 F4 时，默认项目为看板中选中的项目。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，`Enter` 或 `Ctrl+S` 保存，密钥字段始终遮罩。模型和推理强度在字段上按 `Enter` 或直接输入打开选择列表：当前值排在首位，模型列表沿用首页的查询（已保存的 Provider 打开表单即获取；新 BYOK 填写 API Key 后按当前 Base URL 获取），输入可筛选，没有匹配项时 `Enter` 使用输入的自定义值，`Ctrl+R` 重新获取模型列表。
+运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / ZCode / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`Enter` 先选择项目再启动，`o` 只更改默认项目。项目列表合并独立的项目库与本机会话所在目录：置顶项在前，其余按会话活动、从 Usage 启动的时间排序；输入可筛选，也可输入 `/` 或 `~` 开头的完整路径。选择框中 `Ctrl+A` 添加输入的路径（或选中项）、`Ctrl+T` 置顶、`Ctrl+D` 移出列表（会话保留）；在未收录的目录启动后自动加入项目库。从首页项目看板进入 F4 时，默认项目为看板中选中的项目。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，`Enter` 或 `Ctrl+S` 保存，密钥字段始终遮罩。模型和推理强度在字段上按 `Enter` 或直接输入打开选择列表：当前值排在首位，模型列表沿用首页的查询（已保存的 Provider 打开表单即获取；新 BYOK 填写 API Key 后按当前 Base URL 获取），输入可筛选，没有匹配项时 `Enter` 使用输入的自定义值，`Ctrl+R` 重新获取模型列表。
 
 添加时会检测相同配置与凭据，重复项提示使用已有 Provider；不同模型或配置可以分别保存，显式“复制”仍可创建独立副本。插件账号再次登录同一身份会更新原账号凭据并保留绑定，不按昵称合并不同账号。
 
@@ -407,4 +407,4 @@ registry.register("spark", "另一种", render_spark);
 
 注册之后，`--once --style` 和配置文件都能选择这种文本用量视图。
 
-Provider 插件接入（WorkBuddy / Trae 国内版与国际版）：见 [插件文档](docs/plugins.md)。
+Provider 插件接入（WorkBuddy / Trae 国内版与国际版 / ZCode）：见 [插件文档](docs/plugins.md)。

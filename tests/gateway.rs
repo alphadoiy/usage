@@ -297,7 +297,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if self.path.join("manager/gateway-v11/state.json").exists()
+        if self.path.join("manager/gateway-v12/state.json").exists()
             && let Ok(output) = self.command(&["gateway", "status"]).output()
             && let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
             && value["service"] == "usage-gateway"
@@ -405,7 +405,7 @@ fn shared_gateway_survives_launcher_exit_isolates_credentials_and_populates_metr
         assert!(expired.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(50));
     }
-    let mode = fs::metadata(f.path.join("manager/gateway-v11/state.json"))
+    let mode = fs::metadata(f.path.join("manager/gateway-v12/state.json"))
         .unwrap()
         .permissions()
         .mode()
@@ -463,7 +463,7 @@ fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch(
         let f = Fixture::new();
         let upstream = Upstream::new();
         f.add("one", upstream.port, "synthetic-key");
-        let path = f.path.join("manager/gateway-v11");
+        let path = f.path.join("manager/gateway-v12");
         let _locked = match obstruction {
             "busy" => {
                 fs::create_dir_all(&path).unwrap();
@@ -578,7 +578,7 @@ fn a_launch_waits_for_a_brief_concurrent_preparation_instead_of_skipping_observa
     let f = Fixture::new();
     let upstream = Upstream::new();
     f.add("one", upstream.port, "synthetic-key");
-    let path = f.path.join("manager/gateway-v11");
+    let path = f.path.join("manager/gateway-v12");
     fs::create_dir_all(&path).unwrap();
     let held = fs::OpenOptions::new()
         .read(true)
@@ -755,7 +755,7 @@ saved['tokens']['access_token']='synthetic-access-rotated';saved['tokens']['refr
         }
         assert!(skipped, "the direct launch is logged");
         assert!(
-            !f.path.join("manager/gateway-v11/state.json").exists(),
+            !f.path.join("manager/gateway-v12/state.json").exists(),
             "an official launch must not start the gateway"
         );
     }

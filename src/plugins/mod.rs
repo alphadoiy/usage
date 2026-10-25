@@ -25,6 +25,7 @@ pub(crate) const ACTION_SUPPORT: &str = include_str!("action_support.mjs");
 pub(crate) const WORKBUDDY_ACTIONS: &str = include_str!("workbuddy_actions.mjs");
 pub(crate) const TRAE_ACTIONS: &str = include_str!("trae_actions.mjs");
 pub(crate) const PROTOCOL: &str = include_str!("protocol.mjs");
+pub(crate) const INFERENCE: &str = include_str!("inference.mjs");
 pub fn account_endpoint(id: &str) -> String {
     format!("https://usage-plugin.invalid/{id}/v1")
 }

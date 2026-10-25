@@ -636,3 +636,146 @@ async fn overview_refresh_cancels_previous_task_and_drop_cancels_current_task() 
     tokio::task::yield_now().await;
     assert!(current_abort.is_finished());
 }
+
+#[tokio::test]
+async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
+    use crate::http::{HttpClient, HttpResponse, TransportError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowModels {
+        calls: AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    #[async_trait::async_trait]
+    impl HttpClient for SlowModels {
+        async fn request(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[(&str, String)],
+            _: Option<Vec<u8>>,
+        ) -> Result<HttpResponse, TransportError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                self.release.acquire().await.unwrap().forget();
+            }
+            Ok(HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: br#"{"data":[{"id":"fixture-model"}]}"#.to_vec(),
+            })
+        }
+    }
+    async fn until(app: &mut Dashboard, condition: impl Fn(&Dashboard) -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.drain_events();
+                if condition(app) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    let root = std::env::temp_dir().join(format!("usage-provider-change-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let config_path = root.join("usage.toml");
+    std::fs::write(&config_path, "").unwrap();
+    let mut manager = crate::codex_manager::Manager::open(root.join("manager")).unwrap();
+    let config = crate::codex_manager::config::new_config(
+        "https://models.invalid/v1",
+        "fixture-model",
+        None,
+    )
+    .unwrap();
+    let original = manager
+        .add("Original", &config, "synthetic-original")
+        .unwrap();
+    let http = Arc::new(SlowModels {
+        calls: AtomicUsize::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut app = dashboard();
+    app.config_path = config_path;
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
+    app.overview_state.service = Arc::new(
+        crate::provider_catalog::CatalogService::new(
+            root.join("manager"),
+            http.clone(),
+            Arc::new(|_| panic!("unexpected env lookup")),
+        )
+        .with_plugin_root(root.join("plugins")),
+    );
+    let handle = Handle::current();
+    app.refresh_overview(&handle);
+    until(&mut app, |app| !app.overview_state.loading).await;
+    let old = app.overview_state.catalog.clone().unwrap();
+    app.refresh_overview(&handle);
+    until(&mut app, |_| http.calls.load(Ordering::SeqCst) == 2).await;
+    let stale_generation = app.overview_state.generation;
+
+    let added = manager.add("Added", &config, "synthetic-added").unwrap();
+    app.refresh_after_provider_change(&handle);
+    app.home_provider = Some(added.id.clone());
+    app.notice = Some("已添加 Provider".into());
+    assert!(app.overview_state.generation > stale_generation);
+    until(&mut app, |app| {
+        app.overview_state.catalog.as_ref().unwrap().providers.len() == 2
+    })
+    .await;
+    assert!(
+        app.overview_state.loading,
+        "new Provider must appear before model queries finish"
+    );
+    assert_eq!(app.home_provider.as_deref(), Some(added.id.as_str()));
+    assert_eq!(app.notice.as_deref(), Some("已添加 Provider"));
+    assert!(rendered(&app, 100, 30).contains("Added"));
+    assert!(matches!(
+        app.overview_state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .providers
+            .iter()
+            .find(|provider| provider.id == original.id)
+            .unwrap()
+            .models,
+        Models::Ready(_)
+    ));
+    app.tx
+        .send(AppEvent::OverviewLoaded {
+            generation: stale_generation,
+            result: Ok((old, 0)),
+        })
+        .unwrap();
+    app.tx
+        .send(AppEvent::OverviewFinished {
+            generation: stale_generation,
+        })
+        .unwrap();
+    app.drain_events();
+    assert_eq!(
+        app.overview_state.catalog.as_ref().unwrap().providers.len(),
+        2
+    );
+    assert!(app.overview_state.loading);
+
+    manager.remove(&original.id).unwrap();
+    app.refresh_after_provider_change(&handle);
+    until(&mut app, |app| {
+        app.overview_state.catalog.as_ref().unwrap().providers.len() == 1
+    })
+    .await;
+    assert_eq!(
+        app.overview_state.catalog.as_ref().unwrap().providers[0].id,
+        added.id
+    );
+    assert_eq!(app.home_provider.as_deref(), Some(added.id.as_str()));
+    http.release.add_permits(4);
+    until(&mut app, |app| !app.overview_state.loading).await;
+    drop(app);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}

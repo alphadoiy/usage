@@ -302,7 +302,9 @@ impl CodexSubscriptionDetector {
         cancel: &AtomicBool,
     ) -> Result<Value> {
         let _lease = manager.oauth_run_lease(&profile.id)?;
-        let home = manager.materialize(&profile.id, profile.revision)?;
+        // Sampling uses the account's credentials and explicit model arguments,
+        // independently of the saved or mutable configuration used to launch Codex.
+        let home = manager.home(&profile.id, profile.revision)?;
         let auth = oauth::read_auth(&home.join("auth.json"))?;
         if profile.oauth.as_ref().is_none_or(|identity| {
             identity.account_id != auth.identity.account_id

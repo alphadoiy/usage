@@ -1,10 +1,10 @@
 # Provider 插件
 
-Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。内置接入包为 `@magpie-community/opencode-workbuddy-auth@0.1.24`（`workbuddy` / `workbuddy-ai`）和 `@magpie-community/opencode-trae-auth@0.2.17`（`trae-cn` / `trae-global`）。
+Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。内置接入包为 `@magpie-community/opencode-workbuddy-auth@0.1.24`（`workbuddy` / `workbuddy-ai`）和 `@magpie-community/opencode-trae-auth@0.2.17`（`trae-cn` / `trae-global`），以及 `@magpie-community/opencode-zcode-auth@0.1.27`（`zcode`）。
 
 ## 安装和登录
 
-首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy**、**Trae** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择 WorkBuddy 或 Trae。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
+首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy**、**Trae**、**ZCode** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择 WorkBuddy、Trae 或 ZCode。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
 
 接入步骤以紧凑的二级菜单覆盖在原页面上，标题展示当前层级，Esc 返回上一级。地区附账号说明，浏览器登录标为推荐；桌面登录仅支持未加密凭据，本机凭据加密或缺失时显示原因并禁用该选项。
 
@@ -74,6 +74,37 @@ node tests/support/trae_plugin.mjs /临时目录/package/index.mjs target/debug/
 
 此检查经过实际 Usage CLI、Rust 网关与 JS 宿主，覆盖国内版及国际版 SG/US 的浏览器回调、账号保存、动态模型目录、Credits / USD 额度、只读状态与确认签到、绑定 Agent 后的 Responses/SSE 转发。订阅凭据全部为合成数据；没有验证真实 Trae 账号或消耗真实额度。
 
+## ZCode / GLM Coding Plan
+
+添加 Provider 中选择 **ZCode → GLM Coding Plan**，支持 Z.ai 浏览器登录、智谱浏览器登录、团队订阅、读取 ZCode 应用登录，以及 GLM Coding Plan API Key。浏览器方式自动轮询完成，不需要粘贴授权码；团队方式先选择网站。API Key 表单同时显示网站和隐藏密钥输入，网站选择与凭据一起保存。
+
+```sh
+usage plugins install @magpie-community/opencode-zcode-auth@0.1.27 --id zcode
+usage plugins providers zcode
+usage plugins login zcode zcode                    # Z.ai；智谱使用 --method 1
+usage plugins login zcode zcode --method 2 --input site=zai # 团队订阅
+usage plugins login zcode zcode --method 3          # 读取 ZCode 应用账号
+usage plugins login zcode zcode --method 4 --input site=bigmodel --key-stdin
+usage plugins accounts
+usage plugins models <账号ID>
+usage plugins usage <账号ID>
+usage plugins bind <账号ID> --name 'ZCode Codex' --model <模型API-ID>
+usage codex run 'ZCode Codex'
+```
+
+参照 Magpie 固定使用原版 0.1.27 包，模型发现、订阅路由、团队凭据和赠送计划均由插件处理。ZCode 应用登录由插件读取本机数据，仅跟随同一账号；宿主不写入 ZCode 的凭据文件。仅使用 API Key 无法访问 ZCode 赠送计划；`-Trial` 模型是否可用取决于插件查询到的登录和赠送额度。Usage 不自动领取赠送计划，也不提供 ZCode 签到。
+
+ZCode 使用 Anthropic Messages 协议。通用宿主把 Codex Responses 转成 Messages，支持系统指令、文本、图片、命名空间函数／自由文本工具及结果、思考摘要、缓存令牌用量，以及流式／非流式响应。断流或上游错误不能产生成功完成事件。结构化输出当前明确拒绝；内置服务端搜索沿用 Chat 插件的限制。Responses 历史中的思考摘要没有 Anthropic 签名，因此不作为签名思考块回传。
+
+原版包兼容性检查使用合成账号及本地模拟上游，覆盖 Z.ai／智谱浏览器和 API Key、团队与桌面登录、模型目录、额度、Codex 启动及 Messages 转发；不访问真实服务商或消耗订阅额度：
+
+```sh
+# npm pack --ignore-scripts @magpie-community/opencode-zcode-auth@0.1.27
+# 解压后运行原始包入口：
+cargo build
+node tests/support/zcode_plugin.mjs /临时目录/package/index.mjs target/debug/usage
+```
+
 ## 能力与边界
 
 | 接口 | 当前支持 |
@@ -81,13 +112,17 @@ node tests/support/trae_plugin.mjs /临时目录/package/index.mjs target/debug/
 | OpenCode Provider v1 | 模块导出工厂、`config`、`auth.methods`、`auth.loader`、`provider.models`、`chat.headers` |
 | 宿主 client | 当前账号的 `auth.set`、`config.get`、`app.log`、`tui.showToast`；普通插件日志和 toast 不直接转入用户日志 |
 | magpie Provider 扩展 | `auth.usage`、`auth.refresh`、`refreshLead`、`auth.checkin`、只读 `auth.checkinStatus` |
-| 推理协议 | 插件原生 Chat / Responses；Responses 客户端到 Chat 上游的请求和响应转换 |
+| 推理协议 | 插件原生 Chat / Responses；Responses 客户端到 Chat / Anthropic Messages 上游的请求和响应转换 |
 | 转换内容 | 文本、图片输入、指令、思考摘要、函数与自由文本工具调用和结果、命名空间工具、客户端工具搜索、用量、流式/非流式 Responses 返回 |
 | 显式不支持 | 未实现的 SDK client、工具/会话执行插件、OpenCode 新版插件契约、额外协议转换、服务端 `previous_response_id` 存储、内置 web search 等无法映射的工具 |
 
 能力通过插件实际 hooks 发现，一个包可以提供多个上游。并非任意 OpenCode 插件都能运行：缺失的宿主接口、未知协议或输入能力会报错，不伪造成功。未知 SDK 协议不会自动当作 Chat 使用。WorkBuddy 客户端发送完整 Responses 输入，宿主将其转换为 Chat 请求交给插件，不依赖服务端保存上下文。
 
 协议转换在通用 `protocol.mjs` 中，不包含 WorkBuddy 分支；服务商的认证、工具参数兼容及错误解释由原版插件完成。原版插件可能修改请求文本或参数，转发语义以所安装插件版本为准。流式解析支持跨块 UTF-8、多条合并事件，单个事件最多 1 MiB，累计转换内容最多 16 MiB；断流不能产生完成事件。客户端取消会释放上游读取，慢消费者通过 Node/Bun HTTP 流背压暂停上游。
+
+参照 Magpie 的 `textcalls.go` 和 `phase.go`，转换层会将文本中完整的 Hermes JSON、DeepSeek DSML、GLM `arg_key` / `arg_value` 调用恢复为请求已声明的工具；未知工具、无法解析的参数和残缺调用保持原文，不猜测工具或命令。调用前的文字在完成事件中标记 `commentary`，正常完成且没有后续工具的最后文字标记 `final_answer`；截断或失败不会补最终回答阶段。这些标记不能判断模型的文字是否真正完成用户任务，也不自动发送“继续”。
+
+插件请求的短重试参照 Magpie `passing()`：429 临时限流最多再试三次，默认等待 1、2、4 秒；408、500、502、503、504、529 和响应头返回前的连接错误最多再试两次。尊重 `Retry-After` 秒数或日期，单次超过 8 秒即返回原错误；额度、余额和上下文错误不自动重试。已经开始交付的流不会自动重放。该策略针对本次绑定的账号，不自动改用其他账号、模型或订阅，也不包含 Magpie 路由组的 Patience 和候选切换。
 
 Chat 上游的工具名按 `namespace__name` 展平，自由文本工具转换为带 `input` 字符串参数的函数；响应再恢复原始命名空间和工具类型。客户端执行的 `tool_search` 也按函数调用发送，搜索结果里的工具会加入后续请求。Codex 在普通请求中附带的服务端 `web_search` 不能由 Chat 插件执行；Usage 当前没有代搜后端，因此不将它声明给插件，历史中的搜索事件也不伪装成客户端工具调用。普通请求继续运行，但此路径不提供实时搜索；明确强制该工具的请求会报告搜索不可用。工具调用名可能分多个流块返回，宿主收到完整调用后再发送 Responses 工具事件。
 
@@ -117,6 +152,10 @@ Chat 上游的工具名按 `namespace__name` 展平，自由文本工具转换�
 
 日志用 `plugin_host_started`、`plugin_hook_failed` 及现有 `gateway_*` 事件关联插件、版本、账号、hook、Run、Session 和请求。`plugin_hook_failed.error_code` 仅接受宿主预定义的错误码，用于区分协议、登录表单、宿主接口与凭据代理问题；未知插件错误归为 `hook`。普通日志不包含 opaque auth、上游 Token、授权码或消息正文。插件任意日志输出不直接打印，避免插件意外泄露凭据。
 
+`plugin_inference_diagnostic` 按 `run_id`、`session_id` 和 `request_id` 关联以下阶段：`upstream_response`（插件归一化前的原始 HTTP 状态、上游请求 ID、数字错误码）、`response`（每次插件响应的 HTTP 状态、耗时、上游请求 ID、数字错误码及错误分类）、`retry`（次数和等待毫秒数）、`upstream_stream`（原始 SSE 事件数、是否见到结束标记、EOF / 中断 / 取消）、`converted`（转换后的结束原因、工具数、文本恢复工具数、文字和思考字符数）、`delivery`（交付完成 / 中断 / 取消）。上游错误正文只在内存中用于重试分类，不写入日志；诊断接口仅接受固定枚举、数值和受限格式的关联 ID，报告失败不影响推理。
+
+尤其需要对照原始流和转换结果：Trae 原版插件可能在上游没有明确结束标记而自然 EOF 时补 `stop`，此时同一请求可以同时出现 `upstream_stream.outcome=eof_without_terminal` 和 `converted.outcome=completed`。Usage 保留原版插件行为并记录差异，不能把 `gateway_request_finished.complete=true` 单独当作服务商原始流完整结束的证据。
+
 ## 验证
 
 ```sh
@@ -124,7 +163,7 @@ test_root=$(mktemp -d)
 USAGE_CODEX_DIR="$test_root/codex" USAGE_PLUGIN_DIR="$test_root/plugins" \
   XDG_DATA_HOME="$test_root/data" USAGE_LOG=off \
   cargo test --all-targets -- --test-threads=1
-node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
+node --test src/plugins/protocol.test.mjs src/plugins/inference.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
 cargo clippy --all-targets -- -D warnings
 ```
 

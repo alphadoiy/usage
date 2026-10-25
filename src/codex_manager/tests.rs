@@ -364,6 +364,7 @@ fn revision_updates_do_not_rewrite_existing_home_or_credentials() {
     assert_ne!(performance1.scope(), performance2.scope());
     assert_eq!(performance1.revision, "1");
     assert!(performance1.expected_upstream.is_some());
+    assert!(performance1.gateway_observations);
     let provider = crate::hub::Hub::default()
         .provider(crate::hub::ProviderDefinition {
             id: "configured-provider".into(),
@@ -1360,6 +1361,11 @@ fn oauth_import_is_read_only_deduplicates_identity_and_isolates_workspaces() {
     let before = fs::read(&source).unwrap();
     let a = m.import_oauth(Some("A"), None, &source, None).unwrap();
     assert_eq!(a.auth_mode, AuthMode::Oauth);
+    assert!(
+        !m.performance_binding(&a, a.revision)
+            .unwrap()
+            .gateway_observations
+    );
     assert_eq!(a.oauth.as_ref().unwrap().email, "fixture@example.test");
     assert_eq!(fs::read(&source).unwrap(), before);
     let again = m.import_oauth(None, None, &source, None).unwrap();

@@ -70,7 +70,7 @@ test("Unsupported protocols, server-side references and unknown built-in tools f
       ProtocolError,
     );
   assert.throws(
-    () => translateRequest("responses", "messages", {}),
+    () => translateRequest("responses", "unknown", {}),
     ProtocolError,
   );
 });
@@ -341,4 +341,133 @@ test('parallel tool results follow a single assistant tool-call batch',()=>{
   } else if(m.role==='tool') assert.ok(waiting.delete(m.tool_call_id),'tool output must answer the pending assistant batch');
  }
  assert.equal(waiting.size,0);
+});
+
+test("Messages requests preserve images and namespaced tools with round-trip history", () => {
+  const out = translateRequest("responses", "messages", {
+    model: "glm", instructions: "system", reasoning: { effort: "low" },
+    max_output_tokens: 4096, tool_choice: "required", parallel_tool_calls: false,
+    tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] }],
+    input: [
+      { role: "developer", content: "developer" },
+      { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,YQ==" }] },
+      { type: "custom_tool_call", namespace: "functions", name: "exec", call_id: "c1", input: "ls" },
+      { type: "custom_tool_call_output", call_id: "c1", output: "ok" },
+    ],
+  });
+  assert.deepEqual(out.system.map(x => x.text), ["system", "developer"]);
+  assert.deepEqual(out.messages[0].content[0].source, { type: "base64", media_type: "image/png", data: "YQ==" });
+  assert.deepEqual(out.messages[1].content[0], { type: "tool_use", id: "c1", name: "functions__exec", input: { input: "ls" } });
+  assert.equal(out.messages[2].content[0].tool_use_id, "c1");
+  assert.equal(out.tools[0].name, "functions__exec");
+  assert.deepEqual(out.tool_choice, { type: "any", disable_parallel_tool_use: true });
+  assert.equal(out.thinking.budget_tokens, 2048);
+  assert.equal(out.max_tokens, 4096);
+});
+const messagesEvents = (reason = "tool_use") => [
+  { type: "message_start", message: { model: "glm", usage: { input_tokens: 10, cache_read_input_tokens: 4, cache_creation_input_tokens: 2 } } },
+  { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+  { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "想" } },
+  { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "opaque" } },
+  { type: "content_block_stop", index: 0 },
+  { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+  { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "你好" } },
+  { type: "content_block_stop", index: 1 },
+  { type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "call1", name: "functions__exec", input: {} } },
+  { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"input":' } },
+  { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '"ls"}' } },
+  { type: "content_block_stop", index: 2 },
+  { type: "message_delta", delta: { stop_reason: reason }, usage: { output_tokens: 5 } },
+  { type: "message_stop" },
+];
+test("Messages SSE handles fragmented UTF-8, reasoning, custom tools and actual cache usage", async () => {
+  for (const stream of [false, true]) {
+    const request = { stream, tools: [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] }] };
+    const res = await translateResponse("responses", "messages", source(messagesEvents().map(event).join(""), 1), request);
+    const result = stream ? decode(await res.text()).find(x => x.type === "response.completed").response : await res.json();
+    assert.equal(result.output[0].summary[0].text, "想");
+    assert.equal(result.output[1].content[0].text, "你好");
+    assert.equal(result.output[2].namespace, "functions");
+    assert.equal(result.output[2].type, "custom_tool_call");
+    assert.equal(result.output[2].input, "ls");
+    assert.equal(result.usage.input_tokens, 16);
+    assert.equal(result.usage.input_tokens_details.cached_tokens, 4);
+    assert.equal(result.usage.total_tokens, 21);
+  }
+});
+test("Messages truncation, errors and missing stop cannot produce successful completion", async () => {
+  for (const values of [messagesEvents().slice(0, -1), [{ type: "error", error: { message: "secret" } }]]) {
+    const res = await translateResponse("responses", "messages", source(values.map(event).join("")), { stream: true });
+    await assert.rejects(res.text(), ProtocolError);
+  }
+  const res = await translateResponse("responses", "messages", source(messagesEvents("max_tokens").map(event).join("")), { stream: false });
+  assert.equal((await res.json()).status, "incomplete");
+});
+test("Messages cancellation releases upstream", async () => {
+  let cancelled = false;
+  const values = messagesEvents().map(event);
+  const res = new Response(new ReadableStream({ pull(c) { c.enqueue(new TextEncoder().encode(values.shift() ?? ': ping\n\n')); }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } });
+  const result = await translateResponse('responses', 'messages', res, { stream: true });
+  const reader = result.body.getReader();
+  await reader.read(); await reader.cancel();
+  assert.ok(cancelled);
+});
+
+test("Messages tools with no parameters retain an empty JSON object", async () => {
+  const values = [
+    { type: "message_start", message: {} },
+    { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "c", name: "read", input: {} } },
+    { type: "content_block_stop", index: 0 },
+    { type: "message_delta", delta: { stop_reason: "tool_use" } },
+    { type: "message_stop" },
+  ];
+  const res = await translateResponse("responses", "messages", source(values.map(event).join("")), { stream: false });
+  assert.equal((await res.json()).output[0].arguments, "{}");
+});
+
+test("magpie text-call repair restores offered Hermes, DSML and GLM calls across chunks", async () => {
+  const request = { model: "m", stream: true, tools: [{ type: "namespace", name: "functions", tools: [{ type: "function", name: "read" }] }] };
+  const bodies = [
+    '<tool_call>{"name":"functions__read","arguments":{"path":"a"}}</tool_call>',
+    '<｜DSML｜function_calls><｜DSML｜invoke name="functions__read"><｜DSML｜parameter name="path" string="true">a</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>',
+    '<tool_call>functions__read<arg_key>path</arg_key><arg_value>a</arg_value></tool_call>',
+  ];
+  for (const body of bodies) {
+    const reports = [];
+    const wire = [...`Checking. ${body}`].map(content => event(chat({ content }))).join("") + event(chat({}, "stop")) + 'data: [DONE]\n\n';
+    const res = await translateResponse("responses", "chat", source(wire, 1), request, x => reports.push(x));
+    const events = decode(await res.text()), output = events.at(-1).response.output;
+    assert.equal(output[0].phase, "commentary");
+    assert.equal(output[0].content[0].text.trim(), "Checking.");
+    assert.equal(output[1].type, "function_call");
+    assert.equal(output[1].namespace, "functions");
+    assert.equal(output[1].name, "read");
+    assert.deepEqual(JSON.parse(output[1].arguments), { path: "a" });
+    assert.equal(reports.at(-1).recovered_calls, 1);
+    assert.equal(JSON.stringify(reports).includes("Checking"), false);
+  }
+});
+
+test("unknown or malformed text calls remain text, truncation never marks a final answer", async () => {
+  for (const [body, reason] of [
+    ['<tool_call>{"name":"unknown","arguments":{}}</tool_call>', "stop"],
+    ['<tool_call>{"name":"read","arguments":', "length"],
+    ['a literal <tool_', "stop"],
+  ]) {
+    const res = await translateResponse("responses", "chat", source(event(chat({ content: body }, reason)) + 'data: [DONE]\n\n'), {
+      model: "m", stream: true, tools: [{ type: "function", name: "read" }],
+    });
+    const last = decode(await res.text()).at(-1);
+    assert.equal(last.response.output.length, 1);
+    assert.equal(last.response.output[0].content[0].text, body);
+    assert.equal(last.response.output[0].phase, reason === "length" ? undefined : "final_answer");
+  }
+});
+
+test("native calls give progress text commentary phase and plain replies final_answer", async () => {
+  for (const calls of [false, true]) {
+    const wire = event(chat({ content: "hello" })) + (calls ? event(chat({ tool_calls: [{ index: 0, id: "c", function: { name: "read", arguments: "{}" } }] }, "tool_calls")) : event(chat({}, "stop"))) + 'data: [DONE]\n\n';
+    const res = await translateResponse("responses", "chat", source(wire), { model: "m", stream: false });
+    assert.equal((await res.json()).output[0].phase, calls ? "commentary" : "final_answer");
+  }
 });

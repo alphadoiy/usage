@@ -20,6 +20,7 @@ impl Fixture {
             home,
             revision: "1".into(),
             expected_upstream: None,
+            gateway_observations: true,
         };
         let service = Service::at(root.join("index/performance.sqlite3"));
         Self {
@@ -1195,6 +1196,48 @@ fn gateway_supersedes_cli_only_inside_its_recorded_launch_and_keeps_other_sessio
         .unwrap();
     assert_eq!(summary.calls, snapshot.summary.calls);
     assert_eq!(summary.speed_tokens, snapshot.summary.speed_tokens);
+
+    // Official OAuth reads CLI evidence even when this Home has old gateway rows.
+    let mut direct = f.binding.clone();
+    direct.gateway_observations = false;
+    assert_eq!(direct.scope(), f.binding.scope());
+    assert_ne!(direct.cache_key(), f.binding.cache_key());
+    let direct_snapshot = f
+        .service
+        .snapshot(&direct, Period::Month, None, 0, at(30))
+        .unwrap();
+    assert_eq!(direct_snapshot.summary.calls, 3);
+    assert_eq!(direct_snapshot.models[0].calls, 3);
+    assert!(direct_snapshot.recent.iter().any(|r| r.id == "original"));
+    assert!(direct_snapshot.recent.iter().all(|r| !r.gateway));
+    assert_eq!(direct_snapshot.summary.mean_ttft_ms, Some(500.0));
+    let direct_summary = f
+        .service
+        .summary(&direct, Period::Month, at(30))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        direct_summary.mean_ttft_ms,
+        direct_snapshot.summary.mean_ttft_ms
+    );
+
+    let mut unbound = record.clone();
+    unbound.id = "unbound".into();
+    unbound.run = "unbound-run".into();
+    unbound.session.clear();
+    f.service
+        .record_gateway(&scope, "custom", &unbound)
+        .unwrap();
+    f.service
+        .mark_gateway_cli_sources(&[(scope, run.into())])
+        .unwrap();
+    let direct_snapshot = f
+        .service
+        .snapshot(&direct, Period::Month, None, 0, at(30))
+        .unwrap();
+    assert_eq!(direct_snapshot.unmatched, 0);
+    assert!(!direct_snapshot.native_transport);
+    assert_eq!(direct_snapshot.summary.calls, 3);
 }
 
 #[test]

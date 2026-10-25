@@ -10,6 +10,7 @@ pub struct Variant {
 pub enum SignInSource {
     Browser,
     Desktop,
+    Plugin,
 }
 pub struct SignIn {
     pub id: &'static str,
@@ -93,7 +94,52 @@ pub const TRAE: Preset = Preset {
         source: SignInSource::Browser,
     }],
 };
-pub static PRESETS: &[Preset] = &[WORKBUDDY, TRAE];
+pub const ZCODE: Preset = Preset {
+    id: "zcode",
+    name: "ZCode",
+    package: "@magpie-community/opencode-zcode-auth",
+    version: "0.1.27",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[Variant {
+        id: "zcode",
+        name: "GLM Coding Plan",
+        description: "支持 Z.ai、智谱、团队订阅及 ZCode 赠送计划",
+        desktop_auth_file: None,
+    }],
+    sign_in: &[
+        SignIn {
+            id: "0",
+            name: "Z.ai 浏览器登录",
+            description: "在浏览器登录 Z.ai，自动完成授权",
+            source: SignInSource::Browser,
+        },
+        SignIn {
+            id: "1",
+            name: "智谱浏览器登录",
+            description: "在浏览器登录 BigModel，自动完成授权",
+            source: SignInSource::Browser,
+        },
+        SignIn {
+            id: "2",
+            name: "团队订阅登录",
+            description: "选择 Z.ai 或智谱，使用团队 GLM Coding Plan",
+            source: SignInSource::Browser,
+        },
+        SignIn {
+            id: "3",
+            name: "读取 ZCode 应用登录",
+            description: "由插件读取本机 ZCode 已登录账号",
+            source: SignInSource::Plugin,
+        },
+        SignIn {
+            id: "4",
+            name: "GLM Coding Plan API Key",
+            description: "选择密钥所属网站；赠送计划需要 ZCode 登录",
+            source: SignInSource::Plugin,
+        },
+    ],
+};
+pub static PRESETS: &[Preset] = &[WORKBUDDY, TRAE, ZCODE];
 
 pub fn for_package(package: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.package == package)
@@ -107,7 +153,7 @@ impl Preset {
     ) -> Option<SignInOption> {
         let spec = self.sign_in.iter().find(|m| m.id == method)?;
         let reason = match spec.source {
-            SignInSource::Browser => None,
+            SignInSource::Browser | SignInSource::Plugin => None,
             SignInSource::Desktop => {
                 let file = self
                     .variants
@@ -264,5 +310,25 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn zcode_preserves_all_original_login_methods_and_subscription_identity() {
+        let preset = for_package("@magpie-community/opencode-zcode-auth").unwrap();
+        assert_eq!(preset.id, "zcode");
+        assert_eq!(preset.version, "0.1.27");
+        assert_eq!(
+            preset.account_name("zcode", "Alice"),
+            "ZCode GLM Coding Plan · Alice"
+        );
+        for id in ["0", "1", "2", "3", "4"] {
+            assert!(
+                preset
+                    .sign_in_option("zcode", id, std::path::Path::new("/unused"))
+                    .unwrap()
+                    .available
+            );
+        }
+        assert!(preset.variant_name("trae-cn").is_none());
     }
 }

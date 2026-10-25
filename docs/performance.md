@@ -17,7 +17,7 @@
 
 ## 绑定与数据口径
 
-托管 Codex 自动使用当前保存版本的 Home；OAuth 使用该账号的 Home。模型取自日志中观察到的模型，不用配置的默认模型补齐。BYOK 日志的 `model_provider` 与保存版本不符，或模型缺失时，进入未归属计数，不计入模型统计。
+托管 Codex 自动使用当前保存版本的 Home；OAuth 使用该账号的 Home，仅统计会话日志，不合并历史网关记录，也不因历史网关启动范围排除日志样本。模型取自日志中观察到的模型，不用配置的默认模型补齐。BYOK 日志的 `model_provider` 与保存版本不符，或模型缺失时，进入未归属计数，不计入模型统计。
 
 独立 API Provider 需要显式指定专用日志实例，不回退到默认 `~/.codex` 或 `~/.claude`。在原有资源连接中增加 `inference.performance_instance`，指向 `[[instances]]` 的 ID。例如：
 

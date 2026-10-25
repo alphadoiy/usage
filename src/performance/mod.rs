@@ -20,6 +20,8 @@ pub struct Binding {
     pub home: PathBuf,
     pub revision: String,
     pub expected_upstream: Option<String>,
+    /// Whether this binding may merge gateway observations with CLI logs.
+    pub gateway_observations: bool,
 }
 impl Binding {
     /// UI cache identity; unlike the database scope, this performs no filesystem work.
@@ -31,6 +33,7 @@ impl Binding {
             &self.home,
             &self.revision,
             &self.expected_upstream,
+            self.gateway_observations,
         ))
         .expect("binding serializes");
         format!("{:x}", Sha256::digest(value))
@@ -200,6 +203,7 @@ pub(crate) fn local_binding(id: &str, agent: &str, home: &Path, source: RequestS
         home: home.into(),
         revision: String::new(),
         expected_upstream: None,
+        gateway_observations: true,
     }
 }
 pub(crate) fn cancelled(flag: &AtomicBool) -> bool {

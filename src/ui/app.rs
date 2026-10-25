@@ -383,7 +383,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                     Ok(t) => t,
                                     Err(e) => break Err(io::Error::other(e)),
                                 };
-                                app.refresh_background(&handle);
+                                app.refresh_after_provider_change(&handle);
                                 app.notice = result.err().map(|e| e.to_string());
                                 for instance in app.history_state.config.data_instances() {
                                     if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
@@ -403,6 +403,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                     &mut terminal,
                                     &|frame| draw(frame, &app),
                                 );
+                                app.refresh_after_provider_change(&handle);
                                 app.notice = match result {
                                     Ok(Some(added)) => {
                                         if let Some(profile) = added.profile {
@@ -413,7 +414,6 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                     Ok(None) => None,
                                     Err(error) => Some(error.to_string()),
                                 };
-                                app.refresh_background(&handle);
                             }
                             MenuCommand::Stay | MenuCommand::Dismiss => {}
                         }
@@ -1509,6 +1509,13 @@ impl Dashboard {
         self.refresh_with_models(handle, false);
     }
 
+    fn refresh_after_provider_change(&mut self, handle: &Handle) {
+        // Inventory changed while the modal owned the event loop. Supersede
+        // any in-flight snapshot even when its metadata queries are still busy.
+        self.start_overview_refresh(handle, false);
+        self.refresh_background(handle);
+    }
+
     fn refresh_with_models(&mut self, handle: &Handle, refresh_models: bool) {
         if self.history_state.panel.is_none() && self.browser_state.panel.is_none() {
             if refresh_models {
@@ -1564,6 +1571,10 @@ impl Dashboard {
         if !refresh_models && self.overview_state.loading {
             return;
         }
+        self.start_overview_refresh(handle, refresh_models);
+    }
+
+    fn start_overview_refresh(&mut self, handle: &Handle, refresh_models: bool) {
         if let Some(task) = self.overview_state.task.take() {
             task.abort();
         }

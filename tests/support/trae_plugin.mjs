@@ -3,7 +3,7 @@
 // Only synthetic credentials and a loopback upstream; no vendor requests or browser opening.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -64,6 +64,10 @@ const server = createServer(async (req, res) => {
         assert.equal(body.req_source, 1); assert.ok(!claimed); claimed = true;
         answer = { credits: 100, extra_credits: 10 };
       } else if (path.endsWith('/llm_utils_chat')) {
+        if (realm === 'cn' && calls.filter(c => c.path.endsWith('/llm_utils_chat') && c.realm === 'cn').length === 1) {
+          res.writeHead(429, { 'content-type': 'application/json', 'x-request-id': 'fixture-upstream-429' });
+          return res.end('{"error":{"code":1302,"message":"too many requests"}}');
+        }
         assert.equal(body.model, `model-${realm}`);
         assert.deepEqual(body.tools.map(t => t.function.name), ['functions__read', 'functions__exec']);
         res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -72,7 +76,7 @@ const server = createServer(async (req, res) => {
           : realm === 'sg'
             ? '<tool_call>{"name":"functions__read","arguments":{"path":"a"}}</tool_call>'
             : `hello-${realm}`;
-        return res.end(`event: output\ndata: ${JSON.stringify({ response })}\n\nevent: token_usage\ndata: {"prompt_tokens":10,"completion_tokens":5}\n\nevent: done\ndata: {"finish_reason":"stop"}\n\n`);
+        return res.end(`event: output\ndata: ${JSON.stringify({ response })}\n\nevent: token_usage\ndata: {"prompt_tokens":10,"completion_tokens":5}\n\n` + (realm === 'us' ? '' : 'event: done\ndata: {"finish_reason":"stop"}\n\n'));
       } else throw new Error(`unexpected path ${path}`);
     }
     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(answer));
@@ -190,9 +194,24 @@ print('trae-inference-ok')
   for (const realm of ['cn', 'sg', 'us']) {
     assert.match(await cli('codex', 'run', `Trae-${realm}`, '--binary', mock), /trae-inference-ok/);
   }
-  assert.equal(calls.filter(c => c.path.endsWith('/llm_utils_chat')).length, 3);
+  assert.equal(calls.filter(c => c.path.endsWith('/llm_utils_chat')).length, 4);
+  let diagnostics = [], logText = '';
+  const deadline = Date.now() + 3000;
+  do {
+    logText = (await Promise.all((await readdir(env.USAGE_LOG_DIR)).filter(n => n.endsWith('.jsonl')).map(n => readFile(join(env.USAGE_LOG_DIR, n), 'utf8')))).join('');
+    diagnostics = logText.split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(d => d.fields?.event === 'plugin_inference_diagnostic').map(d => d.fields);
+    if (diagnostics.filter(d => d.stage === 'delivery').length >= 3) break;
+    await new Promise(r => setTimeout(r, 50));
+  } while (Date.now() < deadline);
+  assert.ok(diagnostics.some(d => d.stage === 'retry' && d.wait_ms === 1000));
+  assert.ok(diagnostics.some(d => d.stage === 'upstream_response' && d.http_status === 429 && d.vendor_code === '1302' && d.upstream_request_id === 'fixture-upstream-429'));
+  const eof = diagnostics.find(d => d.stage === 'upstream_stream' && d.outcome === 'eof_without_terminal');
+  assert.ok(eof, 'raw upstream EOF must be observable before Trae inserts stop');
+  assert.ok(diagnostics.some(d => d.stage === 'converted' && d.outcome === 'completed' && d.request_id === eof.request_id));
+  assert.ok(diagnostics.every(d => d.request_id && d.run_id));
+  assert.ok(!logText.includes('hello-us'), 'reply text must not leak into diagnostics');
   assert.deepEqual(errors, []);
-  console.log('PASS: original Trae 0.2.17, CN/SG/US browser callbacks, account/binding deduplication, live models and Codex catalog, Credits/USD, explicit check-in, namespaced function/custom tool round-trip beside Codex web_search');
+  console.log('PASS: original Trae 0.2.17, CN/SG/US login/models/tools, 429 retry, correlated upstream EOF versus normalized completion diagnostics without reply text');
 } finally {
   try { const status = await json('gateway', 'status'); if (status.pid) process.kill(status.pid, 'SIGTERM'); } catch {}
   server.closeAllConnections(); await new Promise(r => server.close(r));

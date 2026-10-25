@@ -4,6 +4,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
 import { Readable } from "node:stream";
 import { translateRequest, translateResponse } from "./protocol.mjs";
+import { retryDelay, errorSummary, errorCategory, observeStream } from "./inference.mjs";
 import { supportsCheckin, supportsCheckinStatus, accountAction } from "./actions.mjs";
 const [entry, broker, token, packageName] = process.argv.slice(2);
 const scope = new AsyncLocalStorage();
@@ -22,9 +23,10 @@ class HostError extends Error {
 const fail = (message) => {
   throw new HostError(message);
 };
-globalThis.fetch = (input, init = {}) => {
-  const signal = scope.getStore()?.signal;
-  return rawFetch(
+globalThis.fetch = async (input, init = {}) => {
+  const current = scope.getStore();
+  const signal = current?.signal;
+  const response = await rawFetch(
     input,
     signal
       ? {
@@ -33,6 +35,18 @@ globalThis.fetch = (input, init = {}) => {
         }
       : init,
   );
+  if (current?.report && (!response.ok || response.headers.get("content-type")?.includes("event-stream"))) {
+    const detail = response.ok ? "" : await errorSummary(response);
+    let code;
+    try { const d = JSON.parse(detail); code = String(d.error?.code ?? d.code ?? ""); } catch {}
+    current.report({ stage: "upstream_response", outcome: "returned", status: response.status,
+      attempt: current.attempt,
+      upstream_request_id: response.headers.get("x-request-id") ?? response.headers.get("request-id"),
+      vendor_code: /^\d{1,10}$/.test(code ?? "") ? code : undefined,
+      ...(response.ok ? {} : { category: errorCategory(response.status, detail) }) });
+  }
+  const attempt = current?.attempt;
+  return current?.report ? observeStream(response, fields => current.report({ ...fields, attempt })) : response;
 };
 console.log = console.info = console.warn = console.error = () => {}; // stdout is the startup protocol; plugin prose may contain secrets.
 async function credentials(operation, values = {}) {
@@ -193,7 +207,7 @@ async function models(h, p) {
     name: m.name ?? id,
     context: m.limit?.context ?? m.context,
     output: m.limit?.output ?? m.output,
-    images: m.modalities?.input?.includes("image") ?? m.images ?? false,
+    images: m.modalities?.input?.includes("image") ?? m.capabilities?.input?.image ?? m.images ?? false,
     reasoning: m.variants ?? {},
     protocol: m.api?.wire_api ?? p.protocol,
   }));
@@ -224,7 +238,13 @@ async function rpc(x, signal) {
     if (method.type === "api")
       return {
         complete: true,
-        result: result ?? { type: "success", key: x.inputs?.key },
+        result: {
+          ...(result ?? { type: "success", key: x.inputs?.key }),
+          metadata: {
+            ...Object.fromEntries(Object.entries(x.inputs ?? {}).filter(([k]) => k !== "key")),
+            ...(result?.metadata ?? {}),
+          },
+        },
       };
     if (typeof result?.callback !== "function") fail("invalid_login_callback");
     const session = crypto.randomUUID();
@@ -271,6 +291,16 @@ async function rpc(x, signal) {
   fail("operation_unsupported");
 }
 async function infer(x, signal) {
+  const current = scope.getStore();
+  const diagnostics = current.diagnostics = new Set();
+  const report = current.report = (fields) => {
+    const sent = rawFetch(broker, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ operation: "diagnostic", context: x.context, account: x.account, ...fields }),
+      signal: AbortSignal.timeout(2000),
+    }).then(r => r.body?.cancel()).catch(() => {}).finally(() => diagnostics.delete(sent));
+    diagnostics.add(sent);
+  };
   const h = hooks.get(x.provider);
   if (!h) fail("provider_not_found");
   const p = provider(x.provider);
@@ -289,6 +319,7 @@ async function infer(x, signal) {
   const headers = new Headers(options.headers);
   if (options.apiKey) headers.set("authorization", `Bearer ${options.apiKey}`);
   headers.set("content-type", "application/json");
+  if (p.protocol === "messages") headers.set("anthropic-version", "2023-06-01");
   const native = p.models?.[x.body.model];
   const out = { headers: {} };
   await h["chat.headers"]?.(
@@ -314,13 +345,43 @@ async function infer(x, signal) {
   }[p.protocol];
   if (!suffix) fail("sdk_protocol_unsupported");
   const send = typeof options.fetch === "function" ? options.fetch : rawFetch;
-  const response = await send(`${base}/${suffix}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(converted),
-    signal,
+  const body = JSON.stringify(converted);
+  let response;
+  for (let again = 0; ; again++) {
+    current.attempt = again + 1;
+    const began = Date.now();
+    try {
+      response = await send(`${base}/${suffix}`, { method: "POST", headers, body, signal });
+    } catch (e) {
+      const wait = signal.aborted ? null : retryDelay(502, new Headers(), "", again);
+      report({ stage: "response", outcome: signal.aborted ? "cancelled" : "interrupted", attempt: again + 1, duration_ms: Date.now() - began });
+      if (wait === null) throw e;
+      report({ stage: "retry", outcome: "retrying", category: "upstream", attempt: again + 1, wait_ms: wait });
+      await pause(wait, signal);
+      continue;
+    }
+    const detail = response.ok ? "" : await errorSummary(response);
+    const wait = retryDelay(response.status, response.headers, detail, again);
+    let vendorCode;
+    try { const d = JSON.parse(detail); vendorCode = String(d.error?.code ?? d.code ?? ""); } catch {}
+    report({ stage: "response", outcome: "returned", status: response.status, attempt: again + 1,
+      upstream_request_id: response.headers.get("x-request-id") ?? response.headers.get("request-id"),
+      vendor_code: /^\d{1,10}$/.test(vendorCode ?? "") ? vendorCode : undefined,
+      duration_ms: Date.now() - began, ...(response.ok ? {} : { category: errorCategory(response.status, detail) }) });
+    if (wait === null) break;
+    report({ stage: "retry", outcome: "retrying", status: response.status, attempt: again + 1, wait_ms: wait });
+    await response.body?.cancel();
+    await pause(wait, signal);
+  }
+  return translateResponse(x.protocol, p.protocol, response, x.body, report);
+}
+function pause(wait, signal) {
+  return new Promise((resolve, reject) => {
+    const cancel = () => { clearTimeout(timer); signal.removeEventListener("abort", cancel); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", cancel); resolve(); }, wait);
+    signal.addEventListener("abort", cancel, { once: true });
+    if (signal.aborted) cancel();
   });
-  return translateResponse(x.protocol, p.protocol, response, x.body);
 }
 const server = http.createServer(async (req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
@@ -374,28 +435,36 @@ const server = http.createServer(async (req, res) => {
               headers[k] = v;
           res.writeHead(upstream.status, headers);
           res.flushHeaders();
-          if (upstream.body)
-            for await (const chunk of upstream.body) {
-              if (ctl.signal.aborted) break;
-              if (!res.write(chunk))
-                await new Promise((ok, bad) => {
-                  const clean = () => {
-                    res.off("drain", done);
-                    res.off("close", closed);
-                  };
-                  const done = () => {
-                    clean();
-                    ok();
-                  };
-                  const closed = () => {
-                    clean();
-                    bad(new Error("cancelled"));
-                  };
-                  res.once("drain", done);
-                  res.once("close", closed);
-                });
-            }
-          res.end();
+          try {
+            if (upstream.body)
+              for await (const chunk of upstream.body) {
+                if (ctl.signal.aborted) break;
+                if (!res.write(chunk))
+                  await new Promise((ok, bad) => {
+                    const clean = () => {
+                      res.off("drain", done);
+                      res.off("close", closed);
+                    };
+                    const done = () => {
+                      clean();
+                      ok();
+                    };
+                    const closed = () => {
+                      clean();
+                      bad(new Error("cancelled"));
+                    };
+                    res.once("drain", done);
+                    res.once("close", closed);
+                  });
+              }
+            res.end();
+            scope.getStore().report?.({ stage: "delivery", outcome: ctl.signal.aborted ? "cancelled" : "complete" });
+          } catch (e) {
+            scope.getStore().report?.({ stage: "delivery", outcome: ctl.signal.aborted ? "cancelled" : "interrupted" });
+            throw e;
+          } finally {
+            await Promise.allSettled([...scope.getStore().diagnostics ?? []]);
+          }
         } else {
           res.writeHead(404).end();
         }

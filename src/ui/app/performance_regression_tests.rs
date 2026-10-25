@@ -228,6 +228,7 @@ fn panel() -> super::super::performance::Panel {
         home: "/nonexistent/usage-performance-fixture".into(),
         revision: "1".into(),
         expected_upstream: Some("relay".into()),
+        gateway_observations: true,
     };
     let mut panel = super::super::performance::Panel::new(binding, "Work".into());
     panel.generation = 7;
@@ -286,6 +287,29 @@ fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
     assert!(app.handle_performance_key(KeyCode::Esc, runtime.handle()));
     assert!(app.performance.panel.is_none());
 }
+#[test]
+fn official_oauth_performance_modal_only_describes_session_logs() {
+    let mut panel = panel();
+    panel.binding.gateway_observations = false;
+    for width in [42, 100] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 28)).unwrap();
+        terminal
+            .draw(|frame| super::super::performance::draw(frame, &panel))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let compact = text.split_whitespace().collect::<String>().replace('│', "");
+        assert!(compact.contains("仅使用会话日志"), "{compact}");
+        assert!(!compact.contains("网关"), "{compact}");
+    }
+}
+
 #[test]
 fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
     let mut app = Dashboard::new(

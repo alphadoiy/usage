@@ -384,6 +384,7 @@ impl Manager {
             agent: "codex".into(),
             home: self.home(&profile.id, revision)?,
             revision: revision.to_string(),
+            gateway_observations: profile.auth_mode != AuthMode::Oauth,
             expected_upstream: config
                 .get("model_provider")
                 .and_then(toml::Value::as_str)

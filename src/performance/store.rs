@@ -638,11 +638,11 @@ impl Service {
         let since = now - period.days() * 86_400_000;
         let mut result = Snapshot {
             summary: summary(&db, binding, period, now)?,
-            native_transport:db.query_row("SELECT EXISTS(SELECT 1 FROM perf_gateway_native n JOIN perf_gateway_runs r ON r.scope=n.scope AND r.run=n.run WHERE n.scope=?1 AND r.started<=?3 AND (r.ended IS NULL OR r.ended>=?2))",params![scope,since,now],|r|r.get(0)).map_err(|_| "无法读取原生传输来源")?,
+            native_transport:binding.gateway_observations && db.query_row("SELECT EXISTS(SELECT 1 FROM perf_gateway_native n JOIN perf_gateway_runs r ON r.scope=n.scope AND r.run=n.run WHERE n.scope=?1 AND r.started<=?3 AND (r.ended IS NULL OR r.ended>=?2))",params![scope,since,now],|r|r.get(0)).map_err(|_| "无法读取原生传输来源")?,
             ..Default::default()
         };
         let mut models = HashMap::new();
-        let measured = measured_calls(&binding.agent, &db);
+        let measured = measured_calls(binding, &db);
         let sql = format!(
             "{measured} SELECT model,{TOTALS} FROM measured_calls GROUP BY model ORDER BY model LIMIT 501"
         );
@@ -673,7 +673,7 @@ impl Service {
         result.models.truncate(500);
         let unmatched = format!(
             "WITH source_calls AS ({}) SELECT COUNT(*) FROM source_calls WHERE scope=?1 AND at>=?2 AND at<=?3 AND (model='' OR (?4 IS NOT NULL AND (upstream IS NULL OR upstream<>?4)))",
-            source_calls(&db)
+            source_calls(binding, &db)
         );
         result.unmatched = db
             .query_row(
@@ -682,7 +682,9 @@ impl Service {
                 |r| r.get(0),
             )
             .map_err(|_| "归属统计查询失败")?;
-        result.unmatched+=db.query_row("SELECT COUNT(*) FROM perf_gateway_calls g WHERE scope=?1 AND at>=?2 AND at<=?3 AND session='' AND NOT EXISTS(SELECT 1 FROM perf_gateway_native n WHERE n.scope=g.scope AND n.run=g.run)",params![scope,since,now],|r|r.get::<_,u64>(0)).map_err(|_| "网关归属统计查询失败")?;
+        if binding.gateway_observations {
+            result.unmatched+=db.query_row("SELECT COUNT(*) FROM perf_gateway_calls g WHERE scope=?1 AND at>=?2 AND at<=?3 AND session='' AND NOT EXISTS(SELECT 1 FROM perf_gateway_native n WHERE n.scope=g.scope AND n.run=g.run)",params![scope,since,now],|r|r.get::<_,u64>(0)).map_err(|_| "网关归属统计查询失败")?;
+        }
         let sql = format!(
             "{measured} SELECT id,session,turn,at,model,upstream,output,reasoning,duration,first_ms,native,decode_out,decode_ms,floor_out,floor_ms,output_unknown FROM measured_calls WHERE (?5 IS NULL OR model=?5) ORDER BY at DESC,id LIMIT ?6 OFFSET ?7"
         );
@@ -731,8 +733,8 @@ const TOTALS: &str = "COUNT(*),CAST(AVG(first_ms) AS INTEGER),COUNT(first_ms),CO
 fn has_gateway(db: &Connection) -> bool {
     db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='perf_gateway_calls')", [], |r|r.get(0)).unwrap_or(false)
 }
-fn source_calls(db: &Connection) -> String {
-    if !has_gateway(db) {
+fn source_calls(binding: &Binding, db: &Connection) -> String {
+    if !binding.gateway_observations || !has_gateway(db) {
         return "SELECT *,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls"
             .into();
     }
@@ -751,10 +753,11 @@ fn source_calls(db: &Connection) -> String {
          WHERE NOT EXISTS(SELECT 1 FROM perf_gateway_sessions AS own JOIN perf_gateway_runs AS lifetime ON lifetime.scope=own.scope AND lifetime.run=own.run WHERE EXISTS(SELECT 1 FROM perf_gateway_calls AS observed WHERE observed.scope=lifetime.scope AND observed.run=lifetime.run) {cli_native} AND own.scope=cli.scope AND own.session=cli.session AND cli.at>=lifetime.started AND (lifetime.ended IS NULL OR cli.at<=lifetime.ended))
          UNION ALL SELECT scope,id,session,NULL,at,model,upstream,output,reasoning,duration,ttft,2,decode_out,decode_ms,usage_known=0 FROM perf_gateway_calls g WHERE session<>'' {gateway_native}")
 }
-fn measured_calls(agent: &str, db: &Connection) -> String {
+fn measured_calls(binding: &Binding, db: &Connection) -> String {
+    let agent = binding.agent.as_str();
     let codex = i32::from(agent == "codex");
     let floors = i32::from(matches!(agent, "codex" | "claude" | "claude-desktop"));
-    let rows = source_calls(db);
+    let rows = source_calls(binding, db);
     format!("WITH source_calls AS ({rows}), base_calls AS (
         SELECT *,CASE WHEN native IN (1,2) AND ttft>0 AND ttft<=duration THEN ttft END AS first_ms
         FROM source_calls WHERE {MATCHED}
@@ -794,7 +797,7 @@ fn summary(
     period: Period,
     now: i64,
 ) -> Result<Summary, String> {
-    let measured = measured_calls(&binding.agent, db);
+    let measured = measured_calls(binding, db);
     let sql = format!("{measured} SELECT {TOTALS} FROM measured_calls");
     db.query_row(
         &sql,

@@ -524,6 +524,11 @@ fn official_sample_and_offline_score_obey_five_hour_failure_and_overlap_guards()
     let mut manager = f.manager();
     let source = oauth_source(&f, "fingerprint-workspace", "synthetic-refresh");
     let p = manager.import_oauth(None, None, &source, None).unwrap();
+    let home = manager.home(&p.id, p.revision).unwrap();
+    let config = home.join(format!("usage-r{}.config.toml", p.revision));
+    let changed = "model = \"gpt-6-luna\"\nmodel_provider = \"daily-provider\"\n";
+    fs::write(&config, changed).unwrap();
+    let auth_before = fs::read(home.join("auth.json")).unwrap();
     let fake = test_fpd(&f.path);
     fs::write(&fake, r#"#!/usr/bin/env python3
 import json,os,sys,pathlib
@@ -533,6 +538,8 @@ assert not os.environ.get('BASE_URL')
 if args[0]=='sample':
     assert 'homes' in os.environ['CODEX_HOME']
     assert args[args.index('--model')+1]=='gpt-6.1-sol'
+    assert args[args.index('--response-model')+1]=='gpt-6.1-sol'
+    assert args[args.index('--effort')+1]=='low'
     assert args[args.index('--channel')+1]=='codex-subscription'
     assert args[args.index('--count')+1]=='3'
     assert args[args.index('--max-attempts')+1]=='1'
@@ -556,6 +563,8 @@ else:
     assert_eq!(report.status, ReportStatus::Completed);
     assert!(!report.reference_contains_model);
     assert!(report.directory.join("detection.json").is_file());
+    assert_eq!(fs::read_to_string(&config).unwrap(), changed);
+    assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth_before);
     assert!(
         run(&mut manager, &p.id, true, Some(&fake))
             .unwrap()
@@ -574,11 +583,26 @@ else:
     let mut aged = report.clone();
     aged.started_at -= 5 * 3600;
     save(&base.join("latest.json"), &aged).unwrap();
+    fs::remove_file(&config).unwrap();
     let next = run(&mut manager, &p.id, true, Some(&fake))
         .unwrap()
         .unwrap();
     assert_eq!(next.status, ReportStatus::Completed);
     assert_ne!(next.directory, report.directory);
+    assert!(
+        !config.exists(),
+        "sampling must not materialize configuration"
+    );
+
+    let other = oauth_source(&f, "different-workspace", "other-refresh");
+    fs::copy(&other, home.join("auth.json")).unwrap();
+    let mismatched = run(&mut manager, &p.id, false, Some(&fake))
+        .unwrap()
+        .unwrap();
+    assert_eq!(mismatched.status, ReportStatus::Failed);
+    assert!(mismatched.message.contains("OAuth 登录与所选账号不符"));
+    assert!(!mismatched.directory.join("samples").exists());
+    fs::write(home.join("auth.json"), &auth_before).unwrap();
 
     let lock = fs::File::open(base.join("run.lock")).unwrap();
     lock.lock_exclusive().unwrap();

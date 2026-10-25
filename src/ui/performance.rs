@@ -195,15 +195,25 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
     let mut focus_line = 0;
     let mut lines = vec![
         format!(
-            "最近 {} 天 · {} · 网关与会话日志",
+            "最近 {} 天 · {} · {}",
             p.period.days(),
             if p.loading {
                 "后台增量更新中"
             } else {
                 "已读取索引"
+            },
+            if p.binding.gateway_observations {
+                "网关与会话日志"
+            } else {
+                "会话日志"
             }
         ),
-        "网关请求优先；历史会话日志补充。生成速度与 ≥ 下限分开统计。".into(),
+        if p.binding.gateway_observations {
+            "网关请求优先；历史会话日志补充。生成速度与 ≥ 下限分开统计。"
+        } else {
+            "仅使用会话日志。生成速度与 ≥ 下限分开统计。"
+        }
+        .into(),
     ];
     if let Some(error) = &p.error {
         lines.push(format!("读取失败：{}", super::overview::clean(error)));

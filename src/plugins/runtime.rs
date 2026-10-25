@@ -154,7 +154,7 @@ impl Runtime {
         let dir = self.store.root.join("host").join(format!(
             "{:x}",
             Sha256::digest(format!(
-                "{HOST}{PROTOCOL}{ACTIONS}{WORKBUDDY_ACTIONS}{TRAE_ACTIONS}{ACTION_CAPABILITIES}{ACTION_SUPPORT}"
+                "{HOST}{PROTOCOL}{INFERENCE}{ACTIONS}{WORKBUDDY_ACTIONS}{TRAE_ACTIONS}{ACTION_CAPABILITIES}{ACTION_SUPPORT}"
             ))
         ));
         fs::create_dir_all(&dir).map_err(|_| "无法创建插件宿主目录")?;
@@ -163,6 +163,7 @@ impl Runtime {
         crate::codex_manager::private_write(&dir.join("protocol.mjs"), PROTOCOL.as_bytes())
             .map_err(|_| "无法保存协议适配器")?;
         for (name, source) in [
+            ("inference.mjs", INFERENCE),
             ("actions.mjs", ACTIONS),
             ("action_support.mjs", ACTION_SUPPORT),
             ("action_capabilities.json", ACTION_CAPABILITIES),
@@ -234,6 +235,98 @@ impl Runtime {
             .is_some_and(|(p, h)| p == plugin && h.strong_count() > 0)
         {
             return failure(StatusCode::UNAUTHORIZED, "Invalid plugin capability");
+        }
+        if x["operation"] == "diagnostic" {
+            // The host is executable plugin code: accept typed, bounded fields only.
+            let uuid = |key: &str| {
+                x["context"][key]
+                    .as_str()
+                    .filter(|v| uuid::Uuid::parse_str(v).is_ok())
+            };
+            let pick = |key: &str, allowed: &[&str]| {
+                x[key]
+                    .as_str()
+                    .filter(|v| allowed.contains(v))
+                    .unwrap_or("unknown")
+                    .to_owned()
+            };
+            tracing::info!(
+                event = "plugin_inference_diagnostic",
+                plugin_id = plugin,
+                run_id = uuid("run"),
+                request_id = uuid("request"),
+                session_id = uuid("session"),
+                account_id = x["account"]
+                    .as_str()
+                    .filter(|v| uuid::Uuid::parse_str(v).is_ok()),
+                upstream_request_id =
+                    x["upstream_request_id"].as_str().filter(|v| v.len() <= 128
+                        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+                vendor_code = x["vendor_code"]
+                    .as_str()
+                    .filter(|v| v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit())),
+                stage = pick(
+                    "stage",
+                    &[
+                        "upstream_response",
+                        "upstream_stream",
+                        "retry",
+                        "response",
+                        "converted",
+                        "delivery"
+                    ]
+                ),
+                outcome = pick(
+                    "outcome",
+                    &[
+                        "complete",
+                        "eof_without_terminal",
+                        "interrupted",
+                        "cancelled",
+                        "retrying",
+                        "returned",
+                        "completed",
+                        "incomplete",
+                        "failed"
+                    ]
+                ),
+                category = pick(
+                    "category",
+                    &["rate", "quota", "context", "upstream", "request"]
+                ),
+                reason = pick(
+                    "reason",
+                    &[
+                        "missing_finish",
+                        "missing_terminal",
+                        "upstream_error",
+                        "size_limit",
+                        "invalid_tool_call",
+                        "other"
+                    ]
+                ),
+                finish_reason = pick(
+                    "finish",
+                    &[
+                        "stop",
+                        "tool_calls",
+                        "length",
+                        "content_filter",
+                        "function_call"
+                    ]
+                ),
+                http_status = x["status"].as_u64().filter(|v| (100..=599).contains(v)),
+                attempt = x["attempt"].as_u64().filter(|v| *v <= 4),
+                wait_ms = x["wait_ms"].as_u64().filter(|v| *v <= 8000),
+                duration_ms = x["duration_ms"].as_u64(),
+                terminal = x["terminal"].as_bool(),
+                events = x["events"].as_u64(),
+                tool_calls = x["tool_calls"].as_u64(),
+                recovered_calls = x["recovered_calls"].as_u64(),
+                text_chars = x["text_chars"].as_u64(),
+                reasoning_chars = x["reasoning_chars"].as_u64(),
+            );
+            return axum::Json(serde_json::json!({})).into_response();
         }
         let store = self.store.clone();
         let plugin = plugin.to_owned();

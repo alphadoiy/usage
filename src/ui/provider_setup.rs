@@ -558,17 +558,7 @@ fn login_account(
                 break;
             };
             let method = &provider.methods[index];
-            let mut fields: Vec<_> = method
-                .prompts
-                .iter()
-                .cloned()
-                .map(Field::from_input)
-                .collect();
-            if method.kind == "api" && fields.is_empty() {
-                let mut field = Field::text("key", "API Key", "");
-                field.secret = true;
-                fields.push(field);
-            }
+            let mut fields = login_fields(method);
             if !fields.is_empty() && !form(terminal, "登录参数", &mut fields)? {
                 continue;
             }
@@ -753,6 +743,20 @@ impl From<String> for MenuItem {
             enabled: true,
         }
     }
+}
+fn login_fields(method: &Method) -> Vec<Field> {
+    let mut fields: Vec<_> = method
+        .prompts
+        .iter()
+        .cloned()
+        .map(Field::from_input)
+        .collect();
+    if method.kind == "api" && !fields.iter().any(|field| field.input.key == "key") {
+        let mut field = Field::text("key", "API Key", "");
+        field.secret = true;
+        fields.push(field);
+    }
+    fields
 }
 fn method_rows(
     provider: &Provider,
@@ -986,6 +990,24 @@ fn menu_page(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_login_keeps_site_selection_and_adds_a_secret_key_field() {
+        let method: super::Method = serde_json::from_value(serde_json::json!({
+            "id":"4", "label":"API Key", "type":"api", "prompts":[{
+                "key":"site", "message":"网站", "options":[{"label":"智谱","value":"bigmodel"}]
+            }]
+        }))
+        .unwrap();
+        let mut fields = super::login_fields(&method);
+        assert_eq!(fields.len(), 2);
+        assert!(fields[1].secret);
+        fields[0].value = "bigmodel".into();
+        fields[1].value = "synthetic-secret".into();
+        assert_eq!(
+            super::inputs(&fields),
+            serde_json::json!({"site":"bigmodel","key":"synthetic-secret"})
+        );
+    }
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1096,6 +1118,11 @@ mod tests {
             entries
                 .iter()
                 .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == "trae"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == "zcode"))
         );
         let rows: Vec<_> = entries.into_iter().map(|(_, row)| row).collect();
         for width in [40, 100] {
