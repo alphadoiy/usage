@@ -193,7 +193,7 @@ fn draw_accounts(
         .iter()
         .map(|p| {
             ListItem::new(vec![
-                Line::from(format!("{}  ·  {}  ·  v{}", p.name, p.model, p.revision)),
+                Line::from(format!("{}  ·  {}", p.name, p.model)),
                 Line::from(identity(p)).dim(),
                 Line::from(format!("{} {}", p.id, p.source_status)).dim(),
             ])
@@ -471,7 +471,7 @@ pub fn run_with_config(
                                     .and_then(|text| {
                                         manager.update(&p.id, p.revision, &text, None, None)
                                     })
-                                    .map(|p| format!("已保存 {} v{}", p.name, p.revision))
+                                    .map(|p| format!("已保存 {}", p.name))
                                     .unwrap_or_else(|e| e.to_string());
                                 reload(&manager, &mut profiles, &mut selected, &mut notice);
                             }
