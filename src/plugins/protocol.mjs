@@ -112,12 +112,66 @@ function toolRegistry(declarations = [], discovered = []) {
   for (const tool of discovered) offer(tool, true);
   return { byName, chatTools };
 }
-export function translateRequest(from, to, b) {
+const EFFORT_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+const EFFORT_BUDGETS = { low: 4096, medium: 10000, high: 24000, xhigh: 32000, max: 32000 };
+const claudeVersion = /(?:^|[^a-z0-9])(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:[-.](\d{1,2}))?(?:[^0-9]|$)|claude-(\d+)(?:[-.](\d))?-(?:opus|sonnet|haiku)/;
+
+function claudeVersionOf(model) {
+  const match = claudeVersion.exec(String(model ?? "").toLowerCase());
+  if (!match) return null;
+  return { major: Number(match[1] || match[3]), minor: Number(match[2] || match[4] || 0) };
+}
+function adaptiveOnly(model) {
+  const version = claudeVersionOf(model);
+  return !!version && (version.major > 4 || (version.major === 4 && version.minor >= 6));
+}
+function noXhigh(model) {
+  const version = claudeVersionOf(model);
+  return !!version && version.major === 4 && version.minor === 6;
+}
+function effortOf(value) {
+  const effort = String(value ?? "").trim().toLowerCase();
+  if (effort === "none" || effort === "minimal") return "low";
+  if (effort === "ultra") return "max";
+  return ["low", "medium", "high", "xhigh", "max"].includes(effort) ? effort : "";
+}
+function nearestEffort(want, levels) {
+  const at = EFFORT_RANK.indexOf(want);
+  if (!levels?.length || at < 0 || levels.includes(want)) return want;
+  let best = want;
+  let dist = EFFORT_RANK.length;
+  for (const level of levels) {
+    const index = EFFORT_RANK.indexOf(level);
+    if (index < 0 || level === "none") continue;
+    const distance = Math.abs(index - at);
+    if (distance < dist || (distance === dist && index > at)) {
+      best = level;
+      dist = distance;
+    }
+  }
+  return best;
+}
+function resolveEffort(raw, levels, asked) {
+  const spelled = String(raw ?? "").trim().toLowerCase();
+  const thinkOff = spelled === "none" || spelled === "off";
+  let effort = effortOf(spelled);
+  if (spelled === "off") effort = "low";
+  if (thinkOff && levels?.includes("none")) effort = "none";
+  // ultra is a client alias: fitting max must not select ultra again.
+  const offered = spelled === "ultra" ? levels?.filter((level) => level !== "ultra") : levels;
+  if (effort) effort = nearestEffort(effort, offered);
+  return { effort, thinkOff, asked: !!asked };
+}
+
+export function translateRequest(from, to, b, levels) {
   if (from === to) return b;
-  if (from === "responses" && to === "messages")
-    return messagesRequest(translateRequest(from, "chat", b));
-  if (from !== "responses" || to !== "chat")
+  if (from !== "responses" || (to !== "chat" && to !== "messages"))
     return unsupported(`unsupported protocol conversion: ${from} to ${to}`);
+  const reasoning = resolveEffort(b.reasoning?.effort, levels, b.reasoning != null);
+  const chat = chatRequest(b, reasoning.effort);
+  return to === "messages" ? messagesRequest(chat, reasoning) : chat;
+}
+function chatRequest(b, effort) {
   if (b.previous_response_id)
     return unsupported(
       "previous_response_id requires server-side conversation storage; send full input",
@@ -220,7 +274,7 @@ export function translateRequest(from, to, b) {
     tools,
     tool_choice,
     max_tokens: b.max_output_tokens,
-    reasoning_effort: b.reasoning?.effort,
+    ...(effort ? { reasoning_effort: effort } : {}),
     temperature: b.temperature,
     top_p: b.top_p,
     parallel_tool_calls: b.parallel_tool_calls,
@@ -237,7 +291,7 @@ export function translateRequest(from, to, b) {
   }
   return out;
 }
-function messagesRequest(chat) {
+function messagesRequest(chat, reasoning = { effort: "", thinkOff: false, asked: false }) {
   const system = [], messages = [];
   function blocks(value) {
     if (typeof value === "string") return value ? [{ type: "text", text: value }] : [];
@@ -276,16 +330,34 @@ function messagesRequest(chat) {
   if (tool_choice && chat.parallel_tool_calls === false) tool_choice.disable_parallel_tool_use = true;
   if (chat.response_format && chat.response_format.type !== "text")
     unsupported("structured output is unavailable for Messages providers");
-  const max_tokens = chat.max_tokens ?? 16384;
-  const effort = chat.reasoning_effort;
-  const budget = { minimal: 1024, low: 2048, medium: 8192, high: 16000, xhigh: 32000, max: 32000 }[effort];
+  const requested = chat.max_tokens ?? 0;
+  let max_tokens = requested > 0 ? requested : 16384;
+  const effort = reasoning.effort ?? "";
+  let thinking, output_config, sampling = true;
+  if (reasoning.thinkOff) thinking = { type: "disabled" };
+  else if (reasoning.asked || effort) {
+    if (adaptiveOnly(chat.model)) {
+      let level = effort;
+      if (level === "xhigh" && noXhigh(chat.model)) level = "max";
+      thinking = { type: "adaptive", display: "summarized" };
+      if (level) output_config = { effort: level };
+      sampling = false;
+    } else if (!(requested > 0 && requested <= 2048)) {
+      let budget = EFFORT_BUDGETS[effort] ?? 10000;
+      if (requested > 0) budget = Math.min(budget, max_tokens - 1024);
+      else if (max_tokens < budget + 4096) max_tokens = budget + 4096;
+      thinking = { type: "enabled", budget_tokens: budget };
+      sampling = false;
+    }
+  }
   return {
     model: chat.model, messages, system: system.length ? system : undefined,
-    max_tokens, stream: true, temperature: chat.temperature, top_p: chat.top_p,
+    max_tokens, stream: true,
+    ...(sampling ? { temperature: chat.temperature, top_p: chat.top_p } : {}),
     tools: chat.tools?.map(({ function: f }) => ({ name: f.name, description: f.description, input_schema: f.parameters })),
     tool_choice,
-    ...(effort === "none" ? { thinking: { type: "disabled" } }
-      : budget && max_tokens > 1024 ? { thinking: { type: "enabled", budget_tokens: Math.min(budget, max_tokens - 1) } } : {}),
+    ...(thinking ? { thinking } : {}),
+    ...(output_config ? { output_config } : {}),
   };
 }
 async function* events(body, state) {

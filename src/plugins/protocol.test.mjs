@@ -361,7 +361,7 @@ test("Messages requests preserve images and namespaced tools with round-trip his
   assert.equal(out.messages[2].content[0].tool_use_id, "c1");
   assert.equal(out.tools[0].name, "functions__exec");
   assert.deepEqual(out.tool_choice, { type: "any", disable_parallel_tool_use: true });
-  assert.equal(out.thinking.budget_tokens, 2048);
+  assert.equal(out.thinking.budget_tokens, 3072);
   assert.equal(out.max_tokens, 4096);
 });
 const messagesEvents = (reason = "tool_use") => [
@@ -470,4 +470,79 @@ test("native calls give progress text commentary phase and plain replies final_a
     const res = await translateResponse("responses", "chat", source(wire), { model: "m", stream: false });
     assert.equal((await res.json()).output[0].phase, calls ? "commentary" : "final_answer");
   }
+});
+
+test("Reasoning effort matches magpie aliases, budgets and model levels", () => {
+  const none = translateRequest("responses", "chat", { model: "m", reasoning: { effort: "none" } });
+  assert.equal(none.reasoning_effort, "low");
+  const off = translateRequest("responses", "messages", {
+    model: "glm", reasoning: { effort: "off" }, max_output_tokens: 4096,
+  });
+  assert.deepEqual(off.thinking, { type: "disabled" });
+  assert.equal(off.output_config, undefined);
+
+  const fitted = translateRequest("responses", "chat", {
+    model: "m", reasoning: { effort: "xhigh" },
+  }, ["low", "high", "max"]);
+  assert.equal(fitted.reasoning_effort, "max");
+
+  const ultra = translateRequest("responses", "chat", { model: "m", reasoning: { effort: "ultra" } });
+  assert.equal(ultra.reasoning_effort, "max");
+
+  const minimal = translateRequest("responses", "messages", {
+    model: "glm", reasoning: { effort: "minimal" }, max_output_tokens: 8192,
+  });
+  assert.equal(minimal.thinking.budget_tokens, 4096);
+
+  const adaptive = translateRequest("responses", "messages", {
+    model: "claude-opus-4-6", reasoning: { effort: "xhigh" }, max_output_tokens: 8192,
+  });
+  assert.deepEqual(adaptive.thinking, { type: "adaptive", display: "summarized" });
+  assert.equal(adaptive.output_config.effort, "max");
+  assert.equal(adaptive.temperature, undefined);
+
+  const later = translateRequest("responses", "messages", {
+    model: "claude-sonnet-5", reasoning: { effort: "xhigh" },
+  });
+  assert.equal(later.output_config.effort, "xhigh");
+  assert.equal(later.max_tokens, 16384);
+
+  const stopped = translateRequest("responses", "chat", {
+    model: "m", reasoning: { effort: "none" },
+  }, ["none", "low", "high"]);
+  assert.equal(stopped.reasoning_effort, "none");
+});
+
+test("ultra stays an alias when model levels include ultra", () => {
+  for (const [levels, expected] of [
+    [["low", "high", "ultra"], "high"],
+    [["low", "high", "max", "ultra"], "max"],
+    [["ultra"], "max"],
+  ]) {
+    const out = translateRequest("responses", "chat", {
+      model: "m", reasoning: { effort: " ULTRA " },
+    }, levels);
+    assert.equal(out.reasoning_effort, expected);
+  }
+});
+
+test("magpie normalization and empty reasoning remain consistent across conversions", () => {
+  for (const [raw, expected] of [["minimal", "low"], ["off", "low"], ["persistent", undefined]]) {
+    const out = translateRequest("responses", "chat", {
+      model: "m", reasoning: { effort: raw },
+    }, ["minimal", "low", "high"]);
+    assert.equal(out.reasoning_effort, expected);
+  }
+  for (const reasoning of [{}, { summary: "auto" }]) {
+    const out = translateRequest("responses", "messages", {
+      model: "claude-sonnet-4-5", reasoning, max_output_tokens: 8192, temperature: 0.2,
+    });
+    assert.deepEqual(out.thinking, { type: "enabled", budget_tokens: 7168 });
+    assert.equal(out.temperature, undefined);
+  }
+  const plain = translateRequest("responses", "messages", {
+    model: "claude-sonnet-4-5", max_output_tokens: 8192, temperature: 0.2,
+  });
+  assert.equal(plain.thinking, undefined);
+  assert.equal(plain.temperature, 0.2);
 });

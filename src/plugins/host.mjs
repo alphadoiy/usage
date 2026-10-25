@@ -337,7 +337,10 @@ async function infer(x, signal) {
     out,
   );
   for (const [k, v] of Object.entries(out.headers)) headers.set(k, String(v));
-  const converted = translateRequest(x.protocol, p.protocol, x.body);
+  const levels = native?.variants && typeof native.variants === "object"
+    ? Object.keys(native.variants)
+    : undefined;
+  const converted = translateRequest(x.protocol, p.protocol, x.body, levels);
   const suffix = {
     chat: "chat/completions",
     responses: "responses",

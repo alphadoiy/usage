@@ -3,8 +3,9 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
+use crate::codex_manager::config::REASONING_EFFORTS;
+
 const INSTRUCTIONS: &str = "You are Codex, a coding assistant. Follow the user's instructions and use the available tools to complete the task.";
-const EFFORTS: [&str; 7] = ["none", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 pub(super) fn plugin_models(value: &Value) -> Result<Value, &'static str> {
     let source = value.as_array().ok_or("Invalid plugin model list")?;
@@ -29,19 +30,17 @@ pub(super) fn plugin_models(value: &Value) -> Result<Value, &'static str> {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(slug);
         let offered = entry.get("reasoning").and_then(Value::as_object);
-        let efforts: Vec<&str> = EFFORTS
+        let efforts: Vec<&str> = REASONING_EFFORTS
             .into_iter()
             .filter(|effort| offered.is_some_and(|levels| levels.contains_key(*effort)))
             .collect();
-        let efforts = if efforts.is_empty() {
-            vec!["none"]
-        } else {
-            efforts
-        };
+        // medium, then high, else the weakest offered level. No known level leaves it unset.
         let default = if efforts.contains(&"medium") {
-            "medium"
+            Some("medium")
+        } else if efforts.contains(&"high") {
+            Some("high")
         } else {
-            efforts[0]
+            efforts.first().copied()
         };
         let levels: Vec<Value> = efforts
             .into_iter()
@@ -98,20 +97,37 @@ mod tests {
     fn catalog_contains_only_plugin_models_with_codex_fields() {
         let catalog = plugin_models(&json!([
             {"id":"model-a","name":"Model A","context":128000,"images":true,
-             "reasoning":{"low":{},"medium":{},"high":{}}},
+             "reasoning":{"low":{},"medium":{},"high":{},"minimal":{},"custom":{}}},
             {"id":"model-a","name":"Duplicate"},
-            {"id":"model-b","name":"Model B","images":false}
+            {"id":"model-b","name":"Model B","images":false},
+            {"id":"model-c","name":"Model C","reasoning":{"low":{},"high":{},"max":{}}}
         ]))
         .unwrap();
         let models = catalog["models"].as_array().unwrap();
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0]["slug"], "model-a");
         assert_eq!(models[0]["default_reasoning_level"], "medium");
+        assert_eq!(
+            models[0]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["minimal", "low", "medium", "high"]
+        );
         assert_eq!(models[0]["input_modalities"], json!(["text", "image"]));
         assert_eq!(models[0]["context_window"], 128000);
         assert_eq!(models[1]["slug"], "model-b");
-        assert_eq!(models[1]["default_reasoning_level"], "none");
+        assert!(
+            models[1]["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(models[1]["default_reasoning_level"].is_null());
         assert!(models[1].get("context_window").is_none());
+        assert_eq!(models[2]["default_reasoning_level"], "high");
     }
 
     #[test]

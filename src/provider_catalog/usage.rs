@@ -261,13 +261,13 @@ impl CatalogService {
         let key = query.key;
         let credentials: Arc<CredentialResolver> = Arc::new(move |_| Ok(key.clone()));
         let candidates: Vec<(String, String)> =
-            match crate::resources::provider_usage::balance_endpoint(&profile.base_url) {
+            match crate::resources::balance_endpoint(&profile.base_url) {
                 // Known vendor endpoints resolve to one unambiguous protocol; no probing.
                 Some((service, base)) => vec![(service.to_owned(), base)],
                 None => {
                     let Some(root) = site_root(&profile.base_url)
                         .ok()
-                        .filter(|root| crate::resources::api::validate_base_url(root).is_ok())
+                        .filter(|root| crate::http::validate_api_base_url(root).is_ok())
                     else {
                         return;
                     };
@@ -278,6 +278,7 @@ impl CatalogService {
                 }
             };
         let mut readers: Vec<Arc<dyn ResourceReader>> = Vec::new();
+        let resources = self.usage_service();
         for (service, base_url) in candidates {
             let connection = ConnectionConfig {
                 id: format!("auto:{}", profile.id),
@@ -290,9 +291,7 @@ impl CatalogService {
                 profile_ids: vec![profile.id.clone()],
                 inference: None,
             };
-            if let Ok(reader) = self
-                .usage_service()
-                .prepare_with_credentials(&connection, credentials.clone())
+            if let Ok(reader) = resources.prepare_with_credentials(&connection, credentials.clone())
             {
                 readers.push(reader);
             }
@@ -325,11 +324,10 @@ struct DetectedUsage {
     outcome: std::sync::Mutex<Option<usize>>,
 }
 impl DetectedUsage {
-    fn classification(&self) -> String {
-        match self.outcome.lock().unwrap().as_ref() {
-            Some(index) => self.readers[*index].service().to_owned(),
-            None => "auto_detect".into(),
-        }
+    fn snapshot(&self, mut snapshot: ResourceSnapshot) -> ResourceSnapshot {
+        snapshot.binding = self.binding.clone();
+        snapshot.service = self.service().to_owned();
+        snapshot
     }
 }
 #[async_trait::async_trait]
@@ -341,41 +339,30 @@ impl ResourceReader for DetectedUsage {
         &self.binding
     }
     fn scope(&self) -> ResourceScope {
-        self.outcome
-            .lock()
-            .unwrap()
-            .and_then(|index| self.readers.get(index))
-            .map(|reader| reader.scope())
-            .unwrap_or(ResourceScope::Token)
+        // Both relay candidates query token-scoped usage.
+        ResourceScope::Token
     }
     async fn read(&self) -> ResourceSnapshot {
-        let order: Vec<usize> = self
-            .outcome
-            .lock()
-            .unwrap()
-            .map(|index| vec![index])
-            .unwrap_or_else(|| (0..self.readers.len()).collect());
+        let known = *self.outcome.lock().unwrap();
         let mut fallback = None;
-        for index in order {
-            let snapshot = self.readers[index].read().await;
+        for (index, reader) in self.readers.iter().enumerate() {
+            if known.is_some_and(|known| known != index) {
+                continue;
+            }
+            let mut snapshot = reader.read().await;
             match snapshot.state {
                 ResourceState::Ready => {
                     *self.outcome.lock().unwrap() = Some(index);
-                    let mut snapshot = snapshot;
-                    snapshot.service = self.service().to_owned();
-                    snapshot.message = Some(format!("已识别协议：{}", self.classification()));
-                    return snapshot;
+                    snapshot.message = Some(format!("已识别协议：{}", reader.service()));
+                    return self.snapshot(snapshot);
                 }
+                _ if known.is_some() => return self.snapshot(snapshot),
                 ResourceState::AuthenticationFailed => {
-                    let mut snapshot = snapshot;
-                    snapshot.service = self.service().to_owned();
-                    snapshot.message = Some(format!(
-                        "自动识别到 {}，但凭据被拒绝",
-                        self.readers[index].service()
-                    ));
-                    return snapshot;
+                    // A generic 401/403 does not identify the protocol. Try the next
+                    // same-origin candidate before reporting rejected credentials.
+                    fallback = Some(snapshot);
                 }
-                ResourceState::TransientFailure => fallback = Some(snapshot),
+                ResourceState::TransientFailure if fallback.is_none() => fallback = Some(snapshot),
                 _ => {}
             }
         }
@@ -388,9 +375,10 @@ impl ResourceReader for DetectedUsage {
             queried_at: Some((chrono::Utc::now)()),
             message: None,
         });
-        snapshot.service = self.service().to_owned();
-        snapshot.message = Some("未识别同源余额协议，可显式配置 resources".into());
-        snapshot
+        if snapshot.state != ResourceState::AuthenticationFailed {
+            snapshot.message = Some("未识别同源余额协议，可显式配置 resources".into());
+        }
+        self.snapshot(snapshot)
     }
 }
 
@@ -840,6 +828,18 @@ mod tests {
         }
     }
 
+    fn assert_detected_result_applies(plan: &mut Plan, snapshot: ResourceSnapshot) {
+        let reader = &plan.resources[0];
+        assert_eq!(&snapshot.binding, reader.binding());
+        assert_eq!(snapshot.service, reader.service());
+        let target = reader.binding().cache_key(reader.service());
+        assert!(plan.catalog.apply_resource(&target, snapshot));
+        assert!(matches!(
+            plan.catalog.providers[0].usage.sources[0].state,
+            QueryState::Result(_)
+        ));
+    }
+
     #[tokio::test]
     async fn byok_relay_detects_new_api_token_usage_from_the_same_origin() {
         let f = ManualFixture::new("https://relay.invalid/v1");
@@ -848,7 +848,7 @@ mod tests {
             "https://relay.invalid/api/usage/token",
             reply(r#"{"success":true,"data":{"object":"token_usage","total_used":10,"total_available":90,"unlimited_quota":false}}"#),
         );
-        let plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+        let mut plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
         assert_eq!(plan.resources.len(), 1);
         assert_eq!(plan.resources[0].service(), "auto_detect");
         let snapshot = plan.resources[0].read().await;
@@ -861,6 +861,7 @@ mod tests {
                 .unwrap()
                 .contains("new_api_token")
         );
+        assert_detected_result_applies(&mut plan, snapshot);
         let calls = http.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].url.starts_with("https://relay.invalid/"));
@@ -883,13 +884,15 @@ mod tests {
             "https://sub.invalid/v1/usage",
             reply(r#"{"quota":{"limit":100,"used":25},"unit":"USD"}"#),
         );
-        let plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+        let mut plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
         let reader = plan.resources[0].clone();
         let first = reader.read().await;
         assert_eq!(first.state, ResourceState::Ready);
         assert!(first.message.as_deref().unwrap().contains("sub2api_usage"));
+        assert_detected_result_applies(&mut plan, first);
         let second = reader.read().await;
         assert_eq!(second.state, ResourceState::Ready);
+        assert_eq!(&second.binding, reader.binding());
         let calls = http.calls.lock().unwrap();
         assert!(
             calls
@@ -905,6 +908,63 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn detection_tries_next_protocol_after_an_unidentified_auth_rejection() {
+        for status in [401, 403] {
+            let f = ManualFixture::new("https://sub.invalid/v1");
+            let http = Arc::new(FakeHttp::new());
+            http.route(
+                "https://sub.invalid/api/usage/token",
+                Ok(HttpResponse {
+                    status,
+                    headers: Default::default(),
+                    body: Vec::new(),
+                }),
+            );
+            http.route(
+                "https://sub.invalid/v1/usage",
+                reply(r#"{"quota":{"limit":100,"used":25},"unit":"USD"}"#),
+            );
+            let mut plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+            let reader = plan.resources[0].clone();
+            let snapshot = reader.read().await;
+            assert_eq!(snapshot.state, ResourceState::Ready);
+            assert_detected_result_applies(&mut plan, snapshot);
+            assert_eq!(reader.read().await.state, ResourceState::Ready);
+            assert_eq!(http.calls.lock().unwrap().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn detection_failures_preserve_outer_identity_without_claiming_a_protocol() {
+        for (status, expected) in [
+            (401, ResourceState::AuthenticationFailed),
+            (403, ResourceState::AuthenticationFailed),
+            (503, ResourceState::TransientFailure),
+            (404, ResourceState::NeedsConfiguration),
+        ] {
+            let f = ManualFixture::new("https://unknown.invalid/v1");
+            let http = Arc::new(FakeHttp::new());
+            for path in ["api/usage/token", "v1/usage"] {
+                http.route(
+                    format!("https://unknown.invalid/{path}"),
+                    Ok(HttpResponse {
+                        status,
+                        headers: Default::default(),
+                        body: Vec::new(),
+                    }),
+                );
+            }
+            let mut plan = f.service(http.clone()).load(&AppConfig::default()).unwrap();
+            let snapshot = plan.resources[0].read().await;
+            assert_eq!(snapshot.state, expected);
+            assert!(snapshot.metrics.is_empty());
+            assert!(!snapshot.message.as_deref().unwrap().contains("已识别"));
+            assert_detected_result_applies(&mut plan, snapshot);
+            assert_eq!(http.calls.lock().unwrap().len(), 2);
+        }
     }
 
     #[tokio::test]

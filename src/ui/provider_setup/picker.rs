@@ -22,11 +22,14 @@ pub(super) fn efforts(optional: bool) -> Vec<Choice> {
         .iter()
         .map(|value| {
             let note = match *value {
+                "none" => "关闭",
+                "minimal" => "最少",
                 "low" => "低",
                 "medium" => "中",
                 "high" => "高",
-                "xhigh" => "极高（需模型支持）",
-                "minimal" => "最少（需模型支持）",
+                "xhigh" => "极高",
+                "max" => "最大",
+                "ultra" => "超高",
                 _ => "",
             };
             Choice::new(value, note)
@@ -229,8 +232,8 @@ mod tests {
         assert!(efforts(false).iter().all(|c| !c.value.is_empty()));
         // An unknown saved value is still offered as current.
         assert_eq!(
-            with_current(efforts(false), "max")[0],
-            Choice::new("max", "当前")
+            with_current(efforts(false), "persistent")[0],
+            Choice::new("persistent", "当前")
         );
     }
 }

@@ -2,8 +2,11 @@ use super::{Error, Result};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub const KEY_ENV: &str = "USAGE_CODEX_API_KEY";
-/// Known `model_reasoning_effort` values; a model may accept only some, and others pass through.
-pub const REASONING_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "minimal"];
+/// Known `model_reasoning_effort` values, weakest first, matching magpie's effort rank.
+/// A model may accept only some, and others pass through.
+pub const REASONING_EFFORTS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 
 /// Saved revisions are immutable; the CLI persists trust, onboarding, and model effort in its Home.
 /// Ignore only known, correctly typed runtime state, not arbitrary settings or auth overrides.
