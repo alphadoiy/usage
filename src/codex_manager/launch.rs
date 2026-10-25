@@ -249,13 +249,23 @@ impl Manager {
         let Selected {
             profile,
             saved,
+            home,
+            revision,
             key,
             plugin_account,
             ..
         } = selected;
+        let runtime_path = match profile.auth_mode {
+            AuthMode::Oauth => home.join(format!("usage-r{revision}.config.toml")),
+            AuthMode::Byok => home.join("config.toml"),
+        };
+        let runtime_config = std::fs::read_to_string(runtime_path)?;
+        if !config::matches_runtime_config(&runtime_config, &saved.config) {
+            return Err(Error::message("运行配置已改变，请重新启动"));
+        }
         let environment = |name: &str| std::env::var(name).ok();
         let effective = effective::resolve(
-            &saved.config,
+            &runtime_config,
             profile.auth_mode,
             &prepared.cwd,
             resume.is_some(),
@@ -270,7 +280,7 @@ impl Manager {
         // remains unresolved until an Agent event confirms the session configuration.
         let resume_transport = (plugin_account.is_some() && resume.is_some()).then(|| {
             effective::resolve(
-                &saved.config,
+                &runtime_config,
                 profile.auth_mode,
                 &prepared.cwd,
                 false,

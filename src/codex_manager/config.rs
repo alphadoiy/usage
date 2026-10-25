@@ -8,12 +8,19 @@ pub const REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
-/// Saved revisions are immutable; the CLI persists trust, onboarding, and model effort in its Home.
+/// Saved revisions are immutable; the CLI persists model choices, trust and onboarding in its Home.
 /// Ignore only known, correctly typed runtime state, not arbitrary settings or auth overrides.
 fn managed_settings(text: &str) -> Option<toml::Value> {
     let mut doc: toml::Value = toml::from_str(text).ok()?;
-    // /model persists the chosen reasoning effort in config.toml. It can
-    // change independently of the versioned model and provider route.
+    // /model persists model and effort choices independently of the provider route.
+    // Validate the model's shape without pinning it to a catalog that may be stale.
+    if let Some(model) = doc.get("model") {
+        let model = model.as_str()?;
+        if model.trim().is_empty() || model.chars().any(char::is_control) {
+            return None;
+        }
+        doc.as_table_mut()?.remove("model");
+    }
     if doc
         .get("model_reasoning_effort")
         .and_then(toml::Value::as_str)

@@ -408,7 +408,7 @@ fn manual_home_edits_are_preserved_and_require_explicit_import() {
 }
 
 #[test]
-fn codex_reasoning_choice_survives_relaunch_without_changing_the_saved_revision() {
+fn codex_model_and_reasoning_choices_survive_relaunch_without_changing_the_saved_revision() {
     let f = Fixture::new();
     let mut manager = f.manager();
     let profile = manager
@@ -420,7 +420,7 @@ fn codex_reasoning_choice_survives_relaunch_without_changing_the_saved_revision(
         .unwrap();
     let home = manager.materialize(&profile.id, 1).unwrap();
     let saved = manager.revision(&profile.id, 1).unwrap().config;
-    let runtime = config::patch(&saved, None, None, Some("none")).unwrap();
+    let runtime = config::patch(&saved, None, Some("other"), Some("none")).unwrap();
     fs::write(home.join("config.toml"), &runtime).unwrap();
     assert_eq!(manager.materialize(&profile.id, 1).unwrap(), home);
     assert_eq!(
@@ -432,7 +432,7 @@ fn codex_reasoning_choice_survives_relaunch_without_changing_the_saved_revision(
         "model='m1'\nmodel_reasoning_effort=true",
         "model='m1'"
     ));
-    assert!(!config::matches_runtime_config(
+    assert!(config::matches_runtime_config(
         "model='other'\nmodel_reasoning_effort='none'",
         "model='m1'"
     ));
@@ -1432,6 +1432,58 @@ fn oauth_profile_allows_cli_onboarding_state_but_preserves_versioned_settings() 
 }
 
 #[test]
+fn oauth_model_choices_survive_reopening_without_rewriting_the_revision_or_login() {
+    for initial in ["", "model='initial-model'\n"] {
+        let f = Fixture::new();
+        let mut manager = f.manager();
+        let source = oauth_source(&f, "model-choice", "fixture-refresh");
+        let account = manager
+            .import_oauth(Some("Model choice"), Some(initial), &source, None)
+            .unwrap();
+        let saved = manager.revision(&account.id, 1).unwrap().config;
+        let home = manager.materialize(&account.id, 1).unwrap();
+        let path = home.join("usage-r1.config.toml");
+        let auth = fs::read(home.join("auth.json")).unwrap();
+        let runtime = oauth::patch_config(&saved, Some("gpt-6-luna"), Some("medium")).unwrap();
+        fs::write(&path, &runtime).unwrap();
+        drop(manager);
+
+        let manager = f.manager();
+        assert_eq!(manager.materialize(&account.id, 1).unwrap(), home);
+        assert_eq!(fs::read_to_string(&path).unwrap(), runtime);
+        assert_eq!(manager.resolve(&account.id).unwrap().revision, 1);
+        assert_eq!(manager.revision(&account.id, 1).unwrap().config, saved);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+        assert!(manager.revision(&account.id, 2).is_err());
+
+        // Clearing a selection lets the CLI choose its default again.
+        let runtime = oauth::patch_config(&runtime, Some(""), Some("")).unwrap();
+        fs::write(&path, &runtime).unwrap();
+        manager.materialize(&account.id, 1).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), runtime);
+    }
+}
+
+#[test]
+fn runtime_model_choices_require_valid_strings() {
+    for invalid in [
+        "model=false",
+        "model=[]",
+        "model={}",
+        "model=''",
+        "model='   '",
+        "model=\"line\\nbreak\"",
+    ] {
+        assert!(!config::matches_runtime_config(invalid, "model='saved'"));
+        assert!(!config::matches_runtime_config(invalid, invalid));
+    }
+    assert!(config::matches_runtime_config(
+        "model='vendor/new-model:latest'",
+        "model='saved'"
+    ));
+}
+
+#[test]
 fn oauth_configuration_revisions_retain_one_live_credential_file() {
     let f = Fixture::new();
     let mut m = f.manager();
@@ -1796,8 +1848,8 @@ fn byok_project_trust_updates_survive_relaunch_without_changing_the_revision() {
         runtime
     );
     assert_eq!(m.revision(&p.id, 1).unwrap().config, saved);
-    // Native updates are mutable; model and credential routing remain versioned.
-    let changed = config::patch(&runtime, None, Some("different-model"), None).unwrap();
+    // Native preferences are mutable; credential routing remains versioned.
+    let changed = config::patch(&runtime, Some("https://other.example/v1"), None, None).unwrap();
     fs::write(home.join("config.toml"), &changed).unwrap();
     assert!(m.materialize(&p.id, 1).is_err());
     assert_eq!(
@@ -1946,7 +1998,7 @@ fn byok_cli_onboarding_and_migration_state_survive_relaunch() {
         runtime
     );
     assert_eq!(m.revision(&p.id, 1).unwrap().config, saved);
-    // Runtime metadata never authorizes a changed endpoint or model.
+    // Runtime metadata never authorizes a changed endpoint.
     let changed = config::patch(&runtime, Some("https://other.example/v1"), None, None).unwrap();
     fs::write(home.join("config.toml"), &changed).unwrap();
     assert!(m.materialize(&p.id, 1).is_err());

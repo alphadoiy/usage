@@ -162,6 +162,48 @@ fn failure(output: Output, reason: &str) {
 
 #[cfg(unix)]
 #[test]
+fn persisted_model_choice_is_captured_and_cli_overrides_still_take_precedence() {
+    let fixture = Fixture::new();
+    let id = fixture.add();
+    fixture.configure(&id);
+    let manager = usage::codex_manager::Manager::open(fixture.0.join("manager")).unwrap();
+    let saved = manager.revision(&id, 1).unwrap().config;
+    let home = manager.materialize(&id, 1).unwrap();
+    let runtime = saved.replace("base-model", "selected-model");
+    fs::write(home.join("config.toml"), &runtime).unwrap();
+    drop(manager);
+
+    ok(fixture.launch(&id, &[]).output().unwrap());
+    ok(fixture
+        .launch(&id, &["--model", "override-model"])
+        .output()
+        .unwrap());
+    let runs = fixture.runs();
+    let mut models: Vec<_> = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| {
+            assert_eq!(run["context"]["identity"]["state"], "resolved");
+            assert_eq!(
+                run["context"]["identity"]["endpoint"],
+                "https://a.invalid/v1"
+            );
+            run["context"]["identity"]["model"].as_str().unwrap()
+        })
+        .collect();
+    models.sort_unstable();
+    assert_eq!(models, ["override-model", "selected-model"]);
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        runtime
+    );
+    let manager = usage::codex_manager::Manager::open(fixture.0.join("manager")).unwrap();
+    assert_eq!(manager.revision(&id, 1).unwrap().config, saved);
+}
+
+#[cfg(unix)]
+#[test]
 fn concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credentials() {
     let fixture = Fixture::new();
     let id = fixture.add();
