@@ -7,6 +7,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, StatefulWidget, Widget};
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::history::{SessionUsage, Tokens, compact};
 use crate::sessions::{AgentKind, Session, SessionKey};
@@ -40,6 +41,8 @@ pub struct SessionBrowser {
     pub searching: bool,
     pub launching: bool,
     pub marked: HashSet<SessionKey>,
+    pub preview: Option<Result<crate::sessions::preview::Preview, String>>,
+    pub preview_loading: bool,
     usage: HashMap<SessionKey, SessionUsage>,
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
@@ -61,6 +64,8 @@ impl SessionBrowser {
             searching: false,
             launching: false,
             marked: HashSet::new(),
+            preview: None,
+            preview_loading: false,
             usage: HashMap::new(),
             filter_label: None,
             sort_tokens: false,
@@ -397,7 +402,13 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let preview_height = if area.height >= 12 { 5 } else { 0 };
+    let preview_height = if area.height >= 20 {
+        8
+    } else if area.height >= 12 {
+        5
+    } else {
+        0
+    };
     let [search_area, lists_area, preview_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -428,17 +439,16 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         .style(Style::new().fg(DIM))
         .render(search_area, buf);
 
-    let [project_area, session_area] = if lists_area.width >= 72 {
-        Layout::horizontal([Constraint::Percentage(34), Constraint::Fill(1)]).areas(lists_area)
+    if lists_area.width >= 72 {
+        let [project_area, session_area] =
+            Layout::horizontal([Constraint::Percentage(34), Constraint::Fill(1)]).areas(lists_area);
+        render_projects(project_area, buf, browser, true);
+        render_sessions(session_area, buf, browser);
+    } else if browser.focus == Focus::Projects {
+        render_projects(lists_area, buf, browser, true);
     } else {
-        Layout::vertical([
-            Constraint::Length(lists_area.height.min(8)),
-            Constraint::Fill(1),
-        ])
-        .areas(lists_area)
-    };
-    render_projects(project_area, buf, browser, true);
-    render_sessions(session_area, buf, browser);
+        render_sessions(lists_area, buf, browser);
+    }
     if preview_height > 0 {
         render_preview(preview_area, buf, browser);
     }
@@ -451,7 +461,7 @@ pub(super) fn render_compact(
     browser: &SessionBrowser,
     label: &dyn Fn(&Session) -> String,
 ) {
-    if area.width >= 48 {
+    if area.width >= 36 {
         let [projects, sessions] =
             Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(area);
         render_projects(projects, buf, browser, false);
@@ -482,7 +492,7 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     block.render(area, buf);
     let width = usize::from(inner.width);
     let usage = browser.usage_for(session);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(preview_text(
             &usage.map_or_else(
                 || format!("实例 {} · 尚无用量记录", session.instance),
@@ -510,6 +520,36 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
             width,
         )),
     ];
+    if inner.height >= 5 {
+        lines.push(Line::from(""));
+        match &browser.preview {
+            Some(Ok(preview)) => {
+                lines.push(Line::from(preview_text(
+                    &format!(
+                        "请求  {}",
+                        preview.request.as_deref().unwrap_or("暂无可用内容")
+                    ),
+                    width,
+                )));
+                lines.push(Line::from(preview_text(
+                    &format!(
+                        "回复  {}",
+                        preview.response.as_deref().unwrap_or("暂无可用内容")
+                    ),
+                    width,
+                )));
+            }
+            Some(Err(error)) => lines.push(Line::from(preview_text(error, width)).dim()),
+            None => lines.push(
+                Line::from(if browser.preview_loading {
+                    "正在读取内容预览…"
+                } else {
+                    "暂无内容预览"
+                })
+                .dim(),
+            ),
+        }
+    }
     Paragraph::new(lines)
         .style(Style::new().fg(DIM))
         .render(inner, buf);
@@ -675,30 +715,43 @@ fn render_session_list(
                     Line::from(format!("{} · {time}", clean(&label(session)))).dim(),
                 ]));
             } else {
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled(format!("{time}  "), Style::new().fg(DIM)),
-                    Span::styled(
-                        browser.usage_for(session).map_or_else(
-                            || "—  ".into(),
-                            |u| format!("{}  ", compact(u.tokens.total())),
-                        ),
-                        Style::new().fg(BLUE),
-                    ),
-                    Span::raw(if browser.marked.contains(&session.key()) {
-                        "[✓] "
-                    } else {
-                        "[ ] "
-                    }),
-                    Span::raw(format!(
-                        "{}{}",
-                        if session.instance != session.provider.id() {
-                            format!("[{}] ", clean(&session.instance))
+                let width = usize::from(inner.width.saturating_sub(2));
+                let mark = if browser.marked.contains(&session.key()) {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                };
+                let title = preview_text(
+                    &format!(
+                        "{mark} {}",
+                        if session.title == session.id {
+                            "未命名会话"
                         } else {
-                            String::new()
-                        },
-                        clean(&session.title)
-                    )),
-                ])));
+                            &session.title
+                        }
+                    ),
+                    width,
+                );
+                let right = browser.usage_for(session).map_or_else(
+                    || "".into(),
+                    |u| format!("{} Tokens", compact(u.tokens.total())),
+                );
+                let right = if width >= right.width() + 12 {
+                    right
+                } else {
+                    String::new()
+                };
+                let budget = width.saturating_sub(right.width() + usize::from(!right.is_empty()));
+                let left = preview_text(&format!("{time} · {}", clean(&session.instance)), budget);
+                let gap = width.saturating_sub(left.width() + right.width());
+                items.push(ListItem::new(vec![
+                    Line::from(title).bold(),
+                    Line::from(vec![
+                        Span::styled(left, Style::new().fg(DIM)),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(right, Style::new().fg(BLUE)),
+                    ]),
+                ]));
             }
             session_index += 1;
         }
@@ -708,7 +761,7 @@ fn render_session_list(
     StatefulWidget::render(
         List::new(items)
             .highlight_symbol("› ")
-            .highlight_style(Style::new().fg(BLUE).bold()),
+            .highlight_style(Style::new().bg(Color::Rgb(35, 45, 65))),
         inner,
         buf,
         &mut state,
@@ -848,6 +901,16 @@ mod tests {
         for width in [44, 100] {
             let area = Rect::new(0, 0, width, 22);
             let mut buffer = Buffer::empty(area);
+            browser.focus_projects();
+            render(area, &mut buffer, &browser);
+            let projects = buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(projects.contains("beta  (3)"), "{projects}");
+            browser.focus_sessions();
+            buffer = Buffer::empty(area);
             render(area, &mut buffer, &browser);
             let text = (0..area.height)
                 .map(|y| {
@@ -857,7 +920,6 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(text.contains("beta  (3)"), "{text}");
             assert!(text.contains("Claude Code"), "{text}");
             assert!(text.contains("Codex"), "{text}");
             assert!(text.contains("Grok"), "{text}");

@@ -1,4 +1,5 @@
 //! Local session catalog and Ghostty launcher.
+pub(crate) mod preview;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

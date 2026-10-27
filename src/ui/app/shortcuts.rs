@@ -129,6 +129,38 @@ impl Dashboard {
                 ),
             }
         };
+        if self.browser_state.panel.is_none()
+            && self.history_state.panel.is_none()
+            && self.performance.panel.is_none()
+            && self.home_focus == super::super::home::Focus::Providers
+        {
+            let provider = crate::ui::overview::selected(
+                self.overview_state.catalog.as_ref(),
+                self.home_provider.as_deref(),
+            )
+            .map(|(_, p)| p);
+            for action in &mut actions {
+                let reason = match action.key {
+                    KeyCode::Char('v') if provider.is_none_or(|p| p.performance.is_none()) => {
+                        Some("此 Provider 未配置性能采集")
+                    }
+                    KeyCode::Char('x') if provider.is_none_or(|p| p.usage.reset.is_none()) => {
+                        Some("此 Provider 不支持主动重置")
+                    }
+                    KeyCode::Char('c')
+                        if provider.is_none_or(|p| {
+                            !p.operations.iter().any(|op| op.0.id() == "checkin")
+                        }) =>
+                    {
+                        Some("此 Provider 不支持签到")
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    *action = action.disabled(reason);
+                }
+            }
+        }
         if self.performance.panel.is_none() {
             actions.push(Shortcut::new(
                 KeyCode::F(10),
@@ -174,7 +206,10 @@ mod tests {
             app.handle_shortcuts_key(KeyCode::Char('?')),
             Some(Decision::Stay)
         ));
-        let Some(Decision::Run(key)) = app.handle_shortcuts_key(KeyCode::Char('o')) else {
+        for ch in "排序".chars() {
+            app.handle_shortcuts_key(KeyCode::Char(ch));
+        }
+        let Some(Decision::Run(key)) = app.handle_shortcuts_key(KeyCode::Enter) else {
             panic!("sort action must dispatch")
         };
         app.handle_browser_key(key, &handle);
@@ -182,7 +217,10 @@ mod tests {
         assert!(app.shortcuts.is_none());
         app.handle_browser_key(KeyCode::Right, &handle);
         app.handle_shortcuts_key(KeyCode::Char('?'));
-        let Some(Decision::Run(key)) = app.handle_shortcuts_key(KeyCode::Char('d')) else {
+        for ch in "移入回收站".chars() {
+            app.handle_shortcuts_key(KeyCode::Char(ch));
+        }
+        let Some(Decision::Run(key)) = app.handle_shortcuts_key(KeyCode::Enter) else {
             panic!("delete action must dispatch")
         };
         app.handle_browser_key(key, &handle);

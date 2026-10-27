@@ -69,6 +69,7 @@ impl Panel {
             width,
             height,
         );
+        crate::ui::widgets::clear_popup_edges(modal, frame.buffer_mut());
         Clear.render(modal, frame.buffer_mut());
         let block = Block::bordered()
             .title(" 会话清理 · 回收站 ")

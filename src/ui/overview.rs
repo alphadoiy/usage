@@ -64,11 +64,10 @@ pub(super) fn lines(
             .as_ref()
             .map_or(String::new(), |agent| format!(" · {}", clean(agent)));
         lines.push(Line::from(format!("{}{}", clean(&provider.name), agent)).bold());
-        lines.push(Line::from(format!("类型：{}", provider.kind.label())).dim());
+        lines.extend(usage_lines(&provider.usage, expanded));
         if provider.performance.is_some() {
             lines.extend(super::performance::summary_lines(performance));
         }
-        lines.extend(usage_lines(&provider.usage, expanded));
         for operation in &provider.operations {
             if operation.0.id() == "checkin" {
                 let text = extras.operation_statuses.map_or_else(
@@ -87,6 +86,7 @@ pub(super) fn lines(
         }) {
             lines.push(Line::from("主动重置：次数未返回 · x 查询").dim());
         }
+        lines.push(Line::from(format!("类型：{}", provider.kind.label())).dim());
         if let Some(model) = &provider.configured_model {
             lines.push(Line::from(format!("默认模型（配置）：{}", clean(model))).dim());
         }
@@ -146,7 +146,10 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
         } else {
             format!("{} · {}", clean(&source.label), scope)
         };
-        lines.push(Line::from(title).dim());
+        let heading_first = expanded || usage.sources.len() > 1;
+        if heading_first {
+            lines.push(Line::from(title.clone()).dim());
+        }
         if imported && expanded {
             lines.push(Line::from("  配置来源：CC Switch").dim());
         }
@@ -165,7 +168,11 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                     );
                     continue;
                 }
-                for metric in &snapshot.metrics {
+                let mut metrics: Vec<_> = snapshot.metrics.iter().collect();
+                metrics.sort_by_key(|metric| {
+                    u8::from(matches!(metric, ResourceMetric::Allowance { .. }))
+                });
+                for metric in metrics {
                     let text = match metric {
                         ResourceMetric::ResetCredits { available } => {
                             format!("主动重置 {available} 次 · x 查询／重置")
@@ -299,6 +306,9 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                     );
                 }
             }
+        }
+        if !heading_first {
+            lines.push(Line::from(title).dim());
         }
     }
     lines

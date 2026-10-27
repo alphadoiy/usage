@@ -82,7 +82,7 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
     let area = Rect::new(0, 0, 80, 22);
     let mut buffer = Buffer::empty(area);
     render_home(area, &mut buffer, &app);
-    let status_area = super::super::home::areas(area)[1];
+    let status_area = super::super::home::areas_with_details(area, true)[1];
     let output = (status_area.y..status_area.bottom())
         .flat_map(|y| (status_area.x..status_area.right()).map(move |x| (x, y)))
         .map(|position| buffer[position].symbol())
@@ -95,8 +95,15 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
     }
     assert!(app.handle_home_key(KeyCode::Esc, &handle, (80, 24)));
     assert!(!app.home_connections.is_details());
+    buffer = Buffer::empty(area);
     render_home(area, &mut buffer, &app);
-    assert!(text(&buffer).contains(">○Claude"));
+    assert!(text(&buffer).contains("○Claude"));
+    assert!(
+        buffer
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "C" && cell.bg == Color::Rgb(35, 45, 65))
+    );
     assert!(text(&buffer).contains("OpenAI"));
     assert!(!app.handle_home_key(KeyCode::Esc, &handle, (80, 24)));
 }

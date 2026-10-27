@@ -26,6 +26,7 @@ use crate::ui::history::{HistoryPanel, PickerRequest, ReportRequest};
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{Focus, SessionBrowser};
 mod cleanup;
+mod preview;
 mod render;
 mod shortcuts;
 mod state;
@@ -63,6 +64,11 @@ impl BrowserUsageRequest {
 }
 
 enum AppEvent {
+    SessionPreview {
+        generation: u64,
+        request: preview::Request,
+        result: Result<sessions::preview::Preview, String>,
+    },
     CleanupFinished {
         message: Option<String>,
         entries: Result<Vec<crate::session_cleanup::Entry>, String>,
@@ -313,6 +319,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         app.ensure_history_picker(&handle);
         app.ensure_history_report(&handle);
         app.ensure_browser_usage(&handle);
+        app.ensure_session_preview(&handle);
         let cleanup_refreshed = app.refresh_after_cleanup(&handle);
         let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
         if received || reset_consumed || refresh_started || status_started || cleanup_refreshed {
@@ -559,6 +566,7 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    preview: preview::State,
     shortcuts: Option<super::shortcuts::Menu>,
     cleanup: Option<cleanup::Panel>,
     cleanup_store: crate::session_cleanup::Store,
@@ -644,6 +652,7 @@ impl Dashboard {
             })
             .collect();
         Self {
+            preview: preview::State::default(),
             shortcuts: None,
             cleanup: None,
             cleanup_store: crate::session_cleanup::Store::default(),
@@ -1411,13 +1420,17 @@ impl Dashboard {
                 };
                 match self.home_focus {
                     HomeFocus::Providers => {
-                        let area =
-                            super::home::areas(Rect::new(0, 1, width, height.saturating_sub(2)))[0];
+                        let area = super::home::areas_with_details(
+                            Rect::new(0, 1, width, height.saturating_sub(2)),
+                            self.home_connections.is_details(),
+                        )[0];
                         self.scroll_home(delta, (area.width.saturating_sub(2), area.height));
                     }
                     HomeFocus::Connections => {
-                        let area =
-                            super::home::areas(Rect::new(0, 1, width, height.saturating_sub(2)))[1];
+                        let area = super::home::areas_with_details(
+                            Rect::new(0, 1, width, height.saturating_sub(2)),
+                            self.home_connections.is_details(),
+                        )[1];
                         let inner = Rect::new(
                             0,
                             0,
@@ -1958,6 +1971,14 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::SessionPreview {
+                    generation,
+                    request,
+                    result,
+                } => {
+                    changed |= self.accept_session_preview(generation, request, result);
+                    continue;
+                }
                 AppEvent::CleanupFinished {
                     message,
                     entries,

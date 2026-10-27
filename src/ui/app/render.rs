@@ -64,20 +64,54 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             )
         })
     };
-    let header_title = if app.history_state.panel.is_some() {
-        " F10 菜单  F1 首页  [F2 历史]  F3 会话  F4 Provider "
+    let active = if app.history_state.panel.is_some() {
+        1
     } else if app.browser_state.panel.is_some() {
-        " F10 菜单  F1 首页  F2 历史  [F3 会话]  F4 Provider "
+        2
     } else {
-        " F10 菜单  [F1 首页]  F2 历史  F3 会话  F4 Provider "
+        0
     };
-    Paragraph::new(Line::from(vec![header_title.bold(), status.dim()]))
-        .style(
-            Style::new()
-                .bg(Color::Rgb(22, 22, 24))
-                .fg(Color::Rgb(242, 242, 247)),
-        )
+    let labels = if header.width >= 64 {
+        ["F1 首页", "F2 历史", "F3 会话", "F4 Provider"]
+    } else {
+        ["F1", "F2", "F3", "F4"]
+    };
+    let header_title = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| {
+            if index == active {
+                format!("[{label}]")
+            } else {
+                (*label).into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    let nav_width = (unicode_width::UnicodeWidthStr::width(header_title.as_str()) as u16)
+        .saturating_add(2)
+        .min(header.width);
+    let style = Style::new()
+        .bg(Color::Rgb(22, 22, 24))
+        .fg(Color::Rgb(242, 242, 247));
+    Paragraph::new(format!(" {header_title}"))
+        .bold()
+        .style(style)
         .render(header, frame.buffer_mut());
+    if header.width.saturating_sub(nav_width) >= 12 {
+        Paragraph::new(crate::ui::overview::clean(&status))
+            .dim()
+            .style(style)
+            .alignment(ratatui::layout::Alignment::Right)
+            .render(
+                Rect {
+                    x: header.x + nav_width,
+                    width: header.width - nav_width,
+                    ..header
+                },
+                frame.buffer_mut(),
+            );
+    }
     if let Some(panel) = &app.history_state.panel {
         history::render(body, frame.buffer_mut(), panel);
     } else if let Some(browser) = &app.browser_state.panel {
@@ -131,7 +165,7 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             },
         }
     };
-    Paragraph::new(footer_text)
+    Paragraph::new(crate::ui::widgets::fit_hints(footer_text, footer.width))
         .style(
             Style::new()
                 .fg(Color::Rgb(142, 142, 147))
@@ -195,6 +229,7 @@ fn draw_reset_modal(frame: &mut Frame, app: &Dashboard) {
         ResetStage::Executing => lines.push("正在提交，请勿重复操作…".into()),
         ResetStage::Result(message) => lines.push(message.clone()),
     }
+    crate::ui::widgets::clear_popup_edges(modal, frame.buffer_mut());
     Clear.render(modal, frame.buffer_mut());
     let block = Block::bordered()
         .title(format!(" {} 主动重置 ", flow.provider_name))
@@ -246,7 +281,8 @@ pub(super) fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
 
 pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     use crate::ui::home::{self, Focus as HomeFocus};
-    let [providers, connections, projects] = home::areas(area);
+    let [providers, connections, projects] =
+        home::areas_with_details(area, app.home_connections.is_details());
     let mut provider_title = crate::ui::overview::selected(
         app.overview_state.catalog.as_ref(),
         app.home_provider.as_deref(),

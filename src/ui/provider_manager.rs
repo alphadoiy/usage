@@ -253,10 +253,13 @@ fn draw_accounts(
             &mut state,
         );
     }
-    Paragraph::new(format!("{}\n{notice}", actions(profiles.get(selected))))
-        .style(Style::new().fg(Color::Rgb(142, 142, 147)))
-        .wrap(Wrap { trim: false })
-        .render(footer, frame.buffer_mut());
+    Paragraph::new(format!(
+        "{}\n{notice}",
+        super::widgets::fit_hints(&actions(profiles.get(selected)), footer.width)
+    ))
+    .style(Style::new().fg(Color::Rgb(142, 142, 147)))
+    .wrap(Wrap { trim: false })
+    .render(footer, frame.buffer_mut());
 }
 
 pub fn run_with_config(

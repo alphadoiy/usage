@@ -653,7 +653,14 @@ async fn homepage_status_updates_without_quota_credentials_and_marks_failed_refr
             .map(|c| c.symbol())
             .collect::<String>();
         let compact = text.split_whitespace().collect::<String>();
-        assert!(compact.contains("Claude·正常"), "{width}: {text}");
+        assert!(
+            compact.contains(if width >= 60 {
+                "Claude·正常"
+            } else {
+                "●Claude"
+            }),
+            "{width}: {text}"
+        );
     }
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.refresh_service_statuses(&Handle::current());

@@ -34,20 +34,30 @@ impl Focus {
     }
 }
 
+#[cfg(test)]
 pub(super) fn areas(area: Rect) -> [Rect; 3] {
+    areas_with_details(area, false)
+}
+
+pub(super) fn areas_with_details(area: Rect, details: bool) -> [Rect; 3] {
+    let status_height = if details {
+        (area.height / 2).clamp(3, 14)
+    } else {
+        3
+    };
+    let [connections, main] = Layout::vertical([
+        Constraint::Length(status_height.min(area.height)),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
     if area.width >= 80 {
-        let [top, projects] =
-            Layout::vertical([Constraint::Percentage(54), Constraint::Fill(1)]).areas(area);
-        let [providers, connections] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Fill(1)]).areas(top);
+        let [providers, projects] =
+            Layout::horizontal([Constraint::Percentage(44), Constraint::Fill(1)]).areas(main);
         [providers, connections, projects]
     } else {
-        Layout::vertical([
-            Constraint::Length(area.height / 3),
-            Constraint::Length((area.height / 3).max(8)),
-            Constraint::Fill(1),
-        ])
-        .areas(area)
+        let [providers, projects] =
+            Layout::vertical([Constraint::Percentage(45), Constraint::Fill(1)]).areas(main);
+        [providers, connections, projects]
     }
 }
 
@@ -368,6 +378,33 @@ impl Connections {
         pending: bool,
         active: bool,
     ) {
+        if !self.details {
+            let columns = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+            for (index, source) in SOURCES.iter().enumerate() {
+                let status = statuses.get(source.id);
+                let (state, label) = current(status, pending);
+                let (symbol, color) = indicator(state);
+                let name = if source.id == "grok" {
+                    "Grok"
+                } else {
+                    source.name
+                };
+                let text = if columns[index].width >= 19 {
+                    format!("{symbol} {name} · {label}")
+                } else {
+                    format!("{symbol} {name}")
+                };
+                let style = if active && index == self.selected {
+                    Style::new().fg(color).bg(Color::Rgb(35, 45, 65)).bold()
+                } else {
+                    Style::new().fg(color)
+                };
+                Paragraph::new(text)
+                    .style(style)
+                    .render(columns[index], buf);
+            }
+            return;
+        }
         let lines = self.lines(area, statuses, history, pending, active);
         let max = lines
             .len()
@@ -382,6 +419,25 @@ impl Connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_summary_stays_compact_until_details_are_opened() {
+        for width in [28, 80, 120] {
+            for height in [4, 12, 24, 40] {
+                let area = Rect::new(0, 0, width, height);
+                let normal = areas_with_details(area, false);
+                let details = areas_with_details(area, true);
+                assert_eq!(normal[1].height, 3);
+                assert!(details[1].height >= normal[1].height);
+                for layout in [normal, details] {
+                    for rect in layout {
+                        assert!(rect.right() <= area.right() && rect.bottom() <= area.bottom());
+                    }
+                    assert!(!layout[0].intersects(layout[1]) && !layout[1].intersects(layout[2]));
+                }
+            }
+        }
+    }
 
     fn status(index: i64) -> ServiceStatus {
         let time = DateTime::from_timestamp(index, 0).unwrap();

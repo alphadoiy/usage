@@ -21,6 +21,58 @@ const DIM: Color = Color::Rgb(142, 142, 147);
 const WARNING: Color = Color::Rgb(255, 159, 10);
 const ERROR: Color = Color::Rgb(255, 69, 58);
 
+/// A wide glyph drawn underneath a popup can straddle its edge. Clear its outside
+/// half too, otherwise Terminal::diff skips the popup border as a continuation cell.
+pub(crate) fn clear_popup_edges(area: Rect, buf: &mut Buffer) {
+    if area.is_empty() {
+        return;
+    }
+    for y in area.y..area.bottom() {
+        if area.x > buf.area.x && buf[(area.x - 1, y)].symbol().width() > 1 {
+            buf[(area.x - 1, y)].set_symbol(" ");
+        }
+        if area.right() < buf.area.right() && buf[(area.right() - 1, y)].symbol().width() > 1 {
+            buf[(area.right(), y)].set_symbol(" ");
+        }
+    }
+}
+
+/// Fit whole hint groups. Keep help and back reachable without clipping a key label in half.
+pub(crate) fn fit_hints(text: &str, width: u16) -> String {
+    let mut groups: Vec<_> = text
+        .split(" · ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let back = groups.last().copied().filter(|s| s.starts_with("Esc"));
+    if back.is_some() {
+        groups.pop();
+    }
+    let mut out = String::new();
+    for group in groups {
+        let candidate = if out.is_empty() {
+            group.to_string()
+        } else {
+            format!("{out} · {group}")
+        };
+        let reserved = back.map_or(0, |s| s.width() + 3);
+        if candidate.width() + reserved <= usize::from(width) {
+            out = candidate;
+        }
+    }
+    if let Some(back) = back {
+        let candidate = if out.is_empty() {
+            back.to_string()
+        } else {
+            format!("{out} · {back}")
+        };
+        if candidate.width() <= usize::from(width) {
+            out = candidate;
+        }
+    }
+    out
+}
+
 pub fn accent(provider_id: &str) -> Color {
     let (red, green, blue) = theme::accent(provider_id);
     Color::Rgb(red, green, blue)
@@ -647,6 +699,31 @@ mod tests {
     use super::*;
     use crate::model::{QuotaTier, snapshot_ok};
     use crate::view::{BadgeKind, BarSpec, CardView, ViewKind};
+
+    #[test]
+    fn popup_clears_wide_glyphs_straddling_its_edges() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 3));
+        buffer.set_string(1, 1, "界", Style::default());
+        buffer.set_string(9, 1, "界", Style::default());
+        clear_popup_edges(Rect::new(2, 0, 8, 3), &mut buffer);
+        assert_eq!(buffer[(1, 1)].symbol(), " ");
+        assert_eq!(buffer[(10, 1)].symbol(), " ");
+    }
+
+    #[test]
+    fn hint_groups_fit_without_partial_keys_and_keep_back_available() {
+        let text = "? 操作 · ↑/↓ 选择 · Space 勾选 · Esc 返回";
+        for width in 0..90 {
+            let fitted = fit_hints(text, width);
+            assert!(fitted.width() <= usize::from(width));
+            for group in fitted.split(" · ").filter(|group| !group.is_empty()) {
+                assert!(text.split(" · ").any(|original| original == group));
+            }
+            if usize::from(width) >= "? 操作 · Esc 返回".width() {
+                assert!(fitted.contains("? 操作") && fitted.contains("Esc 返回"));
+            }
+        }
+    }
 
     fn buffer_text(buffer: &Buffer) -> String {
         let area = buffer.area();

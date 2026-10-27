@@ -90,7 +90,10 @@ fn provider_refresh_keeps_content_rows_and_scroll_position() {
     let area = Rect::new(0, 0, 120, 40);
     let mut buffer = Buffer::empty(area);
     render_home(area, &mut buffer, &app);
-    let title: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+    let provider_area = crate::ui::home::areas(area)[0];
+    let title: String = (provider_area.x..provider_area.right())
+        .map(|x| buffer[(x, provider_area.y)].symbol())
+        .collect();
     assert!(
         title
             .split_whitespace()
