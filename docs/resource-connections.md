@@ -1,6 +1,6 @@
 # 资源连接：余额、额度与费用
 
-资源连接与 Agent 类型分开配置。当前已接入 New API、Sub2API、六种官方余额服务和 OpenAI 费用查询，通过 `usage resources` 使用；配置了 `profile_ids` 或独立 `inference` 的资源也可在[首页中枢](home-overview.md)对应 Provider 下展示，无需先启动 Agent。
+资源连接与 Agent 类型分开配置。当前已接入 New API、Sub2API、常见官方余额服务、兼容旧式 OpenAI 账单余额和 OpenAI 费用查询，通过 `usage resources` 使用；配置了 `profile_ids` 或独立 `inference` 的资源也可在[首页中枢](home-overview.md)对应 Provider 下展示，无需先启动 Agent。
 
 ## 配置和查询
 
@@ -43,8 +43,11 @@ usage --config /path/to/config.toml resources --json
 | `new_api_token` | `GET api/usage/token` | 推理 API token，返回该令牌自身的额度；不限量不代表账号余额无限 |
 | `new_api_account` | `GET api/user/self` | 站点账号的管理访问凭据，另需 `options.user_id`；发送 `New-Api-User` 并核对返回的账号 ID |
 | `sub2api_usage` | `GET v1/usage` | 推理 Key，展示当前 Key 可见余额、限额与不限量状态 |
+| `sub2api_account` | `GET api/v1/user/profile` | 站点登录 Token，查询账号钱包（USD）；与推理 Key 分开配置 |
+| `openai_credit_grants` | `GET dashboard/billing/credit_grants` | 中转站推理 Key 可见的余额，USD；不等同于账号钱包证明 |
 | `deepseek_balance` | `GET user/balance` | 推理 Key，按响应中的币种展示账号余额 |
-| `stepfun_balance` | `GET v1/accounts` | 推理 Key，CNY 余额 |
+| `stepfun_balance` / `stepfun_en_balance` | `GET v1/accounts` | 推理 Key，中国站 CNY／国际站 USD |
+| `moonshot_balance` / `moonshot_en_balance` | `GET v1/users/me/balance` | 推理 Key，中国站 CNY／国际站 USD |
 | `siliconflow_balance` / `siliconflow_en_balance` | `GET v1/user/info` | 推理 Key，中站 CNY／国际站 USD |
 | `openrouter_balance` | `GET api/v1/credits` | 可查询 credits 的 Key，购买额度减已用额度，USD；不会把 `/key` 的花费上限当余额 |
 | `novita_balance` | `GET v3/user/balance` | 推理 Key，接口金额单位为万分之一 USD，显式按此协议换算 |
@@ -63,6 +66,29 @@ options = { user_id = 42, quota_per_unit = "500000", currency = "USD" }
 ```
 
 这里的 `500000` 只是显式配置示例，不是程序假设的全局换算比例。`quota_per_unit` 是每一货币单位对应的原始额度，必须为正十进制字符串，并同时填写三位大写币种代码。换算后仍保留原始额度。令牌不限量时同样保留接口返回的 `total_available` 并进行显式换算，与 CC Switch 保持一致；金额标注“接口返回”，不限额状态单独显示，不据此推断账号钱包范围。过期令牌返回认证失败，不能用其额度表示可用状态。
+
+在 Provider 管理中选择 BYOK 账号，按 `b` 打开额度设置，填写比例和币种，`Ctrl+S` 保存。显式关联了 New API 资源时可用左右键选择资源；共享资源的修改会影响其所有关联账号，界面会标明。两项留空可清除换算覆盖。设置只更新 Usage 的资源配置，保留原有配置注释、凭据引用和 Agent 配置版本；保存时会拒绝覆盖已经被其他操作更新的文件。
+
+没有显式资源时，换算偏好按账号 UUID 保存，作用于首页自动识别或 CC Switch 导入的 New API 查询：
+
+```toml
+[provider_usage."123e4567-e89b-12d3-a456-426614174001"]
+quota_per_unit = "500000"
+currency = "USD"
+```
+
+首页始终展示 New API 的原始额度数字；配置换算后另外展示金额。未配置资源的普通 BYOK 中转站会依次尝试同源的 New API 令牌用量、Sub2API Key 用量、旧式 `credit_grants`。账号钱包接口需要独立登录凭据，不参与推理 Key 的自动探测。上述显式 `[[resources]]` 查询仍只访问所选协议的接口。
+
+Sub2API `rate_limits` 支持 `5h`、`1d`、`7d` 窗口，展示精确的已用、限额、剩余和接口提供的重置时间；缺少重置时间时不推算。只有窗口、没有 `remaining` 的 Key 也可正常展示，窗口剩余不会冒充账号余额。该协议默认金额单位为 USD，响应显式提供 `unit` 时按该单位展示。账号钱包需要另外配置：
+
+```toml
+[[resources]]
+id = "sub2api-wallet"
+service = "sub2api_account"
+base_url = "https://relay.example"
+credential_env = "RELAY_LOGIN_TOKEN"
+# profile_ids = ["123e4567-e89b-12d3-a456-426614174001"]
+```
 
 OpenAI 官方费用配置：
 

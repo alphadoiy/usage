@@ -46,6 +46,7 @@ jobs:
         run: |
           python3 scripts/ablate-provider-stage1.py --output /private/tmp/usage-ci-provider-anchors --check-anchors
           python3 scripts/ablate-run-bindings.py --output /private/tmp/usage-ci-run-anchors --check-anchors
+          python3 scripts/ablate-current-changes.py --output /private/tmp/usage-ci-current-anchors --check-anchors
 
   release-cache:
     # Tag caches are isolated from other tags. Warm both native targets on main

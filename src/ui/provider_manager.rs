@@ -159,9 +159,12 @@ fn identity(profile: &Profile) -> String {
     }
 }
 fn actions(profile: Option<&Profile>) -> String {
-    let mut text = "a / F5 添加 · i CC 导入 · o 默认项目 · Esc 返回".to_string();
+    let mut text = "? 操作 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
     if let Some(profile) = profile {
-        text.push_str("\ne Agent 配置 · E TOML · c 复制 · d 移除 · Enter 选择项目并启动 Codex");
+        text.push_str(" · Enter 启动 · e 配置");
+        if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
+            text.push_str(" · b 额度设置");
+        }
         if profile.auth_mode == AuthMode::Oauth {
             text.push_str(" · l 重新登录");
         }
@@ -170,6 +173,43 @@ fn actions(profile: Option<&Profile>) -> String {
         }
     }
     text
+}
+
+fn shortcuts(profile: Option<&Profile>) -> super::shortcuts::Menu {
+    use super::shortcuts::{Action, Menu};
+    let action = |key, hint, label| Action::new(KeyCode::Char(key), hint, label);
+    let mut actions = vec![
+        action('a', "a / F5", "添加 Provider"),
+        action('i', "i", "从 CC Switch 导入"),
+        action('o', "o", "选择默认项目"),
+        action('r', "r", "刷新列表"),
+    ];
+    if let Some(profile) = profile {
+        actions.extend([
+            Action::new(KeyCode::Enter, "Enter", "选择项目并启动 Agent"),
+            action('e', "e", "编辑 Agent 配置"),
+            action('E', "Shift+E", "用外部编辑器编辑完整 TOML"),
+            action('c', "c", "复制 Provider"),
+            action('d', "d / Delete", "移除 Provider（需确认）"),
+        ]);
+        if profile.auth_mode == AuthMode::Oauth {
+            actions.push(action('l', "l", "重新登录 OAuth 账号"));
+        }
+        if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
+            actions.push(action('b', "b", "设置 New API 额度换算"));
+        }
+        if profile.source.is_some() {
+            actions.extend([
+                action('f', "f", "切换跟随 CC Switch"),
+                action('s', "s", "同步 CC Switch"),
+            ]);
+        }
+    }
+    Menu::new(
+        "Provider 管理",
+        "↑/↓ 选择 Provider · Esc 返回上一页",
+        actions,
+    )
 }
 fn draw_accounts(
     frame: &mut ratatui::Frame,
@@ -233,6 +273,7 @@ pub fn run_with_config(
         None => std::env::current_dir()?,
     };
     let mut prompt: Option<Prompt> = None;
+    let mut shortcuts_menu: Option<super::shortcuts::Menu> = None;
     let mut notice = "选择 Provider · e 配置 Agent · Enter 选择项目并启动 Codex".to_string();
     let mut projects = Projects {
         store: crate::projects::Store::from_environment(),
@@ -260,6 +301,9 @@ pub fn run_with_config(
                 if let Some(prompt) = &prompt {
                     draw_prompt(frame, prompt, &cwd, &projects);
                 }
+                if let Some(menu) = &shortcuts_menu {
+                    menu.render(frame);
+                }
             })?;
             if !event::poll(Duration::from_millis(100))? {
                 if refreshed.elapsed() >= Duration::from_secs(15) && prompt.is_none() {
@@ -275,7 +319,7 @@ pub fn run_with_config(
                 }
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
+            let Event::Key(mut key) = event::read()? else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
@@ -283,6 +327,22 @@ pub fn run_with_config(
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(());
+            }
+            if let Some(menu) = &mut shortcuts_menu {
+                match menu.key(key.code) {
+                    super::shortcuts::Decision::Run(code) => {
+                        shortcuts_menu = None;
+                        key.code = code;
+                    }
+                    super::shortcuts::Decision::Close => {
+                        shortcuts_menu = None;
+                        continue;
+                    }
+                    super::shortcuts::Decision::Stay => continue,
+                }
+            } else if key.code == KeyCode::Char('?') && prompt.is_none() {
+                shortcuts_menu = Some(shortcuts(profiles.get(selected)));
+                continue;
             }
             if let Some(current) = prompt.take() {
                 match current {
@@ -448,6 +508,24 @@ pub fn run_with_config(
                         }
                     }
                 }
+                KeyCode::Char('b') => {
+                    if let Some(profile) = profile {
+                        let path = usage_config
+                            .clone()
+                            .unwrap_or_else(crate::config::default_config_path);
+                        let result = super::provider_setup::edit_quota(
+                            &mut terminal,
+                            &|frame| draw_accounts(frame, &profiles, selected, &cwd, &notice),
+                            &profile,
+                            &path,
+                        );
+                        notice = match result {
+                            Ok(true) => "额度换算已保存，返回首页后刷新生效".into(),
+                            Ok(false) => "已取消额度设置".into(),
+                            Err(error) => error.to_string(),
+                        };
+                    }
+                }
                 KeyCode::Char('e') => {
                     if let Some(profile) = profile {
                         let result = super::provider_setup::edit(
@@ -488,7 +566,7 @@ pub fn run_with_config(
                         reload(&manager, &mut profiles, &mut selected, &mut notice);
                     }
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('d') | KeyCode::Delete => {
                     if let Some(p) = profile {
                         prompt = Some(Prompt::Remove(p.id));
                     }

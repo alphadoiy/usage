@@ -6,6 +6,7 @@ pub mod connections;
 mod new_api;
 mod openai_costs;
 mod provider_usage;
+pub use new_api::QuotaConversion;
 pub(crate) use provider_usage::balance_endpoint;
 
 use std::sync::Arc;
@@ -65,6 +66,14 @@ pub enum ResourceMetric {
     QuotaWindow {
         name: String,
         used_percent: f64,
+        resets_at: Option<DateTime<Utc>>,
+    },
+    AllowanceWindow {
+        name: String,
+        used: String,
+        limit: String,
+        remaining: String,
+        unit: String,
         resets_at: Option<DateTime<Utc>>,
     },
     Balance {

@@ -25,7 +25,9 @@ use crate::sessions;
 use crate::ui::history::{HistoryPanel, PickerRequest, ReportRequest};
 use crate::ui::menu::{self, Action as MenuAction, Command as MenuCommand};
 use crate::ui::session_browser::{Focus, SessionBrowser};
+mod cleanup;
 mod render;
+mod shortcuts;
 mod state;
 #[cfg(test)]
 use ratatui::{buffer::Buffer, style::Color};
@@ -61,6 +63,11 @@ impl BrowserUsageRequest {
 }
 
 enum AppEvent {
+    CleanupFinished {
+        message: Option<String>,
+        entries: Result<Vec<crate::session_cleanup::Entry>, String>,
+        mutated: bool,
+    },
     FingerprintLoaded {
         generation: u64,
         result: Result<Vec<crate::codex_manager::fingerprint::Snapshot>, String>,
@@ -306,8 +313,9 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         app.ensure_history_picker(&handle);
         app.ensure_history_report(&handle);
         app.ensure_browser_usage(&handle);
+        let cleanup_refreshed = app.refresh_after_cleanup(&handle);
         let refresh_started = app.maybe_auto_refresh(&handle) || deferred_refresh;
-        if received || reset_consumed || refresh_started || status_started {
+        if received || reset_consumed || refresh_started || status_started || cleanup_refreshed {
             redraw.invalidate();
         }
         if redraw.take(Utc::now().timestamp())
@@ -317,11 +325,23 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         }
         match event::poll(Duration::from_millis(80)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                Ok(Event::Key(mut key)) if key.kind == KeyEventKind::Press => {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
                         break Ok(());
+                    }
+                    match app.handle_shortcuts_key(key.code) {
+                        Some(super::shortcuts::Decision::Run(code)) => key.code = code,
+                        Some(_) => {
+                            redraw.invalidate();
+                            continue;
+                        }
+                        None => {}
+                    }
+                    if app.handle_cleanup_key(key.code, &handle) {
+                        redraw.invalidate();
+                        continue;
                     }
                     if app.handle_performance_key(key.code, &handle) {
                         redraw.invalidate();
@@ -429,7 +449,8 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                             continue;
                         }
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
+                            KeyCode::Esc => app.close_history(),
+                            KeyCode::Char('q') => {
                                 if app.providers.is_empty() {
                                     break Ok(());
                                 }
@@ -471,7 +492,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         continue;
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
+                        KeyCode::Char('q') => break Ok(()),
                         KeyCode::Char('r') => app.refresh(&handle),
                         KeyCode::Char('x') => app.open_reset(&handle),
                         KeyCode::Char('p') => {
@@ -538,6 +559,10 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    shortcuts: Option<super::shortcuts::Menu>,
+    cleanup: Option<cleanup::Panel>,
+    cleanup_store: crate::session_cleanup::Store,
+    cleanup_refresh_due: bool,
     subscription_tests: super::subscription_tests::Tests,
     home_subscription_details: bool,
     fingerprint: state::FingerprintState,
@@ -619,6 +644,10 @@ impl Dashboard {
             })
             .collect();
         Self {
+            shortcuts: None,
+            cleanup: None,
+            cleanup_store: crate::session_cleanup::Store::default(),
+            cleanup_refresh_due: false,
             subscription_tests: super::subscription_tests::Tests::default(),
             home_subscription_details: false,
             fingerprint: state::FingerprintState::new(),
@@ -1015,7 +1044,8 @@ impl Dashboard {
         {
             if let Some(browser) = &mut self.browser_state.panel {
                 match key {
-                    KeyCode::Esc | KeyCode::Enter => browser.searching = false,
+                    KeyCode::Esc => browser.clear_search(),
+                    KeyCode::Enter => browser.searching = false,
                     KeyCode::Backspace => browser.backspace(),
                     KeyCode::Char(ch) => browser.type_char(ch),
                     _ => {}
@@ -1024,6 +1054,45 @@ impl Dashboard {
             return;
         }
         match key {
+            KeyCode::Char('b') => self.open_trash(handle),
+            KeyCode::Char('d') | KeyCode::Delete => self.open_cleanup_delete(false),
+            KeyCode::Char('D') => self.open_cleanup_delete(true),
+            KeyCode::Char(' ') => {
+                if let Some(browser) = &mut self.browser_state.panel {
+                    if browser.focus() == Focus::Projects {
+                        browser.toggle_project_marks();
+                    } else {
+                        browser.toggle_mark();
+                    }
+                }
+            }
+            KeyCode::Char('a' | 'A') => {
+                if let Some(browser) = &mut self.browser_state.panel {
+                    browser.toggle_project_marks();
+                }
+            }
+            KeyCode::Esc
+                if self
+                    .browser_state
+                    .panel
+                    .as_ref()
+                    .is_some_and(|b| !b.query.is_empty()) =>
+            {
+                if let Some(browser) = &mut self.browser_state.panel {
+                    browser.clear_search();
+                }
+            }
+            KeyCode::Esc
+                if self
+                    .browser_state
+                    .panel
+                    .as_ref()
+                    .is_some_and(|b| !b.marked.is_empty()) =>
+            {
+                if let Some(browser) = &mut self.browser_state.panel {
+                    browser.marked.clear();
+                }
+            }
             KeyCode::Esc
                 if self
                     .browser_state
@@ -1070,12 +1139,12 @@ impl Dashboard {
                     browser.toggle_sort();
                 }
             }
-            KeyCode::Tab => {
+            KeyCode::Tab | KeyCode::BackTab => {
                 if let Some(browser) = &mut self.browser_state.panel {
                     browser.toggle_focus();
                 }
             }
-            KeyCode::Left | KeyCode::BackTab => {
+            KeyCode::Left => {
                 if let Some(browser) = &mut self.browser_state.panel {
                     browser.focus_projects();
                 }
@@ -1093,11 +1162,6 @@ impl Dashboard {
             KeyCode::Char('c') => {
                 if let Some(browser) = &mut self.browser_state.panel {
                     browser.clear_search();
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(browser) = &mut self.browser_state.panel {
-                    browser.backspace();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1286,11 +1350,19 @@ impl Dashboard {
         }
         if self.home_focus == HomeFocus::Projects && self.home_sessions_state.browser.searching {
             match key {
-                KeyCode::Esc | KeyCode::Enter => self.home_sessions_state.browser.searching = false,
+                KeyCode::Esc => self.home_sessions_state.browser.clear_search(),
+                KeyCode::Enter => self.home_sessions_state.browser.searching = false,
                 KeyCode::Backspace => self.home_sessions_state.browser.backspace(),
                 KeyCode::Char(ch) => self.home_sessions_state.browser.type_char(ch),
                 _ => {}
             }
+            return true;
+        }
+        if key == KeyCode::Esc
+            && self.home_focus == HomeFocus::Projects
+            && !self.home_sessions_state.browser.query.is_empty()
+        {
+            self.home_sessions_state.browser.clear_search();
             return true;
         }
         match key {
@@ -1886,6 +1958,15 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::CleanupFinished {
+                    message,
+                    entries,
+                    mutated,
+                } => {
+                    self.accept_cleanup(message, entries, mutated);
+                    changed = true;
+                    continue;
+                }
                 AppEvent::FingerprintLoaded { generation, result } => {
                     if generation == self.fingerprint.generation {
                         self.fingerprint.task = None;

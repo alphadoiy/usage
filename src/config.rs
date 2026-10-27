@@ -27,6 +27,7 @@ pub struct AppConfig {
     pub grok_dir: Option<PathBuf>,
     pub instances: Vec<DataInstance>,
     pub resources: Vec<crate::resources::connections::ConnectionConfig>,
+    pub provider_usage: std::collections::BTreeMap<String, crate::resources::QuotaConversion>,
     pub alerts: AlertConfig,
     pub resume: ResumeMode,
 }
@@ -42,6 +43,7 @@ impl Default for AppConfig {
             grok_dir: None,
             instances: Vec::new(),
             resources: Vec::new(),
+            provider_usage: Default::default(),
             alerts: AlertConfig::default(),
             resume: ResumeMode::Auto,
         }
@@ -258,9 +260,111 @@ pub fn load_config(path: &Path, required: bool) -> Result<AppConfig, ConfigError
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| ConfigError(format!("无法读取配置: {error}")))?;
-    let raw: RawConfig = toml::from_str(&text)
+    parse_config(&text)
+}
+
+pub(crate) fn parse_config(text: &str) -> Result<AppConfig, ConfigError> {
+    let raw: RawConfig = toml::from_str(text)
         .map_err(|error| ConfigError(format!("配置不是合法的 TOML: {error}")))?;
     parse_raw(raw)
+}
+
+/// Edit only conversion settings, preserving comments, credentials and unrelated config.
+pub(crate) fn save_quota_conversion(
+    path: &Path,
+    original: &str,
+    profile: &str,
+    resource: Option<&str>,
+    conversion: &crate::resources::QuotaConversion,
+) -> Result<(), ConfigError> {
+    conversion
+        .validate()
+        .map_err(|error| ConfigError(error.to_string()))?;
+    if uuid::Uuid::parse_str(profile).is_err() {
+        return Err(ConfigError("账号 ID 无效".into()));
+    }
+    // Save through existing symlinks instead of replacing a dotfiles-managed link.
+    let resolved = std::fs::canonicalize(path)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() {
+                std::path::absolute(path)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| ConfigError(format!("无法解析配置路径: {error}")))?;
+    let path = resolved.as_path();
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(ConfigError(format!("无法读取配置: {error}"))),
+    };
+    if current != original {
+        return Err(ConfigError(
+            "配置已被其他操作更新，请重新打开额度设置".into(),
+        ));
+    }
+    let config = parse_config(original)?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .map_err(|_| ConfigError("配置不是合法的 TOML".into()))?;
+    if let Some(id) = resource {
+        if !config.resources.iter().any(|r| {
+            r.id == id
+                && r.profile_ids.iter().any(|p| p == profile)
+                && matches!(r.service.as_str(), "new_api_token" | "new_api_account")
+        }) {
+            return Err(ConfigError("资源不属于此账号或不支持额度换算".into()));
+        }
+        let row = doc
+            .get_mut("resources")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .and_then(|rows| {
+                rows.iter_mut()
+                    .find(|row| row.get("id").and_then(toml_edit::Item::as_str) == Some(id))
+            })
+            .ok_or_else(|| ConfigError("资源配置结构无法编辑".into()))?;
+        if row.get("options").is_none() {
+            row.insert("options", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let options = row
+            .get_mut("options")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| ConfigError("资源 options 不是表".into()))?;
+        for (key, value) in [
+            ("quota_per_unit", &conversion.quota_per_unit),
+            ("currency", &conversion.currency),
+        ] {
+            match value {
+                Some(value) => {
+                    options.insert(key, toml_edit::value(value));
+                }
+                None => {
+                    options.remove(key);
+                }
+            }
+        }
+    } else {
+        if doc.get("provider_usage").is_none() {
+            doc["provider_usage"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let usage = doc
+            .get_mut("provider_usage")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| ConfigError("provider_usage 不是表".into()))?;
+        if let (Some(ratio), Some(currency)) = (&conversion.quota_per_unit, &conversion.currency) {
+            let mut options = toml_edit::Table::new();
+            options.insert("quota_per_unit", toml_edit::value(ratio));
+            options.insert("currency", toml_edit::value(currency));
+            usage.insert(profile, toml_edit::Item::Table(options));
+        } else {
+            usage.remove(profile);
+        }
+    }
+    let text = doc.to_string();
+    parse_config(&text)?;
+    crate::codex_manager::private_write(path, text.as_bytes())
+        .map_err(|error| ConfigError(error.to_string()))
 }
 
 pub fn write_default_config(path: &Path, force: bool) -> Result<(), ConfigError> {
@@ -361,6 +465,15 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
         config.resume = sessions.resume;
     }
     config.resources = raw.resources.unwrap_or_default();
+    config.provider_usage = raw.provider_usage.unwrap_or_default();
+    for (id, conversion) in &config.provider_usage {
+        if uuid::Uuid::parse_str(id).is_err() {
+            return Err(ConfigError("provider_usage 的账号 ID 必须为 UUID".into()));
+        }
+        conversion
+            .validate()
+            .map_err(|error| ConfigError(error.to_string()))?;
+    }
     let mut resource_ids = std::collections::HashSet::new();
     for resource in &config.resources {
         resource
@@ -467,6 +580,7 @@ struct RawConfig {
     paths: Option<RawPaths>,
     instances: Option<Vec<DataInstance>>,
     resources: Option<Vec<crate::resources::connections::ConnectionConfig>>,
+    provider_usage: Option<std::collections::BTreeMap<String, crate::resources::QuotaConversion>>,
     alerts: Option<AlertConfig>,
     sessions: Option<RawSessions>,
 }
@@ -494,6 +608,102 @@ struct RawPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_conversion_saves_preserve_other_settings_and_reject_stale_or_invalid_edits() {
+        let root = std::env::temp_dir().join(format!("usage-conversion-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.toml");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let original = "# keep this comment\nstyle='bar'\nrefresh_seconds=90\n";
+        std::fs::write(&path, original).unwrap();
+        let conversion = crate::resources::QuotaConversion {
+            quota_per_unit: Some("500000".into()),
+            currency: Some("USD".into()),
+        };
+        save_quota_conversion(&path, original, &id, None, &conversion).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep this comment"));
+        assert_eq!(load_config(&path, true).unwrap().refresh_seconds, 90);
+        assert_eq!(
+            load_config(&path, true).unwrap().provider_usage[&id],
+            conversion
+        );
+        assert!(save_quota_conversion(&path, original, &id, None, &conversion).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        let invalid = crate::resources::QuotaConversion {
+            quota_per_unit: Some("0".into()),
+            currency: Some("USD".into()),
+        };
+        assert!(save_quota_conversion(&path, &saved, &id, None, &invalid).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        save_quota_conversion(&path, &saved, &id, None, &Default::default()).unwrap();
+        assert!(load_config(&path, true).unwrap().provider_usage.is_empty());
+
+        let resource = format!(
+            "{original}\n[[resources]]\nid='wallet'\nservice='new_api_account'\nbase_url='https://relay.invalid'\ncredential_env='ACCOUNT_TOKEN'\nprofile_ids=['{id}']\noptions={{user_id=42}}\n"
+        );
+        std::fs::write(&path, &resource).unwrap();
+        save_quota_conversion(&path, &resource, &id, Some("wallet"), &conversion).unwrap();
+        let config = load_config(&path, true).unwrap();
+        assert_eq!(config.resources[0].options["user_id"], 42);
+        assert_eq!(config.resources[0].options["quota_per_unit"], "500000");
+        assert_eq!(config.resources[0].credential_env, "ACCOUNT_TOKEN");
+        assert!(config.provider_usage.is_empty());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        save_quota_conversion(&path, &saved, &id, Some("wallet"), &Default::default()).unwrap();
+        assert_eq!(
+            load_config(&path, true).unwrap().resources[0].options,
+            serde_json::json!({"user_id":42})
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_conversion_requires_an_explicit_valid_currency_and_ratio() {
+        let id = uuid::Uuid::new_v4();
+        for options in [
+            "quota_per_unit='500000'",
+            "currency='USD'",
+            "quota_per_unit='-1'\ncurrency='USD'",
+            "quota_per_unit='500000'\ncurrency='usd'",
+            "quota_per_unit=true\ncurrency='USD'",
+        ] {
+            assert!(parse_config(&format!("[provider_usage.'{id}']\n{options}")).is_err());
+        }
+        assert!(
+            parse_config("[provider_usage.wrong]\nquota_per_unit='500000'\ncurrency='USD'")
+                .is_err()
+        );
+        assert!(parse_config("").unwrap().provider_usage.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quota_conversion_save_preserves_config_symlinks_and_rejects_dangling_links() {
+        let root = std::env::temp_dir().join(format!("usage-config-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("dotfiles.toml");
+        let link = root.join("config.toml");
+        std::fs::write(&target, "# managed config\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let conversion = crate::resources::QuotaConversion {
+            quota_per_unit: Some("500000".into()),
+            currency: Some("USD".into()),
+        };
+        save_quota_conversion(&link, "# managed config\n", &id, None, &conversion).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(
+            load_config(&target, true).unwrap().provider_usage[&id],
+            conversion
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert!(save_quota_conversion(&link, "", &id, None, &conversion).is_err());
+        assert!(link.is_symlink());
+        assert!(!target.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resolved_existing_file_and_directory_keep_valid_paths() {

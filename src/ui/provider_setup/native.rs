@@ -62,6 +62,15 @@ impl Form {
                 key: self.fields[4].trim().into(),
             });
         }
+        if self.auth_mode == AuthMode::Byok && !self.plugin {
+            return self
+                .editing
+                .as_ref()
+                .map(|(id, _, _)| ModelSource::SavedKey {
+                    id: id.clone(),
+                    base: self.fields[1].trim().into(),
+                });
+        }
         self.editing
             .as_ref()
             .map(|(id, _, _)| ModelSource::Saved(id.clone()))
@@ -968,5 +977,22 @@ mod tests {
         let cancel = pending._task.cancellation();
         drop(pending);
         assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn edited_byok_model_query_uses_the_typed_base_with_the_saved_key() {
+        let mut form = byok_form();
+        form.editing = Some(("saved-provider".into(), 1, String::new()));
+        form.fields[1] = "https://new-relay.invalid/api".into();
+        form.fields[4].clear();
+        assert!(
+            matches!(form.model_source(), Some(ModelSource::SavedKey { id, base })
+            if id == "saved-provider" && base == "https://new-relay.invalid/api")
+        );
+        form.fields[4] = "replacement-key".into();
+        assert!(
+            matches!(form.model_source(), Some(ModelSource::Endpoint { base, key })
+            if base == "https://new-relay.invalid/api" && key == "replacement-key")
+        );
     }
 }

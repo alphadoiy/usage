@@ -322,9 +322,9 @@ pub(super) fn draw(frame: &mut Frame, p: &Panel) {
         lines.push("正在读取性能索引…".into());
     }
     let footer = if p.detail.is_some() {
-        "↑↓ 滚动  PgUp/PgDn 翻页  ←→ 时间范围  r 更新日志  Esc 返回"
+        "? 操作 · ↑↓ 滚动 · PgUp/PgDn 翻页 · ←→ 范围 · r 刷新 · Esc 返回"
     } else {
-        "↑↓ 模型  Enter 请求明细  ←→ 时间范围  r 更新日志  Esc 关闭"
+        "? 操作 · ↑↓ 模型 · Enter 详情 · ←→ 范围 · r 刷新 · Esc 返回"
     };
     let body = Rect::new(
         inner.x,

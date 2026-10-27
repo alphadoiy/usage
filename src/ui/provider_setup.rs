@@ -1,9 +1,11 @@
 //! Shared onboarding; implementation packages remain behind provider identities.
 mod native;
 mod picker;
+mod quota;
 use crate::{auth, codex_manager::Profile, plugins, provider_catalog::presets};
 pub(super) use native::run as run_native;
 pub(super) use native::{AddMethod, edit, relogin};
+pub(super) use quota::edit as edit_quota;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};

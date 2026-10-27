@@ -1,17 +1,17 @@
 //! Provider inventory with independent model, quota and balance capabilities.
+mod api_models;
 mod codex;
 pub mod presets;
 mod refresh;
 mod sources;
 mod usage;
 pub use refresh::{RefreshRequest, RefreshUpdate};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 pub use usage::{ProviderUsage, QueryState, ResetHandle, UsageSource};
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
@@ -145,8 +145,7 @@ impl Plan {
 }
 
 enum Protocol {
-    OpenAi,
-    Anthropic,
+    Api(api_models::Query),
     Codex(codex::AccountModels),
     Plugin { root: PathBuf, account: String },
 }
@@ -157,23 +156,6 @@ pub struct ModelQuery {
     url: reqwest::Url,
     key: String,
     protocol: Protocol,
-}
-
-fn endpoint(base: &str) -> Result<reqwest::Url, &'static str> {
-    let mut url = crate::http::validate_api_base_url(base).map_err(|error| match error {
-        crate::http::BaseUrlError::Invalid => "模型接口地址无效",
-        crate::http::BaseUrlError::Policy => {
-            "模型接口地址需为无凭据和查询参数的 HTTPS 地址（本机回环可用 HTTP）"
-        }
-    })?;
-    let path = url.path().trim_end_matches('/');
-    let path = if path.is_empty() {
-        "/v1/models".into()
-    } else {
-        format!("{path}/models")
-    };
-    url.set_path(&path);
-    Ok(url)
 }
 
 impl ModelQuery {
@@ -198,23 +180,23 @@ impl ModelQuery {
         if key.trim().is_empty() || key.chars().any(char::is_control) {
             return Err("未提供有效的推理 API Key");
         }
-        let url = endpoint(base)?;
-        let protocol = if url.host_str() == Some("api.anthropic.com") {
-            Protocol::Anthropic
-        } else {
-            Protocol::OpenAi
-        };
+        let query = api_models::Query::new(base)?;
         Ok(Self {
             id,
-            url,
+            url: query.base.clone(),
             key,
-            protocol,
+            protocol: Protocol::Api(query),
         })
     }
 
     async fn read(&self, http: &dyn HttpClient) -> Models {
+        let timeout = if matches!(self.protocol, Protocol::Api(_)) {
+            20
+        } else {
+            12
+        };
         let result = crate::background::query(async {
-            tokio::time::timeout(Duration::from_secs(12), self.fetch(http)).await
+            tokio::time::timeout(Duration::from_secs(timeout), self.fetch(http)).await
         })
         .await;
         match result {
@@ -226,83 +208,32 @@ impl ModelQuery {
     }
 
     async fn fetch(&self, http: &dyn HttpClient) -> Result<Vec<String>, &'static str> {
-        if let Protocol::Plugin { root, account } = &self.protocol {
-            let models = crate::plugins::call_at(
-                root,
-                serde_json::json!({"operation":"models","account":account}),
-            )
-            .await
-            .map_err(|_| "插件模型目录查询失败")?;
-            return models
-                .as_array()
-                .ok_or("插件模型目录格式无效")?
-                .iter()
-                .map(|m| {
-                    m["id"]
-                        .as_str()
-                        .filter(|s| {
-                            !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
-                        })
-                        .map(str::to_owned)
-                        .ok_or("插件模型 ID 无效")
-                })
-                .collect();
-        }
-        if let Protocol::Codex(account) = &self.protocol {
-            return account.fetch(http, &self.key).await;
-        }
-        #[derive(Deserialize)]
-        struct Model {
-            id: String,
-        }
-        #[derive(Deserialize)]
-        struct Response {
-            data: Vec<Model>,
-            #[serde(default)]
-            has_more: bool,
-            last_id: Option<String>,
-        }
-        let headers = match &self.protocol {
-            Protocol::OpenAi => vec![("Authorization", format!("Bearer {}", self.key))],
-            Protocol::Anthropic => vec![
-                ("x-api-key", self.key.clone()),
-                ("anthropic-version", "2023-06-01".into()),
-            ],
-            Protocol::Codex(_) | Protocol::Plugin { .. } => unreachable!(),
-        };
-        let mut url = self.url.clone();
-        let mut models = BTreeSet::new();
-        let mut cursors = BTreeSet::new();
-        for _ in 0..20 {
-            let body = model_response(http, &url, &headers, 2 * 1024 * 1024).await?;
-            let page: Response =
-                serde_json::from_slice(&body).map_err(|_| "模型列表响应格式无效")?;
-            for model in page.data {
-                if model.id.is_empty()
-                    || model.id.len() > 256
-                    || model.id.chars().any(char::is_control)
-                {
-                    return Err("模型列表包含无效的模型名称");
-                }
-                models.insert(model.id);
+        match &self.protocol {
+            Protocol::Plugin { root, account } => {
+                let models = crate::plugins::call_at(
+                    root,
+                    serde_json::json!({"operation":"models","account":account}),
+                )
+                .await
+                .map_err(|_| "插件模型目录查询失败")?;
+                models
+                    .as_array()
+                    .ok_or("插件模型目录格式无效")?
+                    .iter()
+                    .map(|m| {
+                        m["id"]
+                            .as_str()
+                            .filter(|s| {
+                                !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
+                            })
+                            .map(str::to_owned)
+                            .ok_or("插件模型 ID 无效")
+                    })
+                    .collect()
             }
-            if models.len() > 5000 {
-                return Err("模型列表超过展示上限");
-            }
-            if !page.has_more {
-                return Ok(models.into_iter().collect());
-            }
-            let cursor = page
-                .last_id
-                .filter(|id| !id.is_empty())
-                .ok_or("模型列表分页缺少游标")?;
-            if !cursors.insert(cursor.clone()) {
-                return Err("模型列表分页游标重复");
-            }
-            url = self.url.clone();
-            url.query_pairs_mut().append_pair("after_id", &cursor);
+            Protocol::Codex(account) => account.fetch(http, &self.key).await,
+            Protocol::Api(query) => query.fetch(http, &self.key).await,
         }
-        Err("模型列表分页超过上限")
     }
 }
 
@@ -417,6 +348,7 @@ fn unavailable_plugin() -> Models {
 pub enum ModelSource {
     Saved(String),
     Endpoint { base: String, key: String },
+    SavedKey { id: String, base: String },
 }
 
 impl CatalogService {
@@ -448,6 +380,29 @@ impl CatalogService {
         let query = crate::background::blocking(move || match source {
             ModelSource::Endpoint { base, key } => ModelQuery::new("form".into(), &base, key)
                 .map_err(|e| Models::Unavailable(e.into())),
+            ModelSource::SavedKey { id, base } => {
+                let manager = Manager::open_read_only(self.root.clone())
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| Models::Unavailable("读取 Provider 账号库失败".into()))?;
+                let profile = manager
+                    .resolve(&id)
+                    .map_err(|_| Models::Unavailable("Provider 不存在".into()))?;
+                // Only a BYOK key can be used with a newly typed URL. OAuth and
+                // plugin credentials remain bound to their own model services.
+                if profile.auth_mode != AuthMode::Byok
+                    || crate::plugins::endpoint_account(&profile.base_url).is_some()
+                {
+                    return Err(Models::Unavailable(
+                        "此账号的凭据不能用于自定义模型接口".into(),
+                    ));
+                }
+                let saved = manager
+                    .model_catalog_query(&profile)
+                    .map_err(|_| unreadable_query(&profile))?;
+                ModelQuery::new("form".into(), &base, saved.key)
+                    .map_err(|e| Models::Unavailable(e.into()))
+            }
             // Only this Provider's credentials are read, through the same construction as `load`.
             ModelSource::Saved(id) => {
                 let manager = Manager::open_read_only(self.root.clone())
@@ -759,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_inference_uses_only_inference_key_and_keeps_empty_lists_distinct() {
+    async fn configured_inference_uses_only_inference_key_and_reports_empty_lists() {
         let f = Fixture::new();
         let http = Arc::new(FakeHttp::new());
         http.route(
@@ -781,14 +736,22 @@ mod tests {
             assert!(plan.catalog.apply_models(&id, models));
         })
         .await;
-        assert_eq!(plan.catalog.providers[0].models, Models::Ready(Vec::new()));
+        assert!(
+            matches!(&plan.catalog.providers[0].models, Models::Unavailable(message) if message.contains("模型列表为空"))
+        );
         let calls = http.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method, "GET");
         assert!(calls[0].body.is_none());
-        assert_eq!(
-            calls[0].headers,
-            vec![("Authorization".into(), "Bearer synthetic-inference".into())]
+        assert!(
+            calls[0]
+                .headers
+                .contains(&("Authorization".into(), "Bearer synthetic-inference".into()))
+        );
+        assert!(
+            calls[0]
+                .headers
+                .contains(&("x-api-key".into(), "synthetic-inference".into()))
         );
         assert!(!format!("{:?}", plan.catalog).contains("synthetic-inference"));
     }
@@ -808,7 +771,13 @@ mod tests {
                 assert_eq!(method, "GET");
                 assert_eq!(url, "https://relay.invalid/v1/models");
                 assert!(body.is_none());
-                let model = match headers[0].1.as_str() {
+                let token = headers
+                    .iter()
+                    .find(|(name, _)| *name == "Authorization")
+                    .unwrap()
+                    .1
+                    .as_str();
+                let model = match token {
                     "Bearer synthetic-a" => "model-for-a",
                     "Bearer synthetic-b" => "model-for-b",
                     other => panic!("unexpected fixture credential: {other}"),
@@ -870,9 +839,18 @@ mod tests {
                 headers: &[(&str, String)],
                 _body: Option<Vec<u8>>,
             ) -> Result<HttpResponse, TransportError> {
-                let model = match (url, headers[0].1.as_str()) {
+                let token = headers
+                    .iter()
+                    .find(|(name, _)| *name == "Authorization")
+                    .unwrap()
+                    .1
+                    .as_str();
+                let model = match (url, token) {
                     ("https://relay.invalid/v1/models", "Bearer synthetic-a") => "model-for-a",
                     ("https://typed.invalid/v1/models", "Bearer typed-key") => "typed-model",
+                    ("https://typed.invalid/v1/models", "Bearer synthetic-a") => {
+                        "model-with-saved-key"
+                    }
                     other => panic!("unexpected fixture request: {other:?}"),
                 };
                 response(200, &json!({"data":[{"id":model}]}).to_string())
@@ -904,7 +882,7 @@ mod tests {
         );
         let models = |source| service.clone().models(source);
         assert_eq!(
-            models(ModelSource::Saved(a.id)).await,
+            models(ModelSource::Saved(a.id.clone())).await,
             Models::Ready(vec!["model-for-a".into()])
         );
         assert_eq!(
@@ -915,6 +893,22 @@ mod tests {
             .await,
             Models::Ready(vec!["typed-model".into()])
         );
+        assert_eq!(
+            models(ModelSource::SavedKey {
+                id: a.id,
+                base: "https://typed.invalid/v1".into()
+            })
+            .await,
+            Models::Ready(vec!["model-with-saved-key".into()])
+        );
+        assert!(matches!(
+            models(ModelSource::SavedKey {
+                id: orphan.id.clone(),
+                base: "https://typed.invalid/v1".into()
+            })
+            .await,
+            Models::Unavailable(_)
+        ));
         assert_eq!(
             models(ModelSource::Saved(orphan.id)).await,
             unavailable_plugin()
@@ -1103,6 +1097,27 @@ mod tests {
                         || value.contains("synthetic-billing-token"))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn typed_endpoints_cannot_use_saved_oauth_tokens() {
+        let f = Fixture::new();
+        let mut manager = Manager::open(f.0.clone()).unwrap();
+        let (profile, _, _) = oauth_profile(&mut manager, &f.0, "fixture-workspace", "999.0.0");
+        let http = Arc::new(FakeHttp::new());
+        let service = Arc::new(CatalogService::new(
+            f.0.clone(),
+            http.clone(),
+            Arc::new(|_| panic!("unexpected credential lookup")),
+        ));
+        let result = service
+            .models(ModelSource::SavedKey {
+                id: profile.id,
+                base: "https://relay.invalid/v1".into(),
+            })
+            .await;
+        assert!(matches!(result, Models::Unavailable(_)));
+        assert!(http.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

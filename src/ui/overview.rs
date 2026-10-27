@@ -52,9 +52,6 @@ pub(super) fn lines(
         }
         return lines;
     };
-    if loading {
-        lines.push(Line::from("更新状态中…").dim());
-    }
     if catalog.providers.is_empty() {
         lines.push(Line::from("尚无 Provider · a 添加服务商 · F4 添加账号").dim());
     }
@@ -186,28 +183,17 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                             )
                         }
                         ResourceMetric::Allowance {
-                            unit, unlimited, ..
-                        } if matches!(unit.as_str(), "new_api_quota" | "sub2api_quota") => {
-                            if *unlimited {
-                                "令牌不限额".into()
-                            } else if snapshot
-                                .metrics
-                                .iter()
-                                .any(|metric| matches!(metric, ResourceMetric::Balance { .. }))
-                            {
-                                continue;
-                            } else {
-                                "余额：未配置换算比例或币种".into()
-                            }
-                        }
-                        ResourceMetric::Allowance {
                             remaining,
                             used,
                             unit,
                             unlimited,
                         } => format!(
                             "{} · 已用 {} · {}",
-                            unit,
+                            if matches!(unit.as_str(), "new_api_quota" | "sub2api_quota") {
+                                "原始额度"
+                            } else {
+                                unit
+                            },
                             allowance_amount(used.as_deref(), unit),
                             if *unlimited {
                                 match remaining {
@@ -220,6 +206,27 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                             } else {
                                 format!("剩余 {}", allowance_amount(remaining.as_deref(), unit))
                             }
+                        ),
+                        ResourceMetric::AllowanceWindow {
+                            name,
+                            used,
+                            limit,
+                            remaining,
+                            unit,
+                            resets_at,
+                        } => format!(
+                            "{} · 已用 {} / {} {} · 剩余 {}{}",
+                            clean(&crate::labels::tier_label(name)),
+                            used,
+                            limit,
+                            clean(unit),
+                            remaining,
+                            resets_at
+                                .map(|t| format!(
+                                    " · {} 重置",
+                                    t.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                                ))
+                                .unwrap_or_default()
                         ),
                         ResourceMetric::QuotaWindow {
                             name,
@@ -362,6 +369,58 @@ pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_amounts_and_spending_windows_remain_visible_without_claiming_wallet_balance() {
+        use crate::resources::{ResourceBinding, ResourceSnapshot};
+        let binding = ResourceBinding {
+            account: "fixture".into(),
+            revision: "1".into(),
+        };
+        let usage = ProviderUsage {
+            sources: vec![crate::provider_catalog::UsageSource {
+                target: "fixture".into(),
+                label: "令牌".into(),
+                service: "auto_detect".into(),
+                binding: binding.clone(),
+                state: QueryState::Result(ResourceSnapshot {
+                    binding,
+                    service: "auto_detect".into(),
+                    scope: ResourceScope::Token,
+                    state: ResourceState::Ready,
+                    metrics: vec![
+                        ResourceMetric::Allowance {
+                            remaining: Some("9007199254740993".into()),
+                            used: Some("1".into()),
+                            unit: "new_api_quota".into(),
+                            unlimited: false,
+                        },
+                        ResourceMetric::AllowanceWindow {
+                            name: "5 hours".into(),
+                            used: "2.5".into(),
+                            limit: "10".into(),
+                            remaining: "7.5".into(),
+                            unit: "USD".into(),
+                            resets_at: None,
+                        },
+                    ],
+                    queried_at: None,
+                    message: None,
+                }),
+            }],
+            ..Default::default()
+        };
+        let output = usage_lines(&usage, true)
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(output.contains("原始额度"));
+        assert!(output.contains("9007199254740993"));
+        assert!(output.contains("2.5 / 10 USD"));
+        assert!(output.contains("剩余 7.5"));
+        assert!(!output.contains("余额"));
+        assert!(!output.contains("重置"));
+    }
 
     #[test]
     fn credit_display_rounds_only_for_presentation_and_keeps_unknown_values_unknown() {

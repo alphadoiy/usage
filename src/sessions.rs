@@ -262,12 +262,22 @@ fn load_source(
     if cancel.is_cancelled() {
         return;
     }
+    let hidden = match crate::session_cleanup::Store::default().hidden(source.kind.id(), &home) {
+        Ok(hidden) => hidden,
+        Err(error) => {
+            catalog
+                .warnings
+                .push(format!("会话回收站读取失败：{error}"));
+            return;
+        }
+    };
     match result {
         Ok(records) => catalog.sessions.extend(
             records
                 .into_iter()
                 .filter(|record| {
                     source.kind.valid_session_id(&record.id)
+                        && !hidden.contains(&record.id)
                         && record.cwd.is_absolute()
                         && record.cwd.is_dir()
                 })

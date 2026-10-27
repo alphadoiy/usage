@@ -91,49 +91,42 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     } else {
         render_home(body, frame.buffer_mut(), app);
     }
-    let footer_text = if app.history_state.panel.is_some() {
-        if frame.area().width >= 105 {
-            " ↑新 ↓旧  ←/→ 周  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  Tab 来源  c 清筛选  r 更新  Esc 返回"
-        } else {
-            " ↑新 ↓旧  Enter 会话  v 范围  f 项目  M 模型  i 实例  m 日/月  r 更新  Esc 返回"
-        }
+    let footer_text = if app
+        .history_state
+        .panel
+        .as_ref()
+        .is_some_and(|p| p.is_editing())
+    {
+        " 输入筛选条件 · ↑/↓ 选择 · Enter 应用 · Esc 取消"
+    } else if app.history_state.panel.is_some() {
+        " ? 操作 · ↑新 ↓旧 · ←/→ 周 · Enter 会话 · Tab 来源 · r 刷新 · Esc 返回"
     } else if let Some(browser) = &app.browser_state.panel {
-        if app.browser_state.loading {
-            " 正在读取本机会话… Esc 返回"
+        if browser.searching {
+            " 输入搜索 · Enter 应用 · Esc 清除并返回"
         } else if browser.launching {
-            " 正在 Ghostty 右侧打开会话… 请等待"
+            " 正在打开会话，请等待…"
         } else {
-            " ↑/↓ 选择  Tab 列表  Enter 打开  / 搜索  o 排序  R 恢复方式  y 复制  c 清除  r 更新  Esc 返回"
+            " ? 操作 · ↑/↓ 选择 · Tab 列表 · Enter 打开 · / 搜索 · Space 勾选 · d 删除 · Esc 返回"
         }
     } else {
         match app.reset.as_ref().map(|flow| &flow.stage) {
-            Some(ResetStage::Loading) => " 正在查询重置次数…   n/Esc 取消",
-            Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次   n/Esc 取消",
+            Some(ResetStage::Loading) => " 正在查询重置次数… · Esc 取消",
+            Some(ResetStage::Confirm(_)) => " y 确认消耗 1 次 · n / Esc 取消",
             Some(ResetStage::Executing) => " 正在提交主动重置，请等待结果…",
             Some(ResetStage::Result(_)) => " Enter / Esc 返回",
             None if app.home_sessions_state.browser.launching => " 正在恢复会话，请等待…",
+            None if app.home_sessions_state.browser.searching => {
+                " 输入搜索 · Enter 应用 · Esc 清除并返回"
+            }
             None => match app.home_focus {
                 crate::ui::home::Focus::Providers => {
-                    if crate::ui::overview::selected(
-                        app.overview_state.catalog.as_ref(),
-                        app.home_provider.as_deref(),
-                    )
-                    .is_some_and(|(_, provider)| crate::ui::subscription_tests::supports(provider))
-                    {
-                        " Tab 看板  ←/→ Provider  ↑/↓ 滚动  a 添加  Enter 模型  t 订阅测试  v 性能  x 重置  c 签到  r 刷新  F4 管理  q 退出"
-                    } else {
-                        " Tab 看板  ←/→ Provider  ↑/↓ 滚动  a 添加  Enter 模型  v 性能  x 重置  c 签到  r 刷新  F4 管理  q 退出"
-                    }
+                    " ? 操作 · Tab 看板 · ←/→ Provider · ↑/↓ 滚动 · Enter 模型 · r 刷新 · q 退出"
                 }
                 crate::ui::home::Focus::Connections => {
-                    if app.home_connections.is_details() {
-                        " ↑/↓ 滚动详情  Esc 返回状态列表  Tab 看板  r 刷新  q 退出"
-                    } else {
-                        " Tab 看板  ↑/↓ 选择厂商  Enter 事件与历史  r 刷新  q 退出"
-                    }
+                    " ? 操作 · Tab 看板 · ↑/↓ 选择或滚动 · Enter 详情 · r 刷新 · Esc 返回"
                 }
                 crate::ui::home::Focus::Projects => {
-                    " Tab 看板  ↑/↓ 选择  ←项目 →会话  Enter 恢复  / 搜索  R 恢复方式  r 刷新  q 退出"
+                    " ? 操作 · Tab 看板 · ↑/↓ 选择 · Enter 打开 · / 搜索 · r 刷新 · Esc 返回"
                 }
             },
         }
@@ -153,6 +146,12 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
         crate::ui::performance::draw(frame, panel);
     }
     if let Some(menu) = &app.menu {
+        menu.render(frame);
+    }
+    if let Some(panel) = &app.cleanup {
+        panel.render(frame, app.cleanup_store.path());
+    }
+    if let Some(menu) = &app.shortcuts {
         menu.render(frame);
     }
 }
@@ -248,7 +247,7 @@ pub(super) fn home_lines(app: &Dashboard, width: u16) -> Vec<Line<'static>> {
 pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
     use crate::ui::home::{self, Focus as HomeFocus};
     let [providers, connections, projects] = home::areas(area);
-    let provider_title = crate::ui::overview::selected(
+    let mut provider_title = crate::ui::overview::selected(
         app.overview_state.catalog.as_ref(),
         app.home_provider.as_deref(),
     )
@@ -260,6 +259,10 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
         )
     })
     .unwrap_or_else(|| "Provider".into());
+    // Refresh feedback belongs in the border so cached content keeps its rows.
+    if app.overview_state.loading {
+        provider_title.push_str(" · 更新中");
+    }
     let inner = home::board(
         providers,
         buf,

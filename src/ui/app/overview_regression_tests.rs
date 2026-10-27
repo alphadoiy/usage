@@ -67,6 +67,46 @@ fn rendered(app: &Dashboard, width: u16, height: u16) -> String {
         .join("\n")
 }
 
+#[test]
+fn provider_refresh_keeps_content_rows_and_scroll_position() {
+    let mut app = dashboard();
+    let mut catalog = overview();
+    catalog.providers[0].models =
+        Models::Ready((0..12).map(|index| format!("model-{index}")).collect());
+    app.overview_state.catalog = Some(catalog);
+    for expanded in [false, true] {
+        app.home_models_expanded = expanded;
+        for scroll in [0, 3] {
+            app.home_scroll = scroll;
+            for (width, height) in [(100, 20), (24, 6)] {
+                app.overview_state.loading = false;
+                let idle = rendered(&app, width, height);
+                app.overview_state.loading = true;
+                assert_eq!(rendered(&app, width, height), idle);
+                assert_eq!(app.home_scroll, scroll);
+            }
+        }
+    }
+    let area = Rect::new(0, 0, 120, 40);
+    let mut buffer = Buffer::empty(area);
+    render_home(area, &mut buffer, &app);
+    let title: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+    assert!(
+        title
+            .split_whitespace()
+            .collect::<String>()
+            .contains("Provider·1/1·更新中")
+    );
+
+    app.overview_state.catalog = None;
+    assert!(
+        rendered(&app, 40, 6)
+            .split_whitespace()
+            .collect::<String>()
+            .contains("正在读取Provider…")
+    );
+}
+
 #[tokio::test]
 async fn automatic_refresh_keeps_content_and_skips_models_while_manual_refresh_requeries() {
     use crate::http::{HttpClient, HttpResponse, TransportError};
@@ -431,9 +471,9 @@ fn provider_budget_updates_are_scoped_by_generation_and_identity_and_render_abov
     assert!(output.contains("余额12.345678USD"));
     assert!(output.contains("USD（接口返回）"));
     assert!(output.contains("令牌不限额"));
-    assert!(!output.contains("原始额度"));
-    assert!(!output.contains("6172839"));
-    assert!(!output.contains("1000000"));
+    assert!(output.contains("原始额度"));
+    assert!(output.contains("6172839"));
+    assert!(output.contains("1000000"));
     assert!(!output.contains("账号余额需配置"));
     assert!(output.contains("工作令牌·令牌"));
     assert!(output.find("余额12.345678USD").unwrap() < output.find("默认模型").unwrap());

@@ -341,6 +341,19 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
                 ResourceMetric::QuotaWindow {
                     name, used_percent, ..
                 } => format!("  {name} · 已用 {used_percent:.0}%"),
+                ResourceMetric::AllowanceWindow {
+                    name,
+                    used,
+                    limit,
+                    remaining,
+                    unit,
+                    resets_at,
+                } => format!(
+                    "  {name} · 已用 {used} / {limit} {unit} · 剩余 {remaining}{}",
+                    resets_at
+                        .map(|t| format!(" · {} 重置", t.to_rfc3339()))
+                        .unwrap_or_default()
+                ),
                 ResourceMetric::ResetCredits { available } => {
                     format!("  主动重置 {available} 次")
                 }

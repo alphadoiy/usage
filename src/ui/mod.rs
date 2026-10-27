@@ -12,6 +12,7 @@ mod provider_actions;
 mod provider_manager;
 mod provider_setup;
 mod session_browser;
+mod shortcuts;
 mod subscription_tests;
 pub(crate) mod terminal;
 /// Reusable subscription quota widgets; the home Provider board uses the model catalog.

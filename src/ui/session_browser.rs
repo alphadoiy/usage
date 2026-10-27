@@ -39,6 +39,7 @@ pub struct SessionBrowser {
     pub query: String,
     pub searching: bool,
     pub launching: bool,
+    pub marked: HashSet<SessionKey>,
     usage: HashMap<SessionKey, SessionUsage>,
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
@@ -59,6 +60,7 @@ impl SessionBrowser {
             query: String::new(),
             searching: false,
             launching: false,
+            marked: HashSet::new(),
             usage: HashMap::new(),
             filter_label: None,
             sort_tokens: false,
@@ -135,6 +137,57 @@ impl SessionBrowser {
         self.projects.get(self.project_selected).map(|p| &p.cwd)
     }
 
+    pub fn project_sessions(&self) -> Vec<Session> {
+        self.projects
+            .get(self.project_selected)
+            .map_or_else(Vec::new, |project| {
+                project
+                    .sessions
+                    .iter()
+                    .map(|&index| self.sessions[index].clone())
+                    .collect()
+            })
+    }
+
+    pub fn toggle_mark(&mut self) {
+        if let Some(session) = self.selected_session() {
+            let key = session.key();
+            if !self.marked.remove(&key) {
+                self.marked.insert(key);
+            }
+        }
+    }
+
+    pub fn toggle_project_marks(&mut self) {
+        let keys: Vec<_> = self
+            .projects
+            .get(self.project_selected)
+            .into_iter()
+            .flat_map(|project| &project.sessions)
+            .map(|&index| self.sessions[index].key())
+            .collect();
+        let all = keys.iter().all(|key| self.marked.contains(key));
+        for key in keys {
+            if all {
+                self.marked.remove(&key);
+            } else {
+                self.marked.insert(key);
+            }
+        }
+    }
+
+    pub fn cleanup_selection(&self) -> Vec<Session> {
+        if self.marked.is_empty() {
+            self.selected_session().cloned().into_iter().collect()
+        } else {
+            self.sessions
+                .iter()
+                .filter(|s| self.marked.contains(&s.key()))
+                .cloned()
+                .collect()
+        }
+    }
+
     pub fn move_by(&mut self, delta: isize) {
         match self.focus {
             Focus::Projects if !self.projects.is_empty() => {
@@ -180,6 +233,8 @@ impl SessionBrowser {
         let previous_project = self.selected_project().cloned();
         let previous_session = self.selected_session().map(Session::key);
         self.sessions = sessions;
+        let keys: HashSet<_> = self.sessions.iter().map(Session::key).collect();
+        self.marked.retain(|key| keys.contains(key));
         self.launching = false;
         self.rebuild_with_selection(previous_project, previous_session);
     }
@@ -356,7 +411,7 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         format!(" 搜索：{}{cursor}", browser.query)
     };
     let search = format!(
-        "{}{} · {}",
+        "{}{} · {} · 已选 {} · b 回收站",
         browser
             .filter_label
             .as_ref()
@@ -366,7 +421,8 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
             "Token 排序"
         } else {
             "最近活动"
-        }
+        },
+        browser.marked.len(),
     );
     Paragraph::new(search)
         .style(Style::new().fg(DIM))
@@ -628,6 +684,11 @@ fn render_session_list(
                         ),
                         Style::new().fg(BLUE),
                     ),
+                    Span::raw(if browser.marked.contains(&session.key()) {
+                        "[✓] "
+                    } else {
+                        "[ ] "
+                    }),
                     Span::raw(format!(
                         "{}{}",
                         if session.instance != session.provider.id() {
@@ -670,6 +731,28 @@ fn clean(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_marks_keep_instance_identity_and_filtered_project_scope() {
+        let first = session(AgentKind::CODEX, "keep this", "/tmp/project", 1);
+        let mut second = first.clone();
+        second.instance = "other-instance".into();
+        second.title = "exclude this".into();
+        let mut browser = SessionBrowser::new(vec![first.clone(), second.clone()]);
+        for ch in "keep".chars() {
+            browser.type_char(ch);
+        }
+        browser.toggle_project_marks();
+        assert_eq!(browser.marked.len(), 1);
+        assert_eq!(browser.cleanup_selection()[0].instance, first.instance);
+        browser.clear_search();
+        assert_eq!(browser.marked.len(), 1);
+        browser.toggle_project_marks();
+        assert_eq!(browser.marked.len(), 2);
+        browser.refresh(vec![second.clone()]);
+        assert_eq!(browser.marked.len(), 1);
+        assert_eq!(browser.cleanup_selection()[0].instance, second.instance);
+    }
 
     fn session(provider: AgentKind, title: &str, cwd: &str, recency: i64) -> Session {
         Session {

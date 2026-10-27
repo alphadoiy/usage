@@ -222,9 +222,18 @@ impl CatalogService {
                 return Err("CC Switch 中的用量查询未启用".into());
             }
             let prepared = imported_connection(profile, settings, &query)?;
-            let Some((connection, key)) = prepared else {
+            let Some((mut connection, key)) = prepared else {
                 return Err("此 CC Switch 用量模板尚未接入，请配置 resources 查询服务".into());
             };
+            if matches!(
+                connection.service.as_str(),
+                "new_api_token" | "new_api_account"
+            ) && let Some(conversion) = config.provider_usage.get(&profile.id)
+                && let Some(ratio) = &conversion.quota_per_unit
+            {
+                connection.options["quota_per_unit"] = serde_json::json!(ratio);
+                connection.options["currency"] = serde_json::json!(conversion.currency);
+            }
             let credentials: Arc<CredentialResolver> = Arc::new(move |_| Ok(key.clone()));
             let reader = self
                 .usage_service()
@@ -234,7 +243,7 @@ impl CatalogService {
         })();
         match result {
             Ok(Some((connection, reader))) => attach(plan, &profile.id, &connection, Ok(reader)),
-            Ok(None) => self.add_detected_usage(plan, manager, profile),
+            Ok(None) => self.add_detected_usage(plan, manager, profile, config),
             Err(message) => {
                 plan.catalog
                     .providers
@@ -248,7 +257,13 @@ impl CatalogService {
     }
 
     /// Same-origin protocol detection for BYOK relays that have no Usage resource yet.
-    fn add_detected_usage(&self, plan: &mut Plan, manager: &Manager, profile: &Profile) {
+    fn add_detected_usage(
+        &self,
+        plan: &mut Plan,
+        manager: &Manager,
+        profile: &Profile,
+        config: &AppConfig,
+    ) {
         if profile.auth_mode != AuthMode::Byok
             || crate::plugins::endpoint_account(&profile.base_url).is_some()
         {
@@ -273,13 +288,23 @@ impl CatalogService {
                     };
                     vec![
                         ("new_api_token".to_owned(), root.clone()),
-                        ("sub2api_usage".to_owned(), root),
+                        ("sub2api_usage".to_owned(), root.clone()),
+                        ("openai_credit_grants".to_owned(), root),
                     ]
                 }
             };
         let mut readers: Vec<Arc<dyn ResourceReader>> = Vec::new();
         let resources = self.usage_service();
         for (service, base_url) in candidates {
+            let options = if service == "new_api_token" {
+                config
+                    .provider_usage
+                    .get(&profile.id)
+                    .map(|conversion| serde_json::json!(conversion))
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
             let connection = ConnectionConfig {
                 id: format!("auto:{}", profile.id),
                 label: Some("自动识别".into()),
@@ -287,7 +312,7 @@ impl CatalogService {
                 base_url,
                 credential_env: "USAGE_INFERENCE_KEY".into(),
                 revision: profile.revision.to_string(),
-                options: serde_json::Value::Null,
+                options,
                 profile_ids: vec![profile.id.clone()],
                 inference: None,
             };
@@ -301,7 +326,14 @@ impl CatalogService {
         }
         let binding = ResourceBinding {
             account: profile.id.clone(),
-            revision: profile.revision.to_string(),
+            revision: {
+                use sha2::{Digest, Sha256};
+                let mut hash = Sha256::new();
+                for reader in &readers {
+                    hash.update(reader.binding().cache_key(reader.service()));
+                }
+                format!("{:x}", hash.finalize())
+            },
         };
         // Vendor protocols resolve to one reader; relays get sequential same-origin probing.
         if readers.len() == 1 {
@@ -947,7 +979,11 @@ mod tests {
         ] {
             let f = ManualFixture::new("https://unknown.invalid/v1");
             let http = Arc::new(FakeHttp::new());
-            for path in ["api/usage/token", "v1/usage"] {
+            for path in [
+                "api/usage/token",
+                "v1/usage",
+                "dashboard/billing/credit_grants",
+            ] {
                 http.route(
                     format!("https://unknown.invalid/{path}"),
                     Ok(HttpResponse {
@@ -963,8 +999,87 @@ mod tests {
             assert!(snapshot.metrics.is_empty());
             assert!(!snapshot.message.as_deref().unwrap().contains("已识别"));
             assert_detected_result_applies(&mut plan, snapshot);
-            assert_eq!(http.calls.lock().unwrap().len(), 2);
+            assert_eq!(http.calls.lock().unwrap().len(), 3);
         }
+    }
+
+    #[tokio::test]
+    async fn detection_reaches_legacy_credit_grants_and_conversion_changes_invalidate_identity() {
+        let f = ManualFixture::new("https://relay.invalid/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route(
+            "https://relay.invalid/dashboard/billing/credit_grants",
+            reply(r#"{"total_available":"8.75"}"#),
+        );
+        let service = f.service(http.clone());
+        let mut plan = service.load(&AppConfig::default()).unwrap();
+        let snapshot = plan.resources[0].read().await;
+        assert_eq!(snapshot.state, ResourceState::Ready);
+        assert!(
+            snapshot
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("openai_credit_grants")
+        );
+        assert_detected_result_applies(&mut plan, snapshot);
+        assert_eq!(http.calls.lock().unwrap().len(), 3);
+
+        let id = f.manager.list().unwrap()[0].id.clone();
+        let before = service.load(&AppConfig::default()).unwrap().resources[0]
+            .binding()
+            .clone();
+        let mut config = AppConfig::default();
+        config.provider_usage.insert(
+            id,
+            crate::resources::QuotaConversion {
+                quota_per_unit: Some("500000".into()),
+                currency: Some("USD".into()),
+            },
+        );
+        let after = service.load(&config).unwrap().resources[0]
+            .binding()
+            .clone();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn automatic_new_api_conversion_keeps_raw_quota_and_applies_to_the_catalog() {
+        let f = ManualFixture::new("https://relay.invalid/v1");
+        let http = Arc::new(FakeHttp::new());
+        http.route("https://relay.invalid/api/usage/token", reply(r#"{"success":true,"data":{"object":"token_usage","total_used":"1000000","total_available":"6172839","unlimited_quota":false}}"#));
+        let id = f.manager.list().unwrap()[0].id.clone();
+        let mut config = AppConfig::default();
+        config.provider_usage.insert(
+            id.clone(),
+            crate::resources::QuotaConversion {
+                quota_per_unit: Some("500000".into()),
+                currency: Some("USD".into()),
+            },
+        );
+        let service = f.service(http);
+        let mut plan = service.load(&config).unwrap();
+        let snapshot = plan.resources[0].read().await;
+        assert_eq!(snapshot.state, ResourceState::Ready);
+        assert!(
+            snapshot
+                .metrics
+                .contains(&crate::resources::ResourceMetric::Balance {
+                    remaining: crate::resources::Money {
+                        amount: "12.345678".into(),
+                        currency: "USD".into()
+                    }
+                })
+        );
+        assert!(snapshot.metrics.iter().any(|m| matches!(m, crate::resources::ResourceMetric::Allowance { remaining: Some(value), .. } if value == "6172839")));
+        assert_detected_result_applies(&mut plan, snapshot);
+        let mut raw = service.load(&AppConfig::default()).unwrap();
+        raw.reuse(&plan.catalog, false);
+        assert!(matches!(
+            raw.catalog.providers[0].usage.sources[0].state,
+            QueryState::Loading
+        ));
+        assert_eq!(f.manager.resolve(&id).unwrap().revision, 1);
     }
 
     #[tokio::test]
@@ -993,6 +1108,10 @@ mod tests {
         );
         http.route(
             "https://unknown.invalid/v1/usage",
+            reply(r#"{"unexpected":true}"#),
+        );
+        http.route(
+            "https://unknown.invalid/dashboard/billing/credit_grants",
             reply(r#"{"unexpected":true}"#),
         );
         let plan = f.service(http).load(&AppConfig::default()).unwrap();

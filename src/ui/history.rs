@@ -517,15 +517,22 @@ impl HistoryPanel {
                     self.filter = Some(source.into());
                 }
             }
-            KeyCode::Tab => {
-                self.filter = match self
+            KeyCode::Tab | KeyCode::BackTab => {
+                let index = self
                     .filter
                     .as_ref()
                     .and_then(|s| self.allowed.iter().position(|a| a == s))
-                {
-                    None => self.allowed.first().cloned(),
-                    Some(i) => self.allowed.get(i + 1).cloned(),
+                    .map_or(0, |i| i + 1);
+                let count = self.allowed.len() + 1;
+                let next = if key == KeyCode::BackTab {
+                    (index + count - 1) % count
+                } else {
+                    (index + 1) % count
                 };
+                self.filter = next
+                    .checked_sub(1)
+                    .and_then(|i| self.allowed.get(i))
+                    .cloned();
             }
             KeyCode::Char('[') | KeyCode::Char(']') if self.range == TimeRange::Year => {
                 let year = self.selected.year() + if key == KeyCode::Char('[') { -1 } else { 1 };
@@ -1334,6 +1341,10 @@ mod tests {
     #[test]
     fn filters_leap_day_activity_jumps_and_small_terminals() {
         let mut p = panel(false);
+        let original = p.filter.clone();
+        p.key(KeyCode::BackTab);
+        p.key(KeyCode::Tab);
+        assert_eq!(p.filter, original);
         p.selected = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap();
         p.key(KeyCode::Char(']'));
         assert_eq!(p.selected.to_string(), "2025-02-28");

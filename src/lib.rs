@@ -29,6 +29,7 @@ pub mod registry;
 pub mod resources;
 pub mod runs;
 pub mod service_status;
+pub mod session_cleanup;
 pub mod sessions;
 pub mod statusline;
 pub mod theme;

@@ -7,11 +7,16 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value;
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct QuotaOptions {
-    quota_per_unit: Option<String>,
-    currency: Option<String>,
+pub struct QuotaConversion {
+    pub quota_per_unit: Option<String>,
+    pub currency: Option<String>,
+}
+impl QuotaConversion {
+    pub(crate) fn validate(&self) -> Result<(), RegistryError> {
+        validate_conversion(self.quota_per_unit.as_deref(), self.currency.as_deref())
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,14 +43,14 @@ fn validate_conversion(ratio: Option<&str>, currency: Option<&str>) -> Result<()
     }
 }
 
-pub(super) struct Token(QuotaOptions);
+pub(super) struct Token(QuotaConversion);
 pub(super) struct Account(AccountOptions);
 #[async_trait]
 impl ApiProtocol for Token {
     const SERVICE: &'static str = "new_api_token";
     fn configure(value: &Value) -> Result<Self, RegistryError> {
-        let opts: QuotaOptions = options(value)?;
-        validate_conversion(opts.quota_per_unit.as_deref(), opts.currency.as_deref())?;
+        let opts: QuotaConversion = options(value)?;
+        opts.validate()?;
         Ok(Self(opts))
     }
     fn scope(&self) -> ResourceScope {
