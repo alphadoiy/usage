@@ -39,7 +39,13 @@ jobs:
       - name: Rust tests
         run: cargo +stable test --locked -- --test-threads=1
       - name: Plugin protocol and action tests
-        run: node --test src/plugins/protocol.test.mjs src/plugins/actions.test.mjs src/plugins/trae_actions.test.mjs
+        run: node --test src/plugins/*.test.mjs
+      - name: TUI workflow contracts
+        run: python3 tests/support/ui_workflows.py target/debug/usage
+      - name: Install pinned native Codex for contract tests
+        run: npm install --prefix "$RUNNER_TEMP/usage-native-codex" --no-audit --no-fund @openai/codex@0.165.0
+      - name: Native Codex context and shared-session contracts
+        run: python3 tests/support/native_codex_context.py target/debug/usage "$RUNNER_TEMP/usage-native-codex/node_modules/.bin/codex"
       - name: Experiment runner tests
         run: python3 -m unittest discover -s scripts/ablation -p 'test_*.py'
       - name: Ablation anchors

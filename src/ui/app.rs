@@ -28,6 +28,7 @@ use crate::ui::session_browser::{Focus, SessionBrowser};
 mod cleanup;
 mod preview;
 mod render;
+mod resume_provider;
 mod shortcuts;
 mod state;
 #[cfg(test)]
@@ -64,6 +65,10 @@ impl BrowserUsageRequest {
 }
 
 enum AppEvent {
+    ResumeProviders {
+        request: String,
+        result: Result<Vec<sessions::ResumeChoice>, String>,
+    },
     SessionPreview {
         generation: u64,
         request: preview::Request,
@@ -211,6 +216,27 @@ pub fn run(
     run_dashboard(handle, app)
 }
 
+pub(super) fn run_from_page(
+    handle: Handle,
+    config_path: Option<PathBuf>,
+    action: MenuAction,
+) -> io::Result<()> {
+    let path = config_path
+        .clone()
+        .unwrap_or_else(crate::config::default_config_path);
+    let config =
+        crate::config::load_config(&path, config_path.is_some()).map_err(io::Error::other)?;
+    let providers = crate::providers::builtin_factory()
+        .create_many(&config.providers, crate::cli::make_context(&config))
+        .map_err(io::Error::other)?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    let mut app = Dashboard::new(providers, config, path);
+    app.navigate_page(action, &handle);
+    run_dashboard(handle, app)
+}
+
 /// Runs the TUI with additional or replacement local session sources.
 pub fn run_with_sessions(
     handle: Handle,
@@ -338,6 +364,13 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     {
                         break Ok(());
                     }
+                    if app.handle_resume_provider_key(key.code, &handle) {
+                        if let Err(error) = fulfill_resume_plan(&mut app, &handle, &mut terminal) {
+                            break Err(error);
+                        }
+                        redraw.invalidate();
+                        continue;
+                    }
                     match app.handle_shortcuts_key(key.code) {
                         Some(super::shortcuts::Decision::Run(code)) => key.code = code,
                         Some(_) => {
@@ -368,19 +401,14 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     if let Some(command) = app.handle_navigation_key(key.code) {
                         match command {
                             MenuCommand::Activate(MenuAction::Quit) => break Ok(()),
-                            MenuCommand::Activate(MenuAction::Home) => {
-                                app.close_history();
-                                app.close_browser(false);
-                                app.refresh_background(&handle);
-                            }
-                            MenuCommand::Activate(MenuAction::History) => app.open_history(&handle),
-                            MenuCommand::Activate(MenuAction::Sessions) => {
-                                app.browser_state.filter = None;
-                                app.open_browser(&handle);
-                            }
+                            MenuCommand::Activate(
+                                action @ (MenuAction::Home
+                                | MenuAction::History
+                                | MenuAction::Sessions),
+                            ) => app.navigate_page(action, &handle),
                             MenuCommand::Activate(MenuAction::Providers) => {
                                 crate::ui::terminal::leave();
-                                let result = crate::ui::run_provider_manager_with_config(
+                                let result = super::provider_manager::run_embedded(
                                     handle.clone(),
                                     Some(app.config_path.clone()),
                                     // Reuse the home board's sessions once loaded rather than scanning again.
@@ -411,7 +439,12 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                     Err(e) => break Err(io::Error::other(e)),
                                 };
                                 app.refresh_after_provider_change(&handle);
-                                app.notice = result.err().map(|e| e.to_string());
+                                match result {
+                                    Ok(Some(MenuAction::Quit)) => break Ok(()),
+                                    Ok(Some(action)) => app.navigate_page(action, &handle),
+                                    Ok(None) => app.notice = None,
+                                    Err(error) => app.notice = Some(error.to_string()),
+                                }
                                 for instance in app.history_state.config.data_instances() {
                                     if ["codex", "claude", "grok"].contains(&instance.id.as_str()) {
                                         continue;
@@ -476,8 +509,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                     }
                     if app.browser_state.panel.is_some() {
                         app.handle_browser_key(key.code, &handle);
-                        if let Err(error) = fulfill_resume_request(&mut app, &handle, &mut terminal)
-                        {
+                        if let Err(error) = fulfill_resume_plan(&mut app, &handle, &mut terminal) {
                             break Err(error);
                         }
                         redraw.invalidate();
@@ -491,8 +523,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                             .map(|s| (s.width, s.height))
                             .unwrap_or((80, 24)),
                     ) {
-                        if let Err(error) = fulfill_resume_request(&mut app, &handle, &mut terminal)
-                        {
+                        if let Err(error) = fulfill_resume_plan(&mut app, &handle, &mut terminal) {
                             break Err(error);
                         }
                         redraw.invalidate();
@@ -525,7 +556,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
 
 fn resume_in_terminal(
     handle: &Handle,
-    session: &sessions::Session,
+    request: &sessions::ResumePlan,
 ) -> Result<std::process::ExitStatus, String> {
     // The child keeps the default SIGINT behavior. Keep the TUI parent alive when
     // Ctrl-C reaches the foreground process group while raw mode is suspended.
@@ -536,15 +567,15 @@ fn resume_in_terminal(
     #[cfg(windows)]
     let _interrupts =
         tokio::signal::windows::ctrl_c().map_err(|e| format!("无法准备终端中断处理：{e}"))?;
-    sessions::resume_in_current(session)
+    request.run_in_current()
 }
 
-fn fulfill_resume_request(
+fn fulfill_resume_plan(
     app: &mut Dashboard,
     handle: &Handle,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> io::Result<()> {
-    let Some(session) = app.browser_state.resume_request.take() else {
+    let Some(session) = app.browser_state.resume_plan.take() else {
         return Ok(());
     };
     crate::ui::terminal::leave();
@@ -566,6 +597,7 @@ fn fulfill_resume_request(
 }
 
 struct Dashboard {
+    resume_provider: Option<resume_provider::Picker>,
     preview: preview::State,
     shortcuts: Option<super::shortcuts::Menu>,
     cleanup: Option<cleanup::Panel>,
@@ -652,6 +684,7 @@ impl Dashboard {
             })
             .collect();
         Self {
+            resume_provider: None,
             preview: preview::State::default(),
             shortcuts: None,
             cleanup: None,
@@ -732,11 +765,10 @@ impl Dashboard {
             self.menu = Some(menu::Menu::new(current));
             return Some(MenuCommand::Stay);
         }
+        if let Some(action) = menu::page_key(key) {
+            return Some(MenuCommand::Activate(action));
+        }
         match key {
-            KeyCode::F(1) => Some(MenuCommand::Activate(MenuAction::Home)),
-            KeyCode::F(2) => Some(MenuCommand::Activate(MenuAction::History)),
-            KeyCode::F(3) => Some(MenuCommand::Activate(MenuAction::Sessions)),
-            KeyCode::F(4) => Some(MenuCommand::Activate(MenuAction::Providers)),
             KeyCode::F(5) => Some(MenuCommand::Activate(MenuAction::AddProvider)),
             KeyCode::Char('a')
                 if self.history_state.panel.is_none()
@@ -746,6 +778,22 @@ impl Dashboard {
                 Some(MenuCommand::Activate(MenuAction::AddProvider))
             }
             _ => None,
+        }
+    }
+
+    fn navigate_page(&mut self, action: MenuAction, handle: &Handle) {
+        match action {
+            MenuAction::Home => {
+                self.close_history();
+                self.close_browser(false);
+                self.refresh_background(handle);
+            }
+            MenuAction::History => self.open_history(handle),
+            MenuAction::Sessions => {
+                self.browser_state.filter = None;
+                self.open_browser(handle);
+            }
+            _ => {}
         }
     }
 
@@ -1063,6 +1111,7 @@ impl Dashboard {
             return;
         }
         match key {
+            KeyCode::Char('P') => self.open_resume_provider(false, handle),
             KeyCode::Char('b') => self.open_trash(handle),
             KeyCode::Char('d') | KeyCode::Delete => self.open_cleanup_delete(false),
             KeyCode::Char('D') => self.open_cleanup_delete(true),
@@ -1134,9 +1183,12 @@ impl Dashboard {
                     .cloned()
                 {
                     let tx = self.tx.clone();
+                    let request =
+                        sessions::ResumeRequest::new(session, Some(self.config_path.clone()));
                     // An accepted clipboard write completes independently of the view.
                     handle.spawn_blocking(move || {
-                        let result = sessions::copy_resume_command(&session)
+                        let result = request
+                            .copy_command()
                             .map(|_| "已复制恢复命令（含项目及实例目录）".into())
                             .unwrap_or_else(|e| e);
                         let _ = tx.send(AppEvent::Notice(result));
@@ -1197,7 +1249,6 @@ impl Dashboard {
                 let Some(session) = browser.selected_session().cloned() else {
                     return;
                 };
-                browser.launching = true;
                 let mode = browser.resume_mode;
                 self.launch_session(session, mode, false, handle);
             }
@@ -1324,8 +1375,27 @@ impl Dashboard {
         home: bool,
         handle: &Handle,
     ) {
+        let intent = sessions::ResumeIntent::new(session, Some(self.config_path.clone()));
+        match intent.prepare() {
+            Ok(plan) => self.launch_resume_plan(plan, mode, home, handle),
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    fn launch_resume_plan(
+        &mut self,
+        request: sessions::ResumePlan,
+        mode: crate::config::ResumeMode,
+        home: bool,
+        handle: &Handle,
+    ) {
+        if home {
+            self.home_sessions_state.browser.launching = true;
+        } else if let Some(browser) = &mut self.browser_state.panel {
+            browser.launching = true;
+        }
         if !sessions::uses_ghostty(mode) {
-            self.browser_state.resume_request = Some(session);
+            self.browser_state.resume_plan = Some(request);
             return;
         }
         self.notice = Some("正在 Ghostty 右侧打开会话…".into());
@@ -1337,7 +1407,7 @@ impl Dashboard {
         };
         // Accepted launches must not be cancelled when their source view closes.
         handle.spawn_blocking(move || {
-            let result = sessions::resume_in_ghostty(&session);
+            let result = request.run_in_ghostty();
             let event = if home {
                 AppEvent::HomeSessionLaunched { generation, result }
             } else {
@@ -1375,6 +1445,9 @@ impl Dashboard {
             return true;
         }
         match key {
+            KeyCode::Char('P') if self.home_focus == HomeFocus::Projects => {
+                self.open_resume_provider(true, handle)
+            }
             KeyCode::Char('v') if self.home_focus == HomeFocus::Providers => {
                 self.open_performance(handle)
             }
@@ -1508,7 +1581,6 @@ impl Dashboard {
                 }
                 if let Some(session) = self.home_sessions_state.browser.selected_session().cloned()
                 {
-                    self.home_sessions_state.browser.launching = true;
                     self.launch_session(
                         session,
                         self.home_sessions_state.browser.resume_mode,
@@ -1971,6 +2043,22 @@ impl Dashboard {
         let mut reset_consumed = false;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
+                AppEvent::ResumeProviders { request, result } => {
+                    if let Some(picker) = &mut self.resume_provider
+                        && picker.request == request
+                    {
+                        picker.loading = false;
+                        match result {
+                            Ok(choices) => picker.choices = choices,
+                            Err(error) => {
+                                self.resume_provider = None;
+                                self.notice = Some(error);
+                            }
+                        }
+                        changed = true;
+                    }
+                    continue;
+                }
                 AppEvent::SessionPreview {
                     generation,
                     request,
@@ -2228,7 +2316,7 @@ impl Dashboard {
                 }
                 AppEvent::HistoryFailed(error) => {
                     self.history_state.finish_load();
-                    self.notice = Some(error);
+                    self.history_state.refresh_error = Some(error);
                     changed = true;
                     continue;
                 }
@@ -2243,9 +2331,16 @@ impl Dashboard {
                     let history = if history.synced_at.is_none()
                         && self.history_state.loaded.synced_at.is_some()
                     {
-                        self.notice = history.warnings.first().cloned();
+                        self.history_state.refresh_error = Some(
+                            history
+                                .warnings
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "历史未完成同步".into()),
+                        );
                         self.history_state.loaded.clone()
                     } else {
+                        self.history_state.refresh_error = None;
                         Arc::new(history)
                     };
                     self.history_state.show_snapshot(history);

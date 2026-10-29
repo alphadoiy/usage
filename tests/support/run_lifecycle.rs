@@ -15,7 +15,10 @@ assert 'USAGE_CODEX_BARK_CONTEXT' not in os.environ
 home=pathlib.Path(os.environ['CODEX_HOME'])
 session=os.environ['FIXTURE_SESSION']
 if 'resume' in sys.argv[1:]: assert sys.argv[sys.argv.index('resume')+1] == session
-conn=sqlite3.connect(home/'state_5.sqlite')
+state=home
+for arg in sys.argv[1:]:
+    if arg.startswith('sqlite_home='): state=pathlib.Path(tomllib.loads(arg)['sqlite_home'])
+conn=sqlite3.connect(state/'state_5.sqlite')
 conn.execute('CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,source TEXT,thread_source TEXT)')
 conn.execute("INSERT OR REPLACE INTO threads VALUES (?,'cli','user')",(session,))
 conn.commit(); conn.close()

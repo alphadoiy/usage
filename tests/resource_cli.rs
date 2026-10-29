@@ -26,6 +26,7 @@ impl Fixture {
             .args(args)
             .env("USAGE_CONFIG", self.0.join("config.toml"))
             .env("USAGE_CODEX_DIR", self.0.join("manager"))
+            .env("USAGE_CODEX_BASE_HOME", self.0.join("user-codex"))
             .env("USAGE_LOG_DIR", self.0.join("logs"))
             .env("USAGE_LOG", "debug")
             .env("USAGE_GATEWAY", "off")

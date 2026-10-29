@@ -33,6 +33,13 @@ struct Prepared {
     command: Command,
     cwd: PathBuf,
     help: Output,
+    runtime_config: String,
+}
+
+/// Validate external inputs and CLI support before changing any account Home.
+struct ValidatedLaunch {
+    cwd: PathBuf,
+    help: Output,
 }
 
 impl Manager {
@@ -48,8 +55,12 @@ impl Manager {
         usage_config: Option<&Path>,
     ) -> Result<crate::agents::ProcessHandle> {
         crate::logging::operation("codex.run_start", |op| {
+            let mode = op
+                .step("account_resolve", || self.resolve(selector))?
+                .auth_mode;
+            let validated = Self::validate_launch(op, mode, cwd, resume, program, args)?;
             let selected = self.select_run(op, selector, revision, resume)?;
-            let mut prepared = self.prepare_command(op, &selected, cwd, resume, program, args)?;
+            let mut prepared = self.prepare_command(&selected, resume, program, validated)?;
             let run_id = op.id().to_owned();
             let mut gateway = None;
             let capture = op.step("run_identity_capture", || {
@@ -94,6 +105,48 @@ impl Manager {
         let home = op.step("home_materialize", || {
             self.materialize(&profile.id, revision)
         })?;
+        // Older CLIs may predate native writer locks. Do not move their Home while a
+        // recorded process is still alive, even when it currently has no open thread.
+        let mut active_legacy = std::collections::HashSet::new();
+        for run in self
+            .recent_runs(1000)?
+            .into_iter()
+            .filter(|run| run.finished_at.is_none() && run.pid.is_some())
+        {
+            if matches!(
+                crate::runs::RunState::observe(&run),
+                crate::runs::RunState::Running | crate::runs::RunState::Unknown
+            ) && let Ok(path) = self.home(&run.profile_id, run.revision)
+                && crate::codex_native::SessionStore::resolve(&path).root() == path
+            {
+                active_legacy.insert(path);
+            }
+        }
+        if active_legacy.contains(&home) {
+            return Err(Error::message(
+                "该账号仍有运行中的旧实例；退出旧实例后重试，才能合并会话目录",
+            ));
+        }
+        let shared_home = super::shared_sessions::target_home(&self.root);
+        op.step("sessions_share", || {
+            super::shared_sessions::prepare(&home, &shared_home)
+        })?;
+        // Existing account revisions join the store when idle. Active legacy instances retain
+        // their files until their next launch, so migration never interrupts a running session.
+        let homes: Vec<String> = self
+            .conn
+            .prepare("SELECT path FROM homes")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        for other in homes {
+            let other = PathBuf::from(other);
+            if other == home || !other.is_dir() || active_legacy.contains(&other) {
+                continue;
+            }
+            if let Err(error) = super::shared_sessions::prepare(&other, &shared_home) {
+                tracing::warn!(event = "session_share_deferred", reason = %error);
+            }
+        }
         let saved = op.step("revision_read", || self.revision(&profile.id, revision))?;
         let key = if profile.auth_mode == AuthMode::Byok {
             Some(op.step("credential_read", || {
@@ -145,22 +198,14 @@ impl Manager {
         })
     }
 
-    fn prepare_command(
-        &self,
+    fn validate_launch(
         op: &mut Operation,
-        selected: &Selected,
+        mode: AuthMode,
         cwd: &Path,
         resume: Option<&str>,
         program: &Path,
         args: &[String],
-    ) -> Result<Prepared> {
-        let Selected {
-            profile,
-            revision,
-            home,
-            key,
-            ..
-        } = selected;
+    ) -> Result<ValidatedLaunch> {
         op.begin("cwd_validate");
         let cwd = cwd
             .canonicalize()
@@ -171,12 +216,12 @@ impl Manager {
         if let Some(id) = resume {
             uuid::Uuid::parse_str(id).map_err(|_| Error::message("无效的会话 ID"))?;
         }
-        if profile.auth_mode == AuthMode::Oauth {
+        if mode == AuthMode::Oauth {
             op.step("arguments_validate", || oauth::validate_run_args(args))?;
             op.step("cli_version_detect", || oauth::verify_cli_version(program))?;
         } else {
             op.step("arguments_validate", || {
-                launcher::validate_run_args(args, profile.auth_mode)
+                launcher::validate_run_args(args, mode)
             })?;
         }
         op.begin("cli_capability_detect");
@@ -192,22 +237,42 @@ impl Manager {
         if !help.status.success() {
             return Err(Error::message("Codex CLI 能力检测失败"));
         }
+        if mode == AuthMode::Oauth && !String::from_utf8_lossy(&help.stdout).contains("--profile") {
+            return Err(Error::message(
+                "OAuth 配置版本需要支持独立 profile 文件的新版 Codex CLI；请升级 codex",
+            ));
+        }
+        Ok(ValidatedLaunch { cwd, help })
+    }
+
+    fn prepare_command(
+        &self,
+        selected: &Selected,
+        resume: Option<&str>,
+        program: &Path,
+        validated: ValidatedLaunch,
+    ) -> Result<Prepared> {
+        let Selected {
+            profile,
+            revision,
+            home,
+            key,
+            ..
+        } = selected;
+        let ValidatedLaunch { cwd, help } = validated;
         let mut command = Command::new(program);
         clear_auth_env(&mut command);
-        // An inherited state directory would share the user's state database with this Home.
+        // Keep credentials local while using the same native session index for every provider.
         command
             .current_dir(&cwd)
             .env("CODEX_HOME", home)
             .env_remove("CODEX_SQLITE_HOME");
+        let store = crate::codex_native::SessionStore::resolve(home);
+        let state = store.index_dir();
         if let Some(key) = key {
             command.env(config::KEY_ENV, key);
         }
         if profile.auth_mode == AuthMode::Oauth {
-            if !String::from_utf8_lossy(&help.stdout).contains("--profile") {
-                return Err(Error::message(
-                    "OAuth 配置版本需要支持独立 profile 文件的新版 Codex CLI；请升级 codex",
-                ));
-            }
             command.args(["--profile", &format!("usage-r{revision}")]);
             command.args([
                 "-c",
@@ -230,7 +295,34 @@ impl Manager {
         if String::from_utf8_lossy(&help.stdout).contains("--no-daemon") {
             command.arg("--no-daemon");
         }
-        Ok(Prepared { command, cwd, help })
+        command.args([
+            "-c",
+            &format!(
+                "sqlite_home={}",
+                toml::Value::String(state.to_string_lossy().into_owned())
+            ),
+        ]);
+        let runtime_path = match profile.auth_mode {
+            AuthMode::Byok => home.join("config.toml"),
+            AuthMode::Oauth => home.join(format!("usage-r{revision}.config.toml")),
+        };
+        let runtime_config = std::fs::read_to_string(runtime_path)?;
+        // A resumed thread must use the chosen provider, not its saved provider identity.
+        if resume.is_some() && profile.auth_mode == AuthMode::Byok {
+            let doc: toml::Value =
+                toml::from_str(&runtime_config).map_err(|_| Error::message("无法读取运行配置"))?;
+            for key in ["model_provider", "model", "model_reasoning_effort"] {
+                if let Some(value) = doc.get(key) {
+                    command.args(["-c", &format!("{key}={value}")]);
+                }
+            }
+        }
+        Ok(Prepared {
+            command,
+            cwd,
+            help,
+            runtime_config,
+        })
     }
 
     /// Resolves what this launch will actually use, attaches observation where it can be
@@ -471,7 +563,7 @@ impl Manager {
                 &selected.home,
                 &selected.profile.name,
                 run_id,
-                &selected.saved.config,
+                &prepared.runtime_config,
             )
         })?;
         op.step("runtime_events_inject", || {
@@ -480,7 +572,7 @@ impl Manager {
                 &self.root,
                 &selected.home,
                 run_id,
-                &selected.saved.config,
+                &prepared.runtime_config,
                 String::from_utf8_lossy(&prepared.help.stdout)
                     .contains("--dangerously-bypass-hook-trust"),
             )

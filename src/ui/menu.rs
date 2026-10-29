@@ -15,6 +15,16 @@ pub(super) enum Action {
     Quit,
 }
 
+pub(super) fn page_key(key: KeyCode) -> Option<Action> {
+    match key {
+        KeyCode::F(1) => Some(Action::Home),
+        KeyCode::F(2) => Some(Action::History),
+        KeyCode::F(3) => Some(Action::Sessions),
+        KeyCode::F(4) => Some(Action::Providers),
+        _ => None,
+    }
+}
+
 impl Action {
     fn title(self) -> &'static str {
         match self {

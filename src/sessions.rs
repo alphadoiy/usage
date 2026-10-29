@@ -81,8 +81,22 @@ impl SessionHomes {
     }
 
     pub fn with_instance(mut self, id: &str, provider: &str, home: impl Into<PathBuf>) -> Self {
+        let home = home.into();
+        let home = if provider == "codex" {
+            crate::codex_native::SessionStore::resolve(&home)
+                .root()
+                .to_path_buf()
+        } else {
+            home
+        };
         self.extra.retain(|(existing, _, _)| existing != id);
-        self.extra.push((id.into(), provider.into(), home.into()));
+        if !self
+            .all(provider)
+            .iter()
+            .any(|(_, existing)| same_dir(existing, &home))
+        {
+            self.extra.push((id.into(), provider.into(), home));
+        }
         self
     }
     fn all(&self, provider: &str) -> Vec<(&str, &Path)> {
@@ -172,7 +186,8 @@ impl SessionRegistry {
                 if cancel.is_cancelled() {
                     return SessionCatalog::default();
                 }
-                load_source(&mut catalog, *source, instance, home, None, cancel);
+                let home = source_home(source.kind.id(), home);
+                load_source(&mut catalog, *source, instance, &home, None, cancel);
             }
         }
         if let Some(agents) = &self.agents {
@@ -181,14 +196,15 @@ impl SessionRegistry {
                     if cancel.is_cancelled() {
                         return SessionCatalog::default();
                     }
+                    // Resolve once per refresh, before constructing the source adapter.
+                    // Cached SessionHomes may predate a managed-store migration.
+                    let home = source_home(&id, home);
                     if !home.is_dir() {
                         continue;
                     }
                     match agents.create(
                         &id,
-                        crate::agents::AgentContext::Local {
-                            home: home.to_path_buf(),
-                        },
+                        crate::agents::AgentContext::Local { home: home.clone() },
                     ) {
                         Ok(agent) if agent.kind().id() != id => catalog
                             .warnings
@@ -199,7 +215,7 @@ impl SessionRegistry {
                                     &mut catalog,
                                     source,
                                     instance,
-                                    home,
+                                    &home,
                                     Some(agent.clone()),
                                     cancel,
                                 );
@@ -215,6 +231,10 @@ impl SessionRegistry {
                 .cmp(&a.recency_at_ms)
                 .then_with(|| a.id.cmp(&b.id))
         });
+        let mut seen = HashSet::new();
+        catalog
+            .sessions
+            .retain(|s| seen.insert((s.provider.id(), s.home.clone(), s.id.clone())));
         catalog
     }
 }
@@ -226,6 +246,17 @@ impl SessionRegistry {
             agents: Some(agents),
         }
     }
+}
+
+fn source_home(provider: &str, home: &Path) -> PathBuf {
+    let home = if provider == "codex" {
+        crate::codex_native::SessionStore::resolve(home)
+            .root()
+            .to_path_buf()
+    } else {
+        home.to_path_buf()
+    };
+    home.canonicalize().unwrap_or(home)
 }
 
 fn load_source(
@@ -252,7 +283,9 @@ fn load_source(
         ));
         return;
     }
-    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    // This is the same location snapshot used to construct `agent`. Re-resolving
+    // aliases here could split their identities if migration occurred in between.
+    let home = home.to_path_buf();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         agent.as_ref().map_or_else(
             || (source.load)(&home),
@@ -326,11 +359,16 @@ pub(crate) fn load_codex_controlled(
     home: &Path,
     cancel: &Cancellation,
 ) -> Result<Vec<SessionRecord>, String> {
+    let store = crate::codex_native::SessionStore::resolve(home);
+    let home = store.root();
     if cancel.is_cancelled() {
         return Ok(Vec::new());
     }
     // A Home Codex has never run in (e.g. it exited at startup) has no sessions yet; not a failure.
-    let index = codex_index(home)?;
+    let index = store
+        .index()
+        .map_err(|error| error.to_string())?
+        .map(|(_, path)| path);
     if index.is_none() && !home.join("sessions").is_dir() {
         return Ok(Vec::new());
     }
@@ -338,8 +376,21 @@ pub(crate) fn load_codex_controlled(
         .ok_or_else(|| "未找到 Codex 会话索引".to_string())
         .and_then(|database| load_codex_index_controlled(&database, cancel))
     {
-        Ok(sessions) => Ok(sessions),
+        Ok(mut sessions) => {
+            // Migrated rollouts may not be in Codex's index yet. Codex repairs rows on resume;
+            // Usage discovers them without rewriting an Agent-owned database schema.
+            if store.merge_rollouts() {
+                let indexed: HashSet<_> = sessions.iter().map(|s| s.id.clone()).collect();
+                sessions.extend(
+                    load_codex_rollouts_controlled(home, cancel)?
+                        .into_iter()
+                        .filter(|s| !indexed.contains(&s.id)),
+                );
+            }
+            Ok(sessions)
+        }
         Err(index_error) => match load_codex_rollouts_controlled(home, cancel) {
+            Ok(sessions) if sessions.is_empty() && store.merge_rollouts() => Ok(sessions),
             Ok(sessions) if sessions.iter().any(is_local_record) => Ok(sessions),
             _ => Err(index_error),
         },
@@ -390,64 +441,8 @@ fn user_prompt(text: &str) -> Option<String> {
     display_title(text)
 }
 
-/// Where Codex keeps the Home's state database: `sqlite_home` in its config.toml, else
-/// `$CODEX_SQLITE_HOME` (codex-rs `config_toml.rs`), else the Home. The environment applies only
-/// to the user's own Codex Home; managed launches clear it, so their state stays in their Home.
-fn codex_state_dir(home: &Path) -> PathBuf {
-    state_dir_in(
-        home,
-        std::env::var_os("CODEX_SQLITE_HOME").as_deref(),
-        &default_codex_home(),
-    )
-}
-fn state_dir_in(home: &Path, environment: Option<&std::ffi::OsStr>, own_home: &Path) -> PathBuf {
-    fs::read_to_string(home.join("config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|config| config.get("sqlite_home")?.as_str().map(str::to_string))
-        .filter(|dir| !dir.trim().is_empty())
-        .map(|dir| match dir.strip_prefix("~/") {
-            Some(rest) => crate::config::home_dir().join(rest),
-            None => home.join(dir),
-        })
-        .or_else(|| {
-            environment
-                .filter(|dir| !dir.is_empty() && same_dir(home, own_home))
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| home.to_path_buf())
-}
-fn default_codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| crate::config::home_dir().join(".codex"))
-}
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
-}
-
-/// The newest `state_<N>.sqlite` for the Home, if Codex has created one.
-fn codex_index(home: &Path) -> Result<Option<PathBuf>, String> {
-    let dir = codex_state_dir(home);
-    if !dir.is_dir() {
-        return Ok(None);
-    }
-    Ok(fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let version = name
-                .to_str()?
-                .strip_prefix("state_")?
-                .strip_suffix(".sqlite")?
-                .parse::<u32>()
-                .ok()?;
-            Some((version, entry.path()))
-        })
-        .max_by_key(|(version, _)| *version)
-        .map(|(_, path)| path))
 }
 
 #[cfg(test)]
@@ -958,68 +953,16 @@ pub(crate) fn validate_resume(session: &Session) -> Result<(), String> {
     }
     Ok(())
 }
-/// Direct arguments and env avoid a shell. The TUI suspends while this command owns the terminal.
+mod resume;
+pub use resume::{ResumeChoice, ResumeIntent, ResumePlan, ResumeRequest, ResumeTarget};
+
+/// Compatibility entry points share the same preparation and execution policy.
 pub fn resume_in_current(session: &Session) -> Result<std::process::ExitStatus, String> {
-    validate_resume(session)?;
-    let agent = session.agent.clone().or_else(|| legacy_agent(session));
-    if let Some(agent) = agent {
-        let program = session
-            .provider
-            .command()
-            .split_whitespace()
-            .next()
-            .ok_or("恢复命令为空")?;
-        return agent
-            .launcher()
-            .ok_or("此 Agent 不支持恢复会话")?
-            .spawn(&crate::agents::SpawnRequest {
-                cwd: session.cwd.clone(),
-                program: program.into(),
-                args: Vec::new(),
-                resume: Some(session.id.clone()),
-                usage_config: None,
-            })
-            .map(|outcome| outcome.status);
-    }
-    let mut parts = session.provider.command().split_whitespace();
-    let program = parts.next().ok_or("恢复命令为空")?;
-    Command::new(program)
-        .args(parts)
-        .arg(&session.id)
-        .current_dir(&session.cwd)
-        .env(session.provider.home_env(), &session.home)
-        .status()
-        .map_err(|e| format!("无法运行 {}：{e}", session.provider.name()))
-}
-pub fn resume_shell_command(session: &Session) -> Result<String, String> {
-    validate_resume(session)?;
-    match &session.agent {
-        Some(agent) => agent
-            .launcher()
-            .ok_or("此 Agent 不支持恢复会话")?
-            .resume_shell_command(session),
-        None => match legacy_agent(session) {
-            Some(agent) => agent
-                .launcher()
-                .ok_or("此 Agent 不支持恢复会话")?
-                .resume_shell_command(session),
-            None => local_resume_shell_command(session),
-        },
-    }
+    ResumeIntent::new(session.clone(), None).run_in_current()
 }
 
-/// Sessions discovered by a source-only registry carry no adapter; the built-in Agent for
-/// their Home supplies the same launch behavior a registry-discovered session would have.
-fn legacy_agent(session: &Session) -> Option<Arc<dyn crate::agents::AgentAdapter>> {
-    crate::hub::shared()
-        .agents
-        .create(
-            session.provider.id(),
-            crate::agents::AgentContext::Local {
-                home: session.home.clone(),
-            },
-        )
-        .ok()
+pub fn resume_shell_command(session: &Session) -> Result<String, String> {
+    ResumeIntent::new(session.clone(), None).shell_command()
 }
 
 pub(crate) fn local_resume_shell_command(session: &Session) -> Result<String, String> {
@@ -1067,9 +1010,12 @@ pub(crate) fn local_resume_shell_command(session: &Session) -> Result<String, St
     }
 }
 pub fn copy_resume_command(session: &Session) -> Result<(), String> {
+    copy_command(&resume_shell_command(session)?)
+}
+
+fn copy_command(text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
-    let text = resume_shell_command(session)?;
     #[cfg(target_os = "macos")]
     let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
     #[cfg(target_os = "windows")]
@@ -1165,6 +1111,79 @@ pub fn command_in_ghostty(cwd: &Path, command: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_resolves_primary_and_cached_aliases_before_constructing_the_source_agent() {
+        let root =
+            std::env::temp_dir().join(format!("usage-catalog-store-{}", uuid::Uuid::new_v4()));
+        let source = root.join("account");
+        let destination = root.join("shared");
+        let project = root.join("project");
+        fs::create_dir_all(source.join("sessions")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let root = root.canonicalize().unwrap();
+        let source = root.join("account");
+        let destination = root.join("shared");
+        let project = root.join("project");
+        fs::write(destination.join("config.toml"), "sqlite_home='.'").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        fs::write(
+            source.join("sessions/fixture.jsonl"),
+            rollout(&id, &project, "Shared fixture"),
+        )
+        .unwrap();
+        let primary = SessionHomes::new().with("codex", &source);
+        let extra = SessionHomes::new().with_instance("saved-account", "codex", &source);
+        let mut agents = crate::agents::AgentRegistry::new();
+        agents
+            .register(
+                "codex",
+                crate::agents::local(
+                    AgentKind::CODEX,
+                    load_codex,
+                    crate::agents::LocalHooks::default(),
+                ),
+            )
+            .unwrap();
+        let registry = SessionRegistry::from_agents(Arc::new(agents));
+        let assert_source = |homes: &SessionHomes, expected: &Path| {
+            let catalog = registry.load_all(homes);
+            assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+            assert_eq!(catalog.sessions.len(), 1);
+            let session = &catalog.sessions[0];
+            assert_eq!(session.home.as_path(), expected);
+            assert_eq!(session.id, id);
+            session
+                .agent
+                .as_ref()
+                .unwrap()
+                .launcher()
+                .unwrap()
+                .validate_resume_source(session)
+                .unwrap();
+        };
+        assert_source(&primary, &source);
+        crate::codex_native::SessionStore::for_default_home(&destination)
+            .attach_legacy_home(&source)
+            .unwrap();
+        // Both homes objects were cached before migration. A new primary Home also
+        // keeps the alias until the catalog refresh resolves its source snapshot.
+        for homes in [primary, extra, SessionHomes::new().with("codex", &source)] {
+            assert_source(&homes, &destination);
+        }
+        let mut legacy = SessionRegistry::new();
+        legacy
+            .register(SessionSource {
+                kind: AgentKind::CODEX,
+                load: load_codex,
+            })
+            .unwrap();
+        let catalog = legacy.load_all(&SessionHomes::new().with("codex", &source));
+        assert!(catalog.warnings.is_empty());
+        assert_eq!(catalog.sessions[0].home, destination);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn custom_source(home: &Path) -> Result<Vec<SessionRecord>, String> {
         Ok(vec![SessionRecord {
@@ -1444,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_index_follows_sqlite_home_and_the_environment_only_for_the_own_home() {
+    fn codex_index_follows_configured_sqlite_home() {
         let root = std::env::temp_dir().join(format!("usage-sqlite-home-{}", uuid::Uuid::new_v4()));
         let home = root.join("codex");
         let cwd = root.join("project");
@@ -1460,20 +1479,6 @@ mod tests {
         let catalog = load_all(&SessionHomes::new().with("codex", &home));
         assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
         assert_eq!(catalog.sessions[0].title, "Moved index");
-        // As in Codex, `sqlite_home` wins; the environment is the fallback, and only for the
-        // user's own Home, since managed launches clear it.
-        let shared = std::ffi::OsStr::new("/synthetic/shared");
-        assert_eq!(
-            state_dir_in(&home, Some(shared), &home),
-            home.join("../state")
-        );
-        fs::remove_file(home.join("config.toml")).unwrap();
-        assert_eq!(
-            state_dir_in(&home, Some(shared), &home),
-            PathBuf::from("/synthetic/shared")
-        );
-        assert_eq!(state_dir_in(&home, Some(shared), &root.join("other")), home);
-        assert_eq!(state_dir_in(&home, None, &home), home);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -516,7 +516,7 @@ async fn provider_board_shows_only_current_provider_and_scrolls_its_details() {
     );
     app.handle_home_key(KeyCode::Enter, &Handle::current(), (100, 32));
     assert!(app.home_models_expanded);
-    assert!(app.browser_state.resume_request.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
     app.cards.push(CardSlot {
         target: "hidden-card".into(),
         loading: true,
@@ -659,7 +659,7 @@ async fn provider_switch_keeps_identity_on_refresh_and_recovers_when_removed() {
     for key in [KeyCode::Left, KeyCode::Right] {
         assert!(app.handle_home_key(key, &Handle::current(), (100, 30)));
     }
-    assert!(app.browser_state.resume_request.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
 }
 
 #[tokio::test]

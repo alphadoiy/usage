@@ -7,6 +7,8 @@ use std::time::Duration;
 use super::{Error, Result, bark};
 use crate::agents::{ProcessHandle, SpawnRequest};
 
+mod resume_config;
+
 pub fn start_local_codex(home: &Path, request: &SpawnRequest) -> Result<ProcessHandle> {
     crate::logging::operation("codex.local_start", |op| {
         let home = home.canonicalize()?;
@@ -60,6 +62,12 @@ pub fn start_local_codex(home: &Path, request: &SpawnRequest) -> Result<ProcessH
             }
         }
         if let Some(id) = &request.resume {
+            if let Some(provider) = resume_config::provider_override(&home, &cwd, request)? {
+                command.args([
+                    "-c",
+                    &format!("model_provider={}", toml::Value::String(provider)),
+                ]);
+            }
             command.args(["resume", id]);
         }
         let child = op.step("child_spawn", || {
@@ -93,3 +101,6 @@ pub fn local_resume_shell_command(home: &Path, cwd: &Path, session: &str) -> Res
         session.into(),
     ]))
 }
+
+#[cfg(all(test, unix))]
+mod tests;

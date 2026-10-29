@@ -145,7 +145,7 @@ grok = ""
 
 官方 OAuth 订阅支持[模型指纹测试](docs/fingerprint.md)：`usage codex fingerprint run <账号>` 采集固定 `gpt-6.1-sol` 的 3 条样本并本地评分，`enable <账号>` 在 Usage 打开期间每 5 小时运行（退出即停止），`status <账号>` 查看结果，`disable <账号>` 停用。结果仅为参考库相对排名。
 
-Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时／7 天／30 天及分页明细。托管 Codex 使用绑定版本的网关记录及本地日志；独立 API Provider 可显式绑定日志实例。首字仅使用明确计时，生成速度排除首字等待，保守速度下限以 `≥` 单独展示；仅弹窗打开期间后台增量索引，文件未变化时不读正文。配置、口径与性能边界见[Provider 性能](docs/performance.md)。
+Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时／7 天／30 天及分页明细。托管 Codex 使用绑定版本的网关记录及本地日志；共享日志只索引一次，通过已确认的运行、会话、时间范围与轮次归属到账号，缺少证据时显示未归属。独立 API Provider 可显式绑定日志实例。首字仅使用明确计时，生成速度排除首字等待，保守速度下限以 `≥` 单独展示；仅弹窗打开期间后台增量索引，文件未变化时不读正文。配置、口径与性能边界见[Provider 性能](docs/performance.md)。
 
 首页项目标题只显示名称与会话数量，不显示未加载的 Token 统计。托管 Codex 可通过生命周期 hooks 确认每次运行对应的会话，并在会话旁展示执行／等待输入等状态；首次使用需在 Codex `/hooks` 中信任 Usage 回调。活动状态在本机后台更新，不额外查询模型或余额。`usage codex runs --json` 查看确认过的会话，`usage codex run-events <运行UUID> --json` 查看不含对话内容的事件，详见[运行生命周期](docs/run-lifecycle.md)。
 
@@ -157,7 +157,7 @@ Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时�
 
 Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板会显示剩余次数（包括 0）；未返回次数时提示按 `x` 查询，不把未知显示为 0。按 `x` 查询首页当前选中 Provider 的最新次数和最近到期时间，同时更新其已加载的看板次数。查询与确认都绑定该 Provider 的独立账号目录，不回退到默认登录或 Keychain。确认框显示 Provider 名称与账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消；打开确认后目标固定。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。BYOK、Claude Code 和 Grok 没有主动重置入口。
 
-按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引（遵循 `config.toml` 的 `sqlite_home`；`CODEX_SQLITE_HOME` 只作用于本机默认 Codex 目录，托管实例启动时清除该变量以免共用状态库），无法打开时改读本机会话日志；从未运行过的实例目录视为没有会话。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
+按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引，遵循用户配置的 `sqlite_home` 和 `CODEX_SQLITE_HOME`；托管账号共用该索引和会话目录。旧会话尚未进入索引时会补充扫描日志，从未运行过的目录视为没有会话。选中共享存储中的 Codex 会话后可按 `Shift+P` 选择已保存的 Provider 继续同一会话；独立来源目录会说明尚未共享，并保留默认恢复方式。恢复与复制命令沿用当前 Usage 配置文件。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话；Codex 应用压缩后的 `.jsonl.zst` 日志同样可读，压缩过程中同目录存在明文副本时优先读取明文。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
 
@@ -186,7 +186,15 @@ usage codex test work                         # 仅检查配置，不发请求
 usage codex test work --request               # 发送小型 Responses 请求，可能计费
 ```
 
-BYOK 每次编辑或源配置更新生成新版本。不同账号、不同版本各自使用持久的 `CODEX_HOME`，运行中的版本不会被同步改写；同一版本多开共享会话目录。CLI 写入的合法项目信任设置、模型迁移提示及界面引导状态保留在运行目录，不会改变保存的配置版本，也不会阻止下一次启动；模型、供应商、认证及其他设置的直接修改仍需要导入为新版本。历史与会话页自动收录已经启动过的托管目录，恢复时使用该会话绑定的账号、配置版本和密钥。也可显式运行 `usage codex run <ID> --revision 1 --resume <会话UUID>`。密钥轮换后若上游停用了旧 Key，旧会话绑定的 Key 也会失效。
+BYOK 每次编辑或源配置更新生成新版本，账号凭据与连接配置各自保存。启动时自动继承普通 Codex 使用的用户目录（`CODEX_HOME`，未设置时为 `~/.codex`）中的全局指令、用户 skills、rules、子代理、MCP、插件和常用配置；`~/.agents/skills` 与项目上下文仍由 Codex 原生读取。全局默认 profile 的偏好也会继承，相对配置路径按原目录解析。账号明确保存的配置覆盖全局默认值，原有实例文件保留。必要时可用 `USAGE_CODEX_BASE_HOME` 显式指定继承来源。
+
+Codex 可以正常保存模型、推理强度、通知、信任设置和其他偏好，不会再因普通偏好变化被判定为“配置被修改”。启动时将新增全局配置与实例中保存的偏好合并；已经在实例内改过或删除的设置保留，不回写全局 `config.toml`。只有供应商路由和认证配置变化需要通过 Usage 保存新版本，错误会指出发生变化的字段。
+
+所有账号与默认 Codex 共用 `sessions`、`archived_sessions`、SQLite 会话索引和原生线程写锁。同一会话在 Usage 中只显示和统计一次；首页项目列表或 F3 会话页按 `Shift+P` 选择本次使用的 Provider，也可运行 `usage codex run <目标账号> --resume <会话UUID>`，可选 `--revision N`。共享后的普通 `Enter` 使用默认 Codex 配置；显式选择 Provider 时使用目标账号的连接和凭据。普通 BYOK 账号使用相同的原生 `usage_byok` 标识，在同一项目的 Codex 恢复列表中可以互相看到会话。Codex 自带列表仍按原生 provider 标识筛选；自定义标识不同或 OAuth 与 BYOK 之间恢复时，使用上述 Usage 入口显式选择目标账号。
+
+原生恢复列表不显示尚无用户消息的空会话。普通恢复沿用 Codex 原生解析的有效配置，保留受信项目的模型和推理强度设置；项目文件中的 Provider 路由仍按原生规则忽略。
+
+启动先检查项目目录、参数和 CLI 支持，再合并空闲旧实例的会话目录，并保留旧路径的访问方式；不改写 Codex 的数据库结构。运行中的旧实例暂缓迁移，关闭后重试；遇到同名文件冲突或跨磁盘迁移时保留原文件并报错。账号的 `auth.json` 和 API Key 不共享。
 
 数据默认位于 `~/.local/share/usage/codex`，遵循 `XDG_DATA_HOME`；`USAGE_CODEX_DIR` 可指定一个专用目录。BYOK API Key 保存在该目录下的 `keys/<UUID>` 文件，SQLite 只保存密钥引用；macOS/Linux 的数据与密钥目录权限为 `700`，密钥文件权限为 `600`。文件内容为明文，权限控制不等于加密。BYOK 管理不访问 macOS Keychain，生成的 TOML 通过子进程环境变量取 Key。启动命令和复制的恢复命令不包含密钥，也会清除继承的默认 Codex/OpenAI 认证环境变量。移出列表会保留配置版本、密钥和历史，便于恢复旧会话。
 
@@ -211,7 +219,7 @@ usage codex run personal --cwd ~/Coding/project
 
 登录和 refresh token 刷新交给官方 Codex CLI，不自行实现 OAuth 端点或在应用中硬编码 client ID。[官方认证文档](https://learn.chatgpt.com/docs/auth)说明 CLI 支持浏览器 / 设备码登录，以及文件凭据存储。设备码授权需要个人或工作区启用该功能。新增账号默认使用 CLI 的默认模型，也可选择账号可用的模型。
 
-OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `auth.json`；目录权限 `700`，凭据文件权限 `600`，明文存储，不接入 Keychain。SQLite 保存身份信息和配置，令牌不进入数据库、导出的 TOML、账号列表或启动命令。配置版本使用 `usage-rN.config.toml`，通过原生 `--profile` 选择；需要 **Codex CLI 0.134.0 或更新版本**（[原生 profile 文档](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)）。修改配置不会复制或还原旧 token，CLI 刷新后继续使用最新凭据。历史和会话页恢复到原账号，默认使用该账号当前配置；可用 `run --revision N --resume UUID` 显式选择旧配置，仍使用最新登录。
+OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `auth.json`；目录权限 `700`，凭据文件权限 `600`，明文存储，不接入 Keychain。SQLite 保存身份信息和配置，令牌不进入数据库、导出的 TOML、账号列表或启动命令。配置版本使用 `usage-rN.config.toml`，通过原生 `--profile` 选择；需要 **Codex CLI 0.134.0 或更新版本**（[原生 profile 文档](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)）。修改配置不会复制或还原旧 token，CLI 刷新后继续使用最新凭据。在共享会话列表中可选择该 OAuth 账号继续任意会话，默认使用该账号当前配置；可用 `run --revision N --resume UUID` 显式选择旧配置，仍使用最新登录。
 
 不同 OAuth 账号、同一 OAuth 账号都可以并行运行。同账号实例共用一个 `CODEX_HOME` 和 `auth.json`，通过原生 profile 选择各自配置版本，token 刷新及凭据重新加载由 Codex CLI 处理。macOS/Linux 的运行实例及其仍存活的子任务持有共享锁，不限制多开；即使 `usage` 启动器异常退出，也不会提前释放运行锁。重新登录和导入替换凭据需要独占锁，必须先关闭该账号的所有托管实例和子任务。运行中允许保存新的配置版本。OAuth 不能复制为另一个账号，以免复制 refresh token。重新登录失败、取消或身份不符时，原账号登录保留。登录暂存目录在流程结束后清理。
 
@@ -283,9 +291,9 @@ CC Switch 自动导入支持原生 Responses API 的 Codex BYOK 配置，导入�
 
 会话清理参考 magpie 的删除与回收站流程。在 `F3` 会话列表按空格勾选，`a` 勾选／取消当前项目列表中的全部会话，`d` 或 Delete 删除勾选项（未勾选时删除当前会话）。项目列表按空格也可勾选该项目的会话。按 `?` 可选择“清理当前项目列表”；旧的 `A`、`D` 仍兼容。搜索和历史时间筛选继续生效，项目批量清理只包含当前筛选下列出的会话；确认窗口列出数量、标题及实例，按 `y` 执行、`n` / `Esc` 取消。搜索中 `Enter` 应用、`Esc` 清除并返回；退出输入后，`Esc` 依次清除搜索、取消勾选、返回项目列表、返回上一页。
 
-目前支持 Codex、Claude Code 和 Grok，包括 Claude 的子代理、文件历史、环境和待办文件，Codex 的日志分段、压缩副本和子代理日志，以及 Grok 的独立会话目录和子代理目录。自定义 Agent 暂不支持清理。最近一分钟有文件写入的会话、仍在托管运行的会话会跳过；符号链接及未知文件布局会拒绝处理。批量操作逐项报告失败，不影响其他可清理会话。
+目前支持 Codex、Claude Code 和 Grok，包括 Claude 的子代理、文件历史、环境和待办文件，Codex 的日志分段、压缩副本和子代理日志，以及 Grok 的独立会话目录和子代理目录。自定义 Agent 暂不支持清理。最近一分钟有文件写入的会话、仍在托管运行的会话会跳过；Codex 还会检查会话及子任务的原生写锁，等待输入的活动会话同样受保护。Usage 已记录的共享目录链接按真实存储解析，未知符号链接及未知文件布局会拒绝处理。批量操作逐项报告失败，不影响其他可清理会话。
 
-删除先将文件移到 `$XDG_DATA_HOME/usage/trash/sessions`（默认 `~/.local/share/usage/trash/sessions`），不会立即释放文件所占空间。按 `b` 或通过 `?` 打开回收站，`Enter` 恢复，`d` / Delete 永久删除选中项，`e` 清空当前回收站；均需确认。`u`、`E` 保留兼容。回收站不会自动过期。恢复不会覆盖原位置已有文件；中断的清理可重新打开回收站恢复。跨磁盘移动暂不支持，会报错并尝试恢复已移动文件。不会改写 Agent 的共享索引；永久删除后保留用于过滤残留索引的最小身份记录，Usage 刷新时不会重新列出已删除会话。
+删除先将文件移到 `$XDG_DATA_HOME/usage/trash/sessions`（默认 `~/.local/share/usage/trash/sessions`），不会立即释放文件所占空间。按 `b` 或通过 `?` 打开回收站，`Enter` 恢复，`d` / Delete 永久删除选中项，`e` 清空当前回收站；均需确认。`u`、`E` 保留兼容。回收站不会自动过期。恢复不会覆盖原位置已有文件；旧账号迁入共享存储后，原回收站条目与删除标记继续关联同一会话。中断的清理可重新打开回收站恢复。跨磁盘移动暂不支持，会报错并尝试恢复已移动文件。不会改写 Agent 的共享索引；永久删除后保留用于过滤残留索引的最小身份记录，Usage 刷新时不会重新列出已删除会话。
 
 按 `m` 切换月度视图：显示选中月份的输入、输出、缓存及来源合计，与 12 个月的彩色堆叠趋势条；不再重复堆叠月度表格。蓝色为 Codex、暖色为 Claude、灰白色为 Grok。较矮终端优先显示月度趋势，较高终端同时保留热力图。
 
@@ -420,3 +428,5 @@ registry.register("spark", "另一种", render_spark);
 注册之后，`--once --style` 和配置文件都能选择这种文本用量视图。
 
 Provider 插件接入（WorkBuddy / Trae 国内版与国际版 / ZCode）：见 [插件文档](docs/plugins.md)。
+
+原生 Codex 上下文兼容性可用 `python3 tests/support/native_codex_context.py target/debug/usage /path/to/codex` 验证。该检查使用临时用户目录和合成凭据，对比直接启动与托管启动的 skills，验证 A 的会话出现在 B 的原生 `/resume` 列表、恢复后使用 B 的路由和凭据，以及跨 provider 恢复与偏好保存；对话请求由本地模拟服务响应，不调用真实模型服务。

@@ -260,12 +260,22 @@ impl Provider {
             AgentContext::Local { home } => home.clone(),
             AgentContext::Managed(instance) => instance.home().map_err(CapabilityError::Failed)?,
         };
-        let homes = SessionHomes::new().with_instance(&self.id, self.agent.kind().id(), home);
+        let homes = SessionHomes::new().with_instance(&self.id, self.agent.kind().id(), &home);
         let mut registry = SessionRegistry::new();
         registry.register(source).map_err(CapabilityError::Failed)?;
         let mut catalog = registry.load_all(&homes);
-        for session in &mut catalog.sessions {
-            session.agent = Some(self.agent.clone());
+        if !catalog.sessions.is_empty() {
+            // This API explicitly selects a Provider instance. Shared history is
+            // its storage source, while config/auth still belong to that instance.
+            // Bind both fields together; generic catalogs instead select the
+            // normalized shared/default Home before constructing their adapter.
+            let home = home
+                .canonicalize()
+                .map_err(|error| CapabilityError::Failed(error.to_string()))?;
+            for session in &mut catalog.sessions {
+                session.home = home.clone();
+                session.agent = Some(self.agent.clone());
+            }
         }
         Ok(catalog)
     }
@@ -324,6 +334,155 @@ mod tests {
     use async_trait::async_trait;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    fn shared_session_fixture(
+        home: &std::path::Path,
+        shared: &std::path::Path,
+        project: &std::path::Path,
+    ) -> String {
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(shared).unwrap();
+        std::fs::create_dir_all(project).unwrap();
+        std::fs::write(shared.join("config.toml"), "sqlite_home='.'").unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            home.join("sessions/fixture.jsonl"),
+            serde_json::json!({
+                "type":"session_meta", "payload":{"id":id,"cwd":project,"thread_source":"user"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::codex_native::SessionStore::for_default_home(shared)
+            .attach_legacy_home(home)
+            .unwrap();
+        id
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_local_provider_keeps_its_configuration_home_when_reading_shared_history() {
+        let root =
+            std::env::temp_dir().join(format!("usage-provider-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let home = root.join("configured-instance");
+        let id = shared_session_fixture(&home, &root.join("shared"), &root.join("project"));
+        let script = root.join("capture.sh");
+        std::fs::write(
+            &script,
+            "printf '%s\\n%s\\n' \"$CODEX_HOME\" \"$1\" > \"$CODEX_HOME/capture\"\n",
+        )
+        .unwrap();
+        let command: &'static str =
+            Box::leak(format!("/bin/sh {}", script.display()).into_boxed_str());
+        let kind = AgentKind::new("codex", "Codex fixture", None, command, "CODEX_HOME", 1);
+        let mut agents = AgentRegistry::new();
+        agents
+            .register(
+                "codex",
+                crate::agents::local(
+                    kind,
+                    crate::sessions::load_codex,
+                    crate::agents::LocalHooks::default(),
+                ),
+            )
+            .unwrap();
+        let provider = Hub::new(
+            agents,
+            ResourceRegistry::new(),
+            crate::auth::AuthRegistry::new(),
+        )
+        .provider(ProviderDefinition {
+            id: "explicit".into(),
+            agent: "codex".into(),
+            context: AgentContext::Local { home: home.clone() },
+            resources: Vec::new(),
+            auth: None,
+        })
+        .unwrap();
+        let catalog = provider.sessions().unwrap();
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        assert_eq!(catalog.sessions.len(), 1);
+        let source = &catalog.sessions[0];
+        assert_eq!(source.home, home);
+        assert_eq!(source.id, id);
+        assert!(Arc::ptr_eq(source.agent.as_ref().unwrap(), &provider.agent));
+        let plan = crate::sessions::ResumeIntent::new(source.clone(), None)
+            .prepare()
+            .unwrap();
+        assert!(plan.run_in_current().unwrap().success());
+        let expected = std::fs::read(home.join("capture")).unwrap();
+        assert_eq!(
+            String::from_utf8(expected.clone()).unwrap(),
+            format!("{}\n{id}\n", home.display())
+        );
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &plan.shell_command().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(std::fs::read(home.join("capture")).unwrap(), expected);
+        assert!(!root.join("shared/capture").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_managed_provider_keeps_its_account_binding_when_reading_shared_history() {
+        let root =
+            std::env::temp_dir().join(format!("usage-managed-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut manager = crate::codex_manager::Manager::open(root.join("manager")).unwrap();
+        let config = crate::codex_manager::config::new_config(
+            "https://fixture.invalid/v1",
+            "fixture-model",
+            None,
+        )
+        .unwrap();
+        let profile = manager.add("Fixture", &config, "synthetic-key").unwrap();
+        let home = manager.home(&profile.id, profile.revision).unwrap();
+        let id = shared_session_fixture(&home, &root.join("shared"), &root.join("project"));
+        let provider = Hub::default()
+            .provider(ProviderDefinition {
+                id: profile.id.clone(),
+                agent: "codex".into(),
+                context: crate::codex_manager::managed::ManagedAccount {
+                    root: manager.root().to_owned(),
+                    account: profile.id.clone(),
+                    revision: Some(profile.revision),
+                }
+                .context(),
+                resources: Vec::new(),
+                auth: None,
+            })
+            .unwrap();
+        let catalog = provider.sessions().unwrap();
+        assert!(catalog.warnings.is_empty(), "{:?}", catalog.warnings);
+        assert_eq!(catalog.sessions.len(), 1);
+        let source = &catalog.sessions[0];
+        assert_eq!(source.home, home);
+        assert_eq!(source.id, id);
+        assert!(Arc::ptr_eq(source.agent.as_ref().unwrap(), &provider.agent));
+        let plan = crate::sessions::ResumeIntent::new(source.clone(), None)
+            .prepare()
+            .unwrap();
+        let command = plan.shell_command().unwrap();
+        assert!(command.contains(&profile.id));
+        assert!(command.contains(&id));
+        assert!(
+            !home.join("config.toml").exists(),
+            "preparing/exporting must not materialize the account"
+        );
+        assert!(manager.recent_runs(10).unwrap().is_empty());
+        drop(provider);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

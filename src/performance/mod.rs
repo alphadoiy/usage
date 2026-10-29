@@ -1,5 +1,6 @@
 //! Unified performance queries over explicitly bound CLI logs and gateway observations.
 mod loader;
+mod ownership;
 mod parser;
 mod store;
 #[cfg(test)]
@@ -22,6 +23,15 @@ pub struct Binding {
     pub expected_upstream: Option<String>,
     /// Whether this binding may merge gateway observations with CLI logs.
     pub gateway_observations: bool,
+    /// Explicit account identity for attributing logs after their storage is shared.
+    pub managed: Option<ManagedBinding>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ManagedBinding {
+    pub evidence: crate::runs::SessionEvidenceSource,
+    pub account: String,
+    pub revision: i64,
 }
 impl Binding {
     /// UI cache identity; unlike the database scope, this performs no filesystem work.
@@ -34,15 +44,49 @@ impl Binding {
             &self.revision,
             &self.expected_upstream,
             self.gateway_observations,
+            &self.managed,
         ))
         .expect("binding serializes");
         format!("{:x}", Sha256::digest(value))
     }
     pub fn scope(&self) -> String {
-        let home = self
-            .home
+        self.scope_at(&self.home)
+    }
+
+    /// A shared rollout is indexed once, independently of the account using it.
+    fn log_home(&self) -> PathBuf {
+        if self.agent == "codex" {
+            return crate::codex_native::SessionStore::resolve(&self.home)
+                .root()
+                .to_path_buf();
+        }
+        self.home
             .canonicalize()
-            .unwrap_or_else(|_| self.home.clone());
+            .unwrap_or_else(|_| self.home.clone())
+    }
+
+    fn log_scope(&self) -> String {
+        self.scope_at(&self.log_home())
+    }
+
+    fn shared_account(&self) -> Option<&ManagedBinding> {
+        self.managed
+            .as_ref()
+            .filter(|_| self.scope() != self.log_scope())
+    }
+
+    fn upstream_filter(&self) -> Option<&str> {
+        // A resumed rollout may keep its original session_meta.model_provider. Once
+        // ownership is established by a run, that session label is not an account filter.
+        if self.shared_account().is_some() {
+            None
+        } else {
+            self.expected_upstream.as_deref()
+        }
+    }
+
+    fn scope_at(&self, home: &Path) -> String {
+        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
         let mut hash = Sha256::new();
         hash.update(self.source.id.as_bytes());
         hash.update([0]);
@@ -204,6 +248,7 @@ pub(crate) fn local_binding(id: &str, agent: &str, home: &Path, source: RequestS
         revision: String::new(),
         expected_upstream: None,
         gateway_observations: true,
+        managed: None,
     }
 }
 pub(crate) fn cancelled(flag: &AtomicBool) -> bool {

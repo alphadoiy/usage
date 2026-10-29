@@ -188,6 +188,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
         let mut c = Command::new(env!("CARGO_BIN_EXE_usage"));
         c.args(args)
             .env("USAGE_CODEX_DIR", self.path.join("manager"))
+            .env("USAGE_CODEX_BASE_HOME", self.path.join("user-codex"))
             .env("XDG_DATA_HOME", self.path.join("data"))
             .env("USAGE_CONFIG", self.path.join("config.toml"))
             .env("USAGE_LOG_DIR", self.path.join("logs"))

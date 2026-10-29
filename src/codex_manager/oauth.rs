@@ -733,6 +733,12 @@ impl Manager {
         let saved = self.revision(id, revision)?;
         let home = self.home(id, revision)?;
         materialize_home(&self.conn, &home, id, revision, &saved.config)?;
+        super::context::prepare_config(
+            &self.root,
+            &home,
+            &home.join(format!("usage-r{revision}.config.toml")),
+            &saved.config,
+        )?;
         Ok(home)
     }
 }

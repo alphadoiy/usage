@@ -371,7 +371,12 @@ impl Manager {
             .filter(|session| session.provider == crate::agents::AgentKind::CODEX)
         {
             targets
-                .entry((session.home.clone(), session.id.clone()))
+                .entry((
+                    crate::codex_native::SessionStore::resolve(&session.home)
+                        .root()
+                        .to_path_buf(),
+                    session.id.clone(),
+                ))
                 .or_default()
                 .push(session.key());
         }
@@ -395,6 +400,11 @@ impl Manager {
             let home = homes.entry(home_key).or_insert_with(|| {
                 self.home(&run.profile_id, run.revision)
                     .ok()
+                    .map(|home| {
+                        crate::codex_native::SessionStore::resolve(&home)
+                            .root()
+                            .to_path_buf()
+                    })
                     .and_then(|home| home.canonicalize().ok())
             });
             let Some(home) = home else {

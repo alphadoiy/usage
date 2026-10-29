@@ -245,7 +245,8 @@ fn discover(session: &Session, home: &Path, cancel: &Cancellation) -> Result<Vec
     let mut found = Vec::new();
     match session.provider.id() {
         "codex" => {
-            if let Ok(Some(database)) = super::codex_index(home)
+            if let Ok(Some((_, database))) =
+                crate::codex_native::SessionStore::resolve(home).index()
                 && let Ok(db) = rusqlite::Connection::open_with_flags(
                     database,
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

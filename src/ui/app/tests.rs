@@ -946,27 +946,214 @@ async fn history_auto_refresh_scans_locally_and_skips_quota_network() {
 }
 #[tokio::test]
 async fn current_resume_is_requested_only_after_session_enter() {
+    let root = std::env::temp_dir().join(format!("usage-current-plan-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("project")).unwrap();
+    std::fs::create_dir_all(root.join("work")).unwrap();
     let mut app = dashboard();
     app.browser_state.panel = Some(SessionBrowser::new(vec![sessions::Session {
         agent: None,
         provider: AgentKind::CODEX,
         instance: "work".into(),
         id: "123e4567-e89b-12d3-a456-426614174001".into(),
-        cwd: "/tmp/project".into(),
-        home: "/tmp/work".into(),
+        cwd: root.join("project"),
+        home: root.join("work"),
         title: "Work".into(),
         recency_at_ms: 0,
     }]));
     app.browser_state.panel.as_mut().unwrap().resume_mode = crate::config::ResumeMode::Current;
     app.handle_browser_key(KeyCode::Enter, &Handle::current());
-    assert!(app.browser_state.resume_request.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
     app.handle_browser_key(KeyCode::Enter, &Handle::current());
     assert_eq!(
-        app.browser_state.resume_request.as_ref().unwrap().instance,
+        app.browser_state
+            .resume_plan
+            .as_ref()
+            .unwrap()
+            .session()
+            .instance,
         "work"
     );
     assert!(app.browser_state.panel.as_ref().unwrap().launching);
+    std::fs::remove_dir_all(root).unwrap();
 }
+#[tokio::test]
+async fn provider_picker_resumes_the_same_thread_with_the_selected_account() {
+    let root = std::env::temp_dir().join(format!("usage-picker-{}", uuid::Uuid::new_v4()));
+    let mut manager = crate::codex_manager::Manager::open(root.clone()).unwrap();
+    let shared = crate::codex_manager::shared_sessions::target_home(&root);
+    std::fs::create_dir_all(&shared).unwrap();
+    let config =
+        crate::codex_manager::config::new_config("https://fixture.invalid/v1", "model", None)
+            .unwrap();
+    let target = manager.add("Target", &config, "synthetic-key").unwrap();
+    let mut app = dashboard();
+    app.home_activity.root = root.clone();
+    app.browser_state.panel = Some(SessionBrowser::new(vec![Session {
+        agent: None,
+        provider: AgentKind::CODEX,
+        instance: "codex".into(),
+        id: "123e4567-e89b-12d3-a456-426614174001".into(),
+        cwd: root.clone(),
+        home: shared,
+        title: "Shared thread".into(),
+        recency_at_ms: 0,
+    }]));
+    let browser = app.browser_state.panel.as_mut().unwrap();
+    browser.resume_mode = crate::config::ResumeMode::Current;
+    browser.focus_sessions();
+    app.handle_browser_key(KeyCode::Char('P'), &Handle::current());
+    assert!(app.browser_state.resume_plan.is_none());
+    drain_until(&mut app, |a| {
+        a.resume_provider.as_ref().is_some_and(|p| !p.loading)
+    })
+    .await;
+    assert_eq!(
+        app.resume_provider.as_ref().unwrap().choices[0].id,
+        target.id
+    );
+    app.handle_resume_provider_key(KeyCode::Esc, &Handle::current());
+    assert!(app.resume_provider.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
+    app.open_resume_provider(false, &Handle::current());
+    drain_until(&mut app, |a| {
+        a.resume_provider.as_ref().is_some_and(|p| !p.loading)
+    })
+    .await;
+    app.handle_resume_provider_key(KeyCode::Down, &Handle::current());
+    app.handle_resume_provider_key(KeyCode::Enter, &Handle::current());
+    let request = app.browser_state.resume_plan.as_ref().unwrap();
+    let session = request.session();
+    assert_eq!(session.id, "123e4567-e89b-12d3-a456-426614174001");
+    let command = request.shell_command().unwrap();
+    assert!(command.contains(&target.id), "{command}");
+    assert!(command.contains(&session.id), "{command}");
+    assert_eq!(request.usage_config(), Some(app.config_path.as_path()));
+    assert!(
+        session.agent.is_none(),
+        "choosing a target must preserve the source adapter"
+    );
+    let original = app
+        .browser_state
+        .panel
+        .as_ref()
+        .unwrap()
+        .selected_session()
+        .unwrap();
+    assert_eq!(session.key(), original.key());
+    assert_eq!(session.home, original.home);
+    assert!(app.browser_state.panel.as_ref().unwrap().launching);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn provider_picker_disables_unshared_sessions_and_explains_why() {
+    let root = std::env::temp_dir().join(format!("usage-unshared-picker-{}", uuid::Uuid::new_v4()));
+    let mut manager = crate::codex_manager::Manager::open(root.clone()).unwrap();
+    let config =
+        crate::codex_manager::config::new_config("https://fixture.invalid/v1", "model", None)
+            .unwrap();
+    manager
+        .add("Target", &config, "synthetic-picker-key")
+        .unwrap();
+    let home = root.join("independent-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut app = dashboard();
+    app.home_activity.root = root.clone();
+    app.browser_state.panel = Some(SessionBrowser::new(vec![Session {
+        agent: None,
+        provider: AgentKind::CODEX,
+        instance: "independent".into(),
+        id: uuid::Uuid::new_v4().to_string(),
+        cwd: root.clone(),
+        home,
+        title: "Independent conversation".into(),
+        recency_at_ms: 0,
+    }]));
+    app.browser_state.panel.as_mut().unwrap().focus_sessions();
+    app.open_resume_provider(false, &Handle::current());
+    drain_until(&mut app, |app| {
+        app.resume_provider.as_ref().is_some_and(|p| !p.loading)
+    })
+    .await;
+    app.handle_resume_provider_key(KeyCode::Down, &Handle::current());
+    app.handle_resume_provider_key(KeyCode::Enter, &Handle::current());
+    assert!(app.resume_provider.is_some());
+    assert!(app.browser_state.resume_plan.is_none());
+    assert!(!app.browser_state.panel.as_ref().unwrap().launching);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    let text: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(text.contains("独立目录"), "{text}");
+    assert!(text.contains("不可用"), "{text}");
+    drop(app);
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn history_refresh_failure_is_visible_with_cached_data_and_clears_after_success() {
+    let mut app = dashboard();
+    app.history_state.panel = Some(HistoryPanel::new(vec!["codex".into()], 2026, false));
+    let mut successful = crate::history::History::default();
+    successful.synced_at = Some(Utc::now());
+    app.history_state.show_snapshot(Arc::new(successful));
+    let mut failed = crate::history::History::default();
+    failed.warnings = vec!["账本读取失败".into()];
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    for event in [
+        AppEvent::HistoryFailed("任务队列已满".into()),
+        AppEvent::HistoryLoaded {
+            history: failed,
+            cache: crate::history::HistoryCache::default(),
+        },
+    ] {
+        app.tx.send(event).unwrap();
+        app.drain_events();
+        assert!(app.history_state.loaded.synced_at.is_some());
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        let text: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(text.contains("历史更新失败，保留上次结果"), "{text}");
+        assert!(
+            text.contains(app.history_state.refresh_error.as_ref().unwrap()),
+            "{text}"
+        );
+    }
+    let mut successful = crate::history::History::default();
+    successful.synced_at = Some(Utc::now());
+    app.tx
+        .send(AppEvent::HistoryLoaded {
+            history: successful,
+            cache: crate::history::HistoryCache::default(),
+        })
+        .unwrap();
+    app.drain_events();
+    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    let text: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(!text.contains("历史更新失败"), "{text}");
+    assert!(app.history_state.refresh_error.is_none());
+}
+
 #[test]
 fn quota_events_queue_one_alert_and_failures_do_not_emit_recovery() {
     let mut app = dashboard();

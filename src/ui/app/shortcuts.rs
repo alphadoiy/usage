@@ -71,6 +71,7 @@ impl Dashboard {
                 "↑/↓ 选择 · Tab / Shift+Tab 切换列表 · ← 项目 / → 会话",
                 vec![
                     enter("进入列表 / 恢复会话"),
+                    action('P', "Shift+P", "选择 Provider 继续 Codex 会话"),
                     action('/', "/", "搜索项目和会话"),
                     action(' ', "Space", "勾选 / 取消当前会话或项目"),
                     action('a', "a", "全选 / 取消当前项目列表"),
@@ -120,6 +121,7 @@ impl Dashboard {
                     "Tab / Shift+Tab 切换看板 · ↑/↓ 选择 · ← 项目 / → 会话",
                     vec![
                         enter("进入列表 / 恢复会话"),
+                        action('P', "Shift+P", "选择 Provider 继续 Codex 会话"),
                         action('/', "/", "搜索项目和会话"),
                         action('c', "c", "清除搜索"),
                         action('R', "Shift+R", "切换会话恢复方式"),

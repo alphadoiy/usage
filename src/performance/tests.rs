@@ -21,6 +21,7 @@ impl Fixture {
             revision: "1".into(),
             expected_upstream: None,
             gateway_observations: true,
+            managed: None,
         };
         let service = Service::at(root.join("index/performance.sqlite3"));
         Self {
@@ -100,6 +101,533 @@ fn complete() -> String {
         "event_msg",
         json!({"type":"task_complete","turn_id":"turn-a","duration_ms":10000,"time_to_first_token_ms":2000}),
     )
+}
+
+#[derive(Debug, Default)]
+struct MemoryEvidence {
+    snapshot: crate::runs::SessionEvidenceSnapshot,
+    queries: std::sync::Mutex<Vec<(Vec<String>, i64, i64)>>,
+}
+impl crate::runs::SessionEvidenceReader for MemoryEvidence {
+    fn read(
+        &self,
+        query: crate::runs::SessionEvidenceQuery<'_>,
+    ) -> Result<crate::runs::SessionEvidenceSnapshot, String> {
+        self.queries.lock().unwrap().push((
+            query.sessions.to_vec(),
+            query.since_ms,
+            query.until_ms,
+        ));
+        Ok(self.snapshot.clone())
+    }
+}
+fn memory_source(
+    store: &str,
+    reader: std::sync::Arc<MemoryEvidence>,
+) -> crate::runs::SessionEvidenceSource {
+    crate::runs::SessionEvidenceSource::new(
+        crate::runs::SessionEvidenceIdentity {
+            backend: "memory.test".into(),
+            store: store.into(),
+        },
+        reader,
+    )
+}
+
+#[cfg(unix)]
+fn share_home(home: &Path, shared: &Path) {
+    fs::create_dir_all(shared.join("sessions")).unwrap();
+    std::os::unix::fs::symlink(shared.join("sessions"), home.join("sessions")).unwrap();
+    fs::write(
+        home.join("usage-shared-home.json"),
+        serde_json::to_vec(shared).unwrap(),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+struct SharedFixture {
+    fixture: Fixture,
+    other: Binding,
+    runs: rusqlite::Connection,
+}
+
+#[cfg(unix)]
+impl SharedFixture {
+    fn new() -> Self {
+        let mut fixture = Fixture::new("codex");
+        let shared = fixture.root.join("shared");
+        share_home(&fixture.binding.home, &shared);
+        let root = fixture.root.join("accounts");
+        fs::create_dir_all(&root).unwrap();
+        let runs = rusqlite::Connection::open(root.join("manager.sqlite3")).unwrap();
+        runs.execute_batch("CREATE TABLE runs(id TEXT PRIMARY KEY,profile_id TEXT,revision INTEGER,started_at TEXT,finished_at TEXT);
+            CREATE TABLE run_sessions(run_id TEXT,session_id TEXT,first_seen TEXT,last_seen TEXT,PRIMARY KEY(run_id,session_id));
+            CREATE INDEX session_lookup ON run_sessions(session_id,last_seen);
+            CREATE TABLE run_events(run_id TEXT,session_id TEXT,turn_id TEXT,observed_at TEXT);
+            CREATE INDEX event_lookup ON run_events(session_id,observed_at);").unwrap();
+        fixture.binding.managed = Some(ManagedBinding {
+            evidence: crate::codex_manager::Manager::open_read_only(root)
+                .unwrap()
+                .unwrap()
+                .session_evidence_source(),
+            account: "A".into(),
+            revision: 1,
+        });
+        fixture.binding.expected_upstream = Some("usage_byok".into());
+        let mut other = fixture.binding.clone();
+        other.provider = "B".into();
+        other.home = fixture.root.join("other");
+        other.managed.as_mut().unwrap().account = "B".into();
+        fs::create_dir_all(&other.home).unwrap();
+        share_home(&other.home, &shared);
+        Self {
+            fixture,
+            other,
+            runs,
+        }
+    }
+    fn claim(&self, run: &str, account: &str, session: &str, start: u32, end: u32, turns: &[&str]) {
+        let text = |sec| {
+            chrono::DateTime::from_timestamp_millis(at(sec))
+                .unwrap()
+                .to_rfc3339()
+        };
+        self.runs
+            .execute(
+                "INSERT INTO runs VALUES(?1,?2,1,?3,?4)",
+                rusqlite::params![run, account, text(start), text(end)],
+            )
+            .unwrap();
+        self.runs
+            .execute(
+                "INSERT INTO run_sessions VALUES(?1,?2,?3,?4)",
+                rusqlite::params![run, session, text(start), text(end)],
+            )
+            .unwrap();
+        for turn in turns {
+            self.runs
+                .execute(
+                    "INSERT INTO run_events VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![run, session, turn, text(end)],
+                )
+                .unwrap();
+        }
+    }
+    fn call(&self, id: &str, session: &str, turn: Option<&str>, sec: u32) {
+        let db = self.fixture.service.open().unwrap();
+        store::save(
+            &db,
+            &self.fixture.binding.log_scope(),
+            &Observation {
+                id: id.into(),
+                session: session.into(),
+                turn: turn.map(str::to_owned),
+                at: at(sec),
+                model: id.into(),
+                upstream: Some("usage_byok".into()),
+                output: 200,
+                duration_ms: Some(2000),
+                ttft_ms: Some(500),
+                native_timing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    fn snapshot(&self, binding: &Binding) -> Snapshot {
+        self.fixture
+            .service
+            .snapshot(binding, Period::Month, None, 0, at(40))
+            .unwrap()
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn shared_rollouts_are_indexed_once_and_never_attributed_by_provider_name() {
+    let f = SharedFixture::new();
+    for (session, model) in [("session-A", "model-A"), ("session-B", "model-B")] {
+        f.fixture.file(
+            &format!("{session}.jsonl"),
+            &(codex_session(session, model) + &complete()).replace("relay", "usage_byok"),
+        );
+    }
+    f.claim("run-A", "A", "session-A", 0, 12, &["turn-a"]);
+    f.claim("run-B", "B", "session-B", 0, 12, &["turn-a"]);
+    f.fixture.update();
+    let batch = f
+        .fixture
+        .service
+        .refresh(&f.other, f.other.source, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(
+        batch.bytes, 0,
+        "the second account reuses the physical log cursor"
+    );
+    let separate_reader = Service::at(f.fixture.root.join("index/performance.sqlite3"));
+    let batch = separate_reader
+        .refresh(&f.other, f.other.source, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(
+        batch.bytes, 0,
+        "a fresh reader also reuses canonical file paths"
+    );
+    assert_ne!(
+        f.fixture.binding.scope(),
+        f.other.scope(),
+        "gateway scopes remain account-local"
+    );
+    assert_eq!(f.fixture.binding.log_scope(), f.other.log_scope());
+    for (binding, expected) in [(&f.fixture.binding, "model-A"), (&f.other, "model-B")] {
+        let snapshot = f.snapshot(binding);
+        assert_eq!(snapshot.summary.calls, 1);
+        assert_eq!(snapshot.models[0].model, expected);
+        assert_eq!(snapshot.unmatched, 0);
+        assert_eq!(
+            f.fixture
+                .service
+                .summary(binding, Period::Month, at(40))
+                .unwrap()
+                .unwrap()
+                .calls,
+            1
+        );
+    }
+    let db = f.fixture.service.open().unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM perf_calls", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row("SELECT COUNT(DISTINCT scope) FROM perf_files", [], |r| r
+            .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    let local = local_binding(
+        "native",
+        "codex",
+        &f.fixture.root.join("shared"),
+        f.fixture.binding.source,
+    );
+    assert_eq!(
+        f.snapshot(&local).summary.calls,
+        2,
+        "the native storage view still sees both calls"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn one_shared_session_resumed_with_another_account_uses_run_time_and_revision() {
+    let f = SharedFixture::new();
+    f.call("from-A", "shared", Some("turn-A"), 10);
+    f.call("from-B", "shared", Some("turn-B"), 20);
+    f.call("unconfirmed", "shared", Some("turn-C"), 30);
+    f.claim("run-A", "A", "shared", 0, 12, &["turn-A"]);
+    f.claim("run-B", "B", "shared", 15, 22, &["turn-B"]);
+    for (binding, id) in [(&f.fixture.binding, "from-A"), (&f.other, "from-B")] {
+        let snapshot = f.snapshot(binding);
+        assert_eq!(snapshot.summary.calls, 1);
+        assert_eq!(snapshot.recent[0].id, id);
+        assert_eq!(
+            snapshot.unmatched, 1,
+            "unconfirmed continuation is not guessed"
+        );
+    }
+    let mut revised = f.fixture.binding.clone();
+    revised.managed.as_mut().unwrap().revision = 2;
+    assert_eq!(f.snapshot(&revised).summary.calls, 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn cross_provider_resume_uses_confirmed_run_even_when_rollout_keeps_its_original_provider() {
+    let mut f = SharedFixture::new();
+    f.fixture.binding.expected_upstream = Some("provider-A".into());
+    f.other.expected_upstream = Some("provider-B".into());
+    let log = (codex_session("shared", "model-A") + &complete()).replace("relay", "provider-A")
+        + &line(15, "turn_context", json!({"model":"model-B"}))
+        + &line(
+            15,
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-B"}),
+        )
+        + &line(
+            20,
+            "event_msg",
+            json!({"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":20,"output_tokens":1000,"reasoning_output_tokens":400},
+                "last_token_usage":{"output_tokens":500,"reasoning_output_tokens":200}
+            }}),
+        )
+        + &line(
+            21,
+            "event_msg",
+            json!({"type":"task_complete","turn_id":"turn-B","duration_ms":5000,"time_to_first_token_ms":1000}),
+        );
+    f.fixture.file("shared.jsonl", &log);
+    f.claim("run-A", "A", "shared", 0, 12, &["turn-a"]);
+    f.claim("run-B", "B", "shared", 15, 22, &["turn-B"]);
+    f.fixture.update();
+    for (binding, model) in [(&f.fixture.binding, "model-A"), (&f.other, "model-B")] {
+        let snapshot = f.snapshot(binding);
+        assert_eq!(snapshot.summary.calls, 1);
+        assert_eq!(snapshot.models[0].model, model);
+        assert_eq!(
+            snapshot.recent[0].upstream.as_deref(),
+            Some("provider-A"),
+            "session metadata remains unchanged"
+        );
+        assert_eq!(snapshot.unmatched, 0);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn overlapping_shared_runs_need_unique_turn_evidence_and_missing_evidence_stays_unknown() {
+    let f = SharedFixture::new();
+    f.claim("run-A", "A", "shared", 0, 25, &["turn-A", "ambiguous"]);
+    f.claim("run-B", "B", "shared", 0, 25, &["turn-B", "ambiguous"]);
+    f.call("from-A", "shared", Some("turn-A"), 10);
+    f.call("from-B", "shared", Some("turn-B"), 15);
+    f.call("no-turn", "shared", None, 18);
+    f.call("same-turn", "shared", Some("ambiguous"), 20);
+    for binding in [&f.fixture.binding, &f.other] {
+        let snapshot = f.snapshot(binding);
+        assert_eq!(snapshot.summary.calls, 1);
+        assert_eq!(snapshot.unmatched, 2);
+    }
+    f.runs
+        .execute("DELETE FROM run_events WHERE run_id='run-B'", [])
+        .unwrap();
+    for binding in [&f.fixture.binding, &f.other] {
+        let snapshot = f.snapshot(binding);
+        assert_eq!(
+            snapshot.summary.calls, 0,
+            "an overlapping run with missing turn evidence cannot be excluded"
+        );
+        assert_eq!(snapshot.unmatched, 4);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn shared_account_keeps_legacy_gateway_rows_but_does_not_reuse_legacy_cli_attribution() {
+    let f = SharedFixture::new();
+    let scope = f.fixture.binding.scope();
+    f.claim("run-A", "A", "shared", 0, 12, &["turn-A"]);
+    f.call("cli-A", "shared", Some("turn-A"), 10);
+    f.call("unknown", "unmanaged", None, 20);
+    let db = f.fixture.service.open().unwrap();
+    store::save(
+        &db,
+        &scope,
+        &Observation {
+            id: "old-misattribution".into(),
+            session: "unmanaged".into(),
+            at: at(20),
+            model: "wrong".into(),
+            upstream: Some("usage_byok".into()),
+            output: 200,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    f.fixture
+        .service
+        .register_gateway_run(&scope, "run-A", "owner")
+        .unwrap();
+    db.execute(
+        "UPDATE perf_gateway_runs SET started=?1,ended=?2 WHERE run='run-A'",
+        rusqlite::params![at(0), at(12)],
+    )
+    .unwrap();
+    f.fixture
+        .service
+        .record_gateway(
+            &scope,
+            "usage_byok",
+            &crate::gateway::Record {
+                id: "gateway-A".into(),
+                run: "run-A".into(),
+                session: "shared".into(),
+                at: at(10),
+                model: "actual".into(),
+                output: Some(200),
+                duration: 2000,
+                ttft: Some(500),
+                status: 200,
+                complete: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let snapshot = f.snapshot(&f.fixture.binding);
+    assert_eq!(snapshot.summary.calls, 1);
+    assert_eq!(snapshot.recent[0].id, "gateway-A");
+    assert!(snapshot.recent[0].gateway);
+    assert_eq!(snapshot.unmatched, 1);
+    assert_eq!(f.snapshot(&f.other).summary.calls, 0);
+    // OAuth/native fallback uses its own confirmed CLI call and cannot ingest gateway rows.
+    let mut direct = f.fixture.binding.clone();
+    direct.gateway_observations = false;
+    let snapshot = f.snapshot(&direct);
+    assert_eq!(snapshot.summary.calls, 1);
+    assert_eq!(snapshot.recent[0].id, "cli-A");
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_missing_session_evidence_is_unknown_but_isolated_homes_keep_their_history() {
+    let f = SharedFixture::new();
+    f.call("unclaimed", "shared", Some("turn"), 10);
+    f.runs.execute_batch("DROP TABLE run_sessions;").unwrap();
+    let snapshot = f.snapshot(&f.fixture.binding);
+    assert_eq!(snapshot.summary.calls, 0);
+    assert_eq!(snapshot.unmatched, 1);
+    assert_eq!(
+        f.fixture
+            .service
+            .summary(&f.fixture.binding, Period::Month, at(40))
+            .unwrap()
+            .unwrap()
+            .calls,
+        0
+    );
+
+    let mut isolated = Fixture::new("codex");
+    isolated.binding.managed = Some(ManagedBinding {
+        evidence: memory_source("isolated", std::sync::Arc::new(MemoryEvidence::default())),
+        account: "A".into(),
+        revision: 1,
+    });
+    isolated.file(
+        "old.jsonl",
+        &(codex_session("legacy", "old-model") + &complete()),
+    );
+    isolated.update();
+    assert_eq!(
+        isolated.snapshot().summary.calls,
+        1,
+        "an unshared Home still supplies its own historical evidence"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn injected_memory_evidence_attributes_shared_requests_without_an_account_database() {
+    use crate::runs::{SessionClaim, SessionEvidenceSnapshot};
+    use std::sync::Arc;
+    let mut f = Fixture::new("codex");
+    share_home(&f.binding.home, &f.root.join("shared"));
+    let reader = Arc::new(MemoryEvidence {
+        snapshot: SessionEvidenceSnapshot {
+            sessions: std::collections::HashMap::from([(
+                "shared".into(),
+                vec![
+                    SessionClaim {
+                        run: "run-A".into(),
+                        account: "A".into(),
+                        revision: 1,
+                        start: at(0),
+                        end: at(12),
+                        turns: ["turn-A".into()].into(),
+                    },
+                    SessionClaim {
+                        run: "run-B".into(),
+                        account: "B".into(),
+                        revision: 1,
+                        start: at(15),
+                        end: at(22),
+                        turns: ["turn-B".into()].into(),
+                    },
+                ],
+            )]),
+        },
+        ..Default::default()
+    });
+    f.binding.managed = Some(ManagedBinding {
+        evidence: memory_source("one", reader.clone()),
+        account: "A".into(),
+        revision: 1,
+    });
+    let mut other = f.binding.clone();
+    other.managed.as_mut().unwrap().account = "B".into();
+    let db = f.service.open().unwrap();
+    for (id, turn, sec) in [
+        ("from-A", "turn-A", 10),
+        ("from-B", "turn-B", 20),
+        ("unknown", "turn-unknown", 30),
+    ] {
+        store::save(
+            &db,
+            &f.binding.log_scope(),
+            &Observation {
+                id: id.into(),
+                session: "shared".into(),
+                turn: Some(turn.into()),
+                at: at(sec),
+                model: "model".into(),
+                output: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    for (binding, expected) in [(&f.binding, "from-A"), (&other, "from-B")] {
+        let snapshot = f
+            .service
+            .snapshot(binding, Period::Month, None, 0, at(40))
+            .unwrap();
+        assert_eq!(snapshot.summary.calls, 1);
+        assert_eq!(snapshot.recent[0].id, expected);
+        assert_eq!(snapshot.unmatched, 1);
+    }
+    assert_eq!(
+        *reader.queries.lock().unwrap(),
+        vec![(vec!["shared".into()], at(40) - 30 * 86_400_000, at(40)); 2],
+        "the consumer supplies only the indexed session and selected time window"
+    );
+    assert!(!f.root.join("manager.sqlite3").exists());
+    assert!(!f.binding.home.join("manager.sqlite3").exists());
+
+    let key = f.binding.cache_key();
+    f.binding.managed.as_mut().unwrap().evidence =
+        memory_source("one", Arc::new(MemoryEvidence::default()));
+    assert_eq!(
+        f.binding.cache_key(),
+        key,
+        "reallocating the same evidence source does not change cache identity"
+    );
+    let source = &f.binding.managed.as_ref().unwrap().evidence;
+    assert_eq!(
+        serde_json::to_value(source).unwrap(),
+        json!({"identity":{"backend":"memory.test","store":"one"}})
+    );
+    f.binding.managed.as_mut().unwrap().evidence =
+        memory_source("two", Arc::new(MemoryEvidence::default()));
+    assert_ne!(
+        f.binding.cache_key(),
+        key,
+        "different stores cannot share a cache"
+    );
+    let source = &mut f.binding.managed.as_mut().unwrap().evidence;
+    *source = crate::runs::SessionEvidenceSource::new(
+        crate::runs::SessionEvidenceIdentity {
+            backend: "another-backend".into(),
+            store: "one".into(),
+        },
+        Arc::new(MemoryEvidence::default()),
+    );
+    assert_ne!(
+        f.binding.cache_key(),
+        key,
+        "backend namespaces are part of identity"
+    );
 }
 
 fn load_request(f: &Fixture) -> LoadRequest {

@@ -1,5 +1,7 @@
 //! Persisted runs: launch records with their captured identity and confirmed sessions, kept
 //! in the account store but separate from account configuration.
+mod evidence;
+
 use std::path::Path;
 use std::process::ExitStatus;
 
@@ -8,6 +10,11 @@ use rusqlite::OptionalExtension;
 use super::{Error, Manager, Result, RunRecord, runtime};
 
 impl Manager {
+    /// A read-only capability can outlive this connection without exposing account SQL.
+    pub(crate) fn session_evidence_source(&self) -> crate::runs::SessionEvidenceSource {
+        evidence::source(&self.root)
+    }
+
     /// Keep all pages bounded; unfinished records precede completed history.
     pub fn recent_runs(&self, limit: usize) -> Result<Vec<RunRecord>> {
         let has_contexts: bool = self.conn.query_row(

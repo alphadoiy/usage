@@ -35,6 +35,25 @@ sys.exit(3)
 """
 
 
+def terminate_child(pid, timeout=3):
+    """A failed assertion must not turn into an unbounded wait on the PTY child."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if waited:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
 def check_terminal(program, env, ui, cancel):
     pid, fd = pty.fork()
     if pid == 0:
@@ -62,6 +81,7 @@ def check_terminal(program, env, ui, cancel):
 
     try:
         if ui:
+            # The page title remains visible below the shared F1–F4 navigation.
             until("Provider 管理")
             # Both manager entry points open the same service-first wizard.
             os.write(fd, b"\x1b[15~" if cancel else b"a")
@@ -103,7 +123,7 @@ def check_terminal(program, env, ui, cancel):
         code = os.waitstatus_to_exitcode(status)
         assert code == (130 if cancel and not ui else 0), (code, data[-2000:])
         result = subprocess.run(
-            [program, "codex", "list", "--json"], env=env, capture_output=True, check=True
+            [program, "codex", "list", "--json"], env=env, capture_output=True, check=True, timeout=10
         )
         profiles = json.loads(result.stdout)
         assert len(profiles) == (0 if cancel else 1)
@@ -111,11 +131,10 @@ def check_terminal(program, env, ui, cancel):
             assert profiles[0]["name"] == ("synthetic@example.test" if ui else "Synthetic")
         assert not any((Path(env["USAGE_CODEX_DIR"]) / "login-staging").iterdir())
         assert b"panicked" not in data
-        print(f"{'TUI' if ui else 'CLI'} {'cancellation' if cancel else 'login'}: passed")
+        print(f"{'TUI' if ui else 'CLI'} {'cancellation' if cancel else 'login'}: passed", flush=True)
     finally:
-        if not done:
-            os.kill(pid, signal.SIGKILL)
-            os.waitpid(pid, 0)
+        if not done and not terminate_child(pid):
+            print(f"PTY child {pid} did not exit after SIGKILL; cleanup stopped after 3 seconds", file=sys.stderr, flush=True)
         os.close(fd)
 
 

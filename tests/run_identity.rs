@@ -20,6 +20,7 @@ impl Fixture {
         command
             .args(args)
             .env("USAGE_CODEX_DIR", self.0.join("manager"))
+            .env("USAGE_CODEX_BASE_HOME", self.0.join("user-codex"))
             .env("USAGE_CONFIG", self.0.join("usage.toml"))
             .env("USAGE_LOG_DIR", self.0.join("logs"))
             .env("USAGE_LOG", "debug")
@@ -168,7 +169,8 @@ fn persisted_model_choice_is_captured_and_cli_overrides_still_take_precedence() 
     fixture.configure(&id);
     let manager = usage::codex_manager::Manager::open(fixture.0.join("manager")).unwrap();
     let saved = manager.revision(&id, 1).unwrap().config;
-    let home = manager.materialize(&id, 1).unwrap();
+    let home = manager.home(&id, 1).unwrap();
+    fs::create_dir_all(&home).unwrap();
     let runtime = saved.replace("base-model", "selected-model");
     fs::write(home.join("config.toml"), &runtime).unwrap();
     drop(manager);

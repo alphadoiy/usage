@@ -93,20 +93,8 @@ fn origin(thread_source: Option<&str>, source: &Value) -> Origin {
 }
 
 fn from_index(home: &Path, thread: &str) -> Result<Option<Origin>, &'static str> {
-    let database = fs::read_dir(home)
-        .map_err(|_| "home_unreadable")?
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let version = name
-                .to_str()?
-                .strip_prefix("state_")?
-                .strip_suffix(".sqlite")?
-                .parse::<u32>()
-                .ok()?;
-            Some((version, entry.path()))
-        })
-        .max_by_key(|(version, _)| *version);
+    let store = crate::codex_native::SessionStore::resolve(home);
+    let database = store.index().map_err(|_| "home_unreadable")?;
     let Some((version, database)) = database else {
         lookup("index", "database_missing");
         return Ok(None);

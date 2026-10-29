@@ -181,6 +181,94 @@ fn purged_sessions_keep_only_a_tombstone_and_cannot_reappear_from_native_index()
 }
 
 #[test]
+fn purging_a_missing_codex_home_preserves_legacy_child_ids_without_recreating_it() {
+    for legacy in [false, true] {
+        let f = Fixture::new(AgentKind::CODEX);
+        let child = uuid::Uuid::new_v4().to_string();
+        let grandchild = uuid::Uuid::new_v4().to_string();
+        let metadata = |id: &str, parent: Option<&str>| {
+            let mut payload = serde_json::json!({"id":id,"cwd":f.root});
+            if let Some(parent) = parent {
+                payload["source"] =
+                    serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+            }
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session_meta","payload":payload})
+            )
+        };
+        f.put("sessions/main.jsonl", &metadata(&f.session.id, None));
+        f.put(
+            "sessions/child.jsonl",
+            &metadata(&child, Some(&f.session.id)),
+        );
+        // A valid plain twin is authoritative even when its in-progress archive is incomplete.
+        f.put("sessions/child.jsonl.zst", "incomplete archive");
+        fs::write(
+            f.session.home.join("sessions/grandchild.jsonl.zst"),
+            ruzstd::encoding::compress_to_vec(
+                metadata(&grandchild, Some(&child)).as_bytes(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+        )
+        .unwrap();
+        f.old();
+        let entry = f.store.delete(&f.session).unwrap();
+        if legacy {
+            let mut manifest = serde_json::to_value(&entry).unwrap();
+            manifest.as_object_mut().unwrap().remove("session_ids");
+            fs::write(
+                f.store.dir(&entry.key).unwrap().join("entry.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        fs::rename(&f.session.home, f.root.join("detached-home")).unwrap();
+        f.store.purge(&entry.key).unwrap();
+        assert!(
+            !f.session.home.exists(),
+            "purge must not recreate the original Home"
+        );
+        assert!(!f.store.dir(&entry.key).unwrap().join("files").exists());
+        let hidden = f.store.hidden("codex", &f.session.home).unwrap();
+        for id in [&f.session.id, &child, &grandchild] {
+            assert!(
+                hidden.contains(id),
+                "child tombstones must survive legacy purge"
+            );
+        }
+        f.store.purge(&entry.key).unwrap();
+        assert!(!f.session.home.exists());
+    }
+}
+
+#[test]
+fn purged_tombstone_retry_does_not_reacquire_native_locks() {
+    let f = Fixture::new(AgentKind::CODEX);
+    f.put(
+        "sessions/main.jsonl",
+        &format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":f.session.id,"cwd":f.root}})
+        ),
+    );
+    f.old();
+    let entry = f.store.delete(&f.session).unwrap();
+    f.store.purge(&entry.key).unwrap();
+    let manifest = f.store.dir(&entry.key).unwrap().join("entry.json");
+    let before = fs::read(&manifest).unwrap();
+    let coordination = File::open(
+        f.session
+            .home
+            .join("thread-writer-locks/.coordination.lock"),
+    )
+    .unwrap();
+    coordination.lock_exclusive().unwrap();
+    f.store.purge(&entry.key).unwrap();
+    assert_eq!(fs::read(manifest).unwrap(), before);
+}
+
+#[test]
 fn codex_moves_segments_compressed_twins_and_nested_subagents_but_keeps_independent_forks() {
     let f = Fixture::new(AgentKind::CODEX);
     let id = &f.session.id;
@@ -228,6 +316,172 @@ fn codex_moves_segments_compressed_twins_and_nested_subagents_but_keeps_independ
     for path in &moved {
         assert!(path.exists());
     }
+}
+
+#[test]
+fn native_writer_locks_protect_idle_threads_children_and_restoration() {
+    let f = Fixture::new(AgentKind::CODEX);
+    let child = uuid::Uuid::new_v4().to_string();
+    let main = f.put(
+        "sessions/main.jsonl",
+        &format!(
+            "{}\n",
+            serde_json::json!({
+                "type":"session_meta", "payload":{"id":f.session.id,"cwd":f.root}
+            })
+        ),
+    );
+    let child_log = f.put(
+        "sessions/child.jsonl",
+        &format!(
+            "{}\n",
+            serde_json::json!({
+                "type":"session_meta", "payload":{"id":child,"cwd":f.root,
+                "source":{"subagent":{"thread_spawn":{"parent_thread_id":f.session.id}}}}
+            })
+        ),
+    );
+    f.old();
+    let locks = f.session.home.join("thread-writer-locks");
+    fs::create_dir_all(&locks).unwrap();
+    let hold = |id: &str| {
+        let file = File::create(locks.join(format!("{id}.lock"))).unwrap();
+        file.lock_exclusive().unwrap();
+        file
+    };
+    for id in [&f.session.id, &child] {
+        let writer = hold(id);
+        assert!(
+            f.store
+                .delete(&f.session)
+                .unwrap_err()
+                .contains("原生写入锁")
+        );
+        assert!(main.exists() && child_log.exists());
+        assert!(f.store.list().unwrap().is_empty());
+        drop(writer);
+    }
+    // Another live thread must not prevent cleaning this idle conversation.
+    let _unrelated = hold(&uuid::Uuid::new_v4().to_string());
+    let entry = f.store.delete(&f.session).unwrap();
+    assert!(!main.exists() && !child_log.exists());
+    assert!(entry.session_ids.contains(&child));
+    let writer = hold(&child);
+    assert!(
+        f.store
+            .restore(&entry.key)
+            .unwrap_err()
+            .contains("原生写入锁")
+    );
+    assert!(
+        f.store
+            .purge(&entry.key)
+            .unwrap_err()
+            .contains("原生写入锁")
+    );
+    drop(writer);
+    f.store.restore(&entry.key).unwrap();
+    assert!(main.exists() && child_log.exists());
+    // Cleanup never deletes native lock files (which could have waiters).
+    assert!(locks.join(format!("{child}.lock")).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_trash_restores_after_real_shared_migration_and_tombstones_follow_the_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = Fixture::new(AgentKind::CODEX);
+    let mut manager = crate::codex_manager::Manager::open(f.root.join("manager")).unwrap();
+    let config =
+        crate::codex_manager::config::new_config("https://fixture.invalid/v1", "fixture", None)
+            .unwrap();
+    let account = manager.add("A", &config, "synthetic-key").unwrap();
+    f.session.home = manager.materialize(&account.id, 1).unwrap();
+    let metadata = format!(
+        "{}\n",
+        serde_json::json!({"type":"session_meta", "payload":{
+            "id":f.session.id, "cwd":f.root, "source":"cli", "thread_source":"user"
+        }})
+    );
+    let log = f.put("sessions/main.jsonl", &metadata);
+    let child = uuid::Uuid::new_v4().to_string();
+    let child_data = format!(
+        "{}\n",
+        serde_json::json!({"type":"session_meta", "payload":{
+            "id":child, "cwd":f.root, "source":{"subagent":{"thread_spawn":{"parent_thread_id":f.session.id}}}
+        }})
+    );
+    let archive = f.session.home.join("sessions/child.jsonl.zst");
+    fs::write(
+        &archive,
+        ruzstd::encoding::compress_to_vec(
+            child_data.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    f.old();
+    let entry = f.store.delete(&f.session).unwrap();
+    // The persisted old-format entry contains no child-thread ownership list.
+    let mut legacy = serde_json::to_value(&entry).unwrap();
+    legacy.as_object_mut().unwrap().remove("session_ids");
+    fs::write(
+        f.store.dir(&entry.key).unwrap().join("entry.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let binary = f.root.join("fake-codex");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = '--help' ]; then printf '%s\\n' '--no-daemon'; fi\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        manager
+            .run(&account.id, &f.root, None, None, &binary, &[])
+            .unwrap()
+            .success()
+    );
+    let shared = crate::codex_native::SessionStore::resolve(&f.session.home)
+        .root()
+        .to_path_buf();
+    assert_ne!(shared, f.session.home);
+    assert!(
+        f.store
+            .hidden("codex", &shared)
+            .unwrap()
+            .contains(&f.session.id)
+    );
+    let lock = File::create(
+        shared
+            .join("thread-writer-locks")
+            .join(format!("{child}.lock")),
+    )
+    .unwrap();
+    lock.lock_exclusive().unwrap();
+    assert!(
+        f.store
+            .restore(&entry.key)
+            .unwrap_err()
+            .contains("原生写入锁")
+    );
+    drop(lock);
+    f.store.restore(&entry.key).unwrap();
+    assert_eq!(fs::read_to_string(&log).unwrap(), metadata);
+    assert!(archive.exists());
+    assert!(f.store.hidden("codex", &shared).unwrap().is_empty());
+    // A stale UI Session referring to the old Home also resolves the shared store.
+    let entry = f.store.delete(&f.session).unwrap();
+    f.store.purge(&entry.key).unwrap();
+    assert!(
+        f.store
+            .hidden("codex", &shared)
+            .unwrap()
+            .contains(&f.session.id)
+    );
+    assert!(f.store.hidden("codex", &shared).unwrap().contains(&child));
+    assert!(!log.exists() && !archive.exists());
 }
 
 #[test]

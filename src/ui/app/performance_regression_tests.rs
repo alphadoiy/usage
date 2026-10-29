@@ -229,6 +229,7 @@ fn panel() -> super::super::performance::Panel {
         revision: "1".into(),
         expected_upstream: Some("relay".into()),
         gateway_observations: true,
+        managed: None,
     };
     let mut panel = super::super::performance::Panel::new(binding, "Work".into());
     panel.generation = 7;

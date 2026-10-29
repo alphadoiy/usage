@@ -81,6 +81,7 @@ impl Fixture {
         command
             .args(args)
             .env("USAGE_CODEX_DIR", self.path.join("manager"))
+            .env("USAGE_CODEX_BASE_HOME", self.path.join("user-codex"))
             .env("USAGE_LOG_DIR", self.path.join("logs"))
             .env("USAGE_LOG", "debug")
             .env("USAGE_GATEWAY", "off");
@@ -248,6 +249,14 @@ if '--help' in sys.argv:
 if '--version' in sys.argv:
     print('codex-cli 0.162.1'); sys.exit(0)
 args = sys.argv[1:]
+if 'app-server' in args:
+    for line in sys.stdin:
+        request=json.loads(line)
+        if request['method']=='initialize':
+            print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+        elif request['method']=='config/read':
+            print(json.dumps({'id':request['id'],'result':{'config':{}}}),flush=True)
+    sys.exit(0)
 with open(os.environ['CAPTURE_FILE'], 'w') as file:
     json.dump({'args':args,'context':os.environ.get('USAGE_CODEX_BARK_CONTEXT'),'home':os.environ['CODEX_HOME']}, file)
 "#).unwrap();
@@ -817,7 +826,14 @@ fn same_account_opens_twice_and_resume_pins_original_revision() {
     assert_eq!(lines[0], home);
     assert_eq!(lines[1], "fixture-cli-secret");
     assert_eq!(&lines[2..6], ["unset", "unset", "unset", "unset"]);
-    assert_eq!(&lines[6..], ["--no-daemon", "resume", &session]);
+    assert_eq!(lines[6], "--no-daemon");
+    assert_eq!(&lines[lines.len() - 2..], ["resume", &session]);
+    assert!(lines.contains(&"model_provider=\"usage_byok\""));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("sqlite_home=") && line.contains("user-codex"))
+    );
     assert!(
         fs::read_to_string(PathBuf::from(home).join("config.toml"))
             .unwrap()
@@ -1314,6 +1330,7 @@ fn in_isolated_manager_process(name: &str, f: &Fixture) -> bool {
             .args(["--exact", name, "--nocapture"])
             .env("USAGE_MANAGER_TEST", name)
             .env("USAGE_CODEX_DIR", f.path.join("manager"))
+            .env("USAGE_CODEX_BASE_HOME", f.path.join("user-codex"))
             .output()
             .unwrap(),
     );
@@ -1638,8 +1655,15 @@ fn structured_launch_logs_correlate_database_run_and_flush_on_nonzero_exit() {
 fn tampered_config_logs_only_safe_field_names_and_identifies_failed_stage() {
     let f = Fixture::new();
     let id = f.add();
+    let binary = f.binary();
     let manager = usage::codex_manager::Manager::open(f.path.join("manager")).unwrap();
-    let home = manager.materialize(&id, 1).unwrap();
+    let home = manager.home(&id, 1).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        manager.revision(&id, 1).unwrap().config,
+    )
+    .unwrap();
     let config = home.join("config.toml");
     let mut doc: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
     doc["model"] = toml::Value::String("private-tampered-value".into());
@@ -1658,14 +1682,14 @@ fn tampered_config_logs_only_safe_field_names_and_identifies_failed_stage() {
             "--cwd",
             f.path.to_str().unwrap(),
             "--binary",
-            "nonexistent-codex-fixture",
+            binary.to_str().unwrap(),
         ])
         .env("USAGE_LOG", "error")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("实例配置被手动修改"));
+    assert!(stderr.contains("账号路由或认证配置已改变"));
     assert!(stderr.contains("操作 ID："));
     let events = f.events();
     let mismatch = events
@@ -1674,8 +1698,7 @@ fn tampered_config_logs_only_safe_field_names_and_identifies_failed_stage() {
         .unwrap();
     let fields = mismatch["fields"]["changed_fields"].as_str().unwrap();
     assert!(fields.contains("model_providers.<entry>.base_url"));
-    assert!(fields.contains("model"));
-    assert!(fields.contains("<unknown>"));
+    assert_eq!(fields, "[\"model_providers.<entry>.base_url\"]");
     assert_eq!(mismatch["span"]["profile_id"], id);
     assert!(
         events.iter().any(|e| e["fields"]["event"] == "stage_failed"

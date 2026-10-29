@@ -387,7 +387,7 @@ fn revision_updates_do_not_rewrite_existing_home_or_credentials() {
 }
 
 #[test]
-fn manual_home_edits_are_preserved_and_require_explicit_import() {
+fn account_route_edits_are_preserved_and_require_explicit_import() {
     let f = Fixture::new();
     let mut m = f.manager();
     let p = m
@@ -399,7 +399,7 @@ fn manual_home_edits_are_preserved_and_require_explicit_import() {
         m.materialize(&p.id, 1)
             .unwrap_err()
             .to_string()
-            .contains("手动修改")
+            .contains("账号路由或认证配置")
     );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
@@ -428,7 +428,7 @@ fn codex_model_and_reasoning_choices_survive_relaunch_without_changing_the_saved
         runtime
     );
     assert_eq!(manager.revision(&profile.id, 1).unwrap().config, saved);
-    assert!(!config::matches_runtime_config(
+    assert!(config::matches_runtime_config(
         "model='m1'\nmodel_reasoning_effort=true",
         "model='m1'"
     ));
@@ -1025,6 +1025,7 @@ fn concurrent_accounts_receive_separate_homes_credentials_and_endpoints() {
         r#"#!/bin/sh
 if [ "$1" = "--help" ]; then printf '%s\n' '--no-daemon'; exit 0; fi
 if [ "$1" = "--no-daemon" ]; then shift; else exit 9; fi
+while [ "$1" = "-c" ]; do shift 2; done
 printf '%s\n' "$CODEX_HOME" "$USAGE_CODEX_API_KEY" "${OPENAI_API_KEY-unset}" > "$1"
 cp "$CODEX_HOME/config.toml" "$1.config"
 sleep 0.3
@@ -1402,7 +1403,7 @@ fn oauth_import_is_read_only_deduplicates_identity_and_isolates_workspaces() {
 }
 
 #[test]
-fn oauth_profile_allows_cli_onboarding_state_but_preserves_versioned_settings() {
+fn oauth_profile_allows_preferences_but_preserves_account_routes() {
     let f = Fixture::new();
     let mut manager = f.manager();
     let source = oauth_source(&f, "workspace-a", "fixture-refresh");
@@ -1418,10 +1419,6 @@ fn oauth_profile_allows_cli_onboarding_state_but_preserves_versioned_settings() 
     assert_eq!(fs::read_to_string(&path).unwrap(), runtime);
     assert_eq!(manager.revision(&account.id, 1).unwrap().config, saved);
     for invalid in [
-        runtime.replace(
-            "screen_reader_detection_done = true",
-            "screen_reader_detection_done = 'yes'",
-        ),
         runtime.replace("model_provider = \"openai\"", "model_provider = \"other\""),
         format!("openai_base_url = 'https://other.example'\n{runtime}"),
     ] {
@@ -1465,8 +1462,8 @@ fn oauth_model_choices_survive_reopening_without_rewriting_the_revision_or_login
 }
 
 #[test]
-fn runtime_model_choices_require_valid_strings() {
-    for invalid in [
+fn runtime_preference_validation_is_delegated_to_codex() {
+    for preference in [
         "model=false",
         "model=[]",
         "model={}",
@@ -1474,8 +1471,8 @@ fn runtime_model_choices_require_valid_strings() {
         "model='   '",
         "model=\"line\\nbreak\"",
     ] {
-        assert!(!config::matches_runtime_config(invalid, "model='saved'"));
-        assert!(!config::matches_runtime_config(invalid, invalid));
+        assert!(config::matches_runtime_config(preference, "model='saved'"));
+        assert!(config::matches_runtime_config(preference, preference));
     }
     assert!(config::matches_runtime_config(
         "model='vendor/new-model:latest'",
@@ -1859,34 +1856,21 @@ fn byok_project_trust_updates_survive_relaunch_without_changing_the_revision() {
 }
 
 #[test]
-fn byok_runtime_config_only_excludes_valid_project_trust_state() {
-    let saved = "model='m'\n[projects.\"/saved/project\"]\ntrust_level='trusted'\ncustom='kept'\n";
-    let changed = saved.replace("trust_level='trusted'", "trust_level='untrusted'");
+fn project_preferences_remain_mutable_but_account_overrides_are_rejected() {
+    let saved = "model='m'\n[projects.fixture]\ntrust_level='trusted'\ncustom='kept'\n";
+    let changed = saved
+        .replace("trusted", "untrusted")
+        .replace("kept", "changed");
     assert!(config::matches_runtime_config(&changed, saved));
     assert!(!config::matches_runtime_config(
-        &changed.replace("custom='kept'", "custom='changed'"),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        &changed.replace("'untrusted'", "'invalid'"),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        &changed.replace("'untrusted'", "true"),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\nprojects=1",
+        "model='m'\n[projects.fixture]\nmodel_provider='other'",
         "model='m'"
     ));
     assert!(!config::matches_runtime_config(
-        "model='m'\n[projects]\nwrong=1",
+        "model='m'\n[profiles.other]\nforced_login_method='chatgpt'",
         "model='m'"
     ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\n[projects.\"/new\"]\nmodel_provider='other'",
-        "model='m'"
-    ));
+    assert!(!config::matches_runtime_config("invalid = [", saved));
 }
 
 #[test]
@@ -2005,49 +1989,18 @@ fn byok_cli_onboarding_and_migration_state_survive_relaunch() {
 }
 
 #[test]
-fn byok_runtime_metadata_requires_known_fields_and_valid_shapes() {
+fn native_preferences_and_new_metadata_do_not_trigger_account_conflicts() {
     let saved = "model='m'\n[tui]\nnotifications=false\n";
-    let allowed = "model='m'\n[notice.model_migrations]\nm='new-model'\n[tui]\nnotifications=false\nscreen_reader_detection_done=true\n[tui.model_availability_nux]\nnew-model=1\n";
+    let allowed = "model='other'\n[notice.model_migrations]\nm='new-model'\n[tui]\nnotifications=true\nnew_native_preference='enabled'\n[tui.model_availability_nux]\nnew-model=1\n";
     assert!(config::matches_runtime_config(allowed, saved));
     assert!(!config::matches_runtime_config(
-        &allowed.replace("notifications=false", "notifications=true"),
+        &format!("model_provider='another-account'\n{allowed}"),
         saved
-    ));
-    assert!(!config::matches_runtime_config(
-        &allowed.replace(
-            "screen_reader_detection_done=true",
-            "screen_reader_detection_done='yes'"
-        ),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        &allowed.replace("m='new-model'", "m=1"),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        &allowed.replace("new-model=1", "new-model='yes'"),
-        saved
-    ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\nnotice=1",
-        "model='m'"
-    ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\ntui=1",
-        "model='m'"
-    ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\n[tui]\nmodel_provider='other'",
-        "model='m'"
-    ));
-    assert!(!config::matches_runtime_config(
-        "model='m'\n[notice]\nmodel_provider='other'",
-        "model='m'"
     ));
 }
 
 #[test]
-fn byok_hook_review_state_survives_relaunch_without_allowing_new_definitions() {
+fn native_hook_preferences_survive_relaunch() {
     let f = Fixture::new();
     let mut manager = f.manager();
     let profile = manager
@@ -2070,7 +2023,7 @@ fn byok_hook_review_state_survives_relaunch_without_allowing_new_definitions() {
         runtime
     );
     assert_eq!(manager.revision(&profile.id, 1).unwrap().config, saved);
-    for invalid in [
+    for preference in [
         runtime.replace("enabled=true", "enabled='yes'"),
         runtime.replace("trusted_hash='sha256:", "trusted_hash='invalid:"),
         format!("{runtime}\ncommand='run another hook'\n"),
@@ -2078,7 +2031,7 @@ fn byok_hook_review_state_survives_relaunch_without_allowing_new_definitions() {
             "{runtime}\n[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]\ntype='command'\ncommand='new hook'\n"
         ),
     ] {
-        assert!(!config::matches_runtime_config(&invalid, &saved));
+        assert!(config::matches_runtime_config(&preference, &saved));
     }
 }
 

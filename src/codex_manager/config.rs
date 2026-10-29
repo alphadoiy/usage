@@ -8,111 +8,50 @@ pub const REASONING_EFFORTS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
-/// Saved revisions are immutable; the CLI persists model choices, trust and onboarding in its Home.
-/// Ignore only known, correctly typed runtime state, not arbitrary settings or auth overrides.
+/// Codex owns validation and persistence of user preferences. Only account identity is pinned.
 fn managed_settings(text: &str) -> Option<toml::Value> {
-    let mut doc: toml::Value = toml::from_str(text).ok()?;
-    // /model persists model and effort choices independently of the provider route.
-    // Validate the model's shape without pinning it to a catalog that may be stale.
-    if let Some(model) = doc.get("model") {
-        let model = model.as_str()?;
-        if model.trim().is_empty() || model.chars().any(char::is_control) {
-            return None;
-        }
-        doc.as_table_mut()?.remove("model");
-    }
-    if doc
-        .get("model_reasoning_effort")
-        .and_then(toml::Value::as_str)
-        .is_some_and(|effort| {
-            !effort.is_empty()
-                && effort.len() <= 32
-                && effort.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'_'
-                        || byte == b'-'
-                })
-        })
-    {
-        doc.as_table_mut()?.remove("model_reasoning_effort");
-    }
-    if let Some(projects) = doc.get_mut("projects") {
-        let projects = projects.as_table_mut()?;
-        for (_, project) in projects.iter_mut() {
-            let project = project.as_table_mut()?;
-            if let Some(trust) = project.get("trust_level") {
-                if !matches!(trust.as_str(), Some("trusted" | "untrusted")) {
-                    return None;
-                }
-                project.remove("trust_level");
-            }
-        }
-        projects.retain(|_, project| project.as_table().is_none_or(|t| !t.is_empty()));
-        if projects.is_empty() {
-            doc.as_table_mut()?.remove("projects");
-        }
-    }
-    for (section, fields) in [
-        ("notice", &["model_migrations"][..]),
-        (
-            "tui",
-            &["screen_reader_detection_done", "model_availability_nux"][..],
-        ),
+    let doc: toml::Value = toml::from_str(text).ok()?;
+    Some(account_settings(&doc))
+}
+
+/// Keep provider credentials/routes pinned while allowing Codex to persist its own settings.
+/// Named profiles and project tables may also override authentication, so inspect those layers.
+pub(super) fn account_settings(doc: &toml::Value) -> toml::Value {
+    let mut settings = toml::map::Map::new();
+    for key in [
+        "model_provider",
+        "model_providers",
+        "openai_base_url",
+        "chatgpt_base_url",
+        "profile",
+        "cli_auth_credentials_store",
+        "forced_login_method",
+        "forced_chatgpt_workspace_id",
+        "experimental_bearer_token",
+        "api_key",
+        "OPENAI_API_KEY",
+        "auth",
+        "tokens",
     ] {
-        if let Some(table) = doc.get_mut(section) {
-            let table = table.as_table_mut()?;
-            for &field in fields {
-                if let Some(state) = table.get(field) {
-                    let valid = match field {
-                        "model_migrations" => state
-                            .as_table()
-                            .is_some_and(|t| t.values().all(|v| v.as_str().is_some())),
-                        "screen_reader_detection_done" => state.as_bool().is_some(),
-                        "model_availability_nux" => state
-                            .as_table()
-                            .is_some_and(|t| t.values().all(|v| v.as_integer().is_some())),
-                        _ => false,
-                    };
-                    if !valid {
-                        return None;
-                    }
-                    table.remove(field);
-                }
-            }
-            if table.is_empty() {
-                doc.as_table_mut()?.remove(section);
+        if let Some(value) = doc.get(key) {
+            settings.insert(key.into(), value.clone());
+        }
+    }
+    for section in ["profiles", "projects"] {
+        if let Some(table) = doc.get(section).and_then(toml::Value::as_table) {
+            let entries: toml::map::Map<String, toml::Value> = table
+                .iter()
+                .filter_map(|(name, value)| {
+                    let account = account_settings(value);
+                    (!account.as_table().unwrap().is_empty()).then(|| (name.clone(), account))
+                })
+                .collect();
+            if !entries.is_empty() {
+                settings.insert(section.into(), toml::Value::Table(entries));
             }
         }
     }
-    // /hooks saves reviewed hashes and enablement in the Home. These are runtime
-    // metadata; hook definitions themselves must still match the saved revision.
-    if let Some(hooks) = doc.get_mut("hooks") {
-        let hooks = hooks.as_table_mut()?;
-        if let Some(state) = hooks.get("state") {
-            for entry in state.as_table()?.values() {
-                for (key, value) in entry.as_table()? {
-                    let valid = match key.as_str() {
-                        "enabled" => value.as_bool().is_some(),
-                        "trusted_hash" => value.as_str().is_some_and(|hash| {
-                            hash.strip_prefix("sha256:").is_some_and(|hash| {
-                                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
-                            })
-                        }),
-                        _ => false,
-                    };
-                    if !valid {
-                        return None;
-                    }
-                }
-            }
-            hooks.remove("state");
-        }
-        if hooks.is_empty() {
-            doc.as_table_mut()?.remove("hooks");
-        }
-    }
-    Some(doc)
+    toml::Value::Table(settings)
 }
 
 pub(super) fn matches_runtime_config(runtime: &str, saved: &str) -> bool {
@@ -152,6 +91,13 @@ pub(super) fn configuration_differences(runtime: &toml::Value, saved: &toml::Val
                         "model"
                         | "model_provider"
                         | "model_providers"
+                        | "profile"
+                        | "openai_base_url"
+                        | "chatgpt_base_url"
+                        | "api_key"
+                        | "OPENAI_API_KEY"
+                        | "auth"
+                        | "tokens"
                         | "model_reasoning_effort"
                         | "base_url"
                         | "name"
@@ -378,6 +324,7 @@ pub fn summary(text: &str) -> Result<(String, String)> {
     Ok((base.into(), model.into()))
 }
 
+/// Optional edits distinguish an omitted field (keep) from an empty effort (clear).
 pub fn patch(
     text: &str,
     base: Option<&str>,
@@ -396,7 +343,11 @@ pub fn patch(
         doc["model"] = value(model);
     }
     if let Some(effort) = effort {
-        doc["model_reasoning_effort"] = value(effort);
+        if effort.trim().is_empty() {
+            doc.remove("model_reasoning_effort");
+        } else {
+            doc["model_reasoning_effort"] = value(effort);
+        }
     }
     normalize(&doc.to_string())
 }

@@ -113,7 +113,23 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             );
     }
     if let Some(panel) = &app.history_state.panel {
-        history::render(body, frame.buffer_mut(), panel);
+        let content = if let Some(error) = &app.history_state.refresh_error {
+            let [warning, content] =
+                Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(body);
+            let state = if app.history_state.loaded.synced_at.is_some() {
+                "历史更新失败，保留上次结果"
+            } else {
+                "历史加载失败"
+            };
+            Paragraph::new(format!("{state}：{}", crate::ui::overview::clean(error)))
+                .style(Style::new().fg(Color::Yellow))
+                .wrap(Wrap { trim: false })
+                .render(warning, frame.buffer_mut());
+            content
+        } else {
+            body
+        };
+        history::render(content, frame.buffer_mut(), panel);
     } else if let Some(browser) = &app.browser_state.panel {
         if app.browser_state.loading && browser.sessions.is_empty() {
             Paragraph::new(" 正在扫描 Claude Code、Codex 和 Grok 的本机会话…")
@@ -140,7 +156,7 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
         } else if browser.launching {
             " 正在打开会话，请等待…"
         } else {
-            " ? 操作 · ↑/↓ 选择 · Tab 列表 · Enter 打开 · / 搜索 · Space 勾选 · d 删除 · Esc 返回"
+            " ? 操作 · ↑/↓ 选择 · Tab 列表 · Enter 打开 · Shift+P 选 Provider · / 搜索 · Space 勾选 · d 删除 · Esc 返回"
         }
     } else {
         match app.reset.as_ref().map(|flow| &flow.stage) {
@@ -160,7 +176,7 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
                     " ? 操作 · Tab 看板 · ↑/↓ 选择或滚动 · Enter 详情 · r 刷新 · Esc 返回"
                 }
                 crate::ui::home::Focus::Projects => {
-                    " ? 操作 · Tab 看板 · ↑/↓ 选择 · Enter 打开 · / 搜索 · r 刷新 · Esc 返回"
+                    " ? 操作 · Tab 看板 · ↑/↓ 选择 · Enter 打开 · Shift+P 选 Provider · / 搜索 · r 刷新 · Esc 返回"
                 }
             },
         }
@@ -187,6 +203,9 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     }
     if let Some(menu) = &app.shortcuts {
         menu.render(frame);
+    }
+    if let Some(picker) = &app.resume_provider {
+        super::resume_provider::draw(frame, picker);
     }
 }
 

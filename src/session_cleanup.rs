@@ -2,7 +2,7 @@
 //! Manifests precede moves so an interrupted operation can be restored after restart.
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::BufRead;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -36,6 +36,9 @@ pub struct Entry {
     pub deleted_at: i64,
     pub bytes: u64,
     paths: Vec<PathBuf>,
+    /// Includes child threads; older manifests recover these from their payloads on restore.
+    #[serde(default)]
+    session_ids: Vec<String>,
     phase: Phase,
 }
 
@@ -104,7 +107,7 @@ impl Store {
 
     fn read(&self, key: &str) -> Result<Entry> {
         let dir = self.dir(key)?;
-        let entry: Entry =
+        let mut entry: Entry =
             serde_json::from_reader(File::open(dir.join("entry.json")).map_err(err)?)
                 .map_err(err)?;
         if entry.key != key || (entry.paths.is_empty() && entry.phase != Phase::Purged) {
@@ -113,6 +116,9 @@ impl Store {
         for path in &entry.paths {
             validate_relative(path)?;
         }
+        // Resolve only Usage's validated migration alias, not arbitrary symlinks.
+        // This also keeps old tombstones attached to their store after migration.
+        entry.home = storage_home(&entry.provider, &entry.home);
         Ok(entry)
     }
 
@@ -151,11 +157,12 @@ impl Store {
     /// Physical Home identity deliberately covers aliases of the same configured Home.
     pub fn hidden(&self, provider: &str, home: &Path) -> Result<HashSet<String>> {
         let _lock = self.read_lock()?;
+        let home = storage_home(provider, home);
         Ok(self
             .entries()?
             .into_iter()
             .filter(|e| e.provider == provider && e.home == home)
-            .map(|e| e.id)
+            .flat_map(|e| std::iter::once(e.id).chain(e.session_ids))
             .collect())
     }
 
@@ -164,7 +171,10 @@ impl Store {
         if !session.provider.valid_session_id(&session.id) {
             return Err("会话 ID 无效".into());
         }
-        let home = session.home.canonicalize().map_err(err)?;
+        let home = storage_home(session.provider.id(), &session.home)
+            .canonicalize()
+            .map_err(err)?;
+        let mut mutation = mutation_guard(session.provider.id(), &home)?;
         if self
             .entries()?
             .iter()
@@ -172,9 +182,12 @@ impl Store {
         {
             return Err("会话已在回收站中".into());
         }
-        let paths = session_paths(session, &home)?;
+        let (paths, session_ids) = session_paths(session, &home)?;
         if paths.is_empty() {
             return Err("未找到独立会话文件，无法清理此会话".into());
+        }
+        if let Some(guard) = &mut mutation {
+            guard.require_idle(&session_ids).map_err(err)?;
         }
         let now = SystemTime::now();
         let mut bytes = 0;
@@ -193,6 +206,7 @@ impl Store {
             deleted_at: chrono::Utc::now().timestamp_millis(),
             bytes,
             paths,
+            session_ids,
             phase: Phase::Moving,
         };
         let dir = self.dir(&entry.key)?;
@@ -227,6 +241,7 @@ impl Store {
         if entry.phase == Phase::Purged {
             return Err("此会话已永久删除".into());
         }
+        let _mutation = self.lock_entry(&mut entry)?;
         // Preflight every destination before changing anything. Never overwrite a new session.
         for (index, path) in entry.paths.iter().enumerate() {
             let payload = self.dir(key)?.join("files").join(index.to_string());
@@ -262,12 +277,75 @@ impl Store {
         fs::remove_dir_all(dir).map_err(err)
     }
 
+    fn lock_entry(
+        &self,
+        entry: &mut Entry,
+    ) -> Result<Option<crate::codex_native::SessionMutation>> {
+        let mut guard = mutation_guard(&entry.provider, &entry.home)?;
+        if let Some(guard) = &mut guard {
+            self.recover_session_ids(entry)?;
+            guard.require_idle(&entry.session_ids).map_err(err)?;
+        }
+        Ok(guard)
+    }
+
+    fn recover_session_ids(&self, entry: &mut Entry) -> Result<()> {
+        if entry.provider != "codex" || !entry.session_ids.is_empty() {
+            return Ok(());
+        }
+        let mut ids = HashSet::from([entry.id.clone()]);
+        let files = self.dir(&entry.key)?.join("files");
+        for (index, original) in entry.paths.iter().enumerate() {
+            // An incomplete archive may coexist with its valid plain twin.
+            if crate::logfiles::compressed(original)
+                && entry.paths.contains(&original.with_extension(""))
+            {
+                continue;
+            }
+            let payload = files.join(index.to_string());
+            let path = if payload.try_exists().map_err(err)? {
+                payload
+            } else {
+                secure_path(&entry.home, original)?;
+                entry.home.join(original)
+            };
+            inspect(&path, None)?;
+            let metadata = codex_metadata(&path, crate::logfiles::compressed(original))?
+                .ok_or("回收站会话日志无法识别，操作已停止")?;
+            let id = metadata["id"].as_str().ok_or("回收站会话 ID 无效")?;
+            ids.insert(id.to_string());
+        }
+        for id in &ids {
+            uuid::Uuid::parse_str(id).map_err(|_| "回收站会话 ID 无效")?;
+        }
+        entry.session_ids = ids.into_iter().collect();
+        entry.session_ids.sort();
+        Ok(())
+    }
+
     pub fn purge(&self, key: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut entry = self.read(key)?;
-        if entry.phase != Phase::Trashed && entry.phase != Phase::Purged {
+        if entry.phase == Phase::Purged {
+            return Ok(());
+        }
+        if entry.phase != Phase::Trashed {
             return Err("清理曾被中断，请先恢复该会话".into());
         }
+        let _mutation = if entry.provider == "codex" {
+            match fs::symlink_metadata(&entry.home) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Purging touches only trash payloads. An unmounted/deleted Home must
+                    // neither prevent reclamation nor be recreated just to take a lock.
+                    self.recover_session_ids(&mut entry)?;
+                    None
+                }
+                Err(error) => return Err(err(error)),
+                Ok(_) => self.lock_entry(&mut entry)?,
+            }
+        } else {
+            None
+        };
         let files = self.dir(key)?.join("files");
         if files.try_exists().map_err(err)? {
             inspect(&files, None)?;
@@ -285,6 +363,45 @@ impl Store {
 
 fn err(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn storage_home(provider: &str, home: &Path) -> PathBuf {
+    if provider == "codex" {
+        crate::codex_native::SessionStore::resolve(home)
+            .root()
+            .to_path_buf()
+    } else {
+        home.to_path_buf()
+    }
+}
+
+fn mutation_guard(
+    provider: &str,
+    home: &Path,
+) -> Result<Option<crate::codex_native::SessionMutation>> {
+    (provider == "codex")
+        .then(|| {
+            crate::codex_native::SessionStore::resolve(home)
+                .mutation_guard()
+                .map_err(err)
+        })
+        .transpose()
+}
+
+fn codex_metadata(path: &Path, compressed: bool) -> Result<Option<serde_json::Value>> {
+    let file = File::open(path).map_err(err)?;
+    let input: Box<dyn Read> = if compressed {
+        Box::new(ruzstd::decoding::StreamingDecoder::new(file).map_err(err)?)
+    } else {
+        Box::new(file)
+    };
+    Ok(BufReader::new(input.take(1024 * 1024))
+        .lines()
+        .take(8)
+        .find_map(|line| {
+            let row: serde_json::Value = serde_json::from_str(&line.ok()?).ok()?;
+            (row["type"] == "session_meta").then(|| row["payload"].clone())
+        }))
 }
 
 /// Atomic no-clobber moves also close the preflight/rename race on restoration.
@@ -425,8 +542,9 @@ fn children(path: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn session_paths(session: &Session, home: &Path) -> Result<Vec<PathBuf>> {
+fn session_paths(session: &Session, home: &Path) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let mut paths = Vec::new();
+    let mut session_ids = vec![session.id.clone()];
     match session.provider.id() {
         "claude" => {
             for project in children(&home.join("projects"))? {
@@ -482,11 +600,8 @@ fn session_paths(session: &Session, home: &Path) -> Result<Vec<PathBuf>> {
                     }
                     // Read physical files: both a plain rollout and its compressed twin are moved.
                     let (read_path, _) = crate::logfiles::resolve(&path).map_err(err)?;
-                    let mut lines = crate::logfiles::open(&read_path).map_err(err)?.lines();
-                    let metadata = lines.by_ref().take(8).find_map(|line| {
-                        let row: serde_json::Value = serde_json::from_str(&line.ok()?).ok()?;
-                        (row["type"] == "session_meta").then(|| row["payload"].clone())
-                    });
+                    let metadata =
+                        codex_metadata(&read_path, crate::logfiles::compressed(&read_path))?;
                     if let Some(metadata) = metadata {
                         let id = metadata["id"].as_str().unwrap_or_default().to_string();
                         let parent = metadata
@@ -519,6 +634,8 @@ fn session_paths(session: &Session, home: &Path) -> Result<Vec<PathBuf>> {
                     .filter(|(_, id, _)| ids.contains(id))
                     .map(|(path, _, _)| path),
             );
+            session_ids = ids.into_iter().collect();
+            session_ids.sort();
         }
         "grok" => {
             for project in children(&home.join("sessions"))? {
@@ -573,8 +690,9 @@ fn session_paths(session: &Session, home: &Path) -> Result<Vec<PathBuf>> {
         // No generic file deletion for adapters whose on-disk layout is unknown.
         _ => return Err("此 Agent 暂不支持会话清理".into()),
     }
-    paths
+    let paths = paths
         .into_iter()
         .map(|path| path.strip_prefix(home).map(Path::to_path_buf).map_err(err))
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((paths, session_ids))
 }

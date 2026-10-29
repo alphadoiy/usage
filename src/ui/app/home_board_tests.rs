@@ -89,7 +89,7 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
         .collect::<String>();
     assert!(output.contains("Claude"));
     assert!(!output.contains("OpenAI"));
-    assert!(app.browser_state.resume_request.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
     for _ in 0..100 {
         app.handle_home_key(KeyCode::Down, &handle, (80, 24));
     }
@@ -110,12 +110,20 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
 
 #[tokio::test]
 async fn quick_resume_preserves_instance_home_and_session_identity() {
+    let root = std::env::temp_dir().join(format!("usage-home-plan-{}", uuid::Uuid::new_v4()));
     let mut app = app();
     app.home_sessions_state.browser.resume_mode = ResumeMode::Current;
-    app.home_sessions_state.browser.refresh(vec![
+    let mut sessions = vec![
         session("account-b", "ProjectB", 2),
         session("account-a", "ProjectA", 1),
-    ]);
+    ];
+    for session in &mut sessions {
+        session.cwd = root.join(session.cwd.file_name().unwrap());
+        session.home = root.join(&session.instance);
+        std::fs::create_dir_all(&session.cwd).unwrap();
+        std::fs::create_dir_all(&session.home).unwrap();
+    }
+    app.home_sessions_state.browser.refresh(sessions);
     let handle = Handle::current();
     app.handle_home_key(KeyCode::Tab, &handle, (100, 30));
     assert_eq!(app.home_focus, HomeFocus::Connections);
@@ -123,20 +131,26 @@ async fn quick_resume_preserves_instance_home_and_session_identity() {
     assert_eq!(app.home_focus, HomeFocus::Projects);
     app.handle_home_key(KeyCode::Down, &handle, (100, 30));
     app.handle_home_key(KeyCode::Enter, &handle, (100, 30));
-    assert!(app.browser_state.resume_request.is_none());
+    assert!(app.browser_state.resume_plan.is_none());
     app.handle_home_key(KeyCode::Enter, &handle, (100, 30));
-    let requested = app.browser_state.resume_request.as_ref().unwrap();
+    let requested = app.browser_state.resume_plan.as_ref().unwrap().session();
     assert_eq!(requested.instance, "account-a");
-    assert_eq!(requested.home, std::path::Path::new("/synthetic/account-a"));
-    assert_eq!(requested.cwd, std::path::Path::new("/synthetic/ProjectA"));
+    assert_eq!(requested.home, root.join("account-a"));
+    assert_eq!(requested.cwd, root.join("ProjectA"));
     assert_eq!(requested.id, "123e4567-e89b-12d3-a456-426614174001");
     app.handle_home_key(KeyCode::Down, &handle, (100, 30));
     app.handle_home_key(KeyCode::Enter, &handle, (100, 30));
     assert_eq!(
-        app.browser_state.resume_request.as_ref().unwrap().instance,
+        app.browser_state
+            .resume_plan
+            .as_ref()
+            .unwrap()
+            .session()
+            .instance,
         "account-a"
     );
     assert!(app.home_sessions_state.browser.launching);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

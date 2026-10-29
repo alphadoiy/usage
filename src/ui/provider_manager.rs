@@ -159,7 +159,7 @@ fn identity(profile: &Profile) -> String {
     }
 }
 fn actions(profile: Option<&Profile>) -> String {
-    let mut text = "? 操作 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
+    let mut text = "? 操作 · F1–F4 切页 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
     if let Some(profile) = profile {
         text.push_str(" · Enter 启动 · e 配置");
         if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
@@ -219,15 +219,15 @@ fn draw_accounts(
     notice: &str,
 ) {
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Fill(1),
         Constraint::Length(3),
     ])
     .areas(frame.area());
-    Paragraph::new(Line::from(vec![
-        " Provider 管理 ".bold(),
-        format!("默认项目：{}", display_path(cwd)).dim(),
-    ]))
+    Paragraph::new(vec![
+        Line::from(" F1 首页  F2 历史  F3 会话  [F4 Provider] ").bold(),
+        Line::from(format!(" Provider 管理 · 默认项目：{}", display_path(cwd))).dim(),
+    ])
     .render(header, frame.buffer_mut());
     let items: Vec<ListItem> = profiles
         .iter()
@@ -268,6 +268,25 @@ pub fn run_with_config(
     sessions: ProjectSessions,
     default_project: Option<PathBuf>,
 ) -> io::Result<()> {
+    let next = run_embedded(
+        handle.clone(),
+        usage_config.clone(),
+        sessions,
+        default_project,
+    )?;
+    if let Some(action) = next.filter(|action| *action != super::menu::Action::Quit) {
+        super::app::run_from_page(handle, usage_config, action)?;
+    }
+    Ok(())
+}
+
+/// Return navigation to the owning dashboard instead of starting another page loop here.
+pub(super) fn run_embedded(
+    handle: Handle,
+    usage_config: Option<PathBuf>,
+    sessions: ProjectSessions,
+    default_project: Option<PathBuf>,
+) -> io::Result<Option<super::menu::Action>> {
     let mut manager = Manager::open_default().map_err(io::Error::other)?;
     let mut profiles = manager.list().map_err(io::Error::other)?;
     let mut selected = 0usize;
@@ -291,7 +310,7 @@ pub fn run_with_config(
     });
     let mut refreshed = Instant::now();
     let mut terminal = crate::ui::terminal::enter().map_err(io::Error::other)?;
-    let result = (|| -> io::Result<()> {
+    let result = (|| -> io::Result<Option<super::menu::Action>> {
         loop {
             if projects.sessions.is_none()
                 && let Ok((sessions, records)) = projects_rx.try_recv()
@@ -329,7 +348,7 @@ pub fn run_with_config(
                 continue;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                return Ok(());
+                return Ok(Some(super::menu::Action::Quit));
             }
             if let Some(menu) = &mut shortcuts_menu {
                 match menu.key(key.code) {
@@ -345,6 +364,14 @@ pub fn run_with_config(
                 }
             } else if key.code == KeyCode::Char('?') && prompt.is_none() {
                 shortcuts_menu = Some(shortcuts(profiles.get(selected)));
+                continue;
+            }
+            if prompt.is_none()
+                && let Some(action) = super::menu::page_key(key.code)
+            {
+                if action != super::menu::Action::Providers {
+                    return Ok(Some(action));
+                }
                 continue;
             }
             if let Some(current) = prompt.take() {
@@ -474,7 +501,7 @@ pub fn run_with_config(
             }
             let profile = profiles.get(selected).cloned();
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
                 KeyCode::Down | KeyCode::Char('j') => {
                     selected = (selected + 1).min(profiles.len().saturating_sub(1))
                 }

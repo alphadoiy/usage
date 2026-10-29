@@ -8,6 +8,15 @@ if sys.argv[1:] == ['--help']:
     print('--no-daemon'); sys.exit(0)
 args=sys.argv[1:]
 home=pathlib.Path(os.environ['CODEX_HOME'])
+if 'app-server' in args:
+    for line in sys.stdin:
+        request=json.loads(line)
+        if request['method']=='initialize':
+            print(json.dumps({'id':request['id'],'result':{}}),flush=True)
+        elif request['method']=='config/read':
+            config=tomllib.loads((home/'config.toml').read_text()) if (home/'config.toml').exists() else {}
+            print(json.dumps({'id':request['id'],'result':{'config':config}}),flush=True)
+    sys.exit(0)
 with open(os.environ['CAPTURE_FILE'],'w') as file:
     json.dump({'args':args,'context':os.environ.get('USAGE_CODEX_BARK_CONTEXT'),
         'runtime':os.environ.get('USAGE_CODEX_RUN_CONTEXT'),'home':str(home),
@@ -78,7 +87,9 @@ fn local_resume_cli_injects_bark_and_chains_notify_without_importing_home() {
     let record: serde_json::Value = serde_json::from_slice(&fs::read(&capture).unwrap()).unwrap();
     assert!(record["context"].is_null());
     assert!(record["runtime"].is_null());
-    assert_eq!(record["args"],serde_json::json!(["resume",session]));
+    assert_eq!(record["args"],serde_json::json!([
+        "-c", "model_provider=\"openai\"", "resume",session
+    ]));
     assert_eq!(fs::read_to_string(home.join("config.toml")).unwrap(),config);
     assert_eq!(fs::read_to_string(home.join("auth.json")).unwrap(),"fixture-original-auth");
     assert!(!home.join("hooks.json").exists());

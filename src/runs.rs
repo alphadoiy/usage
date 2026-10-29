@@ -1,4 +1,10 @@
 //! Launch-time identity and pinned resource associations. No raw arguments or keys are stored.
+mod evidence;
+pub use evidence::{
+    MAX_EVIDENCE_SESSIONS, SessionClaim, SessionEvidenceIdentity, SessionEvidenceQuery,
+    SessionEvidenceReader, SessionEvidenceSnapshot, SessionEvidenceSource,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;

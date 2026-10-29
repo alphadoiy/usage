@@ -3,6 +3,7 @@ pub mod bark;
 pub mod ccswitch;
 pub mod cli;
 pub mod config;
+mod context;
 mod duplicates;
 mod effective;
 pub mod fingerprint;
@@ -15,10 +16,10 @@ pub mod managed;
 pub mod oauth;
 pub mod runtime;
 mod secrets;
+pub(crate) mod shared_sessions;
 
 use crate::logging;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -64,55 +65,15 @@ pub fn default_root() -> PathBuf {
 }
 
 fn private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::private_fs::create_dir(path).map_err(Error::from)
 }
 
 pub(crate) fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    private_write_impl(path, bytes, true)
+    crate::private_fs::write(path, bytes).map_err(Error::from)
 }
 
-/// Atomically initialize a file without replacing a concurrent CLI's mutable configuration.
 pub(crate) fn private_create(path: &Path, bytes: &[u8]) -> Result<()> {
-    private_write_impl(path, bytes, false)
-}
-
-fn private_write_impl(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::message("文件缺少父目录"))?;
-    fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if overwrite {
-            fs::rename(&temp, path)?;
-        } else {
-            match fs::hard_link(&temp, path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temp);
-    result
+    crate::private_fs::create(path, bytes).map_err(Error::from)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,7 +266,9 @@ impl Manager {
                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                 session_id TEXT NOT NULL, cwd TEXT NOT NULL, activity TEXT NOT NULL,
                 turn_id TEXT, model TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
-                PRIMARY KEY(run_id, session_id));")?;
+                PRIMARY KEY(run_id, session_id));
+            CREATE INDEX IF NOT EXISTS run_sessions_session ON run_sessions(session_id,last_seen);
+            CREATE INDEX IF NOT EXISTS run_events_session_time ON run_events(session_id,observed_at);")?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -385,6 +348,11 @@ impl Manager {
             home: self.home(&profile.id, revision)?,
             revision: revision.to_string(),
             gateway_observations: profile.auth_mode != AuthMode::Oauth,
+            managed: Some(crate::performance::ManagedBinding {
+                evidence: self.session_evidence_source(),
+                account: profile.id.clone(),
+                revision,
+            }),
             expected_upstream: config
                 .get("model_provider")
                 .and_then(toml::Value::as_str)
@@ -787,8 +755,8 @@ impl Manager {
             let tx = self.conn.unchecked_transaction()?;
             op.step("home_prepare", || private_dir(&home))?;
             let config_path = home.join("config.toml");
-            op.step("config_initialize", || {
-                private_create(&config_path, saved.config.as_bytes())
+            op.step("user_context_inherit", || {
+                context::prepare_config(&self.root, &home, &config_path, &saved.config)
             })?;
             let runtime = op.step("runtime_config_read", || fs::read_to_string(&config_path))?;
             op.begin("runtime_config_validate");
@@ -1029,12 +997,26 @@ pub fn managed_instances() -> Result<Vec<crate::config::DataInstance>> {
         .prepare("SELECT profile_id,revision,path FROM homes ORDER BY profile_id,revision")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<std::result::Result<_, _>>()?;
+    let mut seen = std::collections::HashSet::new();
     Ok(rows
         .into_iter()
-        .map(|(id, revision, path)| crate::config::DataInstance {
-            id: format!("managed-{id}-r{revision}"),
-            provider: "codex".into(),
-            path: path.into(),
+        .filter_map(|(id, revision, path)| {
+            let original = PathBuf::from(path);
+            let path = crate::codex_native::SessionStore::resolve(&original)
+                .root()
+                .to_path_buf();
+            if !seen.insert(path.clone()) {
+                return None;
+            }
+            Some(crate::config::DataInstance {
+                id: if path == original {
+                    format!("managed-{id}-r{revision}")
+                } else {
+                    "shared-codex".into()
+                },
+                provider: "codex".into(),
+                path,
+            })
         })
         .collect())
 }

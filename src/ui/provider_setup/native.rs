@@ -80,7 +80,7 @@ impl Form {
         let (label, items, models) = if field == self.model_field() {
             ("模型", picker::models(self.models.as_ref(), optional), true)
         } else {
-            ("推理强度", picker::efforts(optional), false)
+            ("推理强度", picker::efforts(true), false)
         };
         self.picker = Some(Picker {
             field,
@@ -110,13 +110,13 @@ impl Form {
                 (2, "推理强度（可留空）"),
             ]
         } else if self.plugin {
-            vec![(0, "名称"), (2, "模型"), (3, "推理强度")]
+            vec![(0, "名称"), (2, "模型"), (3, "推理强度（可留空）")]
         } else {
             vec![
                 (0, "名称"),
                 (1, "Base URL"),
                 (2, "模型"),
-                (3, "推理强度"),
+                (3, "推理强度（可留空）"),
                 (4, "API Key"),
             ]
         }
@@ -532,7 +532,12 @@ fn save_form(manager: &mut Manager, form: &Form) -> codex_manager::Result<Profil
     }
     let effort = (!fields[3].is_empty()).then_some(fields[3].as_str());
     if let Some((id, revision, original)) = &form.editing {
-        let text = config::patch(original, Some(&fields[1]), Some(&fields[2]), effort)?;
+        let text = config::patch(
+            original,
+            Some(&fields[1]),
+            Some(&fields[2]),
+            Some(&fields[3]),
+        )?;
         manager.update(
             id,
             *revision,
@@ -724,6 +729,48 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn clearing_effort_is_persisted_while_omitted_cli_edits_keep_it() {
+        let root =
+            std::env::temp_dir().join(format!("usage-clear-effort-{}", uuid::Uuid::new_v4()));
+        let config =
+            config::new_config("https://fixture.invalid/v1", "model-a", Some("high")).unwrap();
+        let unchanged = config::patch(&config, None, Some("model-b"), None).unwrap();
+        assert_eq!(
+            config::parse(&unchanged).unwrap()["model_reasoning_effort"].as_str(),
+            Some("high")
+        );
+        let mut manager = Manager::open(root.clone()).unwrap();
+        let profile = manager
+            .add("Fixture", &config, "synthetic-clear-key")
+            .unwrap();
+        let form = Form::new(
+            vec![
+                profile.name.clone(),
+                profile.base_url.clone(),
+                profile.model.clone(),
+                String::new(),
+                String::new(),
+            ],
+            Some((profile.id.clone(), profile.revision, config)),
+            AuthMode::Byok,
+            false,
+        );
+        let saved = save_form(&mut manager, &form).unwrap();
+        drop(manager);
+        let reopened = Manager::open(root.clone()).unwrap();
+        let persisted = reopened.revision(&saved.id, saved.revision).unwrap();
+        assert!(
+            config::parse(&persisted.config)
+                .unwrap()
+                .get("model_reasoning_effort")
+                .is_none(),
+            "clearing the form must survive reopening the store"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn editing_a_plugin_binding_exposes_agent_fields_and_preserves_shared_credentials() {

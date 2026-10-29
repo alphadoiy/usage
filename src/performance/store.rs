@@ -165,10 +165,10 @@ impl Service {
         if let Ok(mut workers) = self.workers.try_lock()
             && workers
                 .walkers
-                .get(&binding.scope())
+                .get(&binding.log_scope())
                 .is_some_and(|w| w.stack.is_empty())
         {
-            workers.walkers.remove(&binding.scope());
+            workers.walkers.remove(&binding.log_scope());
         }
     }
     pub fn at(path: PathBuf) -> Self {
@@ -341,7 +341,8 @@ impl Service {
             }
             Err(TryLockError::Poisoned(_)) => return Err("性能采集状态不可用，请重启 Usage".into()),
         };
-        let scope = binding.scope();
+        let scope = binding.log_scope();
+        let log_home = binding.log_home();
         if workers.archive.as_ref().is_some_and(|a| a.scope != scope) {
             workers.archive = None;
         }
@@ -354,12 +355,12 @@ impl Service {
         let walker = workers
             .walkers
             .entry(scope.clone())
-            .or_insert_with(|| Walker::new(&binding.home, source));
+            .or_insert_with(|| Walker::new(&log_home, source));
         if walker
             .finished
             .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
         {
-            *walker = Walker::new(&binding.home, source);
+            *walker = Walker::new(&log_home, source);
         }
         let mut entries = DISCOVER_ENTRIES;
         while !cancelled(cancel) {
@@ -648,7 +649,7 @@ impl Service {
         );
         let mut statement = db.prepare(&sql).map_err(|_| "性能统计查询失败")?;
         let rows = statement
-            .query_map(params![scope, since, now, binding.expected_upstream], |r| {
+            .query_map(params![scope, since, now, binding.upstream_filter()], |r| {
                 Ok(ModelStats {
                     model: r.get(0)?,
                     calls: r.get(1)?,
@@ -678,10 +679,16 @@ impl Service {
         result.unmatched = db
             .query_row(
                 &unmatched,
-                params![scope, since, now, binding.expected_upstream],
+                params![scope, since, now, binding.upstream_filter()],
                 |r| r.get(0),
             )
             .map_err(|_| "归属统计查询失败")?;
+        if binding.shared_account().is_some() {
+            result.unmatched += db.query_row(
+                "SELECT COUNT(*) FROM perf_calls WHERE scope=?1 AND at>=?2 AND at<=?3 AND usage_cli_owner(session,turn,at)=0",
+                params![binding.log_scope(), since, now], |row| row.get::<_,u64>(0),
+            ).map_err(|_| "共享日志归属查询失败")?;
+        }
         if binding.gateway_observations {
             result.unmatched+=db.query_row("SELECT COUNT(*) FROM perf_gateway_calls g WHERE scope=?1 AND at>=?2 AND at<=?3 AND session='' AND NOT EXISTS(SELECT 1 FROM perf_gateway_native n WHERE n.scope=g.scope AND n.run=g.run)",params![scope,since,now],|r|r.get::<_,u64>(0)).map_err(|_| "网关归属统计查询失败")?;
         }
@@ -695,7 +702,7 @@ impl Service {
                     scope,
                     since,
                     now,
-                    binding.expected_upstream,
+                    binding.upstream_filter(),
                     model,
                     PAGE as i64,
                     i64::from(page) * PAGE as i64
@@ -734,9 +741,19 @@ fn has_gateway(db: &Connection) -> bool {
     db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='perf_gateway_calls')", [], |r|r.get(0)).unwrap_or(false)
 }
 fn source_calls(binding: &Binding, db: &Connection) -> String {
+    // Scope hashes contain only hexadecimal digits. Account/gateway identity is retained
+    // in the projected scope while CLI rows come from one canonical physical log store.
+    let logs = binding.log_scope();
+    let ownership = if binding.shared_account().is_some() {
+        "AND usage_cli_owner(cli.session,cli.turn,cli.at)=1"
+    } else {
+        ""
+    };
+    let cli = format!(
+        "SELECT ?1 AS scope,id,session,turn,at,model,upstream,output,reasoning,duration,ttft,native,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls AS cli WHERE cli.scope='{logs}' {ownership}"
+    );
     if !binding.gateway_observations || !has_gateway(db) {
-        return "SELECT *,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls"
-            .into();
+        return cli;
     }
     let native: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='perf_gateway_native')",[],|r|r.get(0)).unwrap_or(false);
     let cli_native = if native {
@@ -749,8 +766,8 @@ fn source_calls(binding: &Binding, db: &Connection) -> String {
     } else {
         ""
     };
-    format!("SELECT scope,id,session,turn,at,model,upstream,output,reasoning,duration,ttft,native,NULL AS gw_tokens,NULL AS gw_ms,0 AS output_unknown FROM perf_calls AS cli
-         WHERE NOT EXISTS(SELECT 1 FROM perf_gateway_sessions AS own JOIN perf_gateway_runs AS lifetime ON lifetime.scope=own.scope AND lifetime.run=own.run WHERE EXISTS(SELECT 1 FROM perf_gateway_calls AS observed WHERE observed.scope=lifetime.scope AND observed.run=lifetime.run) {cli_native} AND own.scope=cli.scope AND own.session=cli.session AND cli.at>=lifetime.started AND (lifetime.ended IS NULL OR cli.at<=lifetime.ended))
+    format!("{cli}
+         AND NOT EXISTS(SELECT 1 FROM perf_gateway_sessions AS own JOIN perf_gateway_runs AS lifetime ON lifetime.scope=own.scope AND lifetime.run=own.run WHERE EXISTS(SELECT 1 FROM perf_gateway_calls AS observed WHERE observed.scope=lifetime.scope AND observed.run=lifetime.run) {cli_native} AND own.scope=?1 AND own.session=cli.session AND cli.at>=lifetime.started AND (lifetime.ended IS NULL OR cli.at<=lifetime.ended))
          UNION ALL SELECT scope,id,session,NULL,at,model,upstream,output,reasoning,duration,ttft,2,decode_out,decode_ms,usage_known=0 FROM perf_gateway_calls g WHERE session<>'' {gateway_native}")
 }
 fn measured_calls(binding: &Binding, db: &Connection) -> String {
@@ -797,6 +814,7 @@ fn summary(
     period: Period,
     now: i64,
 ) -> Result<Summary, String> {
+    super::ownership::install(db, binding, now - period.days() * 86_400_000, now)?;
     let measured = measured_calls(binding, db);
     let sql = format!("{measured} SELECT {TOTALS} FROM measured_calls");
     db.query_row(
@@ -805,7 +823,7 @@ fn summary(
             binding.scope(),
             now - period.days() * 86_400_000,
             now,
-            binding.expected_upstream
+            binding.upstream_filter()
         ],
         |r| {
             Ok(Summary {

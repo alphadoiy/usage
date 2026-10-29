@@ -120,7 +120,19 @@ pub trait ManagedInstance: Send + Sync + std::fmt::Debug {
         source: crate::performance::RequestSource,
     ) -> Result<crate::performance::Binding, String>;
     fn start(&self, request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String>;
+    /// Read-only eligibility check, repeated before executing or exporting a resume.
+    /// Custom stores retain their existing behavior unless they declare a restriction.
+    fn validate_resume_source(&self, _source: &crate::sessions::Session) -> Result<(), String> {
+        Ok(())
+    }
     fn resume_shell_command(&self, session: &crate::sessions::Session) -> Result<String, String>;
+    fn resume_shell_command_with_config(
+        &self,
+        session: &crate::sessions::Session,
+        _usage_config: Option<&Path>,
+    ) -> Result<String, String> {
+        self.resume_shell_command(session)
+    }
 }
 
 /// Agent-specific handling of a local Home, such as recognizing a Home an account store
@@ -131,7 +143,7 @@ pub struct LocalHooks {
     pub resume: Option<LocalResume>,
 }
 pub type LocalStart = fn(&Path, &SpawnRequest) -> Result<Box<dyn RunningAgent>, String>;
-pub type LocalResume = fn(&crate::sessions::Session) -> Result<String, String>;
+pub type LocalResume = fn(&crate::sessions::Session, Option<&Path>) -> Result<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
@@ -152,6 +164,12 @@ pub struct SpawnOutcome {
 pub trait Launcher: Send + Sync {
     fn spawn(&self, request: &SpawnRequest) -> Result<SpawnOutcome, String>;
 
+    /// Whether this instance can access the selected source conversation. This must
+    /// not launch, migrate, materialize a Home, or probe a native agent process.
+    fn validate_resume_source(&self, _source: &crate::sessions::Session) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Additive capability: legacy/custom launchers may remain foreground-only.
     fn start(&self, _request: &SpawnRequest) -> Result<Box<dyn RunningAgent>, String> {
         Err("此 Agent 不支持非阻塞启动".into())
@@ -164,6 +182,13 @@ pub trait Launcher: Send + Sync {
     /// Adapters must explicitly preserve their own credential/configuration binding.
     fn resume_shell_command(&self, _session: &crate::sessions::Session) -> Result<String, String> {
         Err("此 Agent 不支持导出恢复命令，请使用当前终端".into())
+    }
+    fn resume_shell_command_with_config(
+        &self,
+        session: &crate::sessions::Session,
+        _usage_config: Option<&Path>,
+    ) -> Result<String, String> {
+        self.resume_shell_command(session)
     }
 }
 
@@ -241,13 +266,41 @@ impl AgentAdapter for LocalAgent {
 }
 
 impl Launcher for LocalAgent {
+    fn validate_resume_source(&self, source: &crate::sessions::Session) -> Result<(), String> {
+        match &self.context {
+            AgentContext::Managed(instance) => instance.validate_resume_source(source),
+            AgentContext::Local { home } => {
+                // A local shell hook receives the source Home. Accepting another
+                // Home here would make foreground and exported resumes diverge.
+                if home
+                    .canonicalize()
+                    .ok()
+                    .zip(source.home.canonicalize().ok())
+                    .is_some_and(|(target, source)| target == source)
+                {
+                    Ok(())
+                } else {
+                    Err("目标实例与会话来源目录不同，不能使用此实例恢复".into())
+                }
+            }
+        }
+    }
     fn supports_start(&self) -> bool {
         true
     }
     fn resume_shell_command(&self, session: &crate::sessions::Session) -> Result<String, String> {
+        self.resume_shell_command_with_config(session, None)
+    }
+    fn resume_shell_command_with_config(
+        &self,
+        session: &crate::sessions::Session,
+        usage_config: Option<&Path>,
+    ) -> Result<String, String> {
         match (&self.context, self.hooks.resume) {
-            (AgentContext::Managed(instance), _) => instance.resume_shell_command(session),
-            (AgentContext::Local { .. }, Some(resume)) => resume(session),
+            (AgentContext::Managed(instance), _) => {
+                instance.resume_shell_command_with_config(session, usage_config)
+            }
+            (AgentContext::Local { .. }, Some(resume)) => resume(session, usage_config),
             (AgentContext::Local { .. }, None) => {
                 crate::sessions::local_resume_shell_command(session)
             }

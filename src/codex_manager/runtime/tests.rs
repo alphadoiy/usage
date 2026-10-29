@@ -63,6 +63,9 @@ exit 0
         }
     }
     fn index(&self, home: &Path) {
+        let home = crate::codex_native::SessionStore::resolve(home)
+            .root()
+            .to_path_buf();
         let conn = Connection::open(home.join("state_5.sqlite")).unwrap();
         conn.execute_batch(
             "CREATE TABLE threads(id TEXT PRIMARY KEY,source TEXT,thread_source TEXT)",
