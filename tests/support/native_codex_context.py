@@ -95,21 +95,26 @@ class Client:
         self.process.stdin.flush()
         deadline = time.monotonic() + 25
         while time.monotonic() < deadline:
-            while b"\n" in self.buffer:
+            message = self.next_message(deadline, method)
+            if message.get("id") == self.sequence:
+                assert "error" not in message, message
+                return message["result"]
+            self.notifications.append(message)
+        raise AssertionError(f"Timeout during {method}; see {self.error.name}")
+
+    def next_message(self, deadline, operation):
+        while time.monotonic() < deadline:
+            if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
-                if not line:
-                    continue
-                message = json.loads(line)
-                if message.get("id") == self.sequence:
-                    assert "error" not in message, message
-                    return message["result"]
-                self.notifications.append(message)
-            if self.selector.select(0.2):
+                if line:
+                    return json.loads(line)
+                continue
+            if self.selector.select(min(0.2, max(0, deadline - time.monotonic()))):
                 chunk = os.read(self.process.stdout.fileno(), 65536)
                 if not chunk:
-                    raise AssertionError(f"Codex exited during {method}; see {self.error.name}")
+                    raise AssertionError(f"Codex exited during {operation}; see {self.error.name}")
                 self.buffer += chunk
-        raise AssertionError(f"Timeout during {method}; see {self.error.name}")
+        raise AssertionError(f"Timeout during {operation}; see {self.error.name}")
 
     def complete_turn(self, thread_id, text):
         turn_id = self.rpc("turn/start", {"threadId": thread_id,
@@ -120,9 +125,7 @@ class Client:
                 if message.get("method") == "turn/completed" and message["params"]["turn"]["id"] == turn_id:
                     assert message["params"]["turn"]["status"] == "completed", message
                     return
-            # A read request also drains turn notifications from the same stream.
-            self.rpc("thread/read", {"threadId": thread_id})
-            time.sleep(0.05)
+            self.notifications.append(self.next_message(deadline, "turn/completed"))
         raise AssertionError(f"Local fixture turn did not complete: {self.notifications[-5:]}")
 
     def close(self):
