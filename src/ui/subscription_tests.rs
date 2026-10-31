@@ -42,6 +42,8 @@ pub(super) struct Tests {
     loaded: bool,
     snapshots: HashMap<String, Snapshot>,
     error: Option<String>,
+    pending: Option<(String, bool)>,
+    action_error: Option<(String, String)>,
 }
 impl Tests {
     pub fn set(&mut self, result: Result<Vec<Snapshot>, String>) -> bool {
@@ -67,6 +69,46 @@ impl Tests {
             .then(|| self.snapshots.get(&provider.id))
             .flatten()
     }
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    pub fn enabled(&self, provider: &Provider) -> Option<bool> {
+        (supports(provider) && self.loaded && self.error.is_none())
+            .then(|| self.snapshot(provider).is_some_and(|s| s.enabled))
+    }
+    pub fn begin_toggle(&mut self, provider: &Provider) -> Result<bool, String> {
+        if self.pending() {
+            return Err("正在保存自动测试设置，请稍候".into());
+        }
+        let enabled = !self
+            .enabled(provider)
+            .ok_or("测试状态尚未读取成功，请稍后重试")?;
+        self.pending = Some((provider.id.clone(), enabled));
+        self.action_error = None;
+        Ok(enabled)
+    }
+    pub fn finish_toggle(&mut self, id: &str, result: Result<(), String>) -> bool {
+        let Some((account, enabled)) = &self.pending else {
+            return false;
+        };
+        if account != id {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                self.snapshots
+                    .entry(id.into())
+                    .or_insert_with(|| Snapshot {
+                        id: id.into(),
+                        ..Default::default()
+                    })
+                    .enabled = *enabled;
+            }
+            Err(error) => self.action_error = Some((id.into(), error)),
+        }
+        self.pending = None;
+        true
+    }
     pub fn summary(&self, provider: &Provider) -> Vec<Line<'static>> {
         if !supports(provider) {
             return Vec::new();
@@ -82,6 +124,8 @@ impl Tests {
         };
         let (symbol, color, label) = if snapshot.blocked_reason.is_some() {
             ("○", Color::DarkGray, "暂不测试")
+        } else if snapshot.latest.is_none() && !snapshot.enabled {
+            ("○", Color::DarkGray, "未启用")
         } else {
             display(snapshot.latest.as_ref())
         };
@@ -106,17 +150,72 @@ impl Tests {
         if !supports(provider) {
             return Vec::new();
         }
-        let mut lines = vec![Line::from(format!("{} · 订阅测试", clean(&provider.name))).bold()];
+        let mut lines =
+            vec![Line::from(format!("{} · 订阅测试（模型指纹）", clean(&provider.name))).bold()];
+        lines.push(Line::from("采集模型回答并与本地参考库比较，排名仅供参考。").dim());
         if let Some(error) = &self.error {
             lines.push(Line::from(clean(error)).fg(Color::Yellow));
         }
+        if let Some(snapshot) = self.snapshot(provider) {
+            lines.push(
+                Line::from(format!(
+                    "测试引擎：{}",
+                    if snapshot.engine_available {
+                        snapshot.engine_version.as_ref().map_or_else(
+                            || "已安装".into(),
+                            |version| format!("已安装 · LMFPD {}", clean(version)),
+                        )
+                    } else {
+                        "未找到 · 安装说明见 docs/fingerprint.md".into()
+                    }
+                ))
+                .dim(),
+            );
+        }
+        if self.loaded && self.error.is_none() {
+            let pending = self.pending.as_ref().filter(|(id, _)| id == &provider.id);
+            let enabled = self.enabled(provider).unwrap_or(false);
+            lines.push(
+                Line::from(match pending {
+                    Some((_, true)) => "自动测试：[ ] 正在启用…".into(),
+                    Some((_, false)) => "自动测试：[x] 正在关闭…".into(),
+                    None => format!(
+                        "自动测试：{} · e {}",
+                        if enabled {
+                            "[x] 已启用"
+                        } else {
+                            "[ ] 已关闭"
+                        },
+                        if enabled { "关闭" } else { "启用" }
+                    ),
+                })
+                .bold(),
+            );
+            lines.push(Line::from("每 5 小时测试，仅 Usage 打开期间运行；会消耗订阅额度。").dim());
+            if !enabled {
+                lines.push(Line::from("关闭后保留历史记录，已开始的测试继续完成。").dim());
+            }
+        }
+        if let Some((id, error)) = &self.action_error
+            && id == &provider.id
+        {
+            lines.push(Line::from(format!("设置未保存：{}", clean(error))).yellow());
+        }
+        lines.push(Line::from(""));
         if let Some(snapshot) = self.snapshot(provider) {
             let (symbol, color, label) = display(snapshot.latest.as_ref());
             if let Some(reason) = &snapshot.blocked_reason {
                 lines.push(Line::from("○ 暂不测试").dim());
                 lines.push(Line::from(clean(reason)));
             } else {
-                lines.push(Line::from(format!("{symbol} {label}")).fg(color));
+                lines.push(
+                    Line::from(if snapshot.latest.is_none() && !snapshot.enabled {
+                        "○ 尚无测试记录".into()
+                    } else {
+                        format!("{symbol} {label}")
+                    })
+                    .fg(color),
+                );
             }
             if let Some(report) = &snapshot.latest {
                 if snapshot.blocked_reason.is_some() {
@@ -198,7 +297,7 @@ impl Tests {
         } else if !self.loaded {
             lines.push(Line::from("正在读取此账号的订阅测试记录…").dim());
         } else if self.error.is_none() {
-            lines.push(Line::from("此 Provider 尚未启用订阅测试").dim());
+            lines.push(Line::from("尚无测试记录 · 按 e 启用自动测试").dim());
         }
         lines.push(Line::from("t / Esc 返回 · ↑/↓ 滚动 · ←/→ 切换 Provider").dim());
         super::overview::wrap(lines, width)
@@ -229,6 +328,44 @@ mod tests {
             .join("\n")
     }
     #[test]
+    fn schedule_toggle_keeps_account_identity_rejects_repeats_and_preserves_state_on_error() {
+        let a = provider("a");
+        let b = provider("b");
+        let mut tests = Tests::default();
+        assert!(tests.begin_toggle(&a).is_err());
+        tests.set(Ok(vec![Snapshot {
+            id: "a".into(),
+            engine_available: true,
+            engine_version: Some("0.0.1".into()),
+            ..Default::default()
+        }]));
+        for width in [28, 80] {
+            let shown: String = text(tests.details(&a, width)).split_whitespace().collect();
+            assert!(shown.contains("测试引擎：已安装·LMFPD0.0.1"));
+            assert!(shown.contains("自动测试：[]已关闭·e启用"));
+            assert!(shown.contains("消耗订阅额度"));
+            assert!(shown.contains("尚无测试记录"));
+        }
+        assert_eq!(tests.begin_toggle(&a), Ok(true));
+        assert!(tests.begin_toggle(&a).is_err());
+        assert!(tests.begin_toggle(&b).is_err());
+        assert!(!tests.finish_toggle("b", Ok(())));
+        assert_eq!(tests.enabled(&a), Some(false));
+        assert!(tests.finish_toggle("a", Err("synthetic save failure".into())));
+        assert_eq!(tests.enabled(&a), Some(false));
+        assert!(text(tests.details(&a, 100)).contains("设置未保存：synthetic save failure"));
+        assert!(!text(tests.details(&b, 100)).contains("synthetic save failure"));
+        assert_eq!(tests.begin_toggle(&a), Ok(true));
+        assert!(tests.finish_toggle("a", Ok(())));
+        assert_eq!(tests.enabled(&a), Some(true));
+        assert_eq!(tests.enabled(&b), Some(false));
+        assert!(text(tests.details(&a, 100)).contains("[x] 已启用 · e 关闭"));
+        assert_eq!(tests.begin_toggle(&a), Ok(false));
+        assert!(tests.finish_toggle("a", Ok(())));
+        assert_eq!(tests.enabled(&a), Some(false));
+    }
+
+    #[test]
     fn reports_history_and_engine_updates_belong_only_to_their_provider() {
         let report = Report {
             model: "gpt-6.1-sol".into(),
@@ -257,6 +394,7 @@ mod tests {
             history: vec![report],
             warnings: Vec::new(),
             update_notice: Some("lmfpd 有更新：0.0.1 → 0.0.2".into()),
+            ..Default::default()
         }]));
         assert!(text(tests.summary(&provider("a"))).contains("额度耗尽"));
         assert!(text(tests.summary(&provider("a"))).contains("lmfpd 有更新"));

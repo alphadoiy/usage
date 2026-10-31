@@ -72,3 +72,17 @@ Codex 的 OSC 7501 由 Codex 直接写入自己的终端，不经过 Usage hook 
 6. 在真实终端中验证新建与恢复、焦点、Agent 退出、Ctrl+C、独立 PTY，以及 Agent 原生状态。记录本机验证范围，不把模拟测试等同于界面验证。
 
 正常接入不应修改 Provider、账号存储、会话发现、会话恢复意图或各个 UI 页面的终端名称分支。如果新工具确实需要新布局能力，先扩充 `Placement` 与请求约定，再实现适配器。
+
+## 开发时查询 Rex 文档与社区
+
+[Rex Community MCP](https://www.superlogical.com/rex/docs/beta/community-mcp) 提供官方文档、版本更新及 Beta Discord 历史讨论的检索。维护 Rex 适配器时可给编码 Agent 配置它，辅助排查 CLI、焦点、PTY 和状态协议问题；确认后的行为仍需落实为代码与测试。
+
+Codex 配置命令：
+
+```sh
+codex mcp add superlogical --url https://www.superlogical.com/rex/community-mcp
+```
+
+按提示通过 Discord OAuth 授权，需要加入 Rex Beta Discord。若添加后尚未完成授权，可运行 `codex mcp login superlogical`。服务名采用官方建议的 `superlogical`，避免与 `rex` CLI 混淆。
+
+这是开发者的可选工具，不属于 Usage 运行依赖。用户的 MCP 配置和 OAuth 凭据留在本机，不提交到仓库；终端启动和状态对接继续使用 Rex CLI、Server API 与程序原生协议。

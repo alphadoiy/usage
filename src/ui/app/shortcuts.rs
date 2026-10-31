@@ -94,6 +94,37 @@ impl Dashboard {
                     refresh,
                 ],
             )
+        } else if self.home_subscription_details
+            && self.home_focus == super::super::home::Focus::Providers
+        {
+            let provider = crate::ui::overview::selected(
+                self.overview_state.catalog.as_ref(),
+                self.home_provider.as_deref(),
+            )
+            .map(|(_, provider)| provider);
+            let mut toggle = action(
+                'e',
+                "e",
+                if provider
+                    .is_some_and(|provider| self.subscription_tests.enabled(provider) == Some(true))
+                {
+                    "关闭自动测试（保留历史）"
+                } else {
+                    "启用自动测试（每 5 小时，消耗订阅额度）"
+                },
+            );
+            if self.subscription_tests.pending() {
+                toggle = toggle.disabled("正在保存自动测试设置");
+            } else if provider
+                .is_none_or(|provider| self.subscription_tests.enabled(provider).is_none())
+            {
+                toggle = toggle.disabled("测试状态尚未读取成功");
+            }
+            (
+                "订阅测试",
+                "←/→ 切换 Provider · ↑/↓ 滚动",
+                vec![toggle, action('t', "t", "返回 Provider 摘要"), refresh],
+            )
         } else {
             match self.home_focus {
                 super::super::home::Focus::Providers => {

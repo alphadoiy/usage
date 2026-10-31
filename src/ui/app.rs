@@ -83,6 +83,11 @@ enum AppEvent {
         generation: u64,
         result: Result<Vec<crate::codex_manager::fingerprint::Snapshot>, String>,
     },
+    FingerprintScheduleChanged {
+        generation: u64,
+        account: String,
+        result: Result<(), String>,
+    },
     HomePerformance {
         generation: u64,
         key: String,
@@ -1311,6 +1316,7 @@ impl Dashboard {
     fn maybe_refresh_fingerprint(&mut self, handle: &Handle) {
         if self.history_state.panel.is_some()
             || self.browser_state.panel.is_some()
+            || self.subscription_tests.pending()
             || self.fingerprint.task.is_some()
             || self
                 .fingerprint
@@ -1335,6 +1341,51 @@ impl Dashboard {
                 let _ = tx.send(AppEvent::FingerprintLoaded { generation, result });
             },
         ));
+    }
+
+    fn toggle_fingerprint_schedule(&mut self, handle: &Handle) {
+        let Some((_, provider)) = super::overview::selected(
+            self.overview_state.catalog.as_ref(),
+            self.home_provider.as_deref(),
+        ) else {
+            return;
+        };
+        if !super::subscription_tests::supports(provider) {
+            return;
+        }
+        let account = provider.id.clone();
+        let enabled = match self.subscription_tests.begin_toggle(provider) {
+            Ok(enabled) => enabled,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+        // Invalidate any read started before the write, and keep the accepted write
+        // alive if the user leaves this view or switches to another account.
+        self.fingerprint.task = None;
+        self.fingerprint.generation = self.fingerprint.generation.wrapping_add(1);
+        let generation = self.fingerprint.generation;
+        let service = self.fingerprint.service.clone();
+        let tx = self.tx.clone();
+        handle.spawn(async move {
+            let selector = account.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if enabled {
+                    service.enable(&selector, None).map(|_| ())
+                } else {
+                    service.disable(&selector)
+                }
+                .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap_or_else(|_| Err("自动测试设置保存失败".into()));
+            let _ = tx.send(AppEvent::FingerprintScheduleChanged {
+                generation,
+                account,
+                result,
+            });
+        });
     }
 
     fn maybe_refresh_home_activity(&mut self, handle: &Handle) {
@@ -1500,6 +1551,11 @@ impl Dashboard {
             return true;
         }
         match key {
+            KeyCode::Char('e')
+                if self.home_focus == HomeFocus::Providers && self.home_subscription_details =>
+            {
+                self.toggle_fingerprint_schedule(handle);
+            }
             KeyCode::Char('P') if self.home_focus == HomeFocus::Projects => {
                 self.open_resume_provider(true, handle)
             }
@@ -2135,6 +2191,24 @@ impl Dashboard {
                     if generation == self.fingerprint.generation {
                         self.fingerprint.task = None;
                         changed |= self.subscription_tests.set(result);
+                    }
+                    continue;
+                }
+                AppEvent::FingerprintScheduleChanged {
+                    generation,
+                    account,
+                    result,
+                } => {
+                    let message = match &result {
+                        Ok(()) => "自动测试设置已保存".to_owned(),
+                        Err(error) => format!("自动测试设置未保存：{error}"),
+                    };
+                    if generation == self.fingerprint.generation
+                        && self.subscription_tests.finish_toggle(&account, result)
+                    {
+                        self.fingerprint.last_poll = None;
+                        self.notice = Some(message);
+                        changed = true;
                     }
                     continue;
                 }

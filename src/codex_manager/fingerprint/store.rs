@@ -292,6 +292,8 @@ impl Store {
             id: profile.id.clone(),
             name: profile.name.clone(),
             enabled: settings.is_some(),
+            engine_available: false,
+            engine_version: None,
             blocked_reason: None,
             latest,
             history: cached.reports.clone(),

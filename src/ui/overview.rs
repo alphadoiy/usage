@@ -1,7 +1,7 @@
 //! Compact provider inventory and shared terminal-safe text layout.
 use ratatui::style::{Color, Stylize};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::provider_catalog::{Catalog, Models, Provider, ProviderUsage, QueryState};
 use crate::resources::{ResourceMetric, ResourceScope, ResourceState};
@@ -64,10 +64,9 @@ pub(super) fn lines(
             .as_ref()
             .map_or(String::new(), |agent| format!(" · {}", clean(agent)));
         lines.push(Line::from(format!("{}{}", clean(&provider.name), agent)).bold());
+        lines.push(Line::from(provider.kind.label()).dim());
+        section(&mut lines, "用量与余额");
         lines.extend(usage_lines(&provider.usage, expanded));
-        if provider.performance.is_some() {
-            lines.extend(super::performance::summary_lines(performance));
-        }
         for operation in &provider.operations {
             if operation.0.id() == "checkin" {
                 let text = extras.operation_statuses.map_or_else(
@@ -77,31 +76,34 @@ pub(super) fn lines(
                 lines.push(Line::from(text).dim());
             }
         }
-        if let Some(tests) = extras.subscription_tests {
-            lines.extend(tests.summary(provider));
-        }
         if provider.usage.reset.is_some() && !provider.usage.sources.iter().any(|source| {
             matches!(&source.state, QueryState::Result(snapshot) if snapshot.metrics.iter().any(|metric|
                 matches!(metric, ResourceMetric::ResetCredits { .. })))
         }) {
-            lines.push(Line::from("主动重置：次数未返回 · x 查询").dim());
+            lines.push(Line::from("  主动重置：次数未返回 · x 查询").dim());
         }
-        lines.push(Line::from(format!("类型：{}", provider.kind.label())).dim());
-        if let Some(model) = &provider.configured_model {
-            lines.push(Line::from(format!("默认模型（配置）：{}", clean(model))).dim());
-        }
+        section(&mut lines, "模型");
+        let model = provider.configured_model.as_deref().unwrap_or("").trim();
+        let model = match model {
+            "" | "默认模型" => format!(
+                "由 {} 选择",
+                clean(provider.agent.as_deref().unwrap_or("Agent"))
+            ),
+            model => clean(model),
+        };
+        lines.push(Line::from(format!("  默认模型：{model}")));
         match &provider.models {
-            Models::Loading => lines.push(Line::from("模型：查询中…").dim()),
+            Models::Loading => lines.push(Line::from("  可用模型：查询中…").dim()),
             Models::Unavailable(reason) => {
-                lines.push(Line::from(format!("模型：{}", clean(reason))).fg(Color::Yellow))
+                lines.push(Line::from(format!("  可用模型：{}", clean(reason))).fg(Color::Yellow))
             }
             Models::Ready(models) => {
-                lines.push(Line::from(format!("接口模型列表 · {} 个", models.len())).dim());
+                lines.push(Line::from(format!("  可用模型：{} 个", models.len())).dim());
                 if models.is_empty() {
-                    lines.push(Line::from("接口返回空列表").dim());
+                    lines.push(Line::from("  接口返回空列表").dim());
                 }
                 for model in models.iter().take(if expanded { usize::MAX } else { 3 }) {
-                    lines.push(Line::from(format!("  • {}", clean(model))));
+                    lines.push(Line::from(format!("    • {}", clean(model))));
                 }
                 if !expanded && models.len() > 3 {
                     lines.push(
@@ -110,16 +112,52 @@ pub(super) fn lines(
                 }
             }
         }
+        let mut diagnostics = Vec::new();
+        if provider.performance.is_some() {
+            diagnostics.extend(super::performance::summary_lines(performance));
+        }
+        if let Some(tests) = extras.subscription_tests {
+            diagnostics.extend(tests.summary(provider));
+        }
+        if !diagnostics.is_empty() {
+            section(&mut lines, "性能与检测");
+            lines.extend(diagnostics.into_iter().map(|mut line| {
+                line.spans.insert(0, Span::raw("  "));
+                line
+            }));
+        }
     }
     lines
 }
 
+fn section(lines: &mut Vec<Line<'static>>, title: &'static str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(title).bold().fg(Color::Cyan));
+}
+
 fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // Labels contain CJK characters: align by terminal cells, rather than character count.
+    let label_width = usage
+        .sources
+        .iter()
+        .filter_map(|source| match &source.state {
+            QueryState::Result(snapshot) => Some(&snapshot.metrics),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|metric| match metric {
+            ResourceMetric::QuotaWindow { name, .. } => {
+                Some(clean(&crate::labels::tier_label(name)).width())
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
     if usage.sources.is_empty() {
         lines.push(
             Line::from(format!(
-                "用量／余额：{}",
+                "  用量／余额：{}",
                 clean(usage.hint.as_deref().unwrap_or("尚未配置查询服务"))
             ))
             .dim(),
@@ -146,10 +184,7 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
         } else {
             format!("{} · {}", clean(&source.label), scope)
         };
-        let heading_first = expanded || usage.sources.len() > 1;
-        if heading_first {
-            lines.push(Line::from(title.clone()).dim());
-        }
+        lines.push(Line::from(format!("  {title}")).dim());
         if imported && expanded {
             lines.push(Line::from("  配置来源：CC Switch").dim());
         }
@@ -254,16 +289,18 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                                 "grok_subscription" => "grok",
                                 _ => "",
                             };
-                            let mut spans = vec![Span::raw(format!(
-                                "  {}  ",
-                                clean(&crate::labels::tier_label(name))
-                            ))];
+                            let label = clean(&crate::labels::tier_label(name));
+                            let padding = " ".repeat(label_width.saturating_sub(label.width()));
+                            let mut spans = vec![Span::raw(format!("  {label}{padding}  "))];
                             spans.extend(super::widgets::quota_dots(agent, *used_percent));
-                            spans.push(Span::raw(format!(
-                                " 已用 {}{}",
-                                crate::labels::fmt_percent(*used_percent),
-                                reset
-                            )));
+                            spans.push(
+                                Span::raw(format!(
+                                    " 已用 {:>6}",
+                                    crate::labels::fmt_percent(*used_percent),
+                                ))
+                                .bold(),
+                            );
+                            spans.push(Span::raw(reset).dim());
                             lines.push(Line::from(spans));
                             continue;
                         }
@@ -306,9 +343,6 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                     );
                 }
             }
-        }
-        if !heading_first {
-            lines.push(Line::from(title).dim());
         }
     }
     lines
@@ -379,6 +413,175 @@ pub(super) fn wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subscription_usage(windows: &[(&str, f64)]) -> ProviderUsage {
+        use crate::resources::{ResourceBinding, ResourceSnapshot};
+        let binding = ResourceBinding {
+            account: "hidden-account".into(),
+            revision: "1".into(),
+        };
+        ProviderUsage {
+            sources: vec![crate::provider_catalog::UsageSource {
+                target: "hidden-account".into(),
+                label: "官方订阅额度".into(),
+                service: "chatgpt_subscription".into(),
+                binding: binding.clone(),
+                state: QueryState::Result(ResourceSnapshot {
+                    binding,
+                    service: "chatgpt_subscription".into(),
+                    scope: ResourceScope::Account,
+                    state: ResourceState::Ready,
+                    metrics: windows
+                        .iter()
+                        .map(|(name, percent)| ResourceMetric::QuotaWindow {
+                            name: (*name).into(),
+                            used_percent: *percent,
+                            resets_at: Some(
+                                chrono::DateTime::from_timestamp(1_793_500_000, 0).unwrap(),
+                            ),
+                        })
+                        .chain([ResourceMetric::ResetCredits { available: 1 }])
+                        .collect(),
+                    queried_at: None,
+                    message: None,
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn plain(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn quota_columns_align_in_terminal_cells_for_cjk_labels_and_variable_percentages() {
+        use ratatui::{
+            buffer::Buffer,
+            layout::Rect,
+            widgets::{Paragraph, Widget},
+        };
+        let usage = subscription_usage(&[
+            ("five_hour", 0.0),
+            ("seven_day", 12.5),
+            ("seven_day_sonnet", 100.0),
+        ]);
+        let lines = usage_lines(&usage, false);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, lines.len() as u16));
+        Paragraph::new(lines.clone()).render(buffer.area, &mut buffer);
+        let mut columns = Vec::new();
+        for y in 0..buffer.area.height {
+            let x_of =
+                |symbol: &str| (0..buffer.area.width).find(|&x| buffer[(x, y)].symbol() == symbol);
+            if let Some(dot) =
+                (0..buffer.area.width).find(|&x| matches!(buffer[(x, y)].symbol(), "○" | "●"))
+            {
+                columns.push((dot, x_of("已").unwrap(), x_of("重").unwrap()));
+            }
+        }
+        assert_eq!(columns.len(), 3);
+        assert!(
+            columns
+                .iter()
+                .all(|columns_for_row| *columns_for_row == columns[0]),
+            "{columns:?}"
+        );
+        for width in [28, 48] {
+            let compact: String = plain(&wrap(lines.clone(), width))
+                .split_whitespace()
+                .collect();
+            for expected in [
+                "5小时",
+                "7天",
+                "7天(Sonnet)",
+                "已用0%",
+                "已用12.5%",
+                "已用100%",
+                "主动重置1次",
+            ] {
+                assert!(
+                    compact.contains(expected),
+                    "missing {expected} at width {width}: {compact}"
+                );
+            }
+            assert_eq!(compact.matches("重置").count(), 5);
+        }
+    }
+
+    #[test]
+    fn subscription_board_groups_usage_models_and_diagnostics_and_explains_default_model() {
+        use crate::provider_catalog::ProviderKind;
+        let catalog = Catalog {
+            providers: vec![Provider {
+                id: "hidden-account".into(),
+                name: "个人订阅".into(),
+                agent: Some("Codex".into()),
+                kind: ProviderKind::Subscription,
+                configured_model: Some("默认模型".into()),
+                models: Models::Ready((0..8).map(|n| format!("model-{n}")).collect()),
+                usage: subscription_usage(&[("five_hour", 0.0), ("seven_day", 0.0)]),
+                operations: Vec::new(),
+                performance: Some(crate::performance::local_binding(
+                    "hidden-account",
+                    "codex",
+                    std::path::Path::new("/unused"),
+                    crate::performance::source("codex").unwrap(),
+                )),
+            }],
+            ..Default::default()
+        };
+        let mut tests = super::super::subscription_tests::Tests::default();
+        tests.set(Ok(Vec::new()));
+        let performance = super::super::performance::CachedSummary {
+            result: Ok(Some(Default::default())),
+            updated: std::time::Instant::now(),
+        };
+        for configured in [None, Some("默认模型"), Some("gpt-fixture")] {
+            let mut catalog = catalog.clone();
+            catalog.providers[0].configured_model = configured.map(str::to_owned);
+            let output = plain(&lines(
+                Some(&catalog),
+                false,
+                None,
+                false,
+                None,
+                Some(&performance),
+                Extras {
+                    subscription_tests: Some(&tests),
+                    ..Default::default()
+                },
+            ));
+            let usage = output.find("\n用量与余额\n").unwrap();
+            let models = output.find("\n模型\n").unwrap();
+            let diagnostics = output.find("\n性能与检测\n").unwrap();
+            assert!(usage < output.find("5小时").unwrap());
+            assert!(output.find("主动重置").unwrap() < models);
+            assert!(models < output.find("可用模型：8 个").unwrap());
+            assert!(output.find("另 5 个 · Enter 展开模型").unwrap() < diagnostics);
+            assert!(
+                diagnostics
+                    < output
+                        .find("性能 · 近 24 小时 · 暂无可用样本 · v 详情")
+                        .unwrap()
+            );
+            assert!(diagnostics < output.find("订阅测试 · 未启用 · t 详情").unwrap());
+            assert!(output.contains(if configured == Some("gpt-fixture") {
+                "默认模型：gpt-fixture"
+            } else {
+                "默认模型：由 Codex 选择"
+            }));
+            assert!(!output.contains("hidden-account"));
+        }
+    }
 
     #[test]
     fn raw_amounts_and_spending_windows_remain_visible_without_claiming_wallet_balance() {

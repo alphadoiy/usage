@@ -233,11 +233,18 @@ fn draw_accounts(
     let items: Vec<ListItem> = profiles
         .iter()
         .map(|p| {
-            ListItem::new(vec![
-                Line::from(format!("{}  ·  {}", p.name, p.model)),
+            let model = match p.model.trim() {
+                "" | "默认模型" => "由 Codex 选择",
+                model => model,
+            };
+            let mut lines = vec![
+                Line::from(format!("{}  ·  默认模型：{}", p.name, model)),
                 Line::from(identity(p)).dim(),
-                Line::from(format!("{} {}", p.id, p.source_status)).dim(),
-            ])
+            ];
+            if !p.source_status.trim().is_empty() {
+                lines.push(Line::from(p.source_status.as_str()).dim());
+            }
+            ListItem::new(lines)
         })
         .collect();
     if items.is_empty() {

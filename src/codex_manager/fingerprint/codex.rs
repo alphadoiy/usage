@@ -65,10 +65,8 @@ pub(super) fn failure_details(report: &mut Report) {
         }
     }
 }
-pub(super) fn resolve_fpd(manager: &Manager, explicit: Option<&Path>) -> Result<PathBuf> {
-    let local = manager
-        .root()
-        .join("fingerprint/tools/node_modules/.bin/fpd");
+pub(super) fn resolve_fpd(root: &Path, explicit: Option<&Path>) -> Result<PathBuf> {
+    let local = root.join("fingerprint/tools/node_modules/.bin/fpd");
     let path = explicit.map(Path::to_path_buf).unwrap_or_else(|| {
         if local.is_file() {
             local

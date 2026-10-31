@@ -37,7 +37,7 @@ impl FingerprintService {
         let manager = Manager::open(self.root.clone())?;
         let profile = account(&manager, selector)?;
         self.store
-            .enable(&profile.id, codex::resolve_fpd(&manager, fpd)?)?;
+            .enable(&profile.id, codex::resolve_fpd(manager.root(), fpd)?)?;
         Ok(profile.name)
     }
     pub fn disable(&self, selector: &str) -> Result<()> {
@@ -49,11 +49,7 @@ impl FingerprintService {
         let manager = Manager::open_read_only(self.root.clone())?
             .ok_or_else(|| Error::message("账号库不存在"))?;
         let profile = account(&manager, selector)?;
-        Ok(self.snapshot(&profile).unwrap_or(Snapshot {
-            id: profile.id,
-            name: profile.name,
-            ..Default::default()
-        }))
+        Ok(self.snapshot(&profile))
     }
     pub fn repair(&self, selector: &str) -> Result<usize> {
         let manager = Manager::open_read_only(self.root.clone())?
@@ -65,7 +61,7 @@ impl FingerprintService {
             .ok()
             .flatten()
             .map(|s| s.fpd);
-        let fpd = codex::resolve_fpd(&manager, configured.as_deref()).ok();
+        let fpd = codex::resolve_fpd(manager.root(), configured.as_deref()).ok();
         self.store.repair(&profile.id, fpd.as_deref())
     }
     pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
@@ -78,20 +74,31 @@ impl FingerprintService {
         Ok(profiles
             .iter()
             .filter(|p| p.auth_mode == AuthMode::Oauth)
-            .filter_map(|p| self.snapshot(p))
+            .map(|p| self.snapshot(p))
             .collect())
     }
-    fn snapshot(&self, profile: &super::super::Profile) -> Option<Snapshot> {
-        let mut snapshot = self.store.snapshot(profile)?;
-        let fpd = self
+    fn snapshot(&self, profile: &super::super::Profile) -> Snapshot {
+        let mut snapshot = self.store.snapshot(profile).unwrap_or_else(|| Snapshot {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            ..Default::default()
+        });
+        let configured = self
             .store
             .settings(&profile.id)
             .ok()
             .flatten()
-            .map(|s| s.fpd)
-            .unwrap_or_else(|| update::default_fpd(&self.root));
-        snapshot.blocked_reason = self.reference.reason(&fpd);
-        Some(snapshot)
+            .map(|s| s.fpd);
+        match codex::resolve_fpd(&self.root, configured.as_deref()) {
+            Ok(fpd) => {
+                snapshot.engine_available = true;
+                snapshot.engine_version =
+                    update::installed(&fpd).map(|version| version.to_string());
+                snapshot.blocked_reason = self.reference.reason(&fpd);
+            }
+            Err(error) => snapshot.blocked_reason = Some(error.to_string()),
+        }
+        snapshot
     }
     pub(super) async fn check_updates(&self, http: &dyn crate::http::HttpClient) {
         let configured = self.jobs().unwrap_or_default().iter().any(|id| {
@@ -154,7 +161,7 @@ impl FingerprintService {
             return Ok(None);
         }
         let profile = account(manager, selector)?;
-        let fpd = codex::resolve_fpd(manager, fpd)?;
+        let fpd = codex::resolve_fpd(manager.root(), fpd)?;
         if let Some(reason) = self.reference.reason(&fpd) {
             tracing::info!(
                 event = "fingerprint_skipped",

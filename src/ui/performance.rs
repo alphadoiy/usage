@@ -16,18 +16,23 @@ pub(super) struct CachedSummary {
 
 pub(super) fn summary_lines(entry: Option<&CachedSummary>) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::text::Line;
-    let mut lines = vec![Line::from("性能均值 · 近 24 小时 · v 详情").dim()];
+    let heading = "性能 · 近 24 小时";
+    let mut lines = Vec::new();
     let Some(entry) = entry else {
-        lines.push(Line::from("  正在读取性能摘要…").dim());
+        lines.push(Line::from(format!("{heading} · 读取中… · v 详情")).dim());
         return lines;
     };
     match &entry.result {
         Err(error) => {
+            lines.push(Line::from(format!("{heading} · 读取失败 · v 详情")).yellow());
             lines.push(Line::from(format!("  {}", super::overview::clean(error))).yellow())
         }
-        Ok(None) => lines.push(Line::from("  尚未生成统计").dim()),
-        Ok(Some(s)) if s.calls == 0 => lines.push(Line::from("  暂无可用样本").dim()),
+        Ok(None) => lines.push(Line::from(format!("{heading} · 尚未生成统计 · v 详情")).dim()),
+        Ok(Some(s)) if s.calls == 0 => {
+            lines.push(Line::from(format!("{heading} · 暂无可用样本 · v 详情")).dim())
+        }
         Ok(Some(s)) => {
+            lines.push(Line::from(format!("{heading} · v 详情")).dim());
             lines.push(Line::from(format!(
                 "  {} 次请求 · 平均首字 {}",
                 s.calls,

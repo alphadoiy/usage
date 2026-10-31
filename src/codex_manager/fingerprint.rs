@@ -109,6 +109,8 @@ pub(crate) struct Snapshot {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    pub engine_available: bool,
+    pub engine_version: Option<String>,
     pub blocked_reason: Option<String>,
     pub latest: Option<Report>,
     pub history: Vec<Report>,
