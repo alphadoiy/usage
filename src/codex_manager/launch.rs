@@ -556,7 +556,7 @@ impl Manager {
         prepared: &mut Prepared,
         run_id: &str,
     ) -> Result<()> {
-        op.step("notification_inject", || {
+        let bark_injected = op.step("notification_inject", || {
             bark::inject(
                 &mut prepared.command,
                 &self.root,
@@ -566,6 +566,14 @@ impl Manager {
                 &prepared.runtime_config,
             )
         })?;
+        if !bark_injected {
+            prepared.command.env_remove("USAGE_CODEX_RUN_CONTEXT");
+            tracing::info!(
+                event = "run_events_unavailable",
+                reason = "bark_not_enabled"
+            );
+            return Ok(());
+        }
         op.step("runtime_events_inject", || {
             runtime::inject(
                 &mut prepared.command,
@@ -611,6 +619,11 @@ impl Manager {
         if let Some(lease) = &oauth_lease {
             launcher::inherit_run_lease(&mut command, lease)?;
         }
+        // Native OSC 7501 status belongs to this tab's PTY, independently of Bark hooks.
+        command
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
         let mut child = op.step("child_spawn", || command.spawn())?;
         tracing::info!(event = "child_spawned", child_pid = child.id());
         op.begin("run_record");

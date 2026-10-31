@@ -74,7 +74,7 @@ cargo run -- --once
 usage                 # 打开 TUI
 usage --once          # 查询一次，打印文本
 usage --json          # 查询一次，打印 JSON
-usage status          # 查询 OpenAI、Claude、Grok 官方服务状态，无需登录
+usage status          # 查询 Codex API / CLI、Claude、Grok 官方服务状态，无需登录
 usage status --providers openai,claude --json
 usage statusline --providers claude  # 给 Claude Code 等 agent 输出轻量状态栏
 usage --once --style ring    # 本次文本查询使用圆环
@@ -112,8 +112,8 @@ TUI 保留 `F1` 首页、`F2` 历史、`F3` 会话、`F4` Provider 管理。各�
 | `x` | 查询首页当前 Provider 的主动重置次数，确认后重置其 5 小时额度 |
 | `v` | Provider 看板查看当前 Provider 的模型性能：平均首字、生成速度、速度下限与请求明细 |
 | `h` | 打开本地 Token 贡献看板 |
-| `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 右侧分屏恢复 |
-| `m` / `F10` | 打开功能菜单，选择首页、历史、会话或 Provider 管理；`m` 用于首页 |
+| `p` | 浏览 Claude Code、Codex、Grok 的本机会话，在 Ghostty 分屏 / Rex 新标签页恢复 |
+| `Space` | 打开／关闭功能菜单；再按 `1`–`4` 切换页面，兼容 `F10` 和首页的 `m` |
 | `F4` | 管理 Provider 账号及 Agent 配置、导入 CC Switch、打开独立实例 |
 | `Tab` / `Shift+Tab` | 正向／反向切换首页看板、会话列表或历史来源筛选 |
 | `j` / `k` / `↑` / `↓` | Provider 看板滚动当前 Provider 的信息；其他看板选择厂商／项目／会话 |
@@ -121,7 +121,7 @@ TUI 保留 `F1` 首页、`F2` 历史、`F3` 会话、`F4` Provider 管理。各�
 | `Enter` | Provider 看板展开／收起模型；厂商看板查看事件与历史；项目看板进入列表并恢复会话 |
 | `Esc` | 逐层返回：先清除搜索／勾选，再返回列表或上一页；首页收起详情，不直接退出程序 |
 | `/` / `c` | 在项目与会话看板搜索／清除搜索 |
-| `R` | 切换会话恢复方式：自动、Ghostty 分屏、当前终端 |
+| `R` | 切换会话恢复方式：自动、Ghostty 分屏、Rex 新标签页、当前终端 |
 | `q` | 首页退出；子页面保留原有返回行为。`Ctrl+C` 随时退出 |
 
 没有配置文件也能直接运行。默认首页展示 Provider、厂商状态、项目与会话三个看板，每 60 秒刷新一次。`style` 配置用于 `--once` 的文本用量查询，默认使用 Braille 进度条；首页不再提供无视觉效果的样式切换与保存快捷键。文本查询中，Claude 使用暖色、Codex 使用蓝色、Grok 使用黑白。Claude 和 Codex 的用量达到 70% 时变橙色、90% 时变红色；Grok 始终保持黑白。旧配置中的 `style = "both"` 读取时会转成进度条。
@@ -137,6 +137,8 @@ codex = ""
 grok = ""
 ```
 
+对外 HTTP 请求使用 reqwest 的标准代理机制：支持 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 和 `NO_PROXY`（含小写形式）；macOS、Windows 可读取系统代理设置，代理优先级和绕过规则遵循 reqwest 的默认行为。无需在 Usage 中单独填写代理地址。本地网关和插件控制接口保持直连。
+
 令牌过期时，界面会提示重新登录对应的 CLI。网络抖动或查询超时时保留上一份成功结果。TUI 空闲时按秒更新倒计时，查询结果和按键变化会立即重画。TUI 和一次性查询对单个工具最多等待 20 秒；Keychain 读取最多等待 10 秒。独立状态栏对单个工具最多等待 4 秒。
 
 首页 Provider 定时在后台更新用量与余额，刷新期间保留现有内容；连接未变化时复用模型列表。首次加载或推理连接变化后查询模型，按 `r` 可强制重新查询。返回首页、左右切换 Provider 或上下滚动不会重复请求未变化的模型列表。余额查询失败后显示本次错误，避免继续把旧金额当作当前余额。
@@ -149,25 +151,27 @@ Provider 看板按 `v` 查看按模型统计的请求性能，支持 24 小时�
 
 首页项目标题只显示名称与会话数量，不显示未加载的 Token 统计。托管 Codex 可通过生命周期 hooks 确认每次运行对应的会话，并在会话旁展示执行／等待输入等状态；首次使用需在 Codex `/hooks` 中信任 Usage 回调。活动状态在本机后台更新，不额外查询模型或余额。`usage codex runs --json` 查看确认过的会话，`usage codex run-events <运行UUID> --json` 查看不含对话内容的事件，详见[运行生命周期](docs/run-lifecycle.md)。
 
-首页官方 API 看板以状态符号和文字独立列出 OpenAI、Claude、xAI/Grok。绿色表示官方正常，黄色表示降级，蓝色表示维护，红色表示故障；按 Enter 查看事件与最近查询历史。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
+首页官方 API 看板以状态符号和文字独立列出 Codex API / CLI、Claude、xAI/Grok。绿色表示官方正常，黄色表示降级，蓝色表示维护，红色表示故障；按 Enter 查看事件与最近查询历史。状态查询独立于额度和登录凭据，随首页自动刷新和 `r` 刷新，每个来源最多等待 12 秒。网络失败后保留上次结果及查询时间，标记「更新失败」；首次失败显示「查询失败」，不会当成服务正常。
 
-数据直接来自 [OpenAI 官方 JSON](https://status.openai.com/api/v2/summary.json)（另读 `api/v2/incidents.json` 过滤已解决事件）、[Claude 官方 JSON](https://status.claude.com/api/v2/summary.json) 和 [xAI 官方 RSS](https://status.x.ai/feed.xml)。Grok 显示「未报告故障」表示 RSS 内没有未解决事件，不代表主动探测成功；OpenAI / Claude 是供应商整体状态，可能涉及你未使用的产品，也不保证单个账户的可用性。完整受影响组件和故障事件可用 `usage status` 或 `usage status --json` 查看；此命令不读取用量配置或登录文件，默认查询三个来源，`--providers` 支持 `openai` / `codex`、`claude` / `anthropic`、`grok` / `xai`。查询失败退出码为 1；供应商报告故障但查询成功时为 0。
+Codex 状态直接读取 [OpenAI 官方组件接口](https://status.openai.com/api/v2/components.json)，仅汇总 `Codex API` 和 `CLI`，图片、ChatGPT 和 Codex Web 的状态不参与计算；缺少相关组件时显示查询失败，保留上次结果。其它来源为 [Claude 官方 JSON](https://status.claude.com/api/v2/summary.json) 和 [xAI 官方 RSS](https://status.x.ai/feed.xml)。Grok 显示「未报告故障」表示 RSS 内没有未解决事件，不代表主动探测成功；Claude 使用供应商整体状态。官方状态与本机模型列表、用量接口的请求结果分别展示，也不保证单个账户的可用性。
+
+`usage status` 默认查询 Codex、Claude 和 Grok，`usage status --providers openai` 可查看 OpenAI 全站状态（读取汇总和未解决事件）。`--providers` 支持 `codex`、`openai`、`claude` / `anthropic`、`grok` / `xai`；`--json` 输出完整结果。此命令不读取用量配置或登录文件。查询失败退出码为 1；供应商报告故障但查询成功时为 0。
 
 如需浏览更多 AI 服务，可参考 [aistatus.page](https://aistatus.page/)（OpenAI、Anthropic、Gemini、xAI、Cursor、Perplexity、Midjourney 的官方源聚合）或 [LLM Status](https://llm.status.compare/)；本程序直接读取上述官方源。
 
 Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板会显示剩余次数（包括 0）；未返回次数时提示按 `x` 查询，不把未知显示为 0。按 `x` 查询首页当前选中 Provider 的最新次数和最近到期时间，同时更新其已加载的看板次数。查询与确认都绑定该 Provider 的独立账号目录，不回退到默认登录或 Keychain。确认框显示 Provider 名称与账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消；打开确认后目标固定。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。BYOK、Claude Code 和 Grok 没有主动重置入口。
 
-按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引，遵循用户配置的 `sqlite_home` 和 `CODEX_SQLITE_HOME`；托管账号共用该索引和会话目录。旧会话尚未进入索引时会补充扫描日志，从未运行过的目录视为没有会话。选中共享存储中的 Codex 会话后可按 `Shift+P` 选择已保存的 Provider 继续同一会话；独立来源目录会说明尚未共享，并保留默认恢复方式。恢复与复制命令沿用当前 Usage 配置文件。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
+按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 Rex 中打开新标签页，在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、Rex 新标签页、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引，遵循用户配置的 `sqlite_home` 和 `CODEX_SQLITE_HOME`；托管账号共用该索引和会话目录。旧会话尚未进入索引时会补充扫描日志，从未运行过的目录视为没有会话。选中共享存储中的 Codex 会话后可按 `Shift+P` 选择已保存的 Provider 继续同一会话；独立来源目录会说明尚未共享，并保留默认恢复方式。恢复与复制命令沿用当前 Usage 配置文件。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话；Codex 应用压缩后的 `.jsonl.zst` 日志同样可读，压缩过程中同目录存在明文副本时优先读取明文。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
 
 ## Provider 管理与 Codex 多开
 
-运行 `usage`，在主界面按 `m` 打开功能菜单，选择「Provider 管理」并按 `Enter`；任何主面板页面都可按 `F10` 打开菜单，也可按 `F4` 直接进入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / ZCode / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`Enter` 先选择项目再启动，`o` 只更改默认项目。项目列表合并独立的项目库与本机会话所在目录：置顶项在前，其余按会话活动、从 Usage 启动的时间排序；输入可筛选，也可输入 `/` 或 `~` 开头的完整路径。选择框中 `Ctrl+A` 添加输入的路径（或选中项）、`Ctrl+T` 置顶、`Ctrl+D` 移出列表（会话保留）；在未收录的目录启动后自动加入项目库。从首页项目看板进入 F4 时，默认项目为看板中选中的项目。表单用 `Tab` / 方向键切换字段，`Ctrl+U` 清空当前字段，`Enter` 或 `Ctrl+S` 保存，密钥字段始终遮罩。模型和推理强度在字段上按 `Enter` 或直接输入打开选择列表：当前值排在首位，模型列表沿用首页的查询（已保存的 Provider 打开表单即获取；新 BYOK 填写 API Key 后按当前 Base URL 获取），输入可筛选，没有匹配项时 `Enter` 使用输入的自定义值，`Ctrl+R` 重新获取模型列表。
+运行 `usage`，在主界面按空格打开功能菜单，选择「Provider 管理」并按 `Enter`；首页、历史、会话和 Provider 管理页均可按空格打开菜单（`F10` 仍兼容），也可按 `F4` 直接进入 Provider 管理。搜索和表单输入中的空格正常输入。菜单可用方向键、`j` / `k` 或 `Tab` 选择功能，按 `Esc` 返回。仍保留 `usage codex` 命令入口。首页 Provider 看板的 `a`、管理页的 `a` 和 `F5` 共用同一个添加流程，功能菜单不再单列“添加 Provider”。账号凭据与 Agent 配置继续分别保存；同一订阅账号绑定的多个模型配置共享额度。每个账号配置保存名称、API Key、Base URL、模型和完整 Codex TOML；支持复制、编辑和导出。`a` 或 `F5` 打开统一添加弹窗（BYOK / OAuth 登录 / 导入 OAuth / CC Switch / WorkBuddy / Trae / ZCode / 高级接入），`l` 重新登录选中的 OAuth 账号，`e` 编辑 Agent 配置，`E` 用 `$VISUAL` / `$EDITOR` 编辑完整 TOML，`Enter` 先选择项目再启动，`o` 只更改默认项目。项目列表合并独立的项目库与本机会话所在目录：置顶项在前，其余按会话活动、从 Usage 启动的时间排序；输入可筛选，也可输入 `/` 或 `~` 开头的完整路径。选择框中 `Ctrl+A` 添加输入的路径（或选中项）、`Ctrl+T` 置顶、`Ctrl+D` 移出列表（会话保留）；在未收录的目录启动后自动加入项目库。从首页项目看板进入 F4 时，默认项目为看板中选中的项目。表单用 `Tab` / `↑↓` 切换字段，`←→` 移动光标，`Home` / `End`（或 `Ctrl+A` / `Ctrl+E`）跳到首尾，`Backspace` / `Delete` 删除光标前后文字，`Ctrl+←→` / `Alt+B/F` 按词移动，`Ctrl+W` 删除前一个词，`Ctrl+U` 清空当前字段，`Enter` 或 `Ctrl+S` 保存。长内容会横向滚动，密钥字段始终遮罩；粘贴在光标处插入，换行不会触发表单提交。项目目录选择框仍保留 `Ctrl+A` 添加项目的操作。模型和推理强度在字段上按 `Enter` 或直接输入打开选择列表：当前值排在首位，模型列表沿用首页的查询（已保存的 Provider 打开表单即获取；新 BYOK 填写 API Key 后按当前 Base URL 获取），输入可筛选，没有匹配项时 `Enter` 使用输入的自定义值，`Ctrl+R` 重新获取模型列表。
 
 添加时会检测相同配置与凭据，重复项提示使用已有 Provider；不同模型或配置可以分别保存，显式“复制”仍可创建独立副本。插件账号再次登录同一身份会更新原账号凭据并保留绑定，不按昵称合并不同账号。
 
-在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
+在 Rex 中启动会为每次启动打开独立标签页，并保留 Usage 页面的焦点；在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。Rex 使用官方 [`rex run`](https://www.superlogical.com/rex/docs/automate/shell-scripting) 在当前 `REX_SESSION` 中新建 tab，优先使用 `REX_BIN_DIR` 中与服务器匹配的 CLI；`usage codex run ... --split` 同样支持 Rex 标签页。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
 
 ```bash
 usage codex
@@ -225,6 +229,12 @@ OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `au
 
 导入只读取指定文件，是一次性登录快照，不与 Cockpit / 默认 Codex 目录双向同步，也不读取系统 Keychain。相同用户和工作区重复导入会更新已有账号，不同工作区分别保存；运行中的账号拒绝导入更新。已有 refresh token 若仍被来源工具使用，来源刷新后导入副本可能失效，因此长期并行使用建议为托管账号独立登录。导入要求完整 id / access / refresh token；凭据是否仍有效由官方 CLI 验证，失效时按 `l` 重新登录。`test` 可检查本地配置和登录结构，`test --request` 的 Responses API 请求仅用于 BYOK。
 
+终端适配架构与后续接入约定见[终端适配规范](docs/terminal-integration.md)。
+
+### Rex 标签页状态（OSC 7501）
+
+支持 OSC 7501 的 Codex CLI 会直接向各自标签页报告 `idle`、`working`、`blocked`（审批、提问或认证）、`done`、`error`，退出时清除状态。Usage 的新会话和恢复启动均保留 Codex 的终端输入输出，由 Rex 为每个 tab 分配独立 PTY，因此各实例的状态归属各自标签页。此功能不依赖 Bark 配置或 Usage hook，也无需额外注入协议脚本；其它 Agent 需要自身支持该协议。Rex 会在未聚焦标签页显示运行和等待状态，具体呈现遵循 [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)。
+
 ### Bark 会话通知（动态注入）
 
 安装 iPhone 上的 [Bark](https://github.com/Finb/Bark)，复制 App 中的推送 URL，再配置 `usage`：
@@ -242,7 +252,9 @@ usage codex bark logs --run <运行UUID> # 只查看某个启动实例
 
 也可通过 `configure --url-env BARK_URL` 从指定环境变量读取 URL。`configure --no-approval` 只提醒本轮完成，`--no-completion` 只提醒权限审批请求。Bark 配置在管理数据目录的 `bark.json` 中，权限 `600`、明文存储；通过 `USAGE_CODEX_DIR` 可以分别管理不同通知设置。账号导出和 CC Switch 同步不携带 Bark 配置。
 
-开启后，`usage` 仅向它启动的 Codex 子进程传入临时 `-c notify=...` 和 `-c hooks.PermissionRequest=...`，并通过子进程环境传递本次运行上下文。CLI、账号管理页，以及首页和 F3 会话页在当前终端、Ghostty 或复制命令中恢复的 Codex 会话都使用通知入口。默认 Home 和其他未托管 Home 通过 `usage codex resume-local` 包装恢复，保留原来的 Home、认证环境和账号文件，不导入托管账号。不会将通知回调写进默认 `~/.codex`、托管账号配置或项目配置；直接运行 `codex`，即使使用相同托管 `CODEX_HOME`，也不会获得 `usage` 的 Bark 通知。账号原有的 `notify` 回调仍会收到原完成事件，已有 hook 来源保留。
+本机未配置、已禁用或无法读取 Bark 配置时，不注入 Usage 的通知和运行状态 hook，仅保留进程级运行记录；不会要求其他机器安装 Bark。
+
+开启后，`usage` 仅向它启动的 Codex 子进程传入临时 `-c notify=...` 和 `-c hooks.PermissionRequest=...`，并通过子进程环境传递本次运行上下文。CLI、账号管理页，以及首页和 F3 会话页在当前终端、Ghostty、Rex 或复制命令中恢复的 Codex 会话都使用通知入口。默认 Home 和其他未托管 Home 通过 `usage codex resume-local` 包装恢复，保留原来的 Home、认证环境和账号文件，不导入托管账号。不会将通知回调写进默认 `~/.codex`、托管账号配置或项目配置；直接运行 `codex`，即使使用相同托管 `CODEX_HOME`，也不会获得 `usage` 的 Bark 通知。账号原有的 `notify` 回调仍会收到原完成事件，已有 hook 来源保留。
 
 完成提醒表示**本轮回答结束**，不保证整个需求已经实现。审批提醒表示**出现权限审批请求**，其他审批机制可能随后处理请求；通知 hook 不会批准或拒绝操作。审批使用异步 hook，需要支持生命周期 hooks 的新版 CLI（已用 0.162.1 验证）；首次在 Codex 中打开 `/hooks`，审阅并信任 `usage` 的 PermissionRequest hook。账号和配置版本的运行目录不同，可能需要分别信任；可执行文件路径或 hook 定义变化后需要重新审阅。遵循已有的 hooks 开关和管理员策略，不自动绕过信任检查。CLI 保存的合法 hook 信任状态可以保留，账号配置版本仍不变。等待普通问题回答、额度耗尽、网络卡住暂不单独检测。
 
@@ -289,7 +301,7 @@ CC Switch 自动导入支持原生 Responses API 的 Codex BYOK 配置，导入�
 
 会话列表突出标题，时间与实例放在次行，Token 在空间足够时右对齐。宽终端并排显示项目与会话，窄终端只显示当前聚焦的列表，通过 Tab 或左右键切换。窗口高度足够时，选中会话会在后台读取 Codex、Claude Code 或 Grok 的最近请求与回复摘要；不展示工具输出和思考内容，不将预览写入磁盘。切换会话会取消旧预览，结果按实例与会话身份核对；无法读取或日志过大时显示说明。
 
-会话清理参考 magpie 的删除与回收站流程。在 `F3` 会话列表按空格勾选，`a` 勾选／取消当前项目列表中的全部会话，`d` 或 Delete 删除勾选项（未勾选时删除当前会话）。项目列表按空格也可勾选该项目的会话。按 `?` 可选择“清理当前项目列表”；旧的 `A`、`D` 仍兼容。搜索和历史时间筛选继续生效，项目批量清理只包含当前筛选下列出的会话；确认窗口列出数量、标题及实例，按 `y` 执行、`n` / `Esc` 取消。搜索中 `Enter` 应用、`Esc` 清除并返回；退出输入后，`Esc` 依次清除搜索、取消勾选、返回项目列表、返回上一页。
+会话清理参考 magpie 的删除与回收站流程。在 `F3` 会话列表按 `s` 勾选，`a` 勾选／取消当前项目列表中的全部会话，`d` 或 Delete 删除勾选项（未勾选时删除当前会话）。项目列表按 `s` 也可勾选该项目的会话。按 `?` 可选择“清理当前项目列表”；旧的 `A`、`D` 仍兼容。搜索和历史时间筛选继续生效，项目批量清理只包含当前筛选下列出的会话；确认窗口列出数量、标题及实例，按 `y` 执行、`n` / `Esc` 取消。搜索中 `Enter` 应用、`Esc` 清除并返回；退出输入后，`Esc` 依次清除搜索、取消勾选、返回项目列表、返回上一页。
 
 目前支持 Codex、Claude Code 和 Grok，包括 Claude 的子代理、文件历史、环境和待办文件，Codex 的日志分段、压缩副本和子代理日志，以及 Grok 的独立会话目录和子代理目录。自定义 Agent 暂不支持清理。最近一分钟有文件写入的会话、仍在托管运行的会话会跳过；Codex 还会检查会话及子任务的原生写锁，等待输入的活动会话同样受保护。Usage 已记录的共享目录链接按真实存储解析，未知符号链接及未知文件布局会拒绝处理。批量操作逐项报告失败，不影响其他可清理会话。
 
@@ -349,7 +361,7 @@ bell = false
 desktop = false
 
 [sessions]
-resume = "auto" # auto / ghostty / current
+resume = "auto" # auto / ghostty / rex / current
 
 [[instances]]
 id = "work-codex"

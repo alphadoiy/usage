@@ -1,5 +1,5 @@
 //! Provider management. Accounts and Agent configuration retain their existing stores.
-use super::forms::{edit_input, expand_path, modal};
+use super::forms::{TextInput, expand_path, modal};
 use crate::codex_manager::{self, AuthMode, Manager, Profile};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -21,7 +21,7 @@ enum Prompt {
 }
 /// `launch` holds the account to start once a project is chosen; None only changes the default.
 struct ProjectPicker {
-    query: String,
+    query: TextInput,
     selected: usize,
     launch: Option<Profile>,
     /// Result of the last add / pin / remove, shown inside the picker.
@@ -30,7 +30,7 @@ struct ProjectPicker {
 impl ProjectPicker {
     fn prompt(launch: Option<Profile>) -> Prompt {
         Prompt::Project(Box::new(Self {
-            query: String::new(),
+            query: TextInput::default(),
             selected: 0,
             launch,
             status: String::new(),
@@ -159,7 +159,8 @@ fn identity(profile: &Profile) -> String {
     }
 }
 fn actions(profile: Option<&Profile>) -> String {
-    let mut text = "? 操作 · F1–F4 切页 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
+    let mut text =
+        "Space 菜单 · ? 操作 · F1–F4 切页 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
     if let Some(profile) = profile {
         text.push_str(" · Enter 启动 · e 配置");
         if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
@@ -296,6 +297,7 @@ pub(super) fn run_embedded(
     };
     let mut prompt: Option<Prompt> = None;
     let mut shortcuts_menu: Option<super::shortcuts::Menu> = None;
+    let mut page_menu: Option<super::menu::Menu> = None;
     let mut notice = "选择 Provider · e 配置 Agent · Enter 选择项目并启动 Codex".to_string();
     let mut projects = Projects {
         store: crate::projects::Store::from_environment(),
@@ -326,6 +328,9 @@ pub(super) fn run_embedded(
                 if let Some(menu) = &shortcuts_menu {
                     menu.render(frame);
                 }
+                if let Some(menu) = &page_menu {
+                    menu.render(frame);
+                }
             })?;
             if !event::poll(Duration::from_millis(100))? {
                 if refreshed.elapsed() >= Duration::from_secs(15) && prompt.is_none() {
@@ -341,17 +346,28 @@ pub(super) fn run_embedded(
                 }
                 continue;
             }
-            let Event::Key(mut key) = event::read()? else {
+            let input_event = event::read()?;
+            if let Event::Paste(text) = &input_event {
+                if let Some(menu) = &mut shortcuts_menu {
+                    menu.paste(text);
+                } else if let Some(Prompt::Project(picker)) = &mut prompt
+                    && picker.query.paste(text)
+                {
+                    picker.selected = 0;
+                }
+                continue;
+            }
+            let Event::Key(mut key) = input_event else {
                 continue;
             };
-            if key.kind != KeyEventKind::Press {
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 continue;
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(Some(super::menu::Action::Quit));
             }
             if let Some(menu) = &mut shortcuts_menu {
-                match menu.key(key.code) {
+                match menu.key_event(key) {
                     super::shortcuts::Decision::Run(code) => {
                         shortcuts_menu = None;
                         key.code = code;
@@ -362,8 +378,26 @@ pub(super) fn run_embedded(
                     }
                     super::shortcuts::Decision::Stay => continue,
                 }
-            } else if key.code == KeyCode::Char('?') && prompt.is_none() {
+            } else if key.code == KeyCode::Char('?') && prompt.is_none() && page_menu.is_none() {
                 shortcuts_menu = Some(shortcuts(profiles.get(selected)));
+                continue;
+            }
+            if let Some(menu) = &mut page_menu {
+                let command = menu.key(key.code);
+                if command != super::menu::Command::Stay {
+                    page_menu = None;
+                }
+                match command {
+                    super::menu::Command::Activate(super::menu::Action::Providers)
+                    | super::menu::Command::Stay
+                    | super::menu::Command::Dismiss => continue,
+                    super::menu::Command::Activate(super::menu::Action::AddProvider) => {
+                        key.code = KeyCode::F(5);
+                    }
+                    super::menu::Command::Activate(action) => return Ok(Some(action)),
+                }
+            } else if prompt.is_none() && matches!(key.code, KeyCode::Char(' ') | KeyCode::F(10)) {
+                page_menu = Some(super::menu::Menu::new(super::menu::Action::Providers));
                 continue;
             }
             if prompt.is_none()
@@ -474,13 +508,10 @@ pub(super) fn run_embedded(
                                 }
                                 prompt = Some(Prompt::Project(picker));
                             }
-                            code => {
-                                if code == KeyCode::Char('u') && control {
-                                    picker.query.clear();
-                                } else if !control {
-                                    edit_input(&mut picker.query, code);
+                            _ => {
+                                if picker.query.key(key) {
+                                    picker.selected = 0;
                                 }
-                                picker.selected = 0;
                                 prompt = Some(Prompt::Project(picker));
                             }
                         }
@@ -687,7 +718,7 @@ fn apply_setup(
     }
 }
 
-/// Start Codex for the account in `cwd`: a Ghostty split when available, otherwise this terminal.
+/// Start Codex for the account in `cwd`: a new terminal when available, otherwise this terminal.
 fn launch(
     handle: &Handle,
     terminal: &mut DefaultTerminal,
@@ -696,17 +727,20 @@ fn launch(
     cwd: &Path,
     usage_config: Option<&Path>,
 ) -> io::Result<String> {
-    if crate::sessions::uses_ghostty(crate::config::ResumeMode::Auto) {
+    let mode = crate::config::ResumeMode::Auto;
+    let target = crate::terminals::terminal_target(mode);
+    if !target.is_current() {
         return Ok(
             codex_manager::launch_shell_command(&profile.id, cwd, None, None)
                 .and_then(|command| codex_manager::with_usage_config(command, usage_config))
                 .and_then(|command| {
-                    crate::sessions::command_in_ghostty(cwd, &command)
+                    crate::terminals::command_in_terminal(cwd, &command, mode)
                         .map_err(codex_manager::Error::message)
                 })
                 .map(|_| {
                     format!(
-                        "已在右侧打开 Codex（{}）；可继续选择其他账号",
+                        "已在{}打开 Codex（{}）；可继续选择其他账号",
+                        target.label(),
                         display_path(cwd)
                     )
                 })
@@ -766,10 +800,7 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects
         Prompt::Project(picker) => {
             let choices = project_choices(cwd, &projects.list, &picker.query);
             let first = picker.selected.saturating_sub(PICKER_ROWS - 1);
-            let mut lines = vec![
-                Line::from(format!("筛选或路径：{}▏", picker.query)),
-                Line::from(""),
-            ];
+            let mut lines = vec![Line::from(""), Line::from("")];
             for (index, path) in choices.iter().enumerate().skip(first).take(PICKER_ROWS) {
                 let label = project_label(path, cwd, projects.get(path));
                 lines.push(if index == picker.selected {
@@ -824,6 +855,19 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects
             .wrap(Wrap { trim: false }),
         area,
     );
+    if let Prompt::Project(picker) = prompt {
+        let inner = Block::bordered().inner(area);
+        if !inner.is_empty() {
+            crate::ui::forms::input_row(
+                frame,
+                ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+                "筛选或路径",
+                &picker.query,
+                false,
+                true,
+            );
+        }
+    }
 }
 
 #[cfg(test)]

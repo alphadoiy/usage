@@ -70,6 +70,11 @@ pub fn start_local_codex(home: &Path, request: &SpawnRequest) -> Result<ProcessH
             }
             command.args(["resume", id]);
         }
+        // Native OSC 7501 status belongs to this tab's PTY, independently of Bark hooks.
+        command
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
         let child = op.step("child_spawn", || {
             command.args(&request.args).spawn().map_err(Error::from)
         })?;

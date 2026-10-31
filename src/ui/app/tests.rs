@@ -575,7 +575,7 @@ fn provider_add_shortcut_is_scoped_to_the_provider_board() {
 fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
     let mut app = reset_dashboard(2, Arc::new(AtomicUsize::new(0)));
     assert_eq!(
-        app.handle_navigation_key(KeyCode::Char('m')),
+        app.handle_navigation_key(KeyCode::Char(' ')),
         Some(MenuCommand::Stay)
     );
     assert!(app.menu.is_some());
@@ -597,6 +597,16 @@ fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
     app.history_state.panel = Some(HistoryPanel::new(vec!["codex".into()], 2026, true));
     assert_eq!(app.handle_navigation_key(KeyCode::Char('m')), None);
     assert_eq!(
+        app.handle_navigation_key(KeyCode::Char(' ')),
+        Some(MenuCommand::Stay)
+    );
+    assert_eq!(
+        app.handle_navigation_key(KeyCode::Char(' ')),
+        Some(MenuCommand::Dismiss)
+    );
+    assert!(app.menu.is_none());
+    assert!(app.history_state.panel.as_ref().unwrap().monthly);
+    assert_eq!(
         app.handle_navigation_key(KeyCode::F(10)),
         Some(MenuCommand::Stay)
     );
@@ -604,8 +614,6 @@ fn main_menu_routes_codex_and_dismisses_without_changing_the_current_page() {
         app.handle_navigation_key(KeyCode::Esc),
         Some(MenuCommand::Dismiss)
     );
-    assert!(app.menu.is_none());
-    assert!(app.history_state.panel.as_ref().unwrap().monthly);
 }
 
 #[test]
@@ -620,6 +628,7 @@ fn menu_does_not_intercept_reset_confirmation() {
         stage: ResetStage::Loading,
     });
     assert_eq!(app.handle_navigation_key(KeyCode::F(10)), None);
+    assert_eq!(app.handle_navigation_key(KeyCode::Char(' ')), None);
     assert!(app.menu.is_none());
 }
 

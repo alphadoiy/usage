@@ -1,5 +1,6 @@
 //! Option picker for Agent fields: known values first, type to filter or enter a custom value.
 use crate::provider_catalog::Models;
+use crate::ui::forms::TextInput;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
 
@@ -76,7 +77,7 @@ pub(super) fn with_current(items: Vec<Choice>, current: &str) -> Vec<Choice> {
 pub(super) struct Picker {
     pub field: usize,
     pub label: &'static str,
-    pub query: String,
+    pub query: TextInput,
     pub cursor: usize,
     pub items: Vec<Choice>,
     /// Model fields show fetch progress and can be fetched again.
@@ -112,10 +113,7 @@ impl Picker {
         }
     }
     pub fn lines(&self, status: Option<&Models>, rows: usize) -> Vec<Line<'static>> {
-        let mut lines = vec![
-            Line::from(format!("❯ {}▏", self.query)).fg(Color::LightBlue),
-            Line::from(""),
-        ];
+        let mut lines = vec![Line::from("❯ ").fg(Color::LightBlue), Line::from("")];
         let matches = self.matches();
         if matches.is_empty() {
             lines.push(match self.choice() {

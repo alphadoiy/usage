@@ -1,7 +1,8 @@
 //! Contextual action menu: secondary commands stay discoverable without a crowded footer.
+use super::forms::TextInput;
 use ratatui::{
     Frame,
-    crossterm::event::KeyCode,
+    crossterm::event::{KeyCode, KeyEvent},
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -40,16 +41,20 @@ pub(super) struct Menu {
     navigation: &'static str,
     actions: Vec<Action>,
     selected: usize,
-    query: String,
+    query: TextInput,
 }
 impl Menu {
+    pub fn paste(&mut self, text: &str) {
+        self.query.paste(text);
+        self.selected = 0;
+    }
     pub fn new(title: &'static str, navigation: &'static str, actions: Vec<Action>) -> Self {
         Self {
             title,
             navigation,
             actions,
             selected: 0,
-            query: String::new(),
+            query: TextInput::default(),
         }
     }
     fn visible(&self) -> Vec<&Action> {
@@ -63,6 +68,10 @@ impl Menu {
             .collect()
     }
     pub fn key(&mut self, key: KeyCode) -> Decision {
+        self.key_event(key.into())
+    }
+    pub fn key_event(&mut self, event: KeyEvent) -> Decision {
+        let key = event.code;
         let count = self.visible().len();
         match key {
             KeyCode::Esc if !self.query.is_empty() => {
@@ -85,15 +94,11 @@ impl Menu {
                     return Decision::Run(action.key);
                 }
             }
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
+            _ => {
+                if self.query.key(event) {
+                    self.selected = 0;
+                }
             }
-            KeyCode::Char(ch) => {
-                self.query.push(ch);
-                self.selected = 0;
-            }
-            _ => {}
         }
         Decision::Stay
     }
@@ -125,7 +130,7 @@ impl Menu {
             Constraint::Length(1),
         ])
         .areas(inner);
-        frame.render_widget(Paragraph::new(format!("搜索操作：{}▏", self.query)), search);
+        super::forms::input_row(frame, search, "搜索操作", &self.query, false, true);
         frame.render_widget(
             Paragraph::new(self.navigation)
                 .style(Style::new().fg(Color::DarkGray))

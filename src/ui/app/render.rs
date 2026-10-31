@@ -1,9 +1,6 @@
 //! Dashboard rendering reads state without launching queries or changing it.
 use super::{Dashboard, ResetStage};
-use crate::{
-    sessions,
-    ui::{history, session_browser, widgets::accent},
-};
+use crate::ui::{history, session_browser, widgets::accent};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -149,14 +146,14 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     {
         " 输入筛选条件 · ↑/↓ 选择 · Enter 应用 · Esc 取消"
     } else if app.history_state.panel.is_some() {
-        " ? 操作 · ↑新 ↓旧 · ←/→ 周 · Enter 会话 · Tab 来源 · r 刷新 · Esc 返回"
+        " Space 菜单 · ? 操作 · ↑新 ↓旧 · ←/→ 周 · Enter 会话 · Tab 来源 · r 刷新 · Esc 返回"
     } else if let Some(browser) = &app.browser_state.panel {
         if browser.searching {
             " 输入搜索 · Enter 应用 · Esc 清除并返回"
         } else if browser.launching {
             " 正在打开会话，请等待…"
         } else {
-            " ? 操作 · ↑/↓ 选择 · Tab 列表 · Enter 打开 · Shift+P 选 Provider · / 搜索 · Space 勾选 · d 删除 · Esc 返回"
+            " Space 菜单 · ? 操作 · ↑/↓ 选择 · Tab 列表 · Enter 打开 · Shift+P 选 Provider · / 搜索 · s 勾选 · d 删除 · Esc 返回"
         }
     } else {
         match app.reset.as_ref().map(|flow| &flow.stage) {
@@ -170,13 +167,13 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
             }
             None => match app.home_focus {
                 crate::ui::home::Focus::Providers => {
-                    " ? 操作 · Tab 看板 · ←/→ Provider · ↑/↓ 滚动 · Enter 模型 · r 刷新 · q 退出"
+                    " Space 菜单 · ? 操作 · Tab 看板 · ←/→ Provider · ↑/↓ 滚动 · Enter 模型 · r 刷新 · q 退出"
                 }
                 crate::ui::home::Focus::Connections => {
-                    " ? 操作 · Tab 看板 · ↑/↓ 选择或滚动 · Enter 详情 · r 刷新 · Esc 返回"
+                    " Space 菜单 · ? 操作 · Tab 看板 · ↑/↓ 选择或滚动 · Enter 详情 · r 刷新 · Esc 返回"
                 }
                 crate::ui::home::Focus::Projects => {
-                    " ? 操作 · Tab 看板 · ↑/↓ 选择 · Enter 打开 · Shift+P 选 Provider · / 搜索 · r 刷新 · Esc 返回"
+                    " Space 菜单 · ? 操作 · Tab 看板 · ↑/↓ 选择 · Enter 打开 · Shift+P 选 Provider · / 搜索 · r 刷新 · Esc 返回"
                 }
             },
         }
@@ -339,11 +336,8 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
         app.service_state.pending > 0,
         app.home_focus == HomeFocus::Connections,
     );
-    let mode = if sessions::uses_ghostty(app.home_sessions_state.browser.resume_mode) {
-        "分屏"
-    } else {
-        "当前终端"
-    };
+    let mode =
+        crate::terminals::terminal_target(app.home_sessions_state.browser.resume_mode).label();
     let title = if app.home_sessions_state.browser.query.is_empty() {
         format!(
             "项目与会话 · {} 项目 · {mode}{}",
@@ -380,6 +374,17 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
             buf,
         );
         inner.y = inner.y.saturating_add(1);
+        inner.height = inner.height.saturating_sub(1);
+    }
+    if app.home_sessions_state.browser.searching && !inner.is_empty() {
+        Paragraph::new("搜索：").render(Rect::new(inner.x, inner.y, inner.width.min(6), 1), buf);
+        let prefix = inner.width.min(6);
+        app.home_sessions_state.browser.query.render_buffer(
+            Rect::new(inner.x + prefix, inner.y, inner.width - prefix, 1),
+            buf,
+            true,
+        );
+        inner.y += 1;
         inner.height = inner.height.saturating_sub(1);
     }
     if app.home_sessions_state.browser.sessions.is_empty() {

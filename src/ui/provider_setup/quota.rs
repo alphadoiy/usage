@@ -8,12 +8,13 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::codex_manager::{AuthMode, Profile};
 use crate::resources::QuotaConversion;
+use crate::ui::forms::TextInput;
 
 struct Target {
     id: Option<String>,
     label: String,
-    ratio: String,
-    currency: String,
+    ratio: TextInput,
+    currency: TextInput,
 }
 
 fn targets(config: &crate::config::AppConfig, profile: &str) -> Vec<Target> {
@@ -31,8 +32,8 @@ fn targets(config: &crate::config::AppConfig, profile: &str) -> Vec<Target> {
         return vec![Target {
             id: None,
             label: "自动识别 / CC Switch".into(),
-            ratio: conversion.quota_per_unit.unwrap_or_default(),
-            currency: conversion.currency.unwrap_or_default(),
+            ratio: conversion.quota_per_unit.unwrap_or_default().into(),
+            currency: conversion.currency.unwrap_or_default().into(),
         }];
     }
     associated
@@ -92,8 +93,8 @@ pub(in crate::ui) fn edit(
             let current = &targets[target];
             let rows = [
                 format!("作用范围：{}", current.label),
-                format!("每一货币单位对应额度：{}", current.ratio),
-                format!("币种：{}", current.currency),
+                String::new(),
+                String::new(),
             ];
             let mut lines = vec![
                 Line::from(format!("{} · New API 额度换算", profile.name)),
@@ -116,14 +117,44 @@ pub(in crate::ui) fn edit(
                 Paragraph::new(lines).block(Block::bordered().title(" 额度设置 ")),
                 area,
             );
+            let inner = Block::bordered().inner(area);
+            for (index, label, input) in [
+                (1, "每一货币单位对应额度", &current.ratio),
+                (2, "币种", &current.currency),
+            ] {
+                if inner.height > 2 + index {
+                    crate::ui::forms::input_row(
+                        frame,
+                        ratatui::layout::Rect::new(inner.x, inner.y + 2 + index, inner.width, 1),
+                        label,
+                        input,
+                        false,
+                        field == index as usize,
+                    );
+                }
+            }
         })?;
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let input_event = event::read()?;
+        if let Event::Paste(text) = &input_event {
+            let current = &mut targets[target];
+            match field {
+                1 => {
+                    current.ratio.paste(text);
+                }
+                2 => {
+                    current.currency.paste(text);
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Event::Key(key) = input_event else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -152,18 +183,14 @@ pub(in crate::ui) fn edit(
                     Err(error) => status = error.to_string(),
                 }
             }
-            code if field > 0 => {
+            _ if field > 0 => {
                 let current = &mut targets[target];
                 let text = if field == 1 {
                     &mut current.ratio
                 } else {
                     &mut current.currency
                 };
-                if control && code == KeyCode::Char('u') {
-                    text.clear();
-                } else if !control {
-                    crate::ui::forms::edit_input(text, code);
-                }
+                text.key(key);
             }
             _ => {}
         }

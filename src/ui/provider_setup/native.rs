@@ -2,7 +2,7 @@
 use super::picker::{self, Picker};
 use crate::codex_manager::{self, AuthMode, Manager, Profile, config, oauth};
 use crate::provider_catalog::{CatalogService, ModelSource, Models};
-use crate::ui::forms::{edit_input, expand_path, modal};
+use crate::ui::forms::{TextInput, expand_path, modal};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 struct Form {
-    fields: Vec<String>,
+    fields: Vec<TextInput>,
     selected: usize,
     editing: Option<(String, i64, String)>,
     auth_mode: AuthMode,
@@ -31,7 +31,7 @@ impl Form {
         plugin: bool,
     ) -> Self {
         Self {
-            fields,
+            fields: fields.into_iter().map(TextInput::from).collect(),
             selected: 0,
             editing,
             auth_mode,
@@ -75,7 +75,7 @@ impl Form {
             .as_ref()
             .map(|(id, _, _)| ModelSource::Saved(id.clone()))
     }
-    fn open_picker(&mut self, field: usize, query: String) {
+    fn open_picker(&mut self, field: usize, query: TextInput) {
         let optional = self.auth_mode == AuthMode::Oauth;
         let (label, items, models) = if field == self.model_field() {
             ("模型", picker::models(self.models.as_ref(), optional), true)
@@ -124,9 +124,9 @@ impl Form {
 }
 enum Prompt {
     LoginMethod(String, Option<String>),
-    AuthSource(String),
+    AuthSource(TextInput),
     AuthImport(PathBuf, oauth::Identity),
-    Source(String),
+    Source(TextInput),
     Import(PathBuf, String),
 }
 
@@ -273,10 +273,31 @@ fn run_inner(
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let event = event::read()?;
+        if let Event::Paste(text) = &event {
+            if let Some(edit) = &mut form {
+                if let Some(open) = &mut edit.picker {
+                    if open.query.paste(text) {
+                        open.cursor = 0;
+                    }
+                } else {
+                    let index = edit.fields()[edit.selected].0;
+                    if index == edit.model_field() || index == edit.effort_field() {
+                        edit.open_picker(index, text.as_str().into());
+                    } else if edit.fields[index].paste(text) && matches!(index, 1 | 4) {
+                        models_rx = None;
+                        edit.models = None;
+                    }
+                }
+            } else if let Some(Prompt::Source(input) | Prompt::AuthSource(input)) = &mut prompt {
+                input.paste(text);
+            }
+            continue;
+        }
+        let Event::Key(key) = event else {
             continue;
         };
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -300,31 +321,21 @@ fn run_inner(
                     }
                     KeyCode::Enter => {
                         if let Some(value) = open.choice() {
-                            edit.fields[open.field] = value;
+                            edit.fields[open.field] = value.into();
                             edit.picker = None;
                         }
                     }
-                    code if !control => {
-                        edit_input(&mut open.query, code);
-                        open.cursor = 0;
+                    _ => {
+                        if open.query.key(key) {
+                            open.cursor = 0;
+                        }
                     }
-                    _ => {}
                 }
                 continue;
             }
             let fields = edit.fields();
             let index = fields[edit.selected].0;
             let choosable = index == edit.model_field() || index == edit.effort_field();
-            if edit.auth_mode == AuthMode::Byok
-                && !edit.plugin
-                && matches!(index, 1 | 4)
-                && (matches!(key.code, KeyCode::Backspace)
-                    || matches!(key.code, KeyCode::Char(_) if !control)
-                    || (control && key.code == KeyCode::Char('u')))
-            {
-                models_rx = None;
-                edit.models = None;
-            }
             match key.code {
                 KeyCode::Esc => {
                     form = None;
@@ -334,10 +345,6 @@ fn run_inner(
                 KeyCode::BackTab | KeyCode::Up => {
                     edit.selected = (edit.selected + fields.len() - 1) % fields.len()
                 }
-                KeyCode::Backspace => {
-                    edit.fields[index].pop();
-                }
-                KeyCode::Char('u') if control => edit.fields[index].clear(),
                 // Enter or Space opens the options; typing starts filtering them.
                 code @ (KeyCode::Enter | KeyCode::Char(_))
                     if choosable && (code == KeyCode::Enter || !control) =>
@@ -352,9 +359,8 @@ fn run_inner(
                         KeyCode::Char(ch) if ch != ' ' => ch.to_string(),
                         _ => String::new(),
                     };
-                    edit.open_picker(index, query);
+                    edit.open_picker(index, query.into());
                 }
-                KeyCode::Char(ch) if !control => edit.fields[index].push(ch),
                 KeyCode::Enter | KeyCode::Char('s') if key.code == KeyCode::Enter || control => {
                     match save_form(manager, edit) {
                         Ok(p) => {
@@ -363,7 +369,12 @@ fn run_inner(
                         Err(e) => notice = e.to_string(),
                     }
                 }
-                _ => {}
+                _ => {
+                    if edit.fields[index].key(key) && matches!(index, 1 | 4) {
+                        models_rx = None;
+                        edit.models = None;
+                    }
+                }
             }
             continue;
         }
@@ -440,14 +451,8 @@ fn run_inner(
                             }
                         }
                     }
-                    code => {
-                        if code == KeyCode::Char('u')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            text.clear();
-                        } else if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            edit_input(&mut text, code);
-                        }
+                    _ => {
+                        text.key(key);
                         prompt = Some(Prompt::AuthSource(text));
                     }
                 },
@@ -478,14 +483,8 @@ fn run_inner(
                             }
                         }
                     }
-                    code => {
-                        if code == KeyCode::Char('u')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            text.clear();
-                        } else if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            edit_input(&mut text, code);
-                        }
+                    _ => {
+                        text.key(key);
                         prompt = Some(Prompt::Source(text));
                     }
                 },
@@ -607,74 +606,102 @@ fn fetch_models(handle: &Handle, form: &mut Form) -> Option<PendingModels> {
 fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
     let area = modal(frame.area(), 15);
     frame.render_widget(Clear, area);
-    let mut lines = vec![
-        Line::from(if form.auth_mode == AuthMode::Oauth {
-            "OAuth：模型留空使用默认；保存配置不会复制登录凭据"
-        } else if form.plugin {
-            "Agent 配置 · 共用原订阅账号和额度"
-        } else if form.editing.is_some() {
-            "Agent 配置 · 保存后生成新版本；旧会话保留原版本"
-        } else {
-            "添加 BYOK Provider · Agent 配置"
-        }),
-        Line::from(""),
-    ];
+    let block = Block::bordered().title(" Provider 配置 ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let header = if form.auth_mode == AuthMode::Oauth {
+        "OAuth：模型留空使用默认；保存配置不会复制登录凭据"
+    } else if form.plugin {
+        "Agent 配置 · 共用原订阅账号和额度"
+    } else if form.editing.is_some() {
+        "Agent 配置 · 保存后生成新版本；旧会话保留原版本"
+    } else {
+        "添加 BYOK Provider · Agent 配置"
+    };
+    if !inner.is_empty() {
+        frame.render_widget(
+            Paragraph::new(header),
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+    }
     let fields = form.fields();
-    for (visible, (index, label)) in fields.iter().copied().enumerate() {
+    let capacity = usize::from(inner.height.saturating_sub(3) / 2).max(1);
+    let first = form.selected.saturating_sub(capacity - 1);
+    for (row, (visible, (index, label))) in fields
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(first)
+        .take(capacity)
+        .enumerate()
+    {
+        let y = inner.y + 2 + row as u16 * 2;
+        if y >= inner.bottom().saturating_sub(1) {
+            break;
+        }
+        let rect = ratatui::layout::Rect::new(inner.x, y, inner.width, 1);
         let selected = visible == form.selected;
         let choosable = index == form.model_field() || index == form.effort_field();
-        let mut text = if index == 4 {
-            if form.fields[index].is_empty() && form.editing.is_some() {
-                "（留空保留原密钥）".into()
+        if choosable {
+            let value = if form.fields[index].is_empty() {
+                "（默认）"
             } else {
-                "•".repeat(form.fields[index].chars().count().min(32))
-            }
-        } else if choosable && form.fields[index].is_empty() {
-            "（默认）".into()
+                form.fields[index].as_str()
+            };
+            let line = Line::from(format!(
+                "{} {label}：{value}  ▾ Enter 选择或输入",
+                if selected { "›" } else { " " }
+            ));
+            frame.render_widget(
+                Paragraph::new(if selected {
+                    line.fg(Color::LightBlue)
+                } else {
+                    line
+                }),
+                rect,
+            );
         } else {
-            form.fields[index].clone()
-        };
-        if selected && choosable {
-            text.push_str("  ▾ Enter 选择或输入");
-        } else if selected
-            && !(index == 4 && form.fields[index].is_empty() && form.editing.is_some())
-        {
-            text.push('▏');
+            crate::ui::forms::input_row(
+                frame,
+                rect,
+                label,
+                &form.fields[index],
+                index == 4,
+                selected && form.picker.is_none(),
+            );
         }
-        let line = Line::from(format!(
-            "{} {label}: {text}",
-            if selected { "›" } else { " " }
-        ));
-        lines.push(if selected {
-            line.fg(Color::LightBlue)
-        } else {
-            line
-        });
-        lines.push(Line::from(""));
     }
-    let choosable = fields
-        .get(form.selected)
-        .is_some_and(|(i, _)| *i == form.model_field() || *i == form.effort_field());
-    lines.push(Line::from(if choosable {
-        "Tab / ↑↓ 换字段 · Enter 选择 · Ctrl+S 保存 · Esc 取消"
-    } else {
-        "Tab / ↑↓ 换字段 · Ctrl+U 清空 · Enter / Ctrl+S 保存 · Esc 取消"
-    }));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered())
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    if inner.height > 1 {
+        let hint = if form.editing.is_some() && form.auth_mode == AuthMode::Byok {
+            "密钥留空保留原值 · Tab 换字段 · ←→ 编辑 · Ctrl+S 保存 · Esc 返回"
+        } else {
+            "Tab / ↑↓ 换字段 · ←→ 编辑 · Ctrl+U 清空 · Enter / Ctrl+S 保存 · Esc 返回"
+        };
+        frame.render_widget(
+            Paragraph::new(hint),
+            ratatui::layout::Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+    }
     if let Some(open) = &form.picker {
         const ROWS: usize = 8;
         let area = modal(frame.area(), ROWS as u16 + 9);
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(open.lines(form.models.as_ref(), ROWS))
-                .block(Block::bordered().title(format!("选择{}", open.label)))
-                .wrap(Wrap { trim: false }),
+                .block(Block::bordered().title(format!("选择{}", open.label))),
             area,
+        );
+        let inner = Block::bordered().inner(area);
+        open.query.render(
+            frame,
+            ratatui::layout::Rect::new(
+                inner.x + 2.min(inner.width),
+                inner.y,
+                inner.width.saturating_sub(2),
+                1,
+            ),
+            false,
+            true,
         );
     }
 }
@@ -692,11 +719,9 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
                 }
             ),
         ),
-        Prompt::AuthSource(path) => (
+        Prompt::AuthSource(_) => (
             "OAuth 登录文件",
-            format!(
-                "{path}\n\n支持官方 auth.json 或 Cockpit 单账号 JSON。\n只读来源，导入后独立保存。\nEnter 预览 · Ctrl+U 清空 · Esc 取消"
-            ),
+            "\n\n支持官方 auth.json 或 Cockpit 单账号 JSON。\n只读来源，导入后独立保存。\nEnter 预览 · Ctrl+U 清空 · Esc 取消".into(),
         ),
         Prompt::AuthImport(_, identity) => (
             "OAuth 导入预览",
@@ -706,10 +731,7 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
                 identity.account_id
             ),
         ),
-        Prompt::Source(path) => (
-            "CC Switch 数据库",
-            format!("{path}\n\nEnter 预览 · Esc 取消"),
-        ),
+        Prompt::Source(_) => ("CC Switch 数据库", "\n\nEnter 预览 · Esc 取消".into()),
         Prompt::Import(_, preview) => (
             "导入预览",
             format!("{preview}\nEnter 一次性导入 · f 导入并跟随 · Esc 取消"),
@@ -723,6 +745,15 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt) {
             .wrap(Wrap { trim: false }),
         area,
     );
+    if let Prompt::Source(input) | Prompt::AuthSource(input) = prompt {
+        let inner = Block::bordered().inner(area);
+        input.render(
+            frame,
+            ratatui::layout::Rect::new(inner.x, inner.y, inner.width, 1),
+            false,
+            true,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -925,7 +956,7 @@ mod tests {
             true,
         );
         assert!(matches!(form.model_source(), Some(ModelSource::Saved(id)) if id == "fixture"));
-        form.open_picker(form.model_field(), String::new());
+        form.open_picker(form.model_field(), TextInput::default());
         assert_eq!(
             form.picker.as_ref().unwrap().items.len(),
             1,

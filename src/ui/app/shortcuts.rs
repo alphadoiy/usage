@@ -3,9 +3,18 @@ use crate::ui::shortcuts::{Action as Shortcut, Decision, Menu};
 
 impl Dashboard {
     /// None passes the key through; Stay/Close consume it; Run reuses normal dispatch.
-    pub(super) fn handle_shortcuts_key(&mut self, key: KeyCode) -> Option<Decision> {
+    pub(super) fn handle_shortcuts_key(
+        &mut self,
+        key: impl Into<ratatui::crossterm::event::KeyEvent>,
+    ) -> Option<Decision> {
+        let event = key.into();
+        let key = event.code;
         if let Some(menu) = &mut self.shortcuts {
-            let decision = menu.key(key);
+            let decision = if event.modifiers.is_empty() {
+                menu.key(key)
+            } else {
+                menu.key_event(event)
+            };
             if !matches!(decision, Decision::Stay) {
                 self.shortcuts = None;
             }
@@ -73,13 +82,13 @@ impl Dashboard {
                     enter("进入列表 / 恢复会话"),
                     action('P', "Shift+P", "选择 Provider 继续 Codex 会话"),
                     action('/', "/", "搜索项目和会话"),
-                    action(' ', "Space", "勾选 / 取消当前会话或项目"),
+                    action('s', "s", "勾选 / 取消当前会话或项目"),
                     action('a', "a", "全选 / 取消当前项目列表"),
                     action('d', "d / Delete", "将选中会话移入回收站"),
                     action('D', "Shift+D", "清理当前项目列表（需确认）"),
                     action('b', "b", "打开回收站"),
                     action('o', "o", "切换最近活动 / Token 排序"),
-                    action('R', "Shift+R", "切换当前终端 / Ghostty 分屏恢复"),
+                    action('R', "Shift+R", "切换自动 / Ghostty / Rex / 当前终端"),
                     action('y', "y", "复制会话恢复命令"),
                     action('c', "c", "清除搜索"),
                     refresh,
@@ -165,8 +174,8 @@ impl Dashboard {
         }
         if self.performance.panel.is_none() {
             actions.push(Shortcut::new(
-                KeyCode::F(10),
-                "F10",
+                KeyCode::Char(' '),
+                "Space",
                 "页面菜单（F1–F4 可直接切换）",
             ));
         }
@@ -258,6 +267,10 @@ mod tests {
         assert!(app.handle_shortcuts_key(KeyCode::Char('?')).is_none());
         app.handle_browser_key(KeyCode::Char('?'), &handle);
         assert_eq!(app.browser_state.panel.as_ref().unwrap().query, "?");
+        assert!(app.handle_navigation_key(KeyCode::Char(' ')).is_none());
+        app.handle_browser_key(KeyCode::Char(' '), &handle);
+        assert_eq!(app.browser_state.panel.as_ref().unwrap().query, "? ");
+        assert!(app.menu.is_none());
         app.handle_browser_key(KeyCode::Esc, &handle);
         assert!(app.browser_state.panel.as_ref().unwrap().query.is_empty());
         assert!(!app.browser_state.panel.as_ref().unwrap().searching);

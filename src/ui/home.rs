@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 use crate::service_status::{self, ServiceStatus, State};
 
 pub(super) const SOURCES: [service_status::Source; 3] = [
-    service_status::OPENAI,
+    service_status::CODEX,
     service_status::CLAUDE,
     service_status::GROK,
 ];
@@ -242,7 +242,9 @@ fn detail_lines(
         }
         if s.incidents.is_empty() {
             lines.push(
-                Line::from(if s.stale || s.error.is_some() || s.fetched_at.is_none() {
+                Line::from(if s.provider == "codex" {
+                    "此处仅查询组件状态；事件详情见官方状态页"
+                } else if s.stale || s.error.is_some() || s.fetched_at.is_none() {
                     "暂无可确认的事件信息"
                 } else {
                     "状态源未报告未解决事件"
@@ -505,7 +507,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            for source in ["OpenAI", "Claude", "Grok"] {
+            for source in ["Codex", "Claude", "Grok"] {
                 assert!(text.contains(source), "missing {source} at {width}: {text}");
             }
         }

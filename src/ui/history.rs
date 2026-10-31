@@ -1,8 +1,9 @@
 //! Contribution calendar and daily/monthly token breakdown.
+use super::forms::TextInput;
 use crate::history::{History, HistoryQuery, HistoryReport, SOURCES, Tokens, compact};
 use chrono::{Datelike, Duration, Local, Months, NaiveDate};
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -41,7 +42,7 @@ enum Dimension {
 struct DimensionPicker {
     dimension: Dimension,
     options: Vec<String>,
-    search: String,
+    search: TextInput,
     selected: usize,
     loading: bool,
     error: Option<String>,
@@ -322,7 +323,7 @@ impl HistoryPanel {
         self.picker = Some(DimensionPicker {
             dimension,
             options,
-            search: String::new(),
+            search: TextInput::default(),
             selected,
             loading,
             error: None,
@@ -374,6 +375,28 @@ impl HistoryPanel {
     pub fn is_editing(&self) -> bool {
         self.picker.is_some()
     }
+    pub fn key_event(&mut self, key: KeyEvent) {
+        if let Some(picker) = &mut self.picker
+            && !matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Up | KeyCode::Down
+            )
+        {
+            if !picker.loading && picker.search.key(key) {
+                picker.selected = 0;
+            }
+            return;
+        }
+        self.key(key.code);
+    }
+    pub fn paste(&mut self, text: &str) {
+        if let Some(picker) = &mut self.picker
+            && !picker.loading
+            && picker.search.paste(text)
+        {
+            picker.selected = 0;
+        }
+    }
     pub fn key(&mut self, key: KeyCode) {
         if let Some(picker) = &mut self.picker {
             match key {
@@ -397,15 +420,11 @@ impl HistoryPanel {
                     picker.selected =
                         (picker.selected + 1).min(picker.visible().len().saturating_sub(1))
                 }
-                KeyCode::Backspace => {
-                    picker.search.pop();
-                    picker.selected = 0;
+                code => {
+                    if picker.search.key(code.into()) {
+                        picker.selected = 0;
+                    }
                 }
-                KeyCode::Char(ch) => {
-                    picker.search.push(ch);
-                    picker.selected = 0;
-                }
-                _ => {}
             }
             return;
         }
@@ -727,7 +746,18 @@ fn render_picker(area: Rect, buf: &mut Buffer, picker: &DimensionPicker) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    Paragraph::new(format!("搜索：{}▏", clean_label(&picker.search))).render(search, buf);
+    Paragraph::new("搜索：").render(search, buf);
+    let prefix = 6.min(search.width);
+    picker.search.render_buffer(
+        Rect::new(
+            search.x + prefix,
+            search.y,
+            search.width - prefix,
+            search.height,
+        ),
+        buf,
+        true,
+    );
     let items: Vec<_> = picker
         .visible()
         .into_iter()

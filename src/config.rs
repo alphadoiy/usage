@@ -86,20 +86,32 @@ pub enum ResumeMode {
     #[default]
     Auto,
     Ghostty,
+    Rex,
     Current,
 }
 impl ResumeMode {
+    /// Persisted configuration vocabulary; runtime routing belongs to terminals.
+    pub(crate) fn backend_id(self) -> Option<&'static str> {
+        match self {
+            Self::Ghostty => Some("ghostty"),
+            Self::Rex => Some("rex"),
+            Self::Auto | Self::Current => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "自动",
             Self::Ghostty => "Ghostty 分屏",
+            Self::Rex => "Rex 新标签页",
             Self::Current => "当前终端",
         }
     }
     pub fn next(self) -> Self {
         match self {
             Self::Auto => Self::Ghostty,
-            Self::Ghostty => Self::Current,
+            Self::Ghostty => Self::Rex,
+            Self::Rex => Self::Current,
             Self::Current => Self::Auto,
         }
     }
@@ -224,7 +236,7 @@ bell = false
 desktop = false
 
 [sessions]
-# auto：Ghostty 中分屏，其它终端在当前终端恢复；也可设 ghostty / current
+# auto：Rex 中新建标签页，Ghostty 中分屏，其它终端在当前终端恢复；也可设 rex / ghostty / current
 resume = "auto"
 
 # 额外实例示例（数据只读）

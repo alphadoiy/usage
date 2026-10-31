@@ -1,3 +1,5 @@
+use super::forms::TextInput;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -37,7 +39,7 @@ pub struct SessionBrowser {
     project_selected: usize,
     session_selected: usize,
     focus: Focus,
-    pub query: String,
+    pub query: TextInput,
     pub searching: bool,
     pub launching: bool,
     pub marked: HashSet<SessionKey>,
@@ -60,7 +62,7 @@ impl SessionBrowser {
             project_selected: 0,
             session_selected: 0,
             focus: Focus::Projects,
-            query: String::new(),
+            query: TextInput::default(),
             searching: false,
             launching: false,
             marked: HashSet::new(),
@@ -219,15 +221,31 @@ impl SessionBrowser {
     }
 
     pub fn type_char(&mut self, ch: char) {
-        self.query.push(ch);
+        self.query.key(KeyCode::Char(ch).into());
         self.rebuild();
     }
 
     pub fn backspace(&mut self) {
-        self.query.pop();
+        self.query.key(KeyCode::Backspace.into());
         self.rebuild();
     }
 
+    pub fn input(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.clear_search(),
+            KeyCode::Enter => self.searching = false,
+            _ => {
+                if self.query.key(key) {
+                    self.rebuild();
+                }
+            }
+        }
+    }
+    pub fn paste(&mut self, text: &str) {
+        if self.query.paste(text) {
+            self.rebuild();
+        }
+    }
     pub fn clear_search(&mut self) {
         self.query.clear();
         self.searching = false;
@@ -415,11 +433,10 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         Constraint::Length(preview_height),
     ])
     .areas(area);
-    let cursor = if browser.searching { "▏" } else { "" };
     let search = if browser.query.is_empty() && !browser.searching {
         " / 搜索项目、标题、工具或会话 ID".to_string()
     } else {
-        format!(" 搜索：{}{cursor}", browser.query)
+        format!(" 搜索：{}", browser.query)
     };
     let search = format!(
         "{}{} · {} · 已选 {} · b 回收站",
@@ -438,6 +455,20 @@ pub fn render(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
     Paragraph::new(search)
         .style(Style::new().fg(DIM))
         .render(search_area, buf);
+    if browser.searching {
+        Paragraph::new(" 搜索：").render(search_area, buf);
+        let label_width = 7.min(search_area.width);
+        browser.query.render_buffer(
+            Rect::new(
+                search_area.x + label_width,
+                search_area.y,
+                search_area.width - label_width,
+                search_area.height,
+            ),
+            buf,
+            true,
+        );
+    }
 
     if lists_area.width >= 72 {
         let [project_area, session_area] =
@@ -481,11 +512,7 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         .title(format!(
             " 恢复预览 · {} · {} ",
             session.provider.name(),
-            if crate::sessions::uses_ghostty(browser.resume_mode) {
-                "Ghostty 右侧分屏"
-            } else {
-                "当前终端"
-            }
+            crate::terminals::terminal_target(browser.resume_mode).label()
         ))
         .border_style(DIM);
     let inner = block.inner(area);

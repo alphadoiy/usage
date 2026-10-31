@@ -2,6 +2,7 @@
 mod native;
 mod picker;
 mod quota;
+use super::forms::TextInput;
 use crate::{auth, codex_manager::Profile, plugins, provider_catalog::presets};
 pub(super) use native::run as run_native;
 pub(super) use native::{AddMethod, edit, relogin};
@@ -76,7 +77,7 @@ struct Input {
 }
 struct Field {
     input: Input,
-    value: String,
+    value: TextInput,
     secret: bool,
 }
 impl Field {
@@ -104,7 +105,7 @@ impl Field {
             .unwrap_or_default();
         Self {
             input,
-            value,
+            value: value.into(),
             secret,
         }
     }
@@ -115,9 +116,9 @@ impl Field {
             self.input
                 .options
                 .iter()
-                .find(|o| o.value == self.value)
+                .find(|o| o.value == self.value.as_str())
                 .map(|o| o.label.clone())
-                .unwrap_or_else(|| self.value.clone())
+                .unwrap_or_else(|| self.value.to_string())
         }
     }
 }
@@ -130,7 +131,7 @@ fn visible(fields: &[Field]) -> Vec<usize> {
                 let equal = fields
                     .iter()
                     .find(|f| f.input.key == r.key)
-                    .is_some_and(|f| f.value == r.value);
+                    .is_some_and(|f| f.value.as_str() == r.value);
                 if r.op == "neq" { !equal } else { equal }
             })
         })
@@ -141,7 +142,12 @@ fn inputs(fields: &[Field]) -> Value {
     Value::Object(
         visible(fields)
             .into_iter()
-            .map(|i| (fields[i].input.key.clone(), fields[i].value.clone().into()))
+            .map(|i| {
+                (
+                    fields[i].input.key.clone(),
+                    fields[i].value.to_string().into(),
+                )
+            })
             .collect(),
     )
 }
@@ -333,7 +339,7 @@ fn run_inner(handle: &Handle, terminal: &mut Setup<'_>) -> io::Result<Option<Add
         if !form(terminal, "保存 Provider · 保存后可从项目启动", &mut fields)? {
             continue;
         }
-        let name = fields[0].value.clone();
+        let name = fields[0].value.to_string();
         let id = account.id;
         if let Some(profile) = wait(
             terminal,
@@ -475,7 +481,11 @@ fn advanced_account(
                         handle,
                         "安装插件（最长 120 秒）…",
                         false,
-                        plugins::install(fields[0].value.clone(), fields[1].value.clone(), None),
+                        plugins::install(
+                            fields[0].value.to_string(),
+                            fields[1].value.to_string(),
+                            None,
+                        ),
                     )?;
                 }
                 continue;
@@ -606,15 +616,23 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|_| "插件任务中断".to_string())?
 }
-fn key() -> io::Result<Option<KeyEvent>> {
-    if event::poll(Duration::from_millis(80))?
-        && let Event::Key(key) = event::read()?
-        && key.kind == KeyEventKind::Press
-    {
-        Ok(Some(key))
-    } else {
-        Ok(None)
+fn input_event() -> io::Result<Option<Event>> {
+    if !event::poll(Duration::from_millis(80))? {
+        return Ok(None);
     }
+    Ok(match event::read()? {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            Some(Event::Key(key))
+        }
+        Event::Paste(text) => Some(Event::Paste(text)),
+        _ => None,
+    })
+}
+fn key() -> io::Result<Option<KeyEvent>> {
+    Ok(match input_event()? {
+        Some(Event::Key(key)) => Some(key),
+        _ => None,
+    })
 }
 fn cancelled(key: KeyEvent) -> bool {
     key.code == KeyCode::Esc
@@ -697,7 +715,7 @@ fn notice(terminal: &mut Setup<'_>, text: &str) -> io::Result<()> {
 }
 #[derive(Default)]
 struct Picker {
-    query: String,
+    query: TextInput,
     selected: usize,
 }
 impl Picker {
@@ -715,19 +733,11 @@ impl Picker {
             KeyCode::Down | KeyCode::Tab => {
                 self.selected = (self.selected + 1).min(count.saturating_sub(1))
             }
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
+            _ => {
+                if self.query.key(key) {
+                    self.selected = 0;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.query.clear();
-                self.selected = 0;
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.query.push(c);
-                self.selected = 0;
-            }
-            _ => {}
         }
     }
 }
@@ -814,13 +824,20 @@ fn pick_options(
                 title,
                 visible,
                 Some(picker.selected),
-                &format!(
-                    "↑↓ 选择 · Enter 进入 · Esc 上一级 · 输入筛选：{}",
-                    picker.query
-                ),
+                "↑↓ 选择 · Enter 进入 · Esc 上一级",
+                Some(&picker.query),
             )
         })?;
-        if let Some(key) = key()? {
+        let Some(input_event) = input_event()? else {
+            continue;
+        };
+        if let Event::Paste(text) = &input_event {
+            if picker.query.paste(text) {
+                picker.selected = 0;
+            }
+            continue;
+        }
+        if let Event::Key(key) = input_event {
             if cancelled(key) {
                 return Ok(None);
             }
@@ -838,20 +855,64 @@ fn form(terminal: &mut Setup<'_>, title: &str, fields: &mut [Field]) -> io::Resu
     loop {
         let indices = visible(fields);
         selected = selected.min(indices.len().saturating_sub(1));
-        let rows = indices
-            .iter()
-            .map(|&i| format!("{}：{}", fields[i].input.message, fields[i].display()))
-            .collect();
         terminal.draw(|frame| {
-            page(
-                frame,
-                title,
-                rows,
-                Some(selected),
-                "Tab / ↑↓ 切换字段 · ←→ 选项 · Ctrl+U 清空 · Enter 确认 · Esc 返回",
-            )
+            let area = popup_area(
+                frame.area(),
+                (indices.len() as u16).saturating_mul(2).saturating_add(5),
+            );
+            frame.render_widget(Clear, area);
+            let block = Block::bordered().title(title);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let capacity = usize::from(inner.height.saturating_sub(2) / 2).max(1);
+            let first = selected.saturating_sub(capacity - 1);
+            for (row, &index) in indices.iter().skip(first).take(capacity).enumerate() {
+                let field = &fields[index];
+                let y = inner.y + row as u16 * 2;
+                if y >= inner.bottom() {
+                    break;
+                }
+                let rect = Rect::new(inner.x, y, inner.width, 1);
+                if field.input.options.is_empty() {
+                    super::forms::input_row(
+                        frame,
+                        rect,
+                        &field.input.message,
+                        &field.value,
+                        field.secret,
+                        first + row == selected,
+                    );
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(format!(
+                            "{} {}：{}",
+                            if first + row == selected { "›" } else { " " },
+                            field.input.message,
+                            field.display()
+                        )),
+                        rect,
+                    );
+                }
+            }
+            if inner.height > 1 {
+                frame.render_widget(
+                    Paragraph::new("Tab / ↑↓ 换字段 · ←→ 编辑/选项 · Enter 确认 · Esc 返回"),
+                    Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+                );
+            }
         })?;
-        if let Some(key) = key()? {
+        let Some(input_event) = input_event()? else {
+            continue;
+        };
+        if let Event::Paste(text) = &input_event {
+            if let Some(&index) = indices.get(selected)
+                && fields[index].input.options.is_empty()
+            {
+                fields[index].value.paste(text);
+            }
+            continue;
+        }
+        if let Event::Key(key) = input_event {
             if cancelled(key) {
                 return Ok(false);
             }
@@ -867,36 +928,21 @@ fn form(terminal: &mut Setup<'_>, title: &str, fields: &mut [Field]) -> io::Resu
                     if let Some(&index) = indices.get(selected) {
                         let field = &mut fields[index];
                         if field.input.options.is_empty() {
-                            match key.code {
-                                KeyCode::Backspace => {
-                                    field.value.pop();
-                                }
-                                KeyCode::Char('u')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    field.value.clear()
-                                }
-                                KeyCode::Char(c)
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    field.value.push(c)
-                                }
-                                _ => {}
-                            }
+                            field.value.key(key);
                         } else if matches!(key.code, KeyCode::Left | KeyCode::Right) {
                             let n = field.input.options.len();
                             let at = field
                                 .input
                                 .options
                                 .iter()
-                                .position(|o| o.value == field.value)
+                                .position(|o| o.value == field.value.as_str())
                                 .unwrap_or(0);
                             let next = if key.code == KeyCode::Left {
                                 (at + n - 1) % n
                             } else {
                                 (at + 1) % n
                             };
-                            field.value = field.input.options[next].value.clone();
+                            field.value = field.input.options[next].value.clone().into();
                         }
                     }
                 }
@@ -911,6 +957,7 @@ fn page(frame: &mut Frame, title: &str, rows: Vec<String>, selected: Option<usiz
         rows.into_iter().map(MenuItem::from).collect(),
         selected,
         hint,
+        None,
     );
 }
 fn popup_area(area: Rect, height: u16) -> Rect {
@@ -929,6 +976,7 @@ fn menu_page(
     rows: Vec<MenuItem>,
     selected: Option<usize>,
     hint: &str,
+    editor: Option<&TextInput>,
 ) {
     let area = popup_area(frame.area(), u16::MAX);
     let width = area.width.saturating_sub(4).max(1);
@@ -959,7 +1007,7 @@ fn menu_page(
         vec![Line::from(super::overview::clean(hint))],
         area.width.saturating_sub(2).max(1),
     );
-    let hint_height = hints.len().min(3) as u16;
+    let hint_height = hints.len().min(3) as u16 + u16::from(editor.is_some());
     // Bound long model lists while sizing short submenus to their actual content.
     let area = popup_area(
         frame.area(),
@@ -982,6 +1030,26 @@ fn menu_page(
         body,
         &mut ListState::default().with_selected(selected),
     );
+    let footer = if let Some(editor) = editor {
+        if !footer.is_empty() {
+            super::forms::input_row(
+                frame,
+                Rect::new(footer.x, footer.y, footer.width, 1),
+                "筛选",
+                editor,
+                false,
+                true,
+            );
+        }
+        Rect::new(
+            footer.x,
+            footer.y.saturating_add(1),
+            footer.width,
+            footer.height.saturating_sub(1),
+        )
+    } else {
+        footer
+    };
     frame.render_widget(
         Paragraph::new(hints)
             .style(Style::new().fg(Color::Gray))
@@ -1039,6 +1107,7 @@ mod tests {
                         rows.clone(),
                         Some(0),
                         "↑↓ 选择 · Enter 进入 · Esc 上一级",
+                        None,
                     );
                 })
                 .unwrap();
@@ -1138,6 +1207,7 @@ mod tests {
                             rows.clone(),
                             Some(selected),
                             "Enter 进入 · Esc 返回",
+                            None,
                         )
                     })
                     .unwrap();

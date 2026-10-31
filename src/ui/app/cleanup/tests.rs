@@ -72,7 +72,7 @@ async fn delete_cancel_restore_and_refresh_work_through_browser_keys() {
     assert!(log.exists());
     assert!(app.handle_cleanup_key(KeyCode::Char('n'), &handle));
     assert!(app.cleanup.is_none() && log.exists());
-    app.handle_browser_key(KeyCode::Char(' '), &handle);
+    app.handle_browser_key(KeyCode::Char('s'), &handle);
     app.handle_browser_key(KeyCode::Delete, &handle);
     app.handle_cleanup_key(KeyCode::Char('y'), &handle);
     app.handle_cleanup_key(KeyCode::Esc, &handle);

@@ -48,7 +48,7 @@ fn default_home_renders_three_boards_with_projects_and_sessions() {
         for expected in [
             "Provider",
             "官方API",
-            "OpenAI",
+            "Codex",
             "Claude",
             "Grok",
             "项目与会话",
@@ -88,7 +88,7 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
         .map(|position| buffer[position].symbol())
         .collect::<String>();
     assert!(output.contains("Claude"));
-    assert!(!output.contains("OpenAI"));
+    assert!(!output.contains("Codex"));
     assert!(app.browser_state.resume_plan.is_none());
     for _ in 0..100 {
         app.handle_home_key(KeyCode::Down, &handle, (80, 24));
@@ -104,7 +104,7 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
             .iter()
             .any(|cell| cell.symbol() == "C" && cell.bg == Color::Rgb(35, 45, 65))
     );
-    assert!(text(&buffer).contains("OpenAI"));
+    assert!(text(&buffer).contains("Codex"));
     assert!(!app.handle_home_key(KeyCode::Esc, &handle, (80, 24)));
 }
 

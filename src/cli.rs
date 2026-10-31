@@ -82,7 +82,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// 查询 OpenAI、Claude、Grok 的官方服务状态（无需登录）
+    /// 查询 Codex API / CLI、Claude、Grok 的官方服务状态（无需登录）
     Status {
         /// 输出状态、受影响组件和未解决事件的 JSON
         #[arg(long)]
@@ -367,7 +367,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         }
         Some(Command::Status { json }) => {
             let sources = crate::service_status::select(
-                cli.providers.as_deref().unwrap_or("openai,claude,grok"),
+                cli.providers.as_deref().unwrap_or("codex,claude,grok"),
             )
             .map_err(CliError)?;
             let snapshots =

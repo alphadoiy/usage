@@ -171,7 +171,7 @@ pub enum CodexCommand {
         resume: Option<String>,
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
-        /// 在 Ghostty 右侧分屏运行
+        /// 在 Ghostty 右侧分屏运行，或在 Rex 新标签页运行
         #[arg(long)]
         split: bool,
         #[arg(long)]
@@ -367,7 +367,12 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                             .join(" "),
                     );
                 }
-                crate::sessions::command_in_ghostty(&cwd, &command).map_err(Error::message)?;
+                crate::terminals::command_in_terminal(
+                    &cwd,
+                    &command,
+                    crate::config::ResumeMode::Auto,
+                )
+                .map_err(Error::message)?;
             } else {
                 // Preserve the launcher parent when SIGINT reaches the whole foreground group.
                 #[cfg(unix)]

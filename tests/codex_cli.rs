@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 include!("support/run_lifecycle.rs");
+include!("support/terminal_launch.rs");
 include!("support/local_bark.rs");
 
 #[cfg(unix)]

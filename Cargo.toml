@@ -20,7 +20,7 @@ fs2 = "0.4"
 flate2 = "1"
 ratatui = "0.30"
 quick-xml = { version = "0.38", features = ["serialize"] }
-reqwest = { version = "0.12", default-features = false, features = ["charset", "json", "rustls-tls", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["charset", "json", "rustls-tls", "stream", "blocking", "system-proxy"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 rusqlite = { version = "0.37", features = ["bundled", "functions", "hooks"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +35,8 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "json", "env-filter"] }
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
+tui-input = "0.15.5"
 uuid = { version = "1", features = ["v4"] }
 ruzstd = "0.8"
 

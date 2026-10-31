@@ -67,6 +67,13 @@ pub const OPENAI: Source = Source {
     page_url: "https://status.openai.com/",
     endpoint: "https://status.openai.com/api/v2/summary.json",
 };
+/// Codex API and CLI components, independent of OpenAI's aggregate status.
+pub const CODEX: Source = Source {
+    id: "codex",
+    name: "Codex API / CLI",
+    page_url: "https://status.openai.com/",
+    endpoint: "https://status.openai.com/api/v2/components.json",
+};
 pub const CLAUDE: Source = Source {
     id: "claude",
     name: "Claude",
@@ -82,7 +89,8 @@ pub const GROK: Source = Source {
 
 pub fn source(provider: &str) -> Option<Source> {
     match provider {
-        "openai" | "codex" => Some(OPENAI),
+        "openai" => Some(OPENAI),
+        "codex" => Some(CODEX),
         "claude" | "anthropic" => Some(CLAUDE),
         "grok" | "xai" => Some(GROK),
         _ => None,
@@ -92,8 +100,9 @@ pub fn source(provider: &str) -> Option<Source> {
 pub fn select(providers: &str) -> Result<Vec<Source>, String> {
     let mut sources = Vec::new();
     for id in providers.split(',').map(str::trim) {
-        let source = source(id)
-            .ok_or_else(|| format!("未知状态来源：{id}；可选 openai/codex、claude、grok"))?;
+        let source = source(id).ok_or_else(|| {
+            format!("未知状态来源：{id}；可选 codex、openai（全站）、claude、grok")
+        })?;
         if !sources.contains(&source) {
             sources.push(source);
         }
@@ -229,6 +238,8 @@ pub async fn query(http: &dyn HttpClient, source: Source) -> ServiceStatus {
             let body = get(http, source.endpoint).await?;
             if source == GROK {
                 parse_rss(&body, &mut snapshot)
+            } else if source == CODEX {
+                parse_codex_components(&body, &mut snapshot)
             } else {
                 parse_summary(&body, &mut snapshot)?;
                 // OpenAI's compatibility summary does not contain incidents. Its
@@ -334,6 +345,35 @@ fn indicator(value: &str) -> State {
         "maintenance" | "under_maintenance" => State::Maintenance,
         _ => State::Unknown,
     }
+}
+
+fn parse_codex_components(body: &[u8], snapshot: &mut ServiceStatus) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct Feed {
+        components: Vec<RawComponent>,
+    }
+    let feed: Feed = serde_json::from_slice(body).map_err(|_| "Codex 组件状态格式异常")?;
+    snapshot.components = feed
+        .components
+        .into_iter()
+        .filter(|c| matches!(c.name.as_str(), "Codex API" | "CLI"))
+        .map(|c| Component {
+            name: c.name,
+            state: indicator(&c.status),
+        })
+        .collect();
+    if !["Codex API", "CLI"]
+        .iter()
+        .all(|name| snapshot.components.iter().any(|c| c.name == *name))
+    {
+        return Err("官方状态源缺少 Codex API / CLI 组件".into());
+    }
+    snapshot.state = snapshot
+        .components
+        .iter()
+        .fold(State::Operational, |state, c| state.worst(c.state));
+    snapshot.description = "官方组件状态：Codex API / CLI；事件详情见官方状态页".into();
+    Ok(())
 }
 
 fn parse_summary(body: &[u8], snapshot: &mut ServiceStatus) -> Result<(), String> {
@@ -508,11 +548,52 @@ mod tests {
     }
     const HEALTHY: &[u8] = br#"{"status":{"indicator":"none","description":"All Systems Operational"},"components":[]}"#;
 
+    #[tokio::test]
+    async fn codex_status_tracks_api_and_cli_without_inheriting_unrelated_outages() {
+        for (api, cli, expected) in [
+            ("operational", "operational", State::Operational),
+            ("degraded_performance", "operational", State::Degraded),
+            ("operational", "major_outage", State::MajorOutage),
+        ] {
+            let http = FakeHttp::new();
+            let body = serde_json::json!({"components":[
+                {"name":"Images", "status":"major_outage"},
+                {"name":"Codex Web", "status":"degraded_performance"},
+                {"name":"Codex API", "status":api},
+                {"name":"CLI", "status":cli}
+            ]});
+            http.route(
+                CODEX.endpoint,
+                response(&serde_json::to_vec(&body).unwrap()),
+            );
+            let status = query(&http, CODEX).await;
+            assert_eq!(status.provider, "codex");
+            assert_eq!(status.state, expected);
+            assert_eq!(status.components.len(), 2);
+            assert!(status.error.is_none());
+            assert!(status.fetched_at.is_some());
+            assert_eq!(http.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_codex_components_are_unknown_instead_of_healthy() {
+        let http = FakeHttp::new();
+        http.route(
+            CODEX.endpoint,
+            response(br#"{"components":[{"name":"Responses","status":"operational"}]}"#),
+        );
+        let status = query(&http, CODEX).await;
+        assert_eq!(status.state, State::Unknown);
+        assert!(status.fetched_at.is_none());
+        assert!(status.error.unwrap().contains("缺少 Codex"));
+    }
+
     #[test]
     fn provider_aliases_are_deduplicated_and_unknown_names_rejected() {
         assert_eq!(
-            select("codex, openai,anthropic,xai").unwrap(),
-            vec![OPENAI, CLAUDE, GROK]
+            select("codex,codex,openai,anthropic,claude,xai,grok").unwrap(),
+            vec![CODEX, OPENAI, CLAUDE, GROK]
         );
         assert!(select("openai,typo").is_err());
         assert!(select("").is_err());

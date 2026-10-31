@@ -145,7 +145,9 @@ time.sleep(30)
 "#,
     );
     let started = std::time::Instant::now();
-    let error = read_provider(command, fixture.path.clone(), Duration::from_millis(150))
+    // Include interpreter startup in the probe budget. A 150 ms deadline can
+    // expire before Python writes its PID during a full test run.
+    let error = read_provider(command, fixture.path.clone(), Duration::from_secs(1))
         .await
         .unwrap_err()
         .to_string();

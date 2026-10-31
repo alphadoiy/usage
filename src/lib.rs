@@ -34,6 +34,7 @@ pub mod service_status;
 pub mod session_cleanup;
 pub mod sessions;
 pub mod statusline;
+pub mod terminals;
 pub mod theme;
 pub mod timeutil;
 pub mod ui;

@@ -1,4 +1,6 @@
-//! Local session catalog and Ghostty launcher.
+//! Local session catalog and terminal launchers.
+// Compatibility exports; terminal integration is independent of session discovery.
+pub use crate::terminals::{TerminalTarget, command_in_terminal, terminal_target};
 pub(crate) mod preview;
 
 use std::collections::{HashMap, HashSet};
@@ -915,16 +917,9 @@ fn modified_ms(path: &Path) -> i64 {
 }
 
 pub fn uses_ghostty(mode: crate::config::ResumeMode) -> bool {
-    match mode {
-        crate::config::ResumeMode::Ghostty => true,
-        crate::config::ResumeMode::Current => false,
-        crate::config::ResumeMode::Auto => {
-            cfg!(target_os = "macos")
-                && (std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
-                    || std::env::var("TERM_PROGRAM").as_deref() == Ok("ghostty"))
-        }
-    }
+    terminal_target(mode).id == "ghostty"
 }
+
 pub(crate) fn validate_resume(session: &Session) -> Result<(), String> {
     if session
         .agent
@@ -1071,41 +1066,7 @@ pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
 
 /// Open a launcher command containing identifiers, never credentials, in a fresh Ghostty split.
 pub fn command_in_ghostty(cwd: &Path, command: &str) -> Result<(), String> {
-    if !uses_ghostty(crate::config::ResumeMode::Auto) {
-        return Err("请在 macOS Ghostty 中使用 --split".into());
-    }
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|_| "项目目录不存在".to_string())?;
-    if !cwd.is_dir() {
-        return Err("项目路径不是目录".into());
-    }
-    let script = r#"on run argv
-        tell application "Ghostty"
-            set currentTerm to focused terminal of selected tab of front window
-            if currentTerm is missing value then error "找不到当前 Ghostty 终端"
-            set cfg to new surface configuration
-            set initial working directory of cfg to item 1 of argv
-            set newTerm to split currentTerm direction right with configuration cfg
-            input text (item 2 of argv) to newTerm
-            send key "enter" to newTerm
-            focus newTerm
-        end tell
-    end run"#;
-    let output = Command::new("osascript")
-        .args(["-e", script])
-        .arg(cwd)
-        .arg(command)
-        .output()
-        .map_err(|e| format!("无法打开 Ghostty：{e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Ghostty 分屏失败：{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    command_in_terminal(cwd, command, crate::config::ResumeMode::Ghostty)
 }
 
 #[cfg(test)]

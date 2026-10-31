@@ -358,7 +358,9 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
         }
         match event::poll(Duration::from_millis(80)) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(mut key)) if key.kind == KeyEventKind::Press => {
+                Ok(Event::Key(mut key))
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
@@ -371,7 +373,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
-                    match app.handle_shortcuts_key(key.code) {
+                    match app.handle_shortcuts_key(key) {
                         Some(super::shortcuts::Decision::Run(code)) => key.code = code,
                         Some(_) => {
                             redraw.invalidate();
@@ -484,7 +486,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         if let Some(panel) = &mut app.history_state.panel
                             && panel.is_editing()
                         {
-                            panel.key(key.code);
+                            panel.key_event(key);
                             redraw.invalidate();
                             continue;
                         }
@@ -507,11 +509,25 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
+                    if let Some(browser) = &mut app.browser_state.panel
+                        && browser.searching
+                    {
+                        browser.input(key);
+                        redraw.invalidate();
+                        continue;
+                    }
                     if app.browser_state.panel.is_some() {
                         app.handle_browser_key(key.code, &handle);
                         if let Err(error) = fulfill_resume_plan(&mut app, &handle, &mut terminal) {
                             break Err(error);
                         }
+                        redraw.invalidate();
+                        continue;
+                    }
+                    if app.home_focus == super::home::Focus::Projects
+                        && app.home_sessions_state.browser.searching
+                    {
+                        app.home_sessions_state.browser.input(key);
                         redraw.invalidate();
                         continue;
                     }
@@ -539,6 +555,28 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         }
                         KeyCode::Char('h') => app.open_history(&handle),
                         _ => {}
+                    }
+                    redraw.invalidate();
+                }
+                Ok(Event::Paste(text)) => {
+                    // Pasted text only edits queries; it never executes an action.
+                    if let Some(menu) = &mut app.shortcuts {
+                        menu.paste(&text);
+                        redraw.invalidate();
+                        continue;
+                    }
+                    if let Some(panel) = &mut app.history_state.panel
+                        && panel.is_editing()
+                    {
+                        panel.paste(&text);
+                    } else if let Some(browser) = &mut app.browser_state.panel
+                        && browser.searching
+                    {
+                        browser.paste(&text);
+                    } else if app.home_focus == super::home::Focus::Projects
+                        && app.home_sessions_state.browser.searching
+                    {
+                        app.home_sessions_state.browser.paste(&text);
                     }
                     redraw.invalidate();
                 }
@@ -749,7 +787,21 @@ impl Dashboard {
             }
             return Some(command);
         }
+        let editing = self
+            .browser_state
+            .panel
+            .as_ref()
+            .is_some_and(|b| b.searching)
+            || self
+                .history_state
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.is_editing())
+            || (self.browser_state.panel.is_none()
+                && self.history_state.panel.is_none()
+                && self.home_sessions_state.browser.searching);
         if key == KeyCode::F(10)
+            || (key == KeyCode::Char(' ') && !editing)
             || (key == KeyCode::Char('m')
                 && self.history_state.panel.is_none()
                 && self.browser_state.panel.is_none()
@@ -1115,7 +1167,7 @@ impl Dashboard {
             KeyCode::Char('b') => self.open_trash(handle),
             KeyCode::Char('d') | KeyCode::Delete => self.open_cleanup_delete(false),
             KeyCode::Char('D') => self.open_cleanup_delete(true),
-            KeyCode::Char(' ') => {
+            KeyCode::Char('s') => {
                 if let Some(browser) = &mut self.browser_state.panel {
                     if browser.focus() == Focus::Projects {
                         browser.toggle_project_marks();
@@ -1394,11 +1446,14 @@ impl Dashboard {
         } else if let Some(browser) = &mut self.browser_state.panel {
             browser.launching = true;
         }
-        if !sessions::uses_ghostty(mode) {
+        if crate::terminals::terminal_target(mode).is_current() {
             self.browser_state.resume_plan = Some(request);
             return;
         }
-        self.notice = Some("正在 Ghostty 右侧打开会话…".into());
+        self.notice = Some(format!(
+            "正在{}打开会话…",
+            crate::terminals::terminal_target(mode).label()
+        ));
         let tx = self.tx.clone();
         let generation = if home {
             self.home_sessions_state.generation
@@ -1407,7 +1462,7 @@ impl Dashboard {
         };
         // Accepted launches must not be cancelled when their source view closes.
         handle.spawn_blocking(move || {
-            let result = request.run_in_ghostty();
+            let result = request.run_in_terminal(mode);
             let event = if home {
                 AppEvent::HomeSessionLaunched { generation, result }
             } else {
@@ -2212,7 +2267,7 @@ impl Dashboard {
                     if generation == self.home_sessions_state.generation {
                         self.home_sessions_state.browser.launching = false;
                         self.notice = Some(match result {
-                            Ok(()) => "已在 Ghostty 右侧恢复会话".into(),
+                            Ok(()) => "已在新终端恢复会话".into(),
                             Err(error) => error,
                         });
                         changed = true;
@@ -2475,7 +2530,7 @@ impl Dashboard {
                                     browser.launching = false;
                                 }
                                 self.close_browser(true);
-                                self.notice = Some("已在 Ghostty 右侧恢复会话".into());
+                                self.notice = Some("已在新终端恢复会话".into());
                             }
                             Err(error) => {
                                 if let Some(browser) = &mut self.browser_state.panel {

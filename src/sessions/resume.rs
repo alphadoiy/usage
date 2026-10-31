@@ -175,6 +175,9 @@ impl ResumePlan {
     pub fn run_in_ghostty(&self) -> Result<(), String> {
         super::command_in_ghostty(self.cwd(), &self.shell_command()?)
     }
+    pub fn run_in_terminal(&self, mode: crate::config::ResumeMode) -> Result<(), String> {
+        super::command_in_terminal(self.cwd(), &self.shell_command()?, mode)
+    }
 }
 
 /// UI-facing choice. Its availability is informative; prepare/execution enforce it again.

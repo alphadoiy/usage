@@ -1,17 +1,19 @@
 #[cfg(unix)]
 #[test]
-fn lifecycle_callbacks_bind_concurrent_sessions_and_resumes_without_bark() {
+fn lifecycle_callbacks_bind_concurrent_sessions_and_resumes_with_bark() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     let f = Fixture::new();
     let account = f.add();
+    let server = BarkServer::new();
+    configure_bark(&f, &server);
     let binary = f.path.join("event codex");
     fs::write(&binary, r#"#!/usr/bin/env python3
 import json,os,pathlib,shlex,sqlite3,subprocess,sys,time,tomllib
 if sys.argv[1:] == ['--help']:
     print('--no-daemon --dangerously-bypass-hook-trust'); sys.exit(0)
 assert '--dangerously-bypass-hook-trust' not in sys.argv[1:]
-assert 'USAGE_CODEX_BARK_CONTEXT' not in os.environ
+assert 'USAGE_CODEX_BARK_CONTEXT' in os.environ
 home=pathlib.Path(os.environ['CODEX_HOME'])
 session=os.environ['FIXTURE_SESSION']
 if 'resume' in sys.argv[1:]: assert sys.argv[sys.argv.index('resume')+1] == session
@@ -26,6 +28,7 @@ commands={}
 for arg in sys.argv[1:]:
     if arg.startswith('hooks.'):
         for event,groups in tomllib.loads(arg)['hooks'].items():
+            if event == 'PermissionRequest': continue
             assert groups[-1]['hooks'][0]['timeout'] == 3
             commands[event]=groups[-1]['hooks'][0]['command']
 def event(kind):
@@ -92,5 +95,41 @@ event('Stop'); event('SessionEnd')
     let db = fs::read(f.path.join("manager/manager.sqlite3")).unwrap();
     assert!(!String::from_utf8_lossy(&db).contains("sentinel-private-"));
     assert!(!f.run(&["show",&account]).contains("codex event"));
-    assert!(!f.path.join("manager/bark.json").exists());
+    assert!(f.path.join("manager/bark.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_disabled_or_invalid_bark_does_not_inject_any_usage_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let account = f.add();
+    let binary = bark_binary(&f);
+    let script = fs::read_to_string(&binary).unwrap()
+        .replace("--profile --no-daemon", "--profile --no-daemon --dangerously-bypass-hook-trust")
+        .replace("'context':os.environ.get('USAGE_CODEX_BARK_CONTEXT')", "'runtime':os.environ.get('USAGE_CODEX_RUN_CONTEXT'),'context':os.environ.get('USAGE_CODEX_BARK_CONTEXT')");
+    fs::write(&binary, script).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let server = BarkServer::new();
+    for state in ["missing", "disabled", "invalid"] {
+        if state == "disabled" {
+            configure_bark(&f, &server);
+            f.run(&["bark", "disable"]);
+        } else if state == "invalid" {
+            fs::write(f.path.join("manager/bark.json"), "invalid").unwrap();
+        }
+        let capture = f.path.join(format!("{state}.json"));
+        success(f.command(&["run", &account, "--cwd", f.path.to_str().unwrap(), "--binary", binary.to_str().unwrap()])
+            .env("CAPTURE_FILE", &capture)
+            .env("USAGE_CODEX_BARK_CONTEXT", "inherited-invalid")
+            .env("USAGE_CODEX_RUN_CONTEXT", "inherited-invalid")
+            .output().unwrap());
+        let record: serde_json::Value = serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+        assert!(record["context"].is_null(), "{state}");
+        assert!(record["runtime"].is_null(), "{state}");
+        assert!(!record["args"].as_array().unwrap().iter().any(|arg| {
+            let arg = arg.as_str().unwrap();
+            arg.starts_with("hooks.") || arg.starts_with("notify=")
+        }), "{state}: {record}");
+    }
 }

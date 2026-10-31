@@ -2,6 +2,7 @@
 //! installed once and restores the terminal only when the UI thread itself panics: a panicking
 //! background task must not tear the screen down under a TUI that keeps running.
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::prelude::CrosstermBackend;
@@ -16,12 +17,13 @@ pub(crate) fn enter() -> io::Result<DefaultTerminal> {
     install_panic_hook();
     *UI_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     ratatui::Terminal::new(CrosstermBackend::new(stdout()))
 }
 
 pub(crate) fn leave() {
     *UI_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = execute!(stdout(), DisableBracketedPaste);
     ratatui::restore();
 }
 

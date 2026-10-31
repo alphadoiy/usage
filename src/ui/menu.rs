@@ -28,10 +28,10 @@ pub(super) fn page_key(key: KeyCode) -> Option<Action> {
 impl Action {
     fn title(self) -> &'static str {
         match self {
-            Self::Home => "F1  运行与资源首页",
-            Self::History => "F2  Token 历史",
-            Self::Sessions => "F3  会话浏览",
-            Self::Providers => "F4  Provider 管理",
+            Self::Home => "1   运行与资源首页",
+            Self::History => "2   Token 历史",
+            Self::Sessions => "3   会话浏览",
+            Self::Providers => "4   Provider 管理",
             Self::AddProvider => "添加 Provider",
             Self::Quit => "    退出 usage",
         }
@@ -76,7 +76,7 @@ impl Menu {
 
     pub(super) fn key(&mut self, key: KeyCode) -> Command {
         match key {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(10) => Command::Dismiss,
+            KeyCode::Esc | KeyCode::Char('q' | ' ') | KeyCode::F(10) => Command::Dismiss,
             KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                 self.selected = (self.selected + self.actions.len() - 1) % self.actions.len();
                 Command::Stay
@@ -154,7 +154,8 @@ impl Menu {
             description,
         );
         frame.render_widget(
-            Paragraph::new("↑/↓ 选择 · Enter 打开 · Esc 返回").wrap(Wrap { trim: true }),
+            Paragraph::new("↑/↓ 或 j/k 选择 · 1–4 切页 · Enter 打开 · Space / Esc 返回")
+                .wrap(Wrap { trim: true }),
             hint,
         );
     }

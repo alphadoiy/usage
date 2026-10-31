@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn hint_groups_fit_without_partial_keys_and_keep_back_available() {
-        let text = "? 操作 · ↑/↓ 选择 · Space 勾选 · Esc 返回";
+        let text = "? 操作 · ↑/↓ 选择 · s 勾选 · Esc 返回";
         for width in 0..90 {
             let fitted = fit_hints(text, width);
             assert!(fitted.width() <= usize::from(width));
