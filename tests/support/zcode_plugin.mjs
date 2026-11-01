@@ -13,7 +13,7 @@ const entry = resolve(process.argv[2] ?? 'missing-zcode-package');
 const program = resolve(process.argv[3] ?? 'target/debug/usage');
 const metadata = JSON.parse(await readFile(join(dirname(entry), 'package.json'), 'utf8'));
 assert.equal(metadata.name, '@magpie-community/opencode-zcode-auth');
-assert.equal(metadata.version, '0.1.27');
+assert.equal(metadata.version, '0.1.40');
 const root = await mkdtemp(join(tmpdir(), 'usage-zcode-smoke-'));
 const env = { ...process.env, HOME: root, XDG_DATA_HOME: join(root, 'data'), XDG_CONFIG_HOME: join(root, 'config'),
   USAGE_CODEX_DIR: join(root, 'manager'), USAGE_PLUGIN_DIR: join(root, 'plugins'),
@@ -24,6 +24,7 @@ const exec = promisify(execFile);
 const cli = async (...args) => (await exec(program, args, { env, cwd: root, timeout: 20000 })).stdout;
 const json = async (...args) => JSON.parse(await cli(...args));
 const calls = [], errors = [];
+let claimCode = 0;
 const server = createServer(async (req, res) => {
   try {
     const chunks = []; for await (const b of req) chunks.push(b);
@@ -50,6 +51,12 @@ const server = createServer(async (req, res) => {
     else if (path.endsWith('/api_keys')) data = [
       { name: 'zcode-api-key', apiKey: 'personal' }, { name: 'zcode-team-api-key', apiKey: 'team', keyType: 2 },
     ];
+    else if (path.endsWith('/marketing/touch')) data = { deliveries: [] };
+    else if (path.endsWith('/billing/preview')) data = { plans: [{ plan_id: 'daily-gift', name: 'Daily Gift' }] };
+    else if (path.endsWith('/billing/claim')) {
+      assert.equal(body.plan_id, 'daily-gift');
+      return res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ code: claimCode }));
+    }
     else if (path.endsWith('/messages')) {
       assert.equal(body.model, 'GLM-5.3');
       assert.equal(body.stream, true); assert.ok(body.max_tokens > 0);
@@ -105,7 +112,8 @@ try {
   const providers = await json('plugins', 'providers', 'zcode');
   assert.equal(providers[0].protocol, 'messages');
   assert.equal(providers[0].methods.length, 5);
-  assert.equal(providers[0].capabilities.checkin, false);
+  assert.equal(providers[0].capabilities.checkin, true);
+  assert.equal(providers[0].capabilities.checkin_status, false);
   for (const [method, site, name] of [['0', 'zai', 'Zai'], ['1', 'bigmodel', 'BigModel'], ['2', 'zai', 'Team'], ['3', 'zai', 'Desktop'], ['4', 'zai', 'KeyZai'], ['4', 'bigmodel', 'KeyBigModel']]) {
     await cli('plugins', 'login', 'zcode', 'zcode', '--method', method, '--no-browser', '--name', name,
       '--input', `site=${site}`, ...(method === '4' ? ['--input', 'key=fixture.secret'] : []));
@@ -144,8 +152,23 @@ print('zcode-inference-ok')
   for (const name of ['Zai', 'BigModel', 'Team', 'Desktop', 'KeyZai', 'KeyBigModel'])
     assert.match(await cli('codex', 'run', name, '--binary', mock), /zcode-inference-ok/);
   assert.equal(calls.filter(c => c.path.endsWith('/messages')).length, 12);
+  const accounts = await json('plugins', 'accounts');
+  const keyOnly = accounts.find(a => a.name === 'KeyZai');
+  assert.equal((await json('plugins', 'checkin', keyOnly.id, '--confirm')).outcome, 'ineligible');
+  const signed = accounts.find(a => a.name === 'Zai');
+  const file = join(env.USAGE_PLUGIN_DIR, 'accounts', signed.id + '.json');
+  const record = JSON.parse(await readFile(file, 'utf8'));
+  const state = JSON.parse(record.auth.refresh);
+  state.jwt = `e30.${Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+7200})).toString('base64url')}.fixture`;
+  record.auth.refresh = JSON.stringify(state); await writeFile(file, JSON.stringify(record));
+  assert.equal((await json('plugins', 'checkin', signed.id)).outcome, 'ready');
+  assert.equal(calls.filter(c => c.path.endsWith('/billing/claim')).length, 0);
+  for (const [code, outcome] of [[0,'claimed'],[1003,'done'],[3007,'captcha'],[5000,'failed']]) {
+    claimCode = code;
+    assert.equal((await json('plugins', 'checkin', signed.id, '--confirm')).outcome, outcome);
+  }
   assert.deepEqual(errors, []);
-  console.log('PASS: original ZCode 0.1.27, Z.ai/BigModel browser and API logins, team/desktop login, model catalog, quota, Messages inference, streaming/JSON, custom tool and cache usage');
+  console.log('PASS: original ZCode 0.1.40, Z.ai/BigModel browser and API logins, team/desktop login, model catalog, quota, Messages inference, streaming/JSON, custom tool and cache usage, confirmed gift claim/done/captcha/failure/API-key ineligible');
 } catch (error) {
   console.error('Mock upstream failures:', errors);
   console.error('Mock requests:', calls);

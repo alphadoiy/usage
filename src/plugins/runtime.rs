@@ -184,6 +184,16 @@ impl Runtime {
         ] {
             command.env_remove(key);
         }
+        if plugin.package == "@magpie-community/opencode-codearts-auth" {
+            command.env(
+                "MAGPIE_CODEARTS_LEDGER",
+                self.store
+                    .root
+                    .join("state")
+                    .join(id)
+                    .join("codearts-checkins.json"),
+            );
+        }
         command
             .arg(dir.join("host.mjs"))
             .arg(&plugin.entry)

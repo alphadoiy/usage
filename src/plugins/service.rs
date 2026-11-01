@@ -64,6 +64,7 @@ pub async fn install(package: String, id: String, runtime: Option<PathBuf>) -> R
             .join("packages")
             .join(uuid::Uuid::new_v4().to_string());
         fs::create_dir_all(&candidate).map_err(|_| "无法创建插件安装目录")?;
+        let archive = super::distribution::archive(name, version, &candidate)?;
         let mut command = Command::new("npm");
         command
             .args([
@@ -74,7 +75,12 @@ pub async fn install(package: String, id: String, runtime: Option<PathBuf>) -> R
                 "--prefix",
             ])
             .arg(&candidate)
-            .arg(&package);
+            .arg(
+                archive
+                    .as_ref()
+                    .map(|p| p.as_os_str())
+                    .unwrap_or_else(|| std::ffi::OsStr::new(&package)),
+            );
         let output =
             crate::credentials::output_with_timeout(command, std::time::Duration::from_secs(120))
                 .ok_or("npm 安装超时或无法执行")?;
@@ -142,6 +148,15 @@ pub async fn ensure_preset(
         .min_by_key(|p| (!p.enabled, p.id != preset.id))
         .cloned()
     {
+        if needs_upgrade(&plugin.version, preset.version) {
+            install(
+                format!("{}@{}", preset.package, preset.version),
+                plugin.id.clone(),
+                Some(plugin.runtime.clone()),
+            )
+            .await?;
+            return store.plugin(&plugin.id);
+        }
         if !plugin.enabled {
             plugin.enabled = true;
             store.register(plugin.clone())?;
@@ -160,4 +175,21 @@ pub async fn ensure_preset(
     )
     .await?;
     store.plugin(&id)
+}
+
+fn needs_upgrade(installed: &str, required: &str) -> bool {
+    semver::Version::parse(installed)
+        .ok()
+        .zip(semver::Version::parse(required).ok())
+        .is_some_and(|(installed, required)| installed < required)
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn presets_upgrade_older_packages_without_downgrading_custom_versions() {
+        assert!(super::needs_upgrade("0.1.27", "0.1.40"));
+        assert!(!super::needs_upgrade("0.1.40", "0.1.40"));
+        assert!(!super::needs_upgrade("0.2.0", "0.1.40"));
+        assert!(!super::needs_upgrade("local", "0.1.40"));
+    }
 }

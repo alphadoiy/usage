@@ -9,7 +9,7 @@ pub enum PluginCommand {
         confirm: bool,
     },
 
-    /// 安装固定版本的 npm Provider 插件，安装脚本不执行
+    /// 安装固定版本 Provider 插件（含内置社区 dist 包），安装脚本不执行
     Install {
         package: String,
         #[arg(long)]

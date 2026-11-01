@@ -1,14 +1,25 @@
 # Provider 插件
 
-Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。内置接入包为 `@magpie-community/opencode-workbuddy-auth@0.1.24`（`workbuddy` / `workbuddy-ai`）和 `@magpie-community/opencode-trae-auth@0.2.17`（`trae-cn` / `trae-global`），以及 `@magpie-community/opencode-zcode-auth@0.1.27`（`zcode`）。
+Usage 直接运行 OpenCode Provider 插件，不依赖 magpie 或 OpenCode 主程序。Rust 管理账号、凭据、运行租约及指标，独立的 Bun/Node 子进程执行插件。
+
+| 服务 | 固定包版本 | 上游 |
+| --- | --- | --- |
+| WorkBuddy | `@magpie-community/opencode-workbuddy-auth@0.1.24` | `workbuddy` / `workbuddy-ai` |
+| Trae | `@magpie-community/opencode-trae-auth@0.2.17` | `trae-cn` / `trae-global` |
+| ZCode | `@magpie-community/opencode-zcode-auth@0.1.40` | `zcode` |
+| Qoder | `@magpie-community/opencode-qoder-auth@0.2.52` | `qoder` / `qoder-cn` |
+| CodeArts 码道 | `@magpie-community/opencode-codearts-auth@0.3.0` | `codearts` |
+| 商汤小浣熊 | `@magpie-community/opencode-raccoon-auth@0.1.5` | `raccoon` |
+| MiniMax Code | `@magpie-community/opencode-minimax-auth@0.1.7` | `minimax-code` / `minimax-code-global` |
+
 
 ## 安装和登录
 
-首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy**、**Trae**、**ZCode** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择 WorkBuddy、Trae 或 ZCode。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
+首页 Provider 看板按 `a`，或按 `F5` 打开统一的“添加 Provider”菜单，支持 **BYOK / API Key**、**ChatGPT OAuth**、**导入 OAuth**、**从 CC Switch 导入**、**WorkBuddy**、**Trae**、**ZCode**、**Qoder**、**CodeArts**、**商汤小浣熊**、**MiniMax Code** 和高级自定义接入。所有入口复用 `provider_setup` 的编辑、登录和导入流程，在原页面上显示二级弹窗。`F4` 统一进入 Provider 管理，在管理页按 `a` 或 `F5` 打开同一添加弹窗后选择对应服务商。随后选择已有账号或登录新账号 → 国内版／国际版 → 登录方式 → 模型 → Provider 名称。已有账号无需重新授权；绑定后可从项目启动。
 
 接入步骤以紧凑的二级菜单覆盖在原页面上，标题展示当前层级，Esc 返回上一级。地区附账号说明，浏览器登录标为推荐；桌面登录仅支持未加密凭据，本机凭据加密或缺失时显示原因并禁用该选项。
 
-首次选择服务商会自动准备固定版本的底层组件；已有安装按包身份复用（支持自定义安装 ID），不会要求填写 npm 包名或版本，也不会覆盖同名的其他组件。首页按服务商及地区展示账号和额度，类型为“订阅服务”。服务商名称、地区、类型与实现包的映射集中在 `provider_catalog::presets`，后续服务商复用同一接入流程。
+首次选择服务商会自动准备固定版本的底层组件；已有安装按包身份复用（支持自定义安装 ID），低于内置要求时在同一安装 ID 下升级，保留账号与绑定，较新版本不降级，不会要求填写 npm 包名或版本，也不会覆盖同名的其他组件。首页按服务商及地区展示账号和额度，类型为“订阅服务”。服务商名称、地区、类型与实现包的映射集中在 `provider_catalog::presets`，后续服务商复用同一接入流程。
 
 通用安装与自定义插件账号入口保留在“高级 · 自定义接入”中；CLI 的 `plugins` 命令继续用于开发和排查。查询可按 Esc 返回；浏览器／验证码授权复用原有认证任务，Ctrl+C 取消。API Key 输入隐藏显示，账号名称默认读取授权结果。界面和 CLI 共用安装、认证与绑定实现。
 
@@ -79,7 +90,7 @@ node tests/support/trae_plugin.mjs /临时目录/package/index.mjs target/debug/
 添加 Provider 中选择 **ZCode → GLM Coding Plan**，支持 Z.ai 浏览器登录、智谱浏览器登录、团队订阅、读取 ZCode 应用登录，以及 GLM Coding Plan API Key。浏览器方式自动轮询完成，不需要粘贴授权码；团队方式先选择网站。API Key 表单同时显示网站和隐藏密钥输入，网站选择与凭据一起保存。
 
 ```sh
-usage plugins install @magpie-community/opencode-zcode-auth@0.1.27 --id zcode
+usage plugins install @magpie-community/opencode-zcode-auth@0.1.40 --id zcode
 usage plugins providers zcode
 usage plugins login zcode zcode                    # Z.ai；智谱使用 --method 1
 usage plugins login zcode zcode --method 2 --input site=zai # 团队订阅
@@ -92,18 +103,94 @@ usage plugins bind <账号ID> --name 'ZCode Codex' --model <模型API-ID>
 usage codex run 'ZCode Codex'
 ```
 
-参照 Magpie 固定使用原版 0.1.27 包，模型发现、订阅路由、团队凭据和赠送计划均由插件处理。ZCode 应用登录由插件读取本机数据，仅跟随同一账号；宿主不写入 ZCode 的凭据文件。仅使用 API Key 无法访问 ZCode 赠送计划；`-Trial` 模型是否可用取决于插件查询到的登录和赠送额度。Usage 不自动领取赠送计划，也不提供 ZCode 签到。
+参照 Magpie 固定使用原版 0.1.40 包，模型发现、订阅路由、团队凭据和赠送计划均由插件处理。ZCode 应用登录由插件读取本机数据，仅跟随同一账号；宿主不写入 ZCode 的凭据文件。仅使用 API Key 无法访问 ZCode 赠送计划；`-Trial` 模型是否可用取决于插件查询到的登录和赠送额度。ZCode 0.1.40 提供每日活动包领取，首页按 `c` 并确认后执行；没有活动返回 inactive，遇验证码需要在官方应用完成，纯 API Key 账号没有领取资格。不会自动领取。
 
 ZCode 使用 Anthropic Messages 协议。通用宿主把 Codex Responses 转成 Messages，支持系统指令、文本、图片、命名空间函数／自由文本工具及结果、思考摘要、缓存令牌用量，以及流式／非流式响应。断流或上游错误不能产生成功完成事件。结构化输出当前明确拒绝；内置服务端搜索沿用 Chat 插件的限制。Responses 历史中的思考摘要没有 Anthropic 签名，因此不作为签名思考块回传。
 
 原版包兼容性检查使用合成账号及本地模拟上游，覆盖 Z.ai／智谱浏览器和 API Key、团队与桌面登录、模型目录、额度、Codex 启动及 Messages 转发；不访问真实服务商或消耗订阅额度：
 
 ```sh
-# npm pack --ignore-scripts @magpie-community/opencode-zcode-auth@0.1.27
+# npm pack --ignore-scripts @magpie-community/opencode-zcode-auth@0.1.40
 # 解压后运行原始包入口：
 cargo build
 node tests/support/zcode_plugin.mjs /临时目录/package/index.mjs target/debug/usage
 ```
+
+## Qoder 国内版与国际版
+
+添加 Provider 中选择 **Qoder → 国内版 / 国际版 → 浏览器登录**，在对应地区网站授权后自动轮询完成。国内版使用 qoder.cn（阿里云或手机号）账号，国际版使用 qoder.com 账号；两个地区账号独立。两者均支持个人访问令牌（PAT），国内版还支持企业 VPC 登录，填写企业实例名称或地址后在企业网站授权。PAT 输入隐藏显示。
+
+```sh
+usage plugins install @magpie-community/opencode-qoder-auth@0.2.52 --id qoder
+usage plugins providers qoder
+usage plugins login qoder qoder-cn       # 国际版使用 qoder
+# 国内企业 VPC：--method 2 --input vpc=acme
+usage plugins accounts
+usage plugins models <账号ID>
+usage plugins usage <账号ID>
+usage plugins bind <账号ID> --name 'Qoder Codex' --model <模型API-ID>
+usage codex run 'Qoder Codex'
+```
+
+固定使用 magpie 所引用的原版 0.2.52 包。设备授权、PAT 交换、单次使用的刷新令牌、企业路由、模型发现、COSY 签名及 Qoder 请求编码由原版插件处理；Usage 复用账号库与 Responses → Chat 转换。额度保留 Credits 单位，显示订阅、加购和共享额度。浏览器登录与 PAT 登录属于同一 UID 时复用账号，保留原名称及绑定。
+
+原生 `auth.checkin` 仅在用户确认后调用。插件没有只读签到状态 hook，首页不会自动查询或领取；签到预览只提示确认，不表示已查询今日状态。领取时插件重新读取活动；设备身份要求由插件处理，可能需要本机安装并登录对应地区的官方客户端。Usage 不另行读取、生成或改写官方设备凭据。包中额外导出的 QwenWork 服务保留在高级自定义接入中，不属于 Qoder 的地区选项。
+
+原版包兼容性检查使用合成账号和本地模拟上游，不访问真实 Qoder 账号或消耗额度：
+
+```sh
+# npm pack --ignore-scripts @magpie-community/opencode-qoder-auth@0.2.52
+# 解压后运行原始包入口：
+cargo build
+node tests/support/qoder_plugin.mjs /临时目录/package/index.mjs target/debug/usage
+```
+
+检查覆盖全部原版导出的加载、国内／国际浏览器和 PAT 登录、企业 VPC、凭据刷新落库、动态模型目录、Credits、多种登录的账号复用、无领取副作用的签到预览，以及 Codex 流式／非流式 Responses、工具调用与缓存用量。真实账号授权、模型权限和签到活动仍以服务商实际结果为准。
+
+## CodeArts、商汤小浣熊与 MiniMax Code
+
+添加 Provider 中选择对应服务商，选择浏览器登录并在官方授权页完成操作，然后选择模型保存。CodeArts 使用华为云 OAuth，本机接收回调；小浣熊支持浏览器自动返回、读取本机桌面同一账号，以及手动回调／Token 备用入口；MiniMax 分国内版和国际版，使用对应网站的设备码授权。读取小浣熊桌面登录不会消耗客户端刷新令牌，客户端切换账号不会替换 Usage 席位的身份。
+
+```sh
+usage plugins install @magpie-community/opencode-codearts-auth@0.3.0 --id codearts
+usage plugins login codearts codearts
+usage plugins install @magpie-community/opencode-raccoon-auth@0.1.5 --id raccoon
+usage plugins login raccoon raccoon
+usage plugins install @magpie-community/opencode-minimax-auth@0.1.7 --id minimax
+usage plugins login minimax minimax-code # 国际版使用 minimax-code-global
+usage plugins accounts
+usage plugins models <账号ID>
+usage plugins usage <账号ID>
+usage plugins checkin <账号ID>           # 预览，不领取
+usage plugins checkin <账号ID> --confirm # 明确确认领取
+usage plugins bind <账号ID> --name '我的 Provider' --model <模型API-ID>
+```
+
+三个服务均通过原版 `auth.checkin` 领取，不在后台自动调用。当前原包未导出只读签到状态 hook，因此首页不自动查今日状态，预览只提示确认；执行时由原包读取活动并领取。小浣熊签到可能同时领取一次性的桌面登录奖励；CodeArts 每日签到包含领取和确认两步，确认失败的记录由原包保存供下次处理。MiniMax 读取一周签到面板后领取当天积分，国内与国际账号独立。
+
+CodeArts 的免费模型还有一套单独的每日权益：原版插件在获取免费模型或遇到 benefit not found 时会领取它。这不属于 Usage 的手动签到操作；使用该插件查询目录或推理时保留此原版行为。CodeArts 仅声明文本输入。插件额外导出的 OfficeAce 保留在高级自定义接入中，没有加入 CodeArts 地区菜单。
+
+Credits 和积分保留原单位，不换算成美元。仅返回余额时展示实际余额，不补总额度或使用百分比。CodeArts 的签到记录保存在 Usage 插件目录的 `state/<安装ID>/codearts-checkins.json`，不写 magpie 配置目录。
+
+CodeArts 0.3.0 与小浣熊 0.1.5 尚未发布到 npm，Usage 从 `magpie-community/plugins` 的 dist 分支下载对应固定版本 tgz，并核对代码中固定的 SHA-512，随后通过 npm `--ignore-scripts` 安装；包名、版本再次校验通过后才替换安装记录。下载或校验失败不会替换原插件，也不会静默换版本。
+
+升级已有 ZCode 可以重新打开添加入口选择 ZCode，或显式执行安装命令；账号 ID、凭据与已有 Agent 绑定保留：
+
+```sh
+usage plugins install @magpie-community/opencode-zcode-auth@0.1.40 --id zcode
+usage plugins providers zcode # 刷新能力快照，让首页识别新版签到入口
+```
+
+原包兼容性检查只使用合成账号、模拟浏览器回调和本地上游，覆盖登录、刷新落库、动态目录、额度、签到确认／已签到／失败，以及 Codex 的 Responses/SSE、工具调用和缓存用量：
+
+```sh
+cargo build
+node tests/support/subscription_plugins.mjs codearts /临时目录/codearts/package/index.mjs target/debug/usage
+node tests/support/subscription_plugins.mjs raccoon /临时目录/raccoon/package/index.mjs target/debug/usage
+node tests/support/subscription_plugins.mjs minimax /临时目录/minimax/package/index.mjs target/debug/usage
+```
+
+真实账号授权、活动资格与模型权限仍需实际登录后验证；模拟测试没有领取真实账号积分或消耗真实额度。
 
 ## 能力与边界
 

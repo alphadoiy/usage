@@ -98,7 +98,7 @@ pub const ZCODE: Preset = Preset {
     id: "zcode",
     name: "ZCode",
     package: "@magpie-community/opencode-zcode-auth",
-    version: "0.1.27",
+    version: "0.1.40",
     kind: ProviderKind::SubscriptionService,
     variants: &[Variant {
         id: "zcode",
@@ -139,7 +139,127 @@ pub const ZCODE: Preset = Preset {
         },
     ],
 };
-pub static PRESETS: &[Preset] = &[WORKBUDDY, TRAE, ZCODE];
+pub const QODER: Preset = Preset {
+    id: "qoder",
+    name: "Qoder",
+    package: "@magpie-community/opencode-qoder-auth",
+    version: "0.2.52",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[
+        Variant {
+            id: "qoder-cn",
+            name: "国内版",
+            description: "使用 qoder.cn 账号（阿里云或手机号）；支持企业 VPC",
+            desktop_auth_file: None,
+        },
+        Variant {
+            id: "qoder",
+            name: "国际版",
+            description: "使用 qoder.com 国际账号，与国内版独立",
+            desktop_auth_file: None,
+        },
+    ],
+    sign_in: &[
+        SignIn {
+            id: "0",
+            name: "浏览器登录（推荐）",
+            description: "在对应地区网站授权，自动轮询完成登录",
+            source: SignInSource::Browser,
+        },
+        SignIn {
+            id: "1",
+            name: "个人访问令牌（PAT）",
+            description: "使用对应网站创建的 pt- 开头令牌",
+            source: SignInSource::Plugin,
+        },
+        SignIn {
+            id: "2",
+            name: "企业 VPC 登录",
+            description: "填写国内版企业实例名称，在企业网站授权",
+            source: SignInSource::Browser,
+        },
+    ],
+};
+pub const CODEARTS: Preset = Preset {
+    id: "codearts",
+    name: "CodeArts 码道",
+    package: "@magpie-community/opencode-codearts-auth",
+    version: "0.3.0",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[Variant {
+        id: "codearts",
+        name: "华为云",
+        description: "华为云账号；模型、积分额度及每日福利领取",
+        desktop_auth_file: None,
+    }],
+    sign_in: &[SignIn {
+        id: "0",
+        name: "华为云浏览器登录",
+        description: "在华为云网站授权，本机回调自动完成",
+        source: SignInSource::Browser,
+    }],
+};
+pub const RACCOON: Preset = Preset {
+    id: "raccoon",
+    name: "商汤小浣熊",
+    package: "@magpie-community/opencode-raccoon-auth",
+    version: "0.1.5",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[Variant {
+        id: "raccoon",
+        name: "Raccoon",
+        description: "小浣熊账号；模型、积分余额及每日签到",
+        desktop_auth_file: None,
+    }],
+    sign_in: &[
+        SignIn {
+            id: "0",
+            name: "浏览器登录（推荐）",
+            description: "在浏览器授权，自动返回完成登录",
+            source: SignInSource::Browser,
+        },
+        SignIn {
+            id: "1",
+            name: "读取小浣熊桌面登录",
+            description: "仅复用本机同一账号，不改写客户端凭据",
+            source: SignInSource::Plugin,
+        },
+        SignIn {
+            id: "2",
+            name: "手动回调或 Token",
+            description: "粘贴完整回调链接或 Token，不是短信验证码",
+            source: SignInSource::Plugin,
+        },
+    ],
+};
+pub const MINIMAX: Preset = Preset {
+    id: "minimax",
+    name: "MiniMax Code",
+    package: "@magpie-community/opencode-minimax-auth",
+    version: "0.1.7",
+    kind: ProviderKind::SubscriptionService,
+    variants: &[
+        Variant {
+            id: "minimax-code",
+            name: "国内版",
+            description: "MiniMax 国内账号；Credits、M Plan 及每日签到",
+            desktop_auth_file: None,
+        },
+        Variant {
+            id: "minimax-code-global",
+            name: "国际版",
+            description: "MiniMax 国际账号，与国内账号独立",
+            desktop_auth_file: None,
+        },
+    ],
+    sign_in: &[SignIn {
+        id: "0",
+        name: "浏览器设备授权",
+        description: "在对应地区网站确认设备码，自动轮询完成",
+        source: SignInSource::Browser,
+    }],
+};
+pub static PRESETS: &[Preset] = &[WORKBUDDY, TRAE, ZCODE, QODER, CODEARTS, RACCOON, MINIMAX];
 
 pub fn for_package(package: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.package == package)
@@ -316,7 +436,7 @@ mod tests {
     fn zcode_preserves_all_original_login_methods_and_subscription_identity() {
         let preset = for_package("@magpie-community/opencode-zcode-auth").unwrap();
         assert_eq!(preset.id, "zcode");
-        assert_eq!(preset.version, "0.1.27");
+        assert_eq!(preset.version, "0.1.40");
         assert_eq!(
             preset.account_name("zcode", "Alice"),
             "ZCode GLM Coding Plan · Alice"

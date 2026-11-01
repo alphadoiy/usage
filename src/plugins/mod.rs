@@ -3,6 +3,7 @@ pub(crate) mod adapters;
 pub mod auth;
 pub(crate) mod capabilities;
 mod cli;
+mod distribution;
 mod identity;
 mod runtime;
 mod service;

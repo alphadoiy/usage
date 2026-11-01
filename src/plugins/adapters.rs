@@ -83,6 +83,20 @@ impl Reader {
                         }
                     }
                 }
+                // A prepaid credit balance has no denominator; never invent a percentage.
+                if let Some((amount, unit)) = v["balance"].as_str().and_then(|s| s.split_once(' '))
+                    && matches!(unit, "credits" | "points")
+                    && amount
+                        .parse::<rust_decimal::Decimal>()
+                        .is_ok_and(|n| n >= rust_decimal::Decimal::ZERO)
+                {
+                    snapshot.metrics.push(ResourceMetric::Allowance {
+                        remaining: Some(amount.into()),
+                        used: None,
+                        unit: unit.into(),
+                        unlimited: false,
+                    });
+                }
                 snapshot.message = v["plan"].as_str().map(str::to_owned);
                 if v["balance"] == "unlimited" {
                     snapshot.message = Some(match snapshot.message {
@@ -156,6 +170,24 @@ mod tests {
             },
             root: PathBuf::new(),
             account: "fixture".into(),
+        }
+    }
+
+    #[test]
+    fn prepaid_credits_show_the_reported_balance_without_an_invented_limit() {
+        let snapshot = reader().snapshot(Ok(
+            json!({"plan":"Free","balance":"123.25 credits","windows":[]}),
+        ));
+        assert!(
+            matches!(&snapshot.metrics[..], [ResourceMetric::Allowance { remaining: Some(n), used: None, unit, unlimited: false }] if n == "123.25" && unit == "credits")
+        );
+        for balance in ["unknown credits", "-1 credits", "unlimited", ""] {
+            assert!(
+                reader()
+                    .snapshot(Ok(json!({"balance":balance})))
+                    .metrics
+                    .is_empty()
+            );
         }
     }
 

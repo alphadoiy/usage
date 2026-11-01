@@ -69,6 +69,8 @@ struct Choice {
 }
 #[derive(Clone, Deserialize)]
 struct Input {
+    #[serde(default, rename = "type")]
+    kind: String,
     key: String,
     message: String,
     #[serde(default)]
@@ -84,6 +86,7 @@ impl Field {
     fn text(key: &str, label: &str, value: &str) -> Self {
         Self {
             input: Input {
+                kind: String::new(),
                 key: key.into(),
                 message: label.into(),
                 options: Vec::new(),
@@ -95,9 +98,10 @@ impl Field {
     }
     fn from_input(input: Input) -> Self {
         let key = input.key.to_ascii_lowercase();
-        let secret = ["key", "token", "secret", "password"]
-            .iter()
-            .any(|part| key.contains(part));
+        let secret = input.kind == "password"
+            || ["key", "token", "secret", "password"]
+                .iter()
+                .any(|part| key.contains(part));
         let value = input
             .options
             .first()
@@ -1078,6 +1082,23 @@ mod tests {
             serde_json::json!({"site":"bigmodel","key":"synthetic-secret"})
         );
     }
+    #[test]
+    fn plugin_password_prompts_hide_pat_even_without_a_secret_key_name() {
+        let method: super::Method = serde_json::from_value(serde_json::json!({
+            "id":"1", "label":"Qoder PAT", "type":"oauth", "prompts":[
+                {"key":"pat", "message":"PAT", "type":"password"},
+                {"key":"vpc", "message":"企业实例", "type":"text"}
+            ]
+        }))
+        .unwrap();
+        let mut fields = super::login_fields(&method);
+        fields[0].value = "pt-synthetic-secret".into();
+        fields[1].value = "acme".into();
+        assert!(fields[0].secret);
+        assert!(!fields[0].display().contains("pt-synthetic-secret"));
+        assert_eq!(fields[1].display(), "acme");
+        assert_eq!(super::inputs(&fields)["pat"], "pt-synthetic-secret");
+    }
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -1195,6 +1216,18 @@ mod tests {
                 .iter()
                 .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == "zcode"))
         );
+        assert!(
+            entries
+                .iter()
+                .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == "qoder"))
+        );
+        for id in ["codearts", "raccoon", "minimax"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(entry, _)| matches!(entry, Entry::Service(preset) if preset.id == id))
+            );
+        }
         let rows: Vec<_> = entries.into_iter().map(|(_, row)| row).collect();
         for width in [40, 100] {
             for (selected, row) in rows.iter().enumerate() {
