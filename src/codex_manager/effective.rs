@@ -1,4 +1,5 @@
-//! Conservative launcher-side resolution; unsupported layers never claim a resource binding.
+//! Startup snapshot of the managed configuration pinned by the launcher.
+//! This is not evidence of later interactive model changes.
 use std::path::Path;
 
 use super::{AuthMode, config};
@@ -20,7 +21,7 @@ enum CommandPosition {
 pub(super) fn resolve(
     saved: &str,
     mode: AuthMode,
-    cwd: &Path,
+    _cwd: &Path,
     resume: bool,
     args: &[String],
     managed_key: Option<&str>,
@@ -45,17 +46,10 @@ pub(super) fn resolve(
         if mode == AuthMode::Oauth {
             return Err("OAuth 运行尚未提供可核对的 API 资源身份");
         }
-        // Avoid reimplementing Codex project trust, root markers and layered model defaults.
-        for directory in cwd.ancestors() {
-            if directory.join(".codex/config.toml").exists() {
-                return Err("存在项目配置层，尚未取得 Agent 的实际配置确认");
-            }
-            if directory.join(".git").exists() {
-                break;
-            }
-        }
         let mut document: toml::Value = toml::from_str(saved).map_err(|_| "保存的配置无法解析")?;
         let mut model = None;
+        let mut enabled = Vec::new();
+        let mut disabled = Vec::new();
         let mut iter = args.iter();
         let mut position = CommandPosition::Root;
         while let Some(arg) = iter.next() {
@@ -136,6 +130,15 @@ pub(super) fn resolve(
                             .to_string()
                     },
                 );
+            } else if matches!(flag, "--enable" | "--disable") {
+                let feature = inline
+                    .or_else(|| iter.next().map(String::as_str))
+                    .ok_or("功能开关缺少名称")?;
+                if flag == "--enable" {
+                    enabled.push(feature);
+                } else {
+                    disabled.push(feature);
+                }
             } else if [
                 "--image",
                 "-i",
@@ -143,8 +146,6 @@ pub(super) fn resolve(
                 "-s",
                 "--ask-for-approval",
                 "-a",
-                "--enable",
-                "--disable",
                 "--add-dir",
                 "--color",
                 "--output-last-message",
@@ -174,6 +175,13 @@ pub(super) fn resolve(
             .contains(&flag)
             {
                 return Err("存在尚未识别的启动选项");
+            }
+        }
+        // Native FeatureToggles appends enables and then disables after -c overrides,
+        // regardless of their position in argv (codex-rs/cli/src/main.rs).
+        for (features, value) in [(enabled, "true"), (disabled, "false")] {
+            for feature in features {
+                apply_override(&mut document, &format!("features.{feature}"), value)?;
             }
         }
         if document.get("profile").is_some() {
@@ -267,14 +275,6 @@ pub(super) fn resolve(
                 .get("supports_websockets")
                 .and_then(toml::Value::as_bool)
                 != Some(true)
-            && !args.iter().any(|a| {
-                a == "--enable"
-                    || a.starts_with("--enable=")
-                    || a == "-c"
-                    || a == "--config"
-                    || a.starts_with("--config=")
-                    || (a.starts_with("-c") && !a.starts_with("--"))
-            })
             && ![
                 "responses_websockets",
                 "responses_websockets_v2",
@@ -288,6 +288,9 @@ pub(super) fn resolve(
                     .and_then(toml::Value::as_bool)
                     == Some(true)
             });
+        if !gateway_supported {
+            identity.reason = Some("当前网关不支持所选的传输或代理功能".into());
+        }
         credential_env = Some(env.into());
         Ok(Some(key))
     })();
@@ -348,7 +351,7 @@ fn apply_override(document: &mut toml::Value, key: &str, raw: &str) -> Result<()
 mod gateway_tests {
     use super::*;
     #[test]
-    fn observation_requires_resolved_byok_http_and_unambiguous_overrides() {
+    fn managed_http_route_allows_project_files_and_preference_overrides() {
         let path =
             std::env::temp_dir().join(format!("usage-gateway-resolution-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(path.join(".git")).unwrap();
@@ -367,7 +370,30 @@ mod gateway_tests {
         assert!(resolve(&config, false, &[]).gateway_supported);
         assert!(resolve(&config, false, &["--model".into(), "other".into()]).gateway_supported);
         assert!(!resolve(&config, true, &[]).gateway_supported);
-        assert!(!resolve(&config, false, &["-c".into(), "model='other'".into()]).gateway_supported);
+        assert!(resolve(&config, false, &["-c".into(), "model='other'".into()]).gateway_supported);
+        assert!(
+            resolve(
+                &config,
+                false,
+                &["--enable".into(), "shell_snapshot".into()]
+            )
+            .gateway_supported
+        );
+        assert!(
+            !resolve(&config, false, &["--enable=responses_websockets_v2".into()])
+                .gateway_supported
+        );
+        assert!(
+            resolve(
+                &config,
+                false,
+                &[
+                    "--enable=responses_websockets_v2".into(),
+                    "--disable=responses_websockets_v2".into()
+                ]
+            )
+            .gateway_supported
+        );
         let mut websocket: toml::Value = toml::from_str(&config).unwrap();
         websocket["model_providers"]["usage_byok"]
             .as_table_mut()
@@ -377,7 +403,7 @@ mod gateway_tests {
         assert!(!resolve(&websocket, false, &[]).gateway_supported);
         std::fs::create_dir_all(path.join(".codex")).unwrap();
         std::fs::write(path.join(".codex/config.toml"), "model='project'").unwrap();
-        assert!(!resolve(&config, false, &[]).gateway_supported);
+        assert!(resolve(&config, false, &[]).gateway_supported);
         std::fs::remove_dir_all(path).unwrap();
     }
 }

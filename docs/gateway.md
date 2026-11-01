@@ -32,7 +32,7 @@ USAGE_GATEWAY=off usage codex run <账号>
 - 托管 Codex BYOK 新会话，且原始推理端点、模型提供方、凭据引用可由现有启动解析器确认。
 - HTTP/SSE 的 Responses、Chat Completions 流量；实际 CLI 仍需支持其保存的协议。`models` 和 `responses/compact` 原样转发，不计入本期生成性能统计。
 - OAuth 新会话直连官方服务，不接入网关。
-- 恢复会话、本地未托管实例、项目 `.codex/config.toml`、原生 profile、显式 `-c` 覆盖、未知启动选项、BYOK 显式 WebSocket 或强制系统代理配置等继续使用原有调用路径。默认 WebSocket 升级请求返回 426，引导 Codex 回退 HTTP/SSE；单次启动可选择 WS 观测。跳过时记录 `gateway_skipped` 及原因。保持原生认证，不修改保存的配置。
+- 本地未托管实例、未知启动选项、BYOK 显式 WebSocket 或强制系统代理配置等继续使用原有调用路径。托管启动固定实例通道与已设置的模型，项目配置文件和普通 `-c` / feature 参数不会单独导致跳过；改变账号通道或选择其他原生 profile 的参数在启动前拒绝。插件恢复继续固定选定实例的网关通道，资源身份仍等待实际运行证据。默认 WebSocket 升级请求返回 426，引导 Codex 回退 HTTP/SSE；单次启动可选择 WS 观测。跳过时记录 `gateway_skipped` 及原因。保持原生认证，不修改保存的配置。
 
 独立资源连接仍通过显式绑定的日志实例查询历史性能，不会因展示余额自动代理流量。
 

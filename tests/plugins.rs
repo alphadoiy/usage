@@ -27,9 +27,20 @@ if '--help' in sys.argv:
  print('--no-daemon --profile');sys.exit(0)
 home=pathlib.Path(os.environ['CODEX_HOME'])
 c=tomllib.loads((home/'config.toml').read_text())
-p=c['model_provider'];base=c['model_providers'][p]['base_url']
+def merge(a,b):
+ for k,v in b.items():
+  if isinstance(v,dict) and isinstance(a.get(k),dict):merge(a[k],v)
+  else:a[k]=v
+project=pathlib.Path.cwd()/'.codex/config.toml'
+if project.exists():merge(c,tomllib.loads(project.read_text()))
 for i,arg in enumerate(sys.argv[:-1]):
- if arg=='-c' and '.base_url=' in sys.argv[i+1]:base=tomllib.loads(sys.argv[i+1])['model_providers'][p]['base_url']
+ if arg=='-c':merge(c,tomllib.loads(sys.argv[i+1]))
+p=c['model_provider'];base=c['model_providers'][p]['base_url']
+assert p=='usage_byok',p
+assert c['model']=='fixture-model',c['model']
+assert c['model_reasoning_effort']=='low',c.get('model_reasoning_effort')
+assert c['mcp_servers']['inherited']['enabled'] is False
+assert c['tui']['notifications'] is False
 body=json.dumps({'model':'fixture-model','input':'hello','stream':True}).encode()
 r=urllib.request.Request(base+'/responses',data=body,headers={'authorization':'Bearer '+os.environ['USAGE_CODEX_API_KEY'],'content-type':'application/json','session_id':'11111111-1111-4111-8111-111111111111'})
 with urllib.request.urlopen(r,timeout=15) as response:
@@ -212,14 +223,27 @@ fn plugin_login_bind_managed_inference_and_metric_source_are_connected() {
         "--model",
         "fixture-model",
     ]);
-    f.run(&[
+    // A synthetic user directory doubles as cwd, reproducing ~/.codex discovery.
+    fs::create_dir_all(f.path.join(".codex")).unwrap();
+    let official = "model='official-model'\nmodel_provider='openai'\nmodel_reasoning_effort='high'\n[tui]\nnotifications=false\n[mcp_servers.inherited]\nenabled=false\n";
+    fs::write(f.path.join(".codex/config.toml"), official).unwrap();
+    f.command(&[
         "codex",
         "run",
         "Plugin Codex",
         "--binary",
         f.path.join("codex").to_str().unwrap(),
-    ]);
-    f.run(&[
+        "--",
+        "-c",
+        "model_reasoning_effort='low'",
+        "--enable",
+        "shell_snapshot",
+    ])
+    .env("USAGE_CODEX_BASE_HOME", f.path.join(".codex"))
+    .output()
+    .map(|o| assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr)))
+    .unwrap();
+    f.command(&[
         "codex",
         "run",
         "Plugin Codex",
@@ -227,7 +251,20 @@ fn plugin_login_bind_managed_inference_and_metric_source_are_connected() {
         f.path.join("codex").to_str().unwrap(),
         "--resume",
         "11111111-1111-4111-8111-111111111111",
-    ]);
+        "--",
+        "-c",
+        "model_reasoning_effort='low'",
+        "--enable",
+        "shell_snapshot",
+    ])
+    .env("USAGE_CODEX_BASE_HOME", f.path.join(".codex"))
+    .output()
+    .map(|o| assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr)))
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(f.path.join(".codex/config.toml")).unwrap(),
+        official
+    );
     let db_path = f.path.join("data/usage/performance.sqlite3");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

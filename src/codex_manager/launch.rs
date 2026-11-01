@@ -60,7 +60,7 @@ impl Manager {
                 .auth_mode;
             let validated = Self::validate_launch(op, mode, cwd, resume, program, args)?;
             let selected = self.select_run(op, selector, revision, resume)?;
-            let mut prepared = self.prepare_command(&selected, resume, program, validated)?;
+            let mut prepared = self.prepare_command(&selected, program, validated)?;
             let run_id = op.id().to_owned();
             let mut gateway = None;
             let capture = op.step("run_identity_capture", || {
@@ -248,7 +248,6 @@ impl Manager {
     fn prepare_command(
         &self,
         selected: &Selected,
-        resume: Option<&str>,
         program: &Path,
         validated: ValidatedLaunch,
     ) -> Result<Prepared> {
@@ -307,16 +306,9 @@ impl Manager {
             AuthMode::Oauth => home.join(format!("usage-r{revision}.config.toml")),
         };
         let runtime_config = std::fs::read_to_string(runtime_path)?;
-        // A resumed thread must use the chosen provider, not its saved provider identity.
-        if resume.is_some() && profile.auth_mode == AuthMode::Byok {
-            let doc: toml::Value =
-                toml::from_str(&runtime_config).map_err(|_| Error::message("无法读取运行配置"))?;
-            for key in ["model_provider", "model", "model_reasoning_effort"] {
-                if let Some(value) = doc.get(key) {
-                    command.args(["-c", &format!("{key}={value}")]);
-                }
-            }
-        }
+        // A selected Usage instance owns startup routing/model defaults in every cwd,
+        // including ~ where the ordinary user config can also be a project layer.
+        launcher::pin_managed_config(&mut command, &runtime_config)?;
         Ok(Prepared {
             command,
             cwd,
@@ -341,17 +333,13 @@ impl Manager {
         let Selected {
             profile,
             saved,
-            home,
-            revision,
             key,
             plugin_account,
             ..
         } = selected;
-        let runtime_path = match profile.auth_mode {
-            AuthMode::Oauth => home.join(format!("usage-r{revision}.config.toml")),
-            AuthMode::Byok => home.join("config.toml"),
-        };
-        let runtime_config = std::fs::read_to_string(runtime_path)?;
+        // Resolve the same snapshot already pinned into the command. A concurrent
+        // preference edit must not change the identity captured for this launch.
+        let runtime_config = prepared.runtime_config.clone();
         if !config::matches_runtime_config(&runtime_config, &saved.config) {
             return Err(Error::message("运行配置已改变，请重新启动"));
         }
@@ -457,9 +445,9 @@ impl Manager {
                 .as_deref()
                 .unwrap_or("HTTP/SSE route cannot be confirmed");
             if plugin_account.is_some() {
-                return Err(Error::message(
-                    "插件会话的启动配置无法确认，请移除冲突覆盖参数",
-                ));
+                return Err(Error::message(format!(
+                    "插件会话无法接入本地网关：{reason}"
+                )));
             }
             tracing::info!(event = "gateway_skipped", run_id, reason);
             return Ok(None);

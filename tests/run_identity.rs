@@ -206,12 +206,45 @@ fn persisted_model_choice_is_captured_and_cli_overrides_still_take_precedence() 
 
 #[cfg(unix)]
 #[test]
-fn concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credentials() {
+fn concurrent_saved_revisions_pin_their_own_endpoints_and_credentials() {
     let fixture = Fixture::new();
     let id = fixture.add();
     fixture.configure(&id);
+    let mut edit = fixture
+        .command(&[
+            "codex",
+            "edit",
+            &id,
+            "--base-url",
+            "https://b.invalid/v1",
+            "--key-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    edit.stdin
+        .take()
+        .unwrap()
+        .write_all(b"synthetic-inference-b\n")
+        .unwrap();
+    ok(edit.wait_with_output().unwrap());
     let a = fixture
-        .launch(&id, &["--model", "model-a"])
+        .command(&[
+            "codex",
+            "run",
+            &id,
+            "--revision",
+            "1",
+            "--cwd",
+            fixture.0.to_str().unwrap(),
+            "--binary",
+            fixture.binary().to_str().unwrap(),
+            "--",
+            "--model",
+            "model-a",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -219,17 +252,7 @@ fn concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credenti
     let b = fixture
         .launch(
             &id,
-            &[
-                "exec",
-                "-c",
-                "model_providers.usage_byok.base_url='https://b.invalid/v1'",
-                "-c",
-                "model_providers.usage_byok.env_key='FIXTURE_INFERENCE_B'",
-                "-c",
-                "model='config-model'",
-                "-m",
-                "model-b",
-            ],
+            &["exec", "-c", "model='config-model'", "-m", "model-b"],
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -260,7 +283,7 @@ fn concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credenti
     );
     for (run, resource, endpoint, source) in [
         (a, "a", "https://a.invalid/v1", "managed_revision"),
-        (b, "b", "https://b.invalid/v1", "environment"),
+        (b, "b", "https://b.invalid/v1", "managed_revision"),
     ] {
         let context = &run["context"];
         assert_eq!(context["identity"]["state"], "resolved");
@@ -288,7 +311,8 @@ fn concurrent_runs_of_one_profile_pin_different_effective_endpoints_and_credenti
         assert_eq!(list[0]["id"], resource);
         assert_eq!(list.as_array().unwrap().len(), 1);
     }
-    assert_eq!(fixture.runs()[0]["revision"], 1);
+    assert_eq!(a["revision"], 1);
+    assert_eq!(b["revision"], 2);
     let logs: String = fs::read_dir(fixture.0.join("logs"))
         .unwrap()
         .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
@@ -372,40 +396,20 @@ fn endpoint_override_without_matching_inference_key_cannot_bind_an_account_balan
     let fixture = Fixture::new();
     let id = fixture.add();
     fixture.configure(&id);
-    ok(fixture
-        .launch(
-            &id,
-            &[
-                "-c",
-                "model_providers.usage_byok.base_url='https://b.invalid/v1'",
-            ],
-        )
-        .output()
-        .unwrap());
-    let runs = fixture.runs();
-    let run = &runs[0];
-    let links = run["context"]["resources"].as_array().unwrap();
-    assert_eq!(
-        links
-            .iter()
-            .find(|l| l["binding"]["account"] == "a")
-            .unwrap()["state"],
-        "endpoint_mismatch"
-    );
-    assert_eq!(
-        links
-            .iter()
-            .find(|l| l["binding"]["account"] == "b")
-            .unwrap()["state"],
-        "credential_mismatch"
-    );
     failure(
         fixture
-            .resource_list(run["id"].as_str().unwrap())
+            .launch(
+                &id,
+                &[
+                    "-c",
+                    "model_providers.usage_byok.base_url='https://b.invalid/v1'",
+                ],
+            )
             .output()
             .unwrap(),
-        "没有已匹配的资源",
+        "不能覆盖 model_providers",
     );
+    assert!(fixture.runs().as_array().unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -420,10 +424,14 @@ fn unresolved_sources_are_explicit_and_never_fall_back_to_profile_associations()
             "-c",
             "model_providers.usage_byok.experimental_bearer_token='inline-secret-fixture'",
         ],
-        vec!["--unknown-routing-option"],
     ] {
-        ok(fixture.launch(&id, &args).output().unwrap());
+        failure(fixture.launch(&id, &args).output().unwrap(), "Usage");
     }
+    assert!(fixture.runs().as_array().unwrap().is_empty());
+    ok(fixture
+        .launch(&id, &["--unknown-routing-option"])
+        .output()
+        .unwrap());
     fs::create_dir(fixture.0.join(".codex")).unwrap();
     fs::write(
         fixture.0.join(".codex/config.toml"),
@@ -431,17 +439,29 @@ fn unresolved_sources_are_explicit_and_never_fall_back_to_profile_associations()
     )
     .unwrap();
     ok(fixture.launch(&id, &[]).output().unwrap());
-    for run in fixture.runs().as_array().unwrap() {
-        assert_eq!(run["context"]["identity"]["state"], "unresolved");
-        assert!(run["context"]["identity"]["reason"].is_string());
-        failure(
-            fixture
-                .resource_list(run["id"].as_str().unwrap())
-                .output()
-                .unwrap(),
-            "实际配置未解析",
-        );
-    }
+    let runs = fixture.runs();
+    assert_eq!(runs.as_array().unwrap().len(), 2);
+    let unresolved = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["context"]["identity"]["state"] == "unresolved")
+        .unwrap();
+    assert!(unresolved["context"]["identity"]["reason"].is_string());
+    failure(
+        fixture
+            .resource_list(unresolved["id"].as_str().unwrap())
+            .output()
+            .unwrap(),
+        "实际配置未解析",
+    );
+    let resolved = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["context"]["identity"]["state"] == "resolved")
+        .unwrap();
+    assert_eq!(resolved["context"]["identity"]["model"], "base-model");
     assert!(
         !fixture
             .dump()

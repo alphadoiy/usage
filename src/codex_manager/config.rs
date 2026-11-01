@@ -16,25 +16,33 @@ fn managed_settings(text: &str) -> Option<toml::Value> {
 
 /// Keep provider credentials/routes pinned while allowing Codex to persist its own settings.
 /// Named profiles and project tables may also override authentication, so inspect those layers.
+const ACCOUNT_KEYS: &[&str] = &[
+    "model_provider",
+    "model_providers",
+    "openai_base_url",
+    "chatgpt_base_url",
+    "profile",
+    "cli_auth_credentials_store",
+    "forced_login_method",
+    "forced_chatgpt_workspace_id",
+    "experimental_bearer_token",
+    "api_key",
+    "OPENAI_API_KEY",
+    "auth",
+    "tokens",
+];
+
+/// Includes launcher-owned state paths, which must not bypass instance isolation.
+pub(super) fn protected_override(key: &str) -> bool {
+    let root = key.trim().split('.').next().unwrap_or_default();
+    ACCOUNT_KEYS.contains(&root) || matches!(root, "profiles" | "projects" | "sqlite_home")
+}
+
 pub(super) fn account_settings(doc: &toml::Value) -> toml::Value {
     let mut settings = toml::map::Map::new();
-    for key in [
-        "model_provider",
-        "model_providers",
-        "openai_base_url",
-        "chatgpt_base_url",
-        "profile",
-        "cli_auth_credentials_store",
-        "forced_login_method",
-        "forced_chatgpt_workspace_id",
-        "experimental_bearer_token",
-        "api_key",
-        "OPENAI_API_KEY",
-        "auth",
-        "tokens",
-    ] {
-        if let Some(value) = doc.get(key) {
-            settings.insert(key.into(), value.clone());
+    for key in ACCOUNT_KEYS {
+        if let Some(value) = doc.get(*key) {
+            settings.insert((*key).into(), value.clone());
         }
     }
     for section in ["profiles", "projects"] {

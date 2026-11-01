@@ -50,6 +50,37 @@ pub(super) fn validate_run_args(args: &[String], mode: AuthMode) -> Result<()> {
             {
                 return Err(oauth_args_error());
             }
+            if mode == AuthMode::Byok {
+                if ["--profile", "--oss", "--local-provider"].contains(&flag)
+                    || (arg.starts_with("-p") && !arg.starts_with("--"))
+                {
+                    return Err(Error::message(
+                        "托管启动使用 Usage 选择的 Provider，不能通过 profile 或本地提供方参数改变配置来源",
+                    ));
+                }
+                let raw = if matches!(arg.as_str(), "-c" | "--config") {
+                    Some(
+                        args.next()
+                            .ok_or_else(|| Error::message("配置覆盖缺少值"))?
+                            .as_str(),
+                    )
+                } else {
+                    arg.strip_prefix("--config=")
+                        .or_else(|| arg.strip_prefix("-c").filter(|_| !arg.starts_with("--")))
+                };
+                if let Some(raw) = raw {
+                    let (key, _) = raw
+                        .split_once('=')
+                        .ok_or_else(|| Error::message("配置覆盖缺少等号"))?;
+                    if super::config::protected_override(key) {
+                        let field = key.trim().split('.').next().unwrap_or_default();
+                        return Err(Error::message(format!(
+                            "托管启动不能覆盖 {field}：账号通道、认证和状态目录由 Usage 管理；请通过 Usage 编辑 Provider"
+                        )));
+                    }
+                    continue;
+                }
+            }
             // Skip values even when they resemble auth flags or subcommand names.
             if matches!(
                 arg.as_str(),
@@ -85,6 +116,39 @@ pub(super) fn validate_run_args(args: &[String], mode: AuthMode) -> Result<()> {
             }
             positional = true;
         }
+    }
+    Ok(())
+}
+
+/// Explicit runtime overrides outrank native project layers. User model/effort flags may
+/// follow these defaults; account overrides are rejected before materializing the Home.
+pub(super) fn pin_managed_config(command: &mut std::process::Command, text: &str) -> Result<()> {
+    let doc: toml::Value = toml::from_str(text).map_err(|_| Error::message("无法读取运行配置"))?;
+    let account = super::config::account_settings(&doc);
+    for (key, value) in account.as_table().expect("account table") {
+        // Profiles/projects are configuration containers, not individual launch settings.
+        if !matches!(key.as_str(), "profiles" | "projects" | "profile") {
+            command.args(["-c", &format!("{key}={value}")]);
+        }
+    }
+    for key in ["model", "model_reasoning_effort", "models"] {
+        if let Some(value) = doc.get(key) {
+            command.args(["-c", &format!("{key}={value}")]);
+        }
+    }
+    // Project features must not silently switch a managed HTTP route to a different
+    // transport. Other project features and all trust/permission decisions remain native.
+    for key in [
+        "responses_websockets",
+        "responses_websockets_v2",
+        "respect_system_proxy",
+    ] {
+        let value = doc
+            .get("features")
+            .and_then(|v| v.get(key))
+            .cloned()
+            .unwrap_or(toml::Value::Boolean(false));
+        command.args(["-c", &format!("features.{key}={value}")]);
     }
     Ok(())
 }
@@ -127,4 +191,45 @@ pub(super) fn inherit_run_lease(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod managed_policy_tests {
+    use super::*;
+
+    #[test]
+    fn managed_accounts_reject_channel_overrides_without_echoing_values() {
+        for args in [
+            vec!["-c", "model_provider='openai'"],
+            vec!["--config=model_providers={}"],
+            vec!["-cmodel_providers.usage_byok.base_url='https://private.invalid'"],
+            vec!["-c", "forced_login_method='chatgpt'"],
+            vec!["-c", "sqlite_home='/private'"],
+            vec!["--profile=other"],
+            vec!["--oss"],
+        ] {
+            let result = validate_run_args(
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                AuthMode::Byok,
+            );
+            let error = result.expect_err(&format!("{args:?}")).to_string();
+            assert!(!error.contains("private"));
+        }
+    }
+
+    #[test]
+    fn managed_accounts_allow_preferences_and_respect_argument_boundaries() {
+        for args in [
+            vec!["-c", "model='chosen'", "--enable", "shell_snapshot"],
+            vec!["-cmodel_reasoning_effort='low'"],
+            vec!["--image", "--profile", "--", "-cmodel_provider=other"],
+            vec!["exec", "--output-last-message", "--oss", "hello"],
+        ] {
+            validate_run_args(
+                &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                AuthMode::Byok,
+            )
+            .unwrap();
+        }
+    }
 }
