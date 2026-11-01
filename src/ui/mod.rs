@@ -5,6 +5,7 @@ mod confirmation;
 mod forms;
 mod history;
 mod home;
+mod magpie;
 mod menu;
 mod overview;
 mod performance;

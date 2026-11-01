@@ -218,11 +218,28 @@ pub(super) fn resolve(
                     "stream_max_retries",
                     "stream_idle_timeout_ms",
                     "supports_websockets",
+                    "http_headers",
                 ]
                 .contains(&field.as_str())
             })
         }) {
             return Err("提供方含尚未解析的认证或路由字段");
+        }
+        // Static, non-auth headers do not change endpoint/credential identity. A local
+        // observation proxy must not silently discard them, so such routes stay direct.
+        if let Some(headers) = table.get("http_headers") {
+            let headers = headers.as_table().ok_or("提供方请求头格式无效")?;
+            for (name, value) in headers {
+                if ["authorization", "x-api-key", "api-key", "host"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+                    || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+                    || value
+                        .as_str()
+                        .is_none_or(|v| reqwest::header::HeaderValue::from_str(v).is_err())
+                {
+                    return Err("提供方含尚未解析的认证或路由请求头");
+                }
+            }
         }
         if table
             .get("requires_openai_auth")
@@ -267,10 +284,11 @@ pub(super) fn resolve(
         identity.model = Some(selected_model);
         identity.model_provider = Some(provider.into());
         identity.credential_source = Some(source.into());
-        gateway_supported = table
-            .get("wire_api")
-            .and_then(toml::Value::as_str)
-            .is_none_or(|api| matches!(api, "responses" | "chat"))
+        gateway_supported = table.get("http_headers").is_none()
+            && table
+                .get("wire_api")
+                .and_then(toml::Value::as_str)
+                .is_none_or(|api| matches!(api, "responses" | "chat"))
             && table
                 .get("supports_websockets")
                 .and_then(toml::Value::as_bool)
@@ -350,6 +368,41 @@ fn apply_override(document: &mut toml::Value, key: &str, raw: &str) -> Result<()
 #[cfg(test)]
 mod gateway_tests {
     use super::*;
+    #[test]
+    fn static_connection_headers_keep_direct_transport_and_auth_headers_stay_unresolved() {
+        let connection =
+            crate::magpie::Connection::new("http://127.0.0.1:3425", crate::magpie::LOCAL_KEY)
+                .unwrap();
+        let text = connection
+            .config("group/coding", None, Some("account-a"))
+            .unwrap();
+        let resolve = |text: &str| {
+            super::resolve(
+                text,
+                AuthMode::Byok,
+                std::path::Path::new("/nonexistent"),
+                false,
+                &[],
+                Some("synthetic"),
+                &|_| None,
+            )
+        };
+        let route = resolve(&text);
+        assert_eq!(route.identity.state, crate::runs::IdentityState::Resolved);
+        assert!(!route.gateway_supported);
+        let mut doc: toml::Value = toml::from_str(&text).unwrap();
+        doc["model_providers"]["magpie"]["http_headers"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "Authorization".into(),
+                toml::Value::String("Bearer synthetic".into()),
+            );
+        assert_eq!(
+            resolve(&toml::to_string(&doc).unwrap()).identity.state,
+            crate::runs::IdentityState::Unresolved
+        );
+    }
     #[test]
     fn managed_http_route_allows_project_files_and_preference_overrides() {
         let path =

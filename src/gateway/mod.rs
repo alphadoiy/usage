@@ -1,5 +1,4 @@
 //! Process-independent, loopback-only HTTP observation for Usage-owned launches.
-mod catalog;
 mod metrics;
 mod server;
 #[cfg(test)]
@@ -31,7 +30,6 @@ struct StateFile {
 #[derive(Serialize, Deserialize)]
 pub(crate) enum RouteAuth {
     ApiKey { key: String },
-    Plugin { account: String },
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Registration {
@@ -49,10 +47,6 @@ pub(crate) struct Registration {
 impl Registration {
     fn valid_auth(&self) -> bool {
         match &self.auth {
-            RouteAuth::Plugin { account } => {
-                crate::plugins::endpoint_account(&self.upstream).as_deref()
-                    == Some(account.as_str())
-            }
             RouteAuth::ApiKey { key } => {
                 !key.is_empty()
                     && axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_ok()
@@ -65,14 +59,6 @@ impl Registration {
         headers: &axum::http::HeaderMap,
     ) -> Option<(&'a str, axum::http::HeaderValue)> {
         match &self.auth {
-            RouteAuth::Plugin { .. } => (headers.get("authorization")?.to_str().ok()?
-                == format!("Bearer {}", self.token))
-            .then(|| {
-                (
-                    path,
-                    axum::http::HeaderValue::from_static("Bearer usage-plugin"),
-                )
-            }),
             RouteAuth::ApiKey { key } => {
                 if headers.get("authorization")?.to_str().ok()? != format!("Bearer {}", self.token)
                 {
@@ -189,7 +175,6 @@ fn url(state: &StateFile, path: &str) -> String {
 }
 struct ReadyGateway {
     state: StateFile,
-    status: serde_json::Value,
 }
 fn health(client: &reqwest::blocking::Client, state: &StateFile) -> Option<serde_json::Value> {
     let status: serde_json::Value = client
@@ -204,8 +189,8 @@ fn health(client: &reqwest::blocking::Client, state: &StateFile) -> Option<serde
 }
 fn ready(client: &reqwest::blocking::Client, path: &Path) -> Option<ReadyGateway> {
     let state = read_state(path)?;
-    let status = health(client, &state)?;
-    Some(ReadyGateway { state, status })
+    health(client, &state)?;
+    Some(ReadyGateway { state })
 }
 fn ensure(
     directory: &Path,
@@ -299,7 +284,7 @@ pub(crate) fn attach(
             let result = (|| {
                 private_dir(&directory)?;
                 // Simultaneous launches wait their turn within the budget instead of skipping
-                // observation (or failing a plugin launch) on the first contention.
+                // observation on the first contention.
                 let start = private_file(&directory.join("start.lock"))?;
                 while start.try_lock_exclusive().is_err() {
                     if Instant::now() >= deadline {
@@ -389,23 +374,4 @@ pub async fn execute(command: GatewayCommand) -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-pub(crate) struct PluginControl {
-    pub url: String,
-    pub token: String,
-    pub actions: bool,
-}
-pub(crate) fn plugin_control() -> Result<PluginControl, String> {
-    let directory = directory(&crate::codex_manager::default_root());
-    private_dir(&directory)?;
-    let lock = private_file(&directory.join("start.lock"))?;
-    FileExt::lock_exclusive(&lock).map_err(|_| "插件网关启动锁失败")?;
-    let client = control_client()?;
-    let gateway = ensure(&directory, &client, Instant::now() + Duration::from_secs(5))?;
-    Ok(PluginControl {
-        url: url(&gateway.state, "/_usage/plugins/call"),
-        token: gateway.state.token,
-        actions: gateway.status["plugin_actions"] == 1,
-    })
 }

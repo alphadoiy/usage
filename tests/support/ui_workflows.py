@@ -152,6 +152,7 @@ profile_ids = [{json.dumps(account)}]
         terminal = Terminal(binary, ["--config", str(config), "codex"], env, project)
         try:
             terminal.until("[F4Provider]")
+            terminal.send(b"\x1b[B")
             terminal.send(b"e")
             terminal.until("APIKey")
             terminal.send(b"\t\t\t")

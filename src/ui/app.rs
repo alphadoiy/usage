@@ -298,6 +298,9 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
     let mut redraw = RedrawSchedule::new();
     app.refresh(&handle);
     let result = loop {
+        if app.magpie.as_mut().is_some_and(|panel| panel.poll()) {
+            redraw.invalidate();
+        }
         app.maybe_refresh_fingerprint(&handle);
         let status_started = app.maybe_refresh_operation_status(&handle);
         let (received, reset_consumed) = app.drain_events();
@@ -387,6 +390,13 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         None => {}
                     }
                     if app.handle_cleanup_key(key.code, &handle) {
+                        redraw.invalidate();
+                        continue;
+                    }
+                    if let Some(panel) = &mut app.magpie {
+                        if panel.key(key.code, &handle) {
+                            app.magpie = None;
+                        }
                         redraw.invalidate();
                         continue;
                     }
@@ -536,6 +546,24 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                         redraw.invalidate();
                         continue;
                     }
+                    if key.code == KeyCode::Char('e')
+                        && app.home_focus == super::home::Focus::Providers
+                        && app.home_provider.as_deref() == Some(crate::magpie::BUILTIN_ID)
+                    {
+                        let result = super::provider_setup::configure_magpie(
+                            handle.clone(),
+                            &mut terminal,
+                            &|frame| draw(frame, &app),
+                        );
+                        app.refresh_after_provider_change(&handle);
+                        app.notice = match result {
+                            Ok(Some(added)) => Some(added.notice),
+                            Ok(None) => None,
+                            Err(error) => Some(error.to_string()),
+                        };
+                        redraw.invalidate();
+                        continue;
+                    }
                     if app.handle_home_key(
                         key.code,
                         &handle,
@@ -640,6 +668,7 @@ fn fulfill_resume_plan(
 }
 
 struct Dashboard {
+    magpie: Option<super::magpie::Panel>,
     resume_provider: Option<resume_provider::Picker>,
     preview: preview::State,
     shortcuts: Option<super::shortcuts::Menu>,
@@ -736,6 +765,7 @@ impl Dashboard {
             subscription_tests: super::subscription_tests::Tests::default(),
             home_subscription_details: false,
             fingerprint: state::FingerprintState::new(),
+            magpie: None,
             home_performance: state::HomePerformanceState::new(),
             performance: state::PerformanceState::new(),
             home_activity: state::HomeActivityState::new(),
@@ -1965,6 +1995,14 @@ impl Dashboard {
             self.notice = Some("请先选择首页 Provider".into());
             return;
         };
+        if provider.kind == crate::provider_catalog::ProviderKind::Magpie {
+            self.magpie = Some(super::magpie::Panel::new(
+                handle,
+                provider.id.clone(),
+                provider.name.clone(),
+            ));
+            return;
+        }
         let Some(binding) = provider.performance.clone() else {
             self.notice = Some("此 Provider 尚未绑定本地请求日志".into());
             return;

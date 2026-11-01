@@ -18,7 +18,7 @@ struct Form {
     selected: usize,
     editing: Option<(String, i64, String)>,
     auth_mode: AuthMode,
-    plugin: bool,
+    fixed_connection: bool,
     picker: Option<Picker>,
     /// None until requested; a saved Provider is fetched when its form opens.
     models: Option<Models>,
@@ -28,14 +28,14 @@ impl Form {
         fields: Vec<String>,
         editing: Option<(String, i64, String)>,
         auth_mode: AuthMode,
-        plugin: bool,
+        fixed_connection: bool,
     ) -> Self {
         Self {
             fields: fields.into_iter().map(TextInput::from).collect(),
             selected: 0,
             editing,
             auth_mode,
-            plugin,
+            fixed_connection,
             picker: None,
             models: None,
         }
@@ -56,13 +56,16 @@ impl Form {
     }
     /// A typed key lists models at the typed endpoint; otherwise the saved Provider's query is used.
     fn model_source(&self) -> Option<ModelSource> {
-        if self.auth_mode == AuthMode::Byok && !self.plugin && !self.fields[4].trim().is_empty() {
+        if self.auth_mode == AuthMode::Byok
+            && !self.fixed_connection
+            && !self.fields[4].trim().is_empty()
+        {
             return Some(ModelSource::Endpoint {
                 base: self.fields[1].trim().into(),
                 key: self.fields[4].trim().into(),
             });
         }
-        if self.auth_mode == AuthMode::Byok && !self.plugin {
+        if self.auth_mode == AuthMode::Byok && !self.fixed_connection {
             return self
                 .editing
                 .as_ref()
@@ -109,7 +112,7 @@ impl Form {
                 (1, "模型（可留空）"),
                 (2, "推理强度（可留空）"),
             ]
-        } else if self.plugin {
+        } else if self.fixed_connection {
             vec![(0, "名称"), (2, "模型"), (3, "推理强度（可留空）")]
         } else {
             vec![
@@ -203,11 +206,13 @@ pub(in crate::ui) fn edit(
             String::new(),
         ]
     };
+    let external =
+        crate::magpie::is_config(&rev.config) || crate::magpie::legacy_endpoint(&profile.base_url);
     let form = Form::new(
         fields,
         Some((profile.id.clone(), profile.revision, rev.config)),
         profile.auth_mode,
-        crate::plugins::endpoint_account(&profile.base_url).is_some(),
+        external,
     );
     let added = run_inner(handle, terminal, background, &mut manager, Some(form), None)?;
     Ok(added.map(|mut added| {
@@ -611,8 +616,8 @@ fn draw_form(frame: &mut ratatui::Frame, form: &Form) {
     frame.render_widget(block, area);
     let header = if form.auth_mode == AuthMode::Oauth {
         "OAuth：模型留空使用默认；保存配置不会复制登录凭据"
-    } else if form.plugin {
-        "Agent 配置 · 共用原订阅账号和额度"
+    } else if form.fixed_connection {
+        "Agent 配置 · 共用模型连接，额度由连接管理"
     } else if form.editing.is_some() {
         "Agent 配置 · 保存后生成新版本；旧会话保留原版本"
     } else {
@@ -804,11 +809,14 @@ mod tests {
     }
 
     #[test]
-    fn editing_a_plugin_binding_exposes_agent_fields_and_preserves_shared_credentials() {
+    fn editing_a_fixed_connection_binding_exposes_agent_fields_and_preserves_shared_credentials() {
         let root =
             std::env::temp_dir().join(format!("usage-provider-edit-{}", uuid::Uuid::new_v4()));
         let mut manager = Manager::open(root.clone()).unwrap();
-        let endpoint = crate::plugins::account_endpoint(&uuid::Uuid::new_v4().to_string());
+        let endpoint = format!(
+            "https://usage-fixed_connection.invalid/{}/v1",
+            uuid::Uuid::new_v4()
+        );
         let config = config::new_config(&endpoint, "model-a", Some("high")).unwrap();
         let profile = manager
             .add("Subscription", &config, "synthetic-inference-key")

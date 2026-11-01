@@ -131,43 +131,32 @@ Codex 适配器继续委托官方 CLI 完成授权和令牌刷新，复用 Manag
 交互应用入口统一持有后台任务，最多并发两个账号；配置、采样及历史记录按账号隔离失败。首页的只读快照通过现有 AppEvent 和代次校验更新，历史缓存仅在报告或运行目录变更后重建。测试状态与官方服务健康状态分别建模。退出应用通过共享取消标记停止并回收采样进程，原始报告与启用配置继续保留，不安装系统任务。
 
 
-## Provider 插件宿主
+## Magpie 外部模型连接
 
-[Provider 插件](plugins.md) 由现有网关持有独立 Bun/Node 宿主。插件包、上游 Backend、账号和带 Agent 的 Provider 实例分开标识；WorkBuddy 与 WorkBuddy AI 来自同一插件的两个导出工厂；Trae CN 与 Trae Global 同样通过独立导出工厂接入。通用兼容层执行 OpenCode Provider v1 及用量/刷新扩展，不在 Rust 分派服务商接口。
-
-认证桥接根据能力快照注册 `AuthRegistry` 工厂；插件方法采用动态文本并复用 `AuthTask` 的保存边界。资源桥接使用 `ResourceRegistry` 的 `plugin_account` 工厂，首页模型查询独立执行并按包版本、配置 revision 和账号缓存。`RouteAuth::Plugin` 引用插件账号，Agent 只获得本次路由的能力令牌。Rust credential broker 统一保存 opaque auth，按账号串行刷新并用 generation 拒绝过期写入。
-
-原生 HTTP 转发和插件 fetch 共用运行租约、观测及索引。Responses 到 Chat 的转换独立于服务商插件；不支持的协议或工具明确失败。明确绑定的插件恢复通过临时 CLI 配置固定传输，原资源身份仍保持未解析。构造工厂不加载 JS、不读凭据或请求网络；能力发现和插件调用发生在后台服务边界。
+第三方 Provider 的插件宿主、认证、刷新、协议转换及请求观测归 Magpie 所有。Usage 的 `magpie` 适配器提供连接、模型目录、Codex 目录投影与共享额度读取；Agent 直接请求 Magpie。现有 Manager 保存版本化启动配置，原生 OAuth 继续官方直连。具体身份、迁移与观测边界见 [Magpie 模型连接](magpie.md)。
 
 ## 统一 Provider 管理
 
-F4 的 Provider 管理承接已有账号的操作；首页和管理页的 `a`、F5 共用 `ui::provider_setup` 添加弹窗，功能菜单不单列添加页。BYOK、OAuth 和文件/CC Switch 导入位于 `provider_setup::native`，服务商插件复用统一认证接口，管理 UI 不参与接入流程的状态机。
+F4 管理已有启动配置；首页和管理页的 `a`、F5 共用 `ui::provider_setup` 添加弹窗。原生 BYOK、OAuth 和文件 / CC Switch 导入在 `provider_setup::native`，Magpie 目录及配置绑定委托独立服务。编辑 Magpie 预设只调整名称、模型和推理强度；连接凭据和固定账号保留在原版本配置中。
 
-界面合并不改变凭据和 Agent 配置的数据边界：插件账号继续存入插件账号库，Codex 配置保留模型、推理强度与账号引用。编辑插件绑定只显示名称、模型和推理强度，保留共享账号及其推理凭据。OAuth 提供原地重新登录；当前插件认证仅创建独立账号，其管理项不显示原地重新登录操作。
-
-Provider 操作的确认转换由 `ui::confirmation` 统一管理，重置和签到保留各自业务报告与异步结果生命周期。内置插件动作由 `plugins::capabilities` 投影到账号操作工厂，Rust/JS 共用能力清单，Catalog 只装配操作，不判断具体服务商的签到规则。
-
-Agent 配置表单的模型与推理强度使用选项列表，可筛选，也可输入自定义值。模型选项来自 `CatalogService::models`：已保存的 Provider 与首页共用同一套查询构造（托管账号经 Manager，插件账号经同一插件查询），只读取当前 Provider 的凭据；新 BYOK 按表单中的端点和密钥查询。推理强度的取值属于 Codex 配置语义，由 `codex_manager::config::REASONING_EFFORTS` 提供，UI 只负责展示文案。
-
-管理页启动前先选择项目目录。项目由 `projects` 模块管理：`projects.sqlite3` 只保存用户意图（手动添加、置顶、移出与从 Usage 启动的时间），会话派生的目录在读取时由 `projects::catalog` 合并，不写入项目库；项目库不参与 Run 归属。首页项目看板、管理页的项目选择与 `usage projects` 共用这一合并规则，会话目录通过调用方注入的 `SessionRegistry` 与 `SessionHomes` 读取；`SessionHomes::from_config` 统一解析默认目录与数据实例。启动终端只承载 Agent 输出：启动前的 CC Switch 同步结果写入日志，由管理页和 `usage codex sync` 展示。网关以 `-c model_providers.<id>.base_url` 注入，参数名的构造规则在 `launcher::provider_override` 中维护；Codex 不解析带引号的 TOML 键，无法以裸键引用的 provider ID 直接启动失败，不回退为不经观测的直连。
 
 ## 解耦（2026-10-24）
 
-- **组合根**：`hub::Hub` 是唯一决定有哪些 Agent、资源服务与认证后端的位置。注册表只构建一次并以 `Arc` 共享，`hub::shared()` 返回进程内的 Hub；嵌入方在首次使用前调用 `hub::install` 注入自定义工厂。资源服务、模型目录、会话目录、认证入口与托管启动都从 Hub 取注册表，不再各自调用 `builtin_registry()`。插件资源与认证工厂在组合时注册，`resources` 与 `plugins` 之间不再互相构建注册表。
+- **组合根**：`hub::Hub` 是唯一决定有哪些 Agent、资源服务与认证后端的位置。注册表只构建一次并以 `Arc` 共享，`hub::shared()` 返回进程内的 Hub；嵌入方在首次使用前调用 `hub::install` 注入自定义工厂。资源服务、模型目录、会话目录、认证入口与托管启动都从 Hub 取注册表，不再各自调用 `builtin_registry()`。Magpie 唯一内置卡片及其额度、余额、今日用量在 Catalog 组合层装配，不加载外部代码。
 - **托管实例**：`AgentContext` 为 `Local { home }` 或 `Managed(Arc<dyn ManagedInstance>)`。账号库通过 `ManagedInstance`（Agent 类型、Home、性能绑定、启动、导出恢复命令）接入，`agents` 与 `hub` 不再引用 `codex_manager`。Codex 对本地 Home 的特殊处理（识别托管目录、注入通知）以 `LocalHooks` 在组合时提供；`RunRecord` 移至 `runs`。其他 Agent 接入托管多开只需实现 `ManagedInstance`。
 - **首页目录**：`CatalogService::load` 按托管账号、插件账号、资源连接三个来源依次收集（`provider_catalog/sources.rs`），来源间的绑定关系以参数显式传递。插件库读取失败与单个签到操作创建失败会记录日志，不再静默隐藏或让整个目录失败。
 - **托管启动**：`start_recorded_with_config` 拆为选择账号、准备命令、解析配置并接入观测、注入 hooks、启动并记录五个阶段（`codex_manager/launch.rs`），日志步骤名称不变；运行记录读写位于 `codex_manager/run_store.rs`。
 
 ## 稳定性与负载边界（2026-10-24）
 
-- 插件账号锁和动作锁仅在定位单个账号的锁时持有全局映射锁，等待账号锁前释放映射锁。同账号保持串行，不同账号不会因其中一个账号排队而一起阻塞。
+- 第三方账号的并发与认证锁由 Magpie 管理，Usage 只持有网关连接凭据。
 - OAuth 保存先验证并准备 Home，再替换登录、提交账号事务。返回错误时恢复原认证、配置及绑定文件；恢复失败会保留私有备份目录并返回位置。提交成功后不再执行会让调用者误判保存失败的查询或物化。该阶段的补偿最初仅覆盖可返回的错误；后续加入的持久恢复协议见下文。
 - 资源查询同时最多执行 8 项，排队后的超时从实际开始查询计时；整体取消会撤销正在执行的任务。模型查询失败在下一轮刷新时重试，成功缓存仍按原身份复用。元数据 HTTP 响应按块读取并限制为 4 MiB，推理流继续由网关流式转发。
 - 历史、会话和性能读取共用 `logfiles` 的普通／压缩日志身份与读取入口。历史账本先提供缓存，再发现和解析日志；解析和 JSON 序列化不持有 SQLite 写事务，每个文件用条件更新避免旧刷新覆盖并发写入。后续已将账本拆为游标和记录表，具体边界见下文。
 - 托管恢复命令携带实例自己的账号库路径；已删除项目的相对路径仍归一到原项目身份。损坏的 Bark 配置会停用本次通知并显示原因，Agent 启动继续执行。
 - 捕获输出的后台探测拥有独立进程组，取消或超时回收组内子进程；前台 Agent 的终止先通知所持有的子进程，给包装器转发与回收机会，再强制终止。前台路径不声称拥有任意后代进程树。
 
-日常 push 与 PR 的 CI 执行 Rust 格式检查、Clippy 全 target、串行 Rust 回归、插件 JavaScript 回归及 Python 执行器测试。测试使用临时账号目录与本地模拟服务。
+日常 push 与 PR 的 CI 执行 Rust 格式检查、Clippy 全 target、串行 Rust 回归、Magpie 合成服务契约及 Python 执行器测试。测试使用临时账号目录与本地模拟服务。
 
 ## 后台流程与界面分离（2026-10-24）
 

@@ -51,10 +51,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 安装和使用 OpenCode Provider 插件
-    Plugins {
+    /// Magpie 模型连接、自动路由、额度及请求观测
+    Magpie {
+        #[arg(long, global = true)]
+        address: Option<String>,
+        /// 远程网关密钥所在的环境变量；本机默认使用应用标识
+        #[arg(long, global = true)]
+        key_env: Option<String>,
         #[command(subcommand)]
-        command: crate::plugins::PluginCommand,
+        command: crate::magpie::MagpieCommand,
     },
     /// 项目目录：手动添加、置顶或移出，并合并本机会话所在目录
     Projects {
@@ -204,7 +209,7 @@ pub async fn run() -> i32 {
         };
     }
     let command = match &cli.command {
-        Some(Command::Plugins { .. }) => "plugins",
+        Some(Command::Magpie { .. }) => "magpie",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Projects { .. }) => "projects",
         Some(Command::Resources { .. }) => "resources",
@@ -268,9 +273,14 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
         .interactive()
         .then(crate::app_runtime::AppRuntime::start);
     match cli.command {
-        Some(Command::Plugins { command }) => {
-            crate::plugins::dispatch(command).await.map_err(CliError)
-        }
+        Some(Command::Magpie {
+            address,
+            key_env,
+            command,
+        }) => crate::magpie::dispatch(address, key_env, command)
+            .await
+            .map(|()| 0)
+            .map_err(CliError),
         Some(Command::Projects { command }) => {
             let config = cli.config.clone();
             tokio::task::spawn_blocking(move || {

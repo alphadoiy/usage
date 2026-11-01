@@ -60,6 +60,16 @@ pub struct Money {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceMetric {
+    RequestUsage {
+        name: String,
+        requests: u64,
+        failed_requests: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        reasoning_tokens: u64,
+    },
     ResetCredits {
         available: u32,
     },
@@ -78,6 +88,11 @@ pub enum ResourceMetric {
     },
     Balance {
         remaining: Money,
+    },
+    /// A vendor-reported balance whose currency or unit must stay as returned.
+    ReportedBalance {
+        name: String,
+        display: String,
     },
     Cost {
         used: Money,

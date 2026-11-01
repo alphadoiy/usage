@@ -752,14 +752,11 @@ async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
     let mut app = dashboard();
     app.config_path = config_path;
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
-    app.overview_state.service = Arc::new(
-        crate::provider_catalog::CatalogService::new(
-            root.join("manager"),
-            http.clone(),
-            Arc::new(|_| panic!("unexpected env lookup")),
-        )
-        .with_plugin_root(root.join("plugins")),
-    );
+    app.overview_state.service = Arc::new(crate::provider_catalog::CatalogService::new(
+        root.join("manager"),
+        http.clone(),
+        Arc::new(|_| panic!("unexpected env lookup")),
+    ));
     let handle = Handle::current();
     app.refresh_overview(&handle);
     until(&mut app, |app| !app.overview_state.loading).await;

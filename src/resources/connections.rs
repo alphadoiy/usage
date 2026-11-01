@@ -297,6 +297,15 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
         }
         for metric in &snapshot.metrics {
             lines.push(match metric {
+                ResourceMetric::RequestUsage {
+                    name, requests, failed_requests, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                } => format!(
+                    "  {name} · 请求 {requests} 次 · 失败 {failed_requests} 次 · 输入 {input_tokens} / 输出 {output_tokens} Token · 缓存读取 {cache_read_tokens} / 写入 {cache_write_tokens} Token · 推理 {reasoning_tokens} Token"
+                ),
+                ResourceMetric::ReportedBalance { name, display } => {
+                    format!("  {name} 余额：{display}")
+                }
                 ResourceMetric::Balance { remaining } => {
                     format!(
                         "  余额 {} {}{}",

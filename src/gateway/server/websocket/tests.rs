@@ -365,7 +365,6 @@ async fn native_socket(compressed: bool) {
     let route = base_tracker.route.clone();
     let lease = route.clone();
     let state = Arc::new(Shared {
-        plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), 0),
         sources: Arc::new(recording::Sources::default()),
         directory: PathBuf::new(),
         token: "admin".into(),
@@ -519,7 +518,6 @@ async fn websocket_refusal_preserves_status_body_and_retry_after_without_inferen
         axum::serve(listener, app).await.unwrap();
     });
     let state = Arc::new(Shared {
-        plugins: crate::plugins::Runtime::new(crate::plugins::store::root(), 0),
         sources: Arc::new(recording::Sources::default()),
         directory: PathBuf::new(),
         token: "admin".into(),

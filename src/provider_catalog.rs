@@ -1,7 +1,6 @@
 //! Provider inventory with independent model, quota and balance capabilities.
 mod api_models;
 mod codex;
-pub mod presets;
 mod refresh;
 mod sources;
 mod usage;
@@ -27,6 +26,7 @@ pub enum ProviderKind {
     Subscription,
     SubscriptionService,
     Plugin,
+    Magpie,
 }
 impl ProviderKind {
     pub fn label(self) -> &'static str {
@@ -35,7 +35,8 @@ impl ProviderKind {
             Self::CompatibleApi => "兼容 API · BYOK",
             Self::Subscription => "官方订阅 · OAuth",
             Self::SubscriptionService => "订阅服务",
-            Self::Plugin => "扩展服务",
+            Self::Plugin => "旧插件 · 待迁移至 Magpie",
+            Self::Magpie => "内置 Magpie · 模型与路由",
         }
     }
 }
@@ -147,7 +148,6 @@ impl Plan {
 enum Protocol {
     Api(api_models::Query),
     Codex(codex::AccountModels),
-    Plugin { root: PathBuf, account: String },
 }
 
 // Credentials only live in query plans; never Debug/Serialize them or put them in UI state.
@@ -159,14 +159,14 @@ pub struct ModelQuery {
 }
 
 impl ModelQuery {
+    pub(crate) fn credential(&self) -> &str {
+        &self.key
+    }
     fn cache_key(&self) -> String {
         let mut hash = Sha256::new();
         hash.update(self.url.as_str());
         hash.update([0]);
         hash.update(&self.key);
-        if let Protocol::Plugin { root, .. } = &self.protocol {
-            hash.update(root.as_os_str().as_encoded_bytes());
-        }
         if let Protocol::Codex(account) = &self.protocol {
             hash.update([0]);
             hash.update(&account.account_id);
@@ -209,28 +209,6 @@ impl ModelQuery {
 
     async fn fetch(&self, http: &dyn HttpClient) -> Result<Vec<String>, &'static str> {
         match &self.protocol {
-            Protocol::Plugin { root, account } => {
-                let models = crate::plugins::call_at(
-                    root,
-                    serde_json::json!({"operation":"models","account":account}),
-                )
-                .await
-                .map_err(|_| "插件模型目录查询失败")?;
-                models
-                    .as_array()
-                    .ok_or("插件模型目录格式无效")?
-                    .iter()
-                    .map(|m| {
-                        m["id"]
-                            .as_str()
-                            .filter(|s| {
-                                !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
-                            })
-                            .map(str::to_owned)
-                            .ok_or("插件模型 ID 无效")
-                    })
-                    .collect()
-            }
             Protocol::Codex(account) => account.fetch(http, &self.key).await,
             Protocol::Api(query) => query.fetch(http, &self.key).await,
         }
@@ -279,8 +257,8 @@ pub struct CatalogService {
     root: PathBuf,
     http: Arc<dyn HttpClient>,
     credentials: Arc<CredentialResolver>,
-    plugins: crate::plugins::store::Store,
     resources: Arc<crate::resources::ResourceRegistry>,
+    builtin_magpie: bool,
 }
 impl CatalogService {
     pub fn new(
@@ -292,12 +270,13 @@ impl CatalogService {
             root,
             http,
             credentials,
-            plugins: crate::plugins::store::Store::new(crate::plugins::store::root()),
             resources: crate::hub::shared().resources.clone(),
+            builtin_magpie: false,
         }
     }
-    pub fn with_plugin_root(mut self, root: PathBuf) -> Self {
-        self.plugins = crate::plugins::store::Store::new(root);
+    /// Enable the product's fixed Magpie entry; embedders can query saved accounts alone.
+    pub fn with_builtin_magpie(mut self) -> Self {
+        self.builtin_magpie = true;
         self
     }
     pub fn from_environment() -> Self {
@@ -309,19 +288,16 @@ impl CatalogService {
                 std::env::var(name).map_err(|_| "推理凭据环境变量未设置".into())
             }),
         )
+        .with_builtin_magpie()
     }
-    /// Discovery runs in a fixed order: managed accounts record which plugin accounts they
-    /// bind, plugin accounts reuse those bindings, and resource connections skip Providers
-    /// already listed.
+    /// Assemble saved accounts, the optional built-in entry, and explicit resources.
     pub fn load(&self, config: &AppConfig) -> Result<Plan, String> {
         let mut plan = Plan {
             catalog: Catalog::default(),
             queries: Vec::new(),
             resources: Vec::new(),
         };
-        let plugins = self.plugin_snapshot();
-        let bindings = self.add_managed_profiles(&mut plan, config, &plugins)?;
-        self.add_plugin_accounts(&mut plan, &plugins, bindings);
+        self.add_managed_profiles(&mut plan, config)?;
         self.add_resource_connections(&mut plan, config)?;
         self.add_configured_usage(&mut plan, config);
         plan.catalog.model_keys = plan
@@ -340,8 +316,10 @@ fn unreadable_query(profile: &crate::codex_manager::Profile) -> Models {
         "无法读取此 Provider 的模型查询凭据".into()
     })
 }
-fn unavailable_plugin() -> Models {
-    Models::Unavailable("插件账号不可用或插件已停用".into())
+fn retired_plugin() -> Models {
+    Models::Unavailable(
+        "旧插件接入已迁至 Magpie，请使用 usage magpie bind --replace 迁移此配置".into(),
+    )
 }
 
 /// Where an Agent form lists models: a saved Provider, or an endpoint typed into the form.
@@ -352,28 +330,6 @@ pub enum ModelSource {
 }
 
 impl CatalogService {
-    /// Cached by package version, plugin revision and account, so a plugin update refetches.
-    fn plugin_query(
-        &self,
-        id: String,
-        plugin: &crate::plugins::store::Plugin,
-        account: &str,
-    ) -> ModelQuery {
-        ModelQuery {
-            id,
-            url: reqwest::Url::parse(&crate::plugins::account_endpoint(account))
-                .expect("plugin endpoint"),
-            key: format!(
-                "{}:{}:{}:{}",
-                plugin.id, plugin.version, plugin.revision, account
-            ),
-            protocol: Protocol::Plugin {
-                root: self.plugins.root.clone(),
-                account: account.into(),
-            },
-        }
-    }
-
     /// The query the home board makes for one Provider, outside a full refresh.
     pub async fn models(self: Arc<Self>, source: ModelSource) -> Models {
         let http = self.http.clone();
@@ -391,7 +347,7 @@ impl CatalogService {
                 // Only a BYOK key can be used with a newly typed URL. OAuth and
                 // plugin credentials remain bound to their own model services.
                 if profile.auth_mode != AuthMode::Byok
-                    || crate::plugins::endpoint_account(&profile.base_url).is_some()
+                    || crate::magpie::legacy_endpoint(&profile.base_url)
                 {
                     return Err(Models::Unavailable(
                         "此账号的凭据不能用于自定义模型接口".into(),
@@ -405,6 +361,11 @@ impl CatalogService {
             }
             // Only this Provider's credentials are read, through the same construction as `load`.
             ModelSource::Saved(id) => {
+                if id == crate::magpie::BUILTIN_ID {
+                    let connection = crate::magpie::saved_connection(&self.root, &id)
+                        .map_err(Models::Unavailable)?;
+                    return connection.model_query(&id).map_err(Models::Unavailable);
+                }
                 let manager = Manager::open_read_only(self.root.clone())
                     .ok()
                     .flatten()
@@ -414,23 +375,12 @@ impl CatalogService {
                     .ok()
                     .and_then(|profiles| profiles.into_iter().find(|p| p.id == id))
                     .ok_or_else(|| Models::Unavailable("Provider 不存在".into()))?;
-                match crate::plugins::endpoint_account(&profile.base_url) {
-                    Some(account) => self
-                        .plugins
-                        .account(&account)
-                        .ok()
-                        .and_then(|a| {
-                            self.plugins
-                                .plugins()
-                                .ok()?
-                                .into_iter()
-                                .find(|p| p.enabled && p.id == a.plugin)
-                        })
-                        .map(|plugin| self.plugin_query(profile.id.clone(), &plugin, &account))
-                        .ok_or_else(unavailable_plugin),
-                    None => manager
+                if crate::magpie::legacy_endpoint(&profile.base_url) {
+                    Err(retired_plugin())
+                } else {
+                    manager
                         .model_catalog_query(&profile)
-                        .map_err(|_| unreadable_query(&profile)),
+                        .map_err(|_| unreadable_query(&profile))
                 }
             }
         })
@@ -866,20 +816,17 @@ mod tests {
         .unwrap();
         let a = manager.add("A", &text, "synthetic-a").unwrap();
         let plugin_text = crate::codex_manager::config::new_config(
-            &crate::plugins::account_endpoint(&uuid::Uuid::new_v4().to_string()),
+            &format!("https://usage-plugin.invalid/{}/v1", uuid::Uuid::new_v4()),
             "model",
             None,
         )
         .unwrap();
         let orphan = manager.add("Plugin", &plugin_text, "inference").unwrap();
-        let service = Arc::new(
-            CatalogService::new(
-                f.0.clone(),
-                Arc::new(KeyHttp),
-                Arc::new(|_| panic!("unexpected env lookup")),
-            )
-            .with_plugin_root(f.0.join("plugins")),
-        );
+        let service = Arc::new(CatalogService::new(
+            f.0.clone(),
+            Arc::new(KeyHttp),
+            Arc::new(|_| panic!("unexpected env lookup")),
+        ));
         let models = |source| service.clone().models(source);
         assert_eq!(
             models(ModelSource::Saved(a.id.clone())).await,
@@ -911,7 +858,7 @@ mod tests {
         ));
         assert_eq!(
             models(ModelSource::Saved(orphan.id)).await,
-            unavailable_plugin()
+            retired_plugin()
         );
         assert!(matches!(
             models(ModelSource::Saved("missing".into())).await,

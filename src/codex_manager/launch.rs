@@ -21,9 +21,8 @@ struct Selected {
     saved: Revision,
     /// BYOK credential, passed to the child through its environment.
     key: Option<String>,
-    /// For plugin bindings: the saved endpoint and the plugin account it names.
-    plugin_base: Option<String>,
-    plugin_account: Option<String>,
+    /// External model connections own transport and request observation.
+    magpie: Option<crate::magpie::Connection>,
     /// Held for the run's lifetime so login replacement waits for every OAuth run.
     oauth_lease: Option<std::fs::File>,
 }
@@ -164,36 +163,38 @@ impl Manager {
             }
             None
         };
-        let plugin_base = if profile.auth_mode == AuthMode::Byok {
+        let saved_base = if profile.auth_mode == AuthMode::Byok {
             Some(config::summary(&saved.config)?.0)
         } else {
             None
         };
-        let plugin_account = plugin_base
+        if saved_base
             .as_deref()
-            .and_then(crate::plugins::endpoint_account);
-        if let Some(id) = &plugin_account {
-            let plugin_store = crate::plugins::store::Store::new(crate::plugins::store::root());
-            let account = plugin_store.account(id).map_err(Error::message)?;
-            plugin_store
-                .plugin(&account.plugin)
-                .map_err(Error::message)?;
-            let expected = plugin_store.inference_key(id).map_err(Error::message)?;
-            if key.as_deref() != Some(expected.as_str()) {
-                return Err(Error::message("插件账号与启动凭据不匹配"));
-            }
-            if !crate::gateway::enabled() {
-                return Err(Error::message("插件推理依赖本地网关，请启用 USAGE_GATEWAY"));
-            }
+            .is_some_and(crate::magpie::legacy_endpoint)
+        {
+            return Err(Error::message(
+                "旧插件接入已迁至 Magpie；请使用 usage magpie bind --replace 迁移此配置",
+            ));
         }
+        let magpie =
+            if profile.auth_mode == AuthMode::Byok && crate::magpie::is_config(&saved.config) {
+                Some(
+                    crate::magpie::Connection::new(
+                        saved_base.as_deref().expect("BYOK endpoint"),
+                        key.as_deref().unwrap_or_default(),
+                    )
+                    .map_err(Error::message)?,
+                )
+            } else {
+                None
+            };
         Ok(Selected {
             profile,
             revision,
             home,
             saved,
             key,
-            plugin_base,
-            plugin_account,
+            magpie,
             oauth_lease,
         })
     }
@@ -334,7 +335,7 @@ impl Manager {
             profile,
             saved,
             key,
-            plugin_account,
+            magpie,
             ..
         } = selected;
         // Resolve the same snapshot already pinned into the command. A concurrent
@@ -356,10 +357,10 @@ impl Manager {
         if let (Some(env), Some(key)) = (&effective.credential_env, &effective.key) {
             prepared.command.env(env, key);
         }
-        // A plugin resume pins its transport explicitly, while its resource identity
-        // remains unresolved until an Agent event confirms the session configuration.
-        let resume_transport = (plugin_account.is_some() && resume.is_some()).then(|| {
-            effective::resolve(
+        if let Some(connection) = magpie {
+            // Resume resource identity still waits for Agent evidence. The requested
+            // transport can be validated independently and is pinned by managed config.
+            let transport = effective::resolve(
                 &runtime_config,
                 profile.auth_mode,
                 &prepared.cwd,
@@ -367,10 +368,34 @@ impl Manager {
                 args,
                 key.as_deref(),
                 &environment,
-            )
-        });
-        let route_effective = resume_transport.as_ref().unwrap_or(&effective);
-        *gateway = self.attach_gateway(selected, &mut prepared.command, run_id, route_effective)?;
+            );
+            if transport.identity.endpoint.as_deref().is_some_and(|base| {
+                base.trim_end_matches('/') != connection.inference_url().trim_end_matches('/')
+            }) {
+                return Err(Error::message("Magpie 启动配置被覆盖，无法确认模型连接"));
+            }
+            let saved_model = config::summary(&runtime_config)?.1;
+            let model = transport
+                .identity
+                .model
+                .as_deref()
+                // app-server owns subsequent model selection through its native API.
+                // Managed config already pins auth and transport independently of
+                // resource-proof support for a particular native subcommand.
+                .unwrap_or(&saved_model);
+            let catalog = connection
+                .prepare_launch(&selected.home, model)
+                .map_err(Error::message)?;
+            prepared.command.args([
+                "-c",
+                &format!(
+                    "model_catalog_json={}",
+                    toml::Value::String(catalog.to_string_lossy().into_owned())
+                ),
+            ]);
+        } else {
+            *gateway = self.attach_gateway(selected, &mut prepared.command, run_id, &effective)?;
+        }
         let path = usage_config
             .map(Path::to_path_buf)
             .unwrap_or_else(crate::config::default_config_path);
@@ -411,7 +436,7 @@ impl Manager {
     }
 
     /// Official subscriptions always reach OpenAI directly; their performance comes from the
-    /// session log. BYOK observation degrades to a direct launch; plugin accounts require it.
+    /// session log. Magpie owns external observation; other BYOK routes may use local observation.
     fn attach_gateway(
         &self,
         selected: &Selected,
@@ -422,11 +447,12 @@ impl Manager {
         let Selected {
             profile,
             revision,
-            key,
-            plugin_base,
-            plugin_account,
+            magpie,
             ..
         } = selected;
+        if magpie.is_some() {
+            return Ok(None);
+        }
         if profile.auth_mode == AuthMode::Oauth {
             tracing::info!(
                 event = "gateway_skipped",
@@ -444,11 +470,6 @@ impl Manager {
                 .reason
                 .as_deref()
                 .unwrap_or("HTTP/SSE route cannot be confirmed");
-            if plugin_account.is_some() {
-                return Err(Error::message(format!(
-                    "插件会话无法接入本地网关：{reason}"
-                )));
-            }
             tracing::info!(event = "gateway_skipped", run_id, reason);
             return Ok(None);
         }
@@ -475,18 +496,8 @@ impl Manager {
                 .endpoint
                 .as_deref()
                 .expect("resolved endpoint");
-            let auth = if let Some(id) = plugin_account {
-                if route.identity.endpoint.as_deref() != plugin_base.as_deref() || route.key != *key
-                {
-                    return Err(Error::message("插件启动配置被覆盖，无法确认账号关联"));
-                }
-                crate::gateway::RouteAuth::Plugin {
-                    account: id.clone(),
-                }
-            } else {
-                crate::gateway::RouteAuth::ApiKey {
-                    key: route.key.clone().expect("resolved credential"),
-                }
+            let auth = crate::gateway::RouteAuth::ApiKey {
+                key: route.key.clone().expect("resolved credential"),
             };
             let attached =
                 crate::gateway::attach(&self.root, run_id, &binding, upstream, provider, auth)
@@ -498,9 +509,6 @@ impl Manager {
         let attached = match prepared {
             Ok(attached) => attached,
             Err(error) => {
-                if plugin_account.is_some() {
-                    return Err(error);
-                }
                 tracing::warn!(event = "gateway_fallback", run_id, provider_id = profile.id, reason = %error, action = "direct_launch");
                 return Ok(None);
             }
@@ -514,17 +522,6 @@ impl Manager {
             &attached.token,
         );
         command.args(["-c", &format!("{base_url_key}={base}")]);
-        if plugin_account.is_some() {
-            let catalog_key = launcher::provider_override(provider, "model_catalog_url")
-                .expect("validated provider id");
-            let catalog_url = toml::Value::String(format!("{}/codex/models", attached.base));
-            command.args([
-                "-c",
-                &format!("model_provider={}", toml::Value::String(provider.into())),
-                "-c",
-                &format!("{catalog_key}={catalog_url}"),
-            ]);
-        }
         for variable in ["NO_PROXY", "no_proxy"] {
             let mut bypass = std::env::var(variable).unwrap_or_default();
             if !bypass.is_empty() {

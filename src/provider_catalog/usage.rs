@@ -264,8 +264,7 @@ impl CatalogService {
         profile: &Profile,
         config: &AppConfig,
     ) {
-        if profile.auth_mode != AuthMode::Byok
-            || crate::plugins::endpoint_account(&profile.base_url).is_some()
+        if profile.auth_mode != AuthMode::Byok || crate::magpie::legacy_endpoint(&profile.base_url)
         {
             return;
         }

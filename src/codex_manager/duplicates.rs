@@ -39,6 +39,11 @@ pub(super) fn reject(conn: &Connection, root: &Path, text: &str, key: &str) -> R
     })?;
     for row in rows {
         let (id, name, config, reference) = row?;
+        if crate::magpie::is_config(text) && crate::magpie::is_config(&config) {
+            return Err(Error::message(
+                "内置 Magpie 已存在；请配置已有 Magpie，不能重复添加",
+            ));
+        }
         if settings(&config).as_ref() == Some(&candidate)
             && secrets::get(root, &reference).is_ok_and(|stored| stored == key)
         {

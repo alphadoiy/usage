@@ -55,7 +55,8 @@ VARIANTS = {
         existing.extend(overlay.clone());
     } else { table.insert(key, value); }""")],
     "ignore_unknown_flags": [("src/codex_manager/effective.rs", 'return Err("存在尚未识别的启动选项");', 'let _ = flag;')],
-    "ignore_project_layer": [("src/codex_manager/effective.rs", 'if directory.join(".codex/config.toml").exists() {', 'if false && directory.join(".codex/config.toml").exists() {')],
+    # Project layers are now allowed; the managed launch pins its own route explicitly.
+    "remove_managed_config_pin": [("src/codex_manager/launch.rs", 'launcher::pin_managed_config(&mut command, &runtime_config)?;', '// managed route pin removed by ablation')],
     "ignore_resume_gate": [("src/codex_manager/effective.rs", "        if resume {", "        if false && resume {")],
     "ignore_resource_factory_validation": [("src/runs.rs", "} else if scope.is_none() {", "} else if false && scope.is_none() {")],
     "remove_run_transaction": [("src/codex_manager/launch.rs", """            let tx = self.conn.transaction()?;

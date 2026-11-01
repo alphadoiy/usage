@@ -192,6 +192,9 @@ pub(super) fn draw(frame: &mut Frame, app: &Dashboard) {
     if let Some(panel) = &app.performance.panel {
         crate::ui::performance::draw(frame, panel);
     }
+    if let Some(panel) = &app.magpie {
+        panel.render(frame);
+    }
     if let Some(menu) = &app.menu {
         menu.render(frame);
     }

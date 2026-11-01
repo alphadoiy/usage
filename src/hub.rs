@@ -281,11 +281,9 @@ impl Provider {
     }
 }
 
-/// Built-in resource services plus plugin-backed accounts.
+/// Built-in resources. Magpie supplies external account resources at composition.
 pub fn builtin_resources() -> ResourceRegistry {
-    let mut registry = crate::resources::builtin_registry();
-    crate::plugins::adapters::register(&mut registry);
-    registry
+    crate::resources::builtin_registry()
 }
 
 /// The built-in Agents. Agent-specific local behavior is supplied here, at composition, so the

@@ -319,14 +319,11 @@ mod tests {
         let path = root.join("config.toml");
         std::fs::write(&path, "private-sentinel = [").unwrap();
         let http = http();
-        let service = Arc::new(
-            CatalogService::new(
-                root.join("accounts"),
-                http.clone(),
-                Arc::new(|_| Err("unused".into())),
-            )
-            .with_plugin_root(root.join("plugins")),
-        );
+        let service = Arc::new(CatalogService::new(
+            root.join("accounts"),
+            http.clone(),
+            Arc::new(|_| Err("unused".into())),
+        ));
         let (tx, mut rx) = mpsc::unbounded_channel();
         service
             .refresh(

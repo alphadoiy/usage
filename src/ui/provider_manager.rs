@@ -139,11 +139,13 @@ fn display_path(path: &Path) -> String {
     }
 }
 fn subscription_account(profile: &Profile) -> bool {
-    crate::plugins::endpoint_account(&profile.base_url).is_some()
+    crate::magpie::legacy_endpoint(&profile.base_url)
 }
 fn identity(profile: &Profile) -> String {
     if subscription_account(profile) {
-        "订阅服务 · 共享插件账号".into()
+        "订阅服务 · 旧插件待迁移至 Magpie".into()
+    } else if profile.model_provider == crate::magpie::PROVIDER {
+        format!("Magpie · {} · {}", profile.base_url, profile.model)
     } else if let Some(oauth) = &profile.oauth {
         format!("ChatGPT OAuth · {}", oauth.label())
     } else {
@@ -163,7 +165,10 @@ fn actions(profile: Option<&Profile>) -> String {
         "Space 菜单 · ? 操作 · F1–F4 切页 · ↑/↓ 选择 · a 添加 · r 刷新 · Esc 返回".to_string();
     if let Some(profile) = profile {
         text.push_str(" · Enter 启动 · e 配置");
-        if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
+        if profile.auth_mode == AuthMode::Byok
+            && !subscription_account(profile)
+            && profile.model_provider != crate::magpie::PROVIDER
+        {
             text.push_str(" · b 额度设置");
         }
         if profile.auth_mode == AuthMode::Oauth {
@@ -190,13 +195,20 @@ fn shortcuts(profile: Option<&Profile>) -> super::shortcuts::Menu {
             Action::new(KeyCode::Enter, "Enter", "选择项目并启动 Agent"),
             action('e', "e", "编辑 Agent 配置"),
             action('E', "Shift+E", "用外部编辑器编辑完整 TOML"),
-            action('c', "c", "复制 Provider"),
-            action('d', "d / Delete", "移除 Provider（需确认）"),
         ]);
+        if profile.model_provider != crate::magpie::PROVIDER {
+            actions.extend([
+                action('c', "c", "复制 Provider"),
+                action('d', "d / Delete", "移除 Provider（需确认）"),
+            ]);
+        }
         if profile.auth_mode == AuthMode::Oauth {
             actions.push(action('l', "l", "重新登录 OAuth 账号"));
         }
-        if profile.auth_mode == AuthMode::Byok && !subscription_account(profile) {
+        if profile.auth_mode == AuthMode::Byok
+            && !subscription_account(profile)
+            && profile.model_provider != crate::magpie::PROVIDER
+        {
             actions.push(action('b', "b", "设置 New API 额度换算"));
         }
         if profile.source.is_some() {
@@ -296,7 +308,7 @@ pub(super) fn run_embedded(
     default_project: Option<PathBuf>,
 ) -> io::Result<Option<super::menu::Action>> {
     let mut manager = Manager::open_default().map_err(io::Error::other)?;
-    let mut profiles = manager.list().map_err(io::Error::other)?;
+    let mut profiles = crate::magpie::manager_profiles(&manager).map_err(io::Error::other)?;
     let mut selected = 0usize;
     let mut cwd = match default_project.filter(|path| path.is_dir()) {
         Some(path) => path,
@@ -578,6 +590,10 @@ pub(super) fn run_embedded(
                 }
                 KeyCode::Char('b') => {
                     if let Some(profile) = profile {
+                        if profile.model_provider == crate::magpie::PROVIDER {
+                            notice = "Magpie 额度与余额由内置连接直接读取".into();
+                            continue;
+                        }
                         let path = usage_config
                             .clone()
                             .unwrap_or_else(crate::config::default_config_path);
@@ -596,18 +612,29 @@ pub(super) fn run_embedded(
                 }
                 KeyCode::Char('e') => {
                     if let Some(profile) = profile {
-                        let result = super::provider_setup::edit(
-                            handle.clone(),
-                            &mut terminal,
-                            &|frame| draw_accounts(frame, &profiles, selected, &cwd, &notice),
-                            &profile,
-                        );
+                        let result = if profile.model_provider == crate::magpie::PROVIDER {
+                            super::provider_setup::configure_magpie(
+                                handle.clone(),
+                                &mut terminal,
+                                &|frame| draw_accounts(frame, &profiles, selected, &cwd, &notice),
+                            )
+                        } else {
+                            super::provider_setup::edit(
+                                handle.clone(),
+                                &mut terminal,
+                                &|frame| draw_accounts(frame, &profiles, selected, &cwd, &notice),
+                                &profile,
+                            )
+                        };
                         apply_setup(result, &manager, &mut profiles, &mut selected, &mut notice);
                     }
                 }
                 KeyCode::Char('E') => {
                     if let Some(p) = profile {
-                        match manager.revision(&p.id, p.revision) {
+                        match manager
+                            .resolve(&p.id)
+                            .and_then(|saved| manager.revision(&saved.id, saved.revision))
+                        {
                             Ok(rev) => {
                                 crate::ui::terminal::leave();
                                 let edited = codex_manager::cli::edit_text(&rev.config);
@@ -636,7 +663,11 @@ pub(super) fn run_embedded(
                 }
                 KeyCode::Char('d') | KeyCode::Delete => {
                     if let Some(p) = profile {
-                        prompt = Some(Prompt::Remove(p.id));
+                        if p.model_provider == crate::magpie::PROVIDER {
+                            notice = "Magpie 是内置 Provider，不能删除".into();
+                        } else {
+                            prompt = Some(Prompt::Remove(p.id));
+                        }
                     }
                 }
                 KeyCode::Char('i') => {
@@ -692,7 +723,7 @@ fn reload(
     notice: &mut String,
 ) {
     let id = profiles.get(*selected).map(|p| p.id.clone());
-    match manager.list() {
+    match crate::magpie::manager_profiles(manager) {
         Ok(new) => {
             *profiles = new;
             *selected = id
@@ -882,10 +913,11 @@ mod tests {
     use super::*;
     fn profile() -> Profile {
         Profile {
+            model_provider: "usage_byok".into(),
             id: "fixture".into(),
             name: "WorkBuddy".into(),
             revision: 1,
-            base_url: crate::plugins::account_endpoint(&uuid::Uuid::new_v4().to_string()),
+            base_url: format!("https://usage-plugin.invalid/{}/v1", uuid::Uuid::new_v4()),
             model: "model-a".into(),
             source: None,
             follow: false,

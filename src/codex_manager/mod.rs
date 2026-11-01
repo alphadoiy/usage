@@ -83,6 +83,8 @@ pub struct Profile {
     pub revision: i64,
     pub base_url: String,
     pub model: String,
+    /// Active model connection from the saved Agent configuration (not an upstream vendor).
+    pub model_provider: String,
     pub source: Option<String>,
     pub follow: bool,
     pub source_status: String,
@@ -292,6 +294,10 @@ impl Manager {
     }
 
     pub fn resolve(&self, selector: &str) -> Result<Profile> {
+        if selector == crate::magpie::BUILTIN_ID {
+            return crate::magpie::default_profile(self).map_err(Error::message)?
+                .ok_or_else(|| Error::message("Magpie 尚未选择模型；请按 e 配置，或使用 usage magpie configure --model <模型 ID>"));
+        }
         let profiles = list_profiles(&self.conn, true)?;
         if let Some(profile) = profiles.iter().find(|p| p.id == selector) {
             return Ok(profile.clone());
@@ -339,6 +345,9 @@ impl Manager {
         revision: i64,
     ) -> Result<crate::performance::Binding> {
         let saved = self.revision(&profile.id, revision)?;
+        if crate::magpie::is_config(&saved.config) {
+            return Err(Error::message("Magpie 请求性能请通过 Magpie 观测接口读取"));
+        }
         let config: toml::Value =
             toml::from_str(&saved.config).map_err(|_| Error::message("性能配置无效"))?;
         Ok(crate::performance::Binding {
@@ -391,7 +400,19 @@ impl Manager {
     }
 
     pub fn add(&mut self, name: &str, text: &str, key: &str) -> Result<Profile> {
+        if crate::magpie::is_config(text) {
+            return Err(Error::message(
+                "Magpie 是内置 Provider，不能添加或复制；请配置已有 Magpie",
+            ));
+        }
         self.insert_profile(name, text, key, false)
+    }
+
+    pub(crate) fn initialize_magpie(&mut self, text: &str, key: &str) -> Result<Profile> {
+        if !crate::magpie::is_config(text) {
+            return Err(Error::message("内置 Magpie 配置无效"));
+        }
+        self.insert_profile(crate::magpie::BUILTIN_NAME, text, key, false)
     }
 
     fn insert_profile(
@@ -455,6 +476,19 @@ impl Manager {
                 }
             };
             let old = self.revision(&profile.id, profile.revision)?;
+            if profile.model_provider == crate::magpie::PROVIDER
+                && !crate::magpie::is_config(&config)
+            {
+                return Err(Error::message("内置 Magpie 不能改为其他 Provider"));
+            }
+            if profile.model_provider != crate::magpie::PROVIDER
+                && crate::magpie::is_config(&config)
+                && !crate::magpie::legacy_endpoint(&profile.base_url)
+            {
+                return Err(Error::message(
+                    "Magpie 是内置 Provider，不能通过修改普通 Provider 添加",
+                ));
+            }
             op.begin("database_transaction");
             let tx = self
                 .conn
@@ -498,7 +532,13 @@ impl Manager {
     }
 
     pub fn copy(&mut self, selector: &str, name: &str) -> Result<Profile> {
+        if selector == crate::magpie::BUILTIN_ID {
+            return Err(Error::message("Magpie 是内置 Provider，不能复制或添加"));
+        }
         let profile = self.resolve(selector)?;
+        if profile.model_provider == crate::magpie::PROVIDER {
+            return Err(Error::message("Magpie 是内置 Provider，不能复制或添加"));
+        }
         if profile.auth_mode == AuthMode::Oauth {
             return Err(Error::message(
                 "OAuth 登录不能复制；请添加另一个账号并独立登录",
@@ -510,7 +550,13 @@ impl Manager {
     }
 
     pub fn remove(&mut self, selector: &str) -> Result<()> {
+        if selector == crate::magpie::BUILTIN_ID {
+            return Err(Error::message("Magpie 是内置 Provider，不能删除"));
+        }
         let p = self.resolve(selector)?;
+        if p.model_provider == crate::magpie::PROVIDER {
+            return Err(Error::message("Magpie 是内置 Provider，不能删除"));
+        }
         self.conn.execute(
             "UPDATE profiles SET archived=1,follow=0 WHERE id=?1",
             [&p.id],
@@ -962,6 +1008,11 @@ fn list_profiles(conn: &Connection, archived: bool) -> Result<Vec<Profile>> {
                 (url, model, None)
             };
             Ok(Profile {
+                model_provider: config::parse(&r.config)?
+                    .get("model_provider")
+                    .and_then(toml_edit::Item::as_str)
+                    .unwrap_or("openai")
+                    .into(),
                 id: r.id,
                 name: r.name,
                 revision: r.revision,

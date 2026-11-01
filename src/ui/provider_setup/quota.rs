@@ -65,9 +65,7 @@ pub(in crate::ui) fn edit(
     profile: &Profile,
     path: &Path,
 ) -> io::Result<bool> {
-    if profile.auth_mode != AuthMode::Byok
-        || crate::plugins::endpoint_account(&profile.base_url).is_some()
-    {
+    if profile.auth_mode != AuthMode::Byok || crate::magpie::legacy_endpoint(&profile.base_url) {
         return Err(io::Error::other("此账号不使用 New API 原始额度换算"));
     }
     let original = match std::fs::read_to_string(path) {
