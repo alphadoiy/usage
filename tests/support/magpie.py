@@ -13,6 +13,7 @@ import uuid
 
 binary = str(Path(sys.argv[1]).resolve())
 seen = []
+delivered = []
 models = [{"id": "group/coding", "owned_by": "group", "context_window": 200000,
            "reasoning_levels": ["low", "high"], "modalities": {"input": ["text", "image"], "output": ["text"]}},
           {"id": "vendor/model", "owned_by": "vendor"}]
@@ -48,14 +49,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         assert self.path == '/v1/responses'
-        assert self.headers.get("Authorization") == "Bearer synthetic-gateway-key"
-        assert self.headers.get('x-openai-actor-authorization') == 'magpie'
+        byok = self.headers.get('X-Fixture-Provider') == 'byok'
+        assert self.headers.get("Authorization") == ('Bearer synthetic-byok-key' if byok else 'Bearer synthetic-gateway-key')
+        if not byok:
+            assert self.headers.get('x-openai-actor-authorization') == 'magpie'
         data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         seen.append((data['model'], self.headers.get('X-Magpie-Account'), self.headers['session_id']))
+        delivered.append((self.headers.get('Authorization'), json.dumps(data)))
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
-        self.wfile.write(b'event: response.completed\ndata: {"type":"response.completed"}\n\n')
+        for event in [
+            {'type': 'response.created', 'response': {'id': 'fixture-response'}},
+            {'type': 'response.output_item.done', 'item': {'type': 'message', 'role': 'assistant', 'id': 'fixture-message',
+                'content': [{'type': 'output_text', 'text': 'Synthetic fixture reply'}]}},
+            {'type': 'response.completed', 'response': {'id': 'fixture-response', 'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}}
+        ]:
+            self.wfile.write(('event: '+event['type']+'\ndata: '+json.dumps(event)+'\n\n').encode())
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -101,7 +111,7 @@ def merge(target, source):
 for index,arg in enumerate(sys.argv):
     if arg=='-c':merge(config,tomllib.loads(sys.argv[index+1]))
 provider=config['model_providers'][config['model_provider']]
-assert config['model_provider']=='magpie'
+assert config['model_provider']=='custom'
 assert provider['base_url']==os.environ['EXPECTED_MAGPIE']+'/v1', provider
 catalog=json.loads(Path(config['model_catalog_json']).read_text())['models']
 assert [m['slug'] for m in catalog]==['group/coding','vendor/model']
@@ -195,20 +205,54 @@ with urllib.request.urlopen(request,timeout=5) as response:
                             env, root, root / 'native-magpie.stderr')
             try:
                 config = native.rpc('config/read', {'cwd': str(root)})['config']
-                assert config['model_provider'] == 'magpie', config
+                assert config['model_provider'] == 'custom', config
                 assert config['model'] == 'group/coding', config
                 listed = native.rpc('model/list', {})['data']
                 assert {m['id'] for m in listed} >= {'group/coding', 'vendor/model'}, listed
                 started = native.rpc('thread/start', {'cwd': str(root), 'model': 'group/coding'})
-                assert started['modelProvider'] == 'magpie', started
+                assert started['modelProvider'] == 'custom', started
+                thread_id = started['thread']['id']
+                native.complete_turn(thread_id, 'Magpie shared history fixture')
+                native.rpc('thread/name/set', {'threadId': thread_id, 'name': 'Shared Magpie fixture'})
                 print('Native Codex accepted Magpie configuration and generated model catalog')
             finally:
                 native.close()
+            # The same native thread is discoverable and resumable through an ordinary BYOK,
+            # with its own key and no Magpie-specific authorization header.
+            byok_config = root / 'native-byok.toml'
+            byok_config.write_text(f'''model = "vendor/model"
+model_provider = "another-vendor"
+[model_providers.another-vendor]
+name = "BYOK fixture"
+base_url = "{address}/v1"
+wire_api = "responses"
+[model_providers.another-vendor.http_headers]
+X-Fixture-Provider = "byok"
+''')
+            byok_env = dict(env, BYOK_NATIVE_KEY='synthetic-byok-key')
+            result = subprocess.run([binary, 'codex', 'add', 'Native BYOK', '--config', str(byok_config), '--key-env', 'BYOK_NATIVE_KEY'],
+                                    env=byok_env, cwd=root, text=True, capture_output=True, timeout=20)
+            assert result.returncode == 0, result.stderr
+            byok = Client([binary, 'codex', 'run', 'Native BYOK', '--cwd', str(root),
+                           '--binary', sys.argv[2], '--', 'app-server', '--listen', 'stdio://'],
+                          env, root, root / 'native-byok.stderr')
+            try:
+                visible = byok.rpc('thread/list', {'cwd': str(root), 'modelProviders': ['custom'], 'limit': 25})['data']
+                assert thread_id in {thread['id'] for thread in visible}, visible
+                resumed = byok.rpc('thread/resume', {'threadId': thread_id, 'modelProvider': 'custom', 'model': 'vendor/model'})
+                assert resumed['thread']['id'] == thread_id and resumed['modelProvider'] == 'custom', resumed
+                byok.complete_turn(thread_id, 'Continue through BYOK fixture')
+                assert any(key == 'Bearer synthetic-byok-key' and 'Magpie shared history fixture' in body
+                           and 'Continue through BYOK fixture' in body for key, body in delivered), delivered
+                print('Native Magpie -> BYOK: same thread resumed with BYOK key and full shared history')
+            finally:
+                byok.close()
+        requests_before_rejection = len(seen)
         # A missing model must fail before the Agent can send a request.
         models[:] = [models[1]]
         result = run(['codex', 'run', group['id'], '--cwd', str(root), '--binary', str(fake)], success=False)
         assert '不再提供' in result.stderr
-        assert len(seen) == 3
+        assert len(seen) == requests_before_rejection
         # Migrate in place, preserving saved revisions and profile identity.
         migrated = json.loads(run([*prefix, 'bind', '--name', 'Migrated', '--model', 'vendor/model', '--replace', group['id']]).stdout)
         assert migrated['id'] == group['id'] and migrated['revision'] == profiles[0]['revision'] + 1

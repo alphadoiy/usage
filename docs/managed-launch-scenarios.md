@@ -26,4 +26,4 @@
 - `python3 tests/support/managed_launch_config.py target/debug/usage /path/to/codex`：通过真实 Codex 的 `config/read` 检查用户目录、项目目录、并行账号和显式模型覆盖；临时 Home、合成凭据，不发起模型推理。
 - `cargo clippy --all-targets -- -D warnings` 与 `cargo fmt --check`。
 
-另一个既有脚本 `native_codex_context.py` 在当前安装的 Codex 0.166.0 上，跨 Provider 的 `thread/resume` 返回 `modelProviderNotConfigured`；本机已安装的旧版 Usage 同样复现。该兼容问题独立于本次配置优先级修复，不能将该脚本标记为通过。
+`native_codex_context.py` 已在 Codex 0.166.0 上验证：第三方运行时统一为 `custom`，原生 `/resume` 能发现并恢复不同第三方配置的会话，也能恢复自动迁移的旧分类；官方 `openai` 会话保持隔离。`magpie.py` 的真实 Codex 模式另验证 Magpie → 普通 BYOK 使用相同线程 ID、完整历史和目标实例凭据继续。官方与第三方不再承诺跨分类恢复。

@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum CodexCommand {
+    /// 将旧第三方会话统一归入 custom；保留官方会话，迁移前备份
+    UnifySessions {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// GPT 官方订阅模型指纹测试与每小时调度
     Fingerprint {
         #[command(subcommand)]
@@ -191,6 +196,7 @@ impl CodexCommand {
     /// Fixed command names only; never format the enum (it contains user input).
     pub(crate) fn log_name(&self) -> &'static str {
         match self {
+            Self::UnifySessions { .. } => "codex.unify_sessions",
             Self::Fingerprint { .. } => "codex.fingerprint",
             Self::ResumeLocal { .. } => "codex.resume_local",
             Self::Event => "codex.event",
@@ -261,6 +267,16 @@ fn fs_text(path: &Path) -> Result<String> {
 
 pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> Result<i32> {
     let command = match command {
+        CodexCommand::UnifySessions { dry_run } => {
+            let report =
+                super::shared_sessions::unify_third_party(&super::default_root(), dry_run)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|_| Error::message("无法输出迁移结果"))?
+            );
+            return Ok(0);
+        }
         CodexCommand::Fingerprint { command } => {
             return super::fingerprint::dispatch(command).await;
         }
@@ -411,7 +427,8 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
     };
     let mut manager = Manager::open(super::default_root())?;
     match command {
-        CodexCommand::Fingerprint { .. }
+        CodexCommand::UnifySessions { .. }
+        | CodexCommand::Fingerprint { .. }
         | CodexCommand::ResumeLocal { .. }
         | CodexCommand::Event
         | CodexCommand::Notify { .. }

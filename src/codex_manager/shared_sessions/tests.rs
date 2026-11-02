@@ -271,10 +271,7 @@ pathlib.Path('capture.json').write_text(json.dumps({'args':args,'key':os.environ
             .contains("https://b.invalid/v1")
     );
     let args = capture["args"].as_array().unwrap();
-    assert!(
-        args.iter()
-            .any(|arg| arg == "model_provider=\"second_provider\"")
-    );
+    assert!(args.iter().any(|arg| arg == "model_provider=\"custom\""));
     assert!(args.iter().any(|arg| arg == "model=\"native-b-choice\""));
     assert!(args.iter().any(|arg| {
         arg.as_str()
@@ -284,4 +281,35 @@ pathlib.Path('capture.json').write_text(json.dumps({'args':args,'key':os.environ
         fs::read_to_string(home_b.join("config.toml")).unwrap(),
         runtime
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_history_maintenance_allows_new_launch_but_blocks_explicit_resume() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let mut manager = fixture.manager();
+    let account = manager
+        .add("A", &native("https://a.invalid/v1", "a"), "key-a")
+        .unwrap();
+    let base = context::base_home(manager.root());
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("state_5.sqlite"), b"corrupted synthetic index").unwrap();
+    let binary = fixture.path.join("synthetic-codex");
+    fs::write(&binary, "#!/bin/sh\nif [ \"$1\" = '--help' ]; then echo '--no-daemon'; exit 0; fi\ntouch launched\n").unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        manager
+            .run(&account.id, &fixture.path, None, None, &binary, &[])
+            .unwrap()
+            .success()
+    );
+    assert!(fixture.path.join("launched").exists());
+    fs::remove_file(fixture.path.join("launched")).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let error = manager
+        .run(&account.id, &fixture.path, None, Some(&id), &binary, &[])
+        .unwrap_err();
+    assert!(error.to_string().contains("索引"), "{error}");
+    assert!(!fixture.path.join("launched").exists());
 }

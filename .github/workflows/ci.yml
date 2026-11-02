@@ -40,9 +40,11 @@ jobs:
       - name: TUI workflow contracts
         run: python3 tests/support/ui_workflows.py target/debug/usage
       - name: Install pinned native Codex for contract tests
-        run: npm install --prefix "$RUNNER_TEMP/usage-native-codex" --no-audit --no-fund @openai/codex@0.165.0
+        run: npm install --prefix "$RUNNER_TEMP/usage-native-codex" --no-audit --no-fund @openai/codex@0.166.0
       - name: Native Codex context and shared-session contracts
-        run: python3 tests/support/native_codex_context.py target/debug/usage "$RUNNER_TEMP/usage-native-codex/node_modules/.bin/codex"
+        run: |
+          python3 tests/support/native_codex_context.py target/debug/usage "$RUNNER_TEMP/usage-native-codex/node_modules/.bin/codex"
+          python3 tests/support/magpie.py target/debug/usage "$RUNNER_TEMP/usage-native-codex/node_modules/.bin/codex"
       - name: Experiment runner tests
         run: python3 -m unittest discover -s scripts/ablation -p 'test_*.py'
       - name: Ablation anchors

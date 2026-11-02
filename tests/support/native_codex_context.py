@@ -253,10 +253,10 @@ def main():
         (base / "modules").mkdir()
         (base / "tools").mkdir()
         (base / "tools/node").symlink_to("/usr/bin/true")
-        write(base / "config.toml", 'model="gpt-5.4"\nmodel_provider="global-only"\n'
+        write(base / "config.toml", 'model="gpt-5.4"\nmodel_provider="custom"\n'
               'check_for_update_on_startup=false\n'
               'cli_auth_credentials_store="file"\njs_repl_node_path="tools/node"\njs_repl_node_module_dirs=["modules"]\n'
-              f'[model_providers.global-only]\nname="Global fixture"\nbase_url="{stub.url}/default/v1"\nwire_api="responses"\n'
+              f'[model_providers.custom]\nname="Global fixture"\nbase_url="{stub.url}/default/v1"\nwire_api="responses"\n'
               '[analytics]\nenabled=false\n[tui]\nnotifications=false\nscreen_reader_detection_done=true\n'
               '[mcp_servers.fixture]\ncommand="true"\nenabled=false\n'
               '[sandbox_workspace_write]\nwritable_roots=["shared-files"]\n'
@@ -291,15 +291,41 @@ def main():
             native_skills = {skill["name"] for entry in entries for skill in entry["skills"]}
         finally:
             baseline.close()
+        official_env = dict(env, OPENAI_API_KEY="synthetic-official-key")
+        official = Client([codex, '-c', 'model_provider="openai"', '-c',
+                           f'openai_base_url="{stub.url}/official/v1"',
+                           'app-server', '--listen', 'stdio://'],
+                          official_env, project, root / 'official.stderr')
+        try:
+            official_id = official.rpc('thread/start', {'cwd': str(project), 'model': 'gpt-5.4'})['thread']['id']
+            official.complete_turn(official_id, 'Official isolated fixture history')
+            official.rpc('thread/name/set', {'threadId': official_id, 'name': 'Official fixture'})
+        finally:
+            official.close()
+        legacy = Client([codex, '-c', 'model_provider="legacy-third-party"', '-c',
+                         f'model_providers.legacy-third-party={{name="Legacy fixture",base_url="{stub.url}/legacy/v1",wire_api="responses"}}',
+                         'app-server', '--listen', 'stdio://'],
+                        env, project, root / 'legacy.stderr')
+        try:
+            legacy_id = legacy.rpc('thread/start', {'cwd': str(project), 'model': 'gpt-5.4'})['thread']['id']
+            legacy.complete_turn(legacy_id, 'Legacy third-party fixture history')
+            legacy.rpc('thread/name/set', {'threadId': legacy_id, 'name': 'Legacy third-party fixture'})
+        finally:
+            legacy.close()
         thread_id = None
         for name in ["A", "B", "C"]:
-            provider = "second-provider" if name == "C" else "usage_byok"
+            provider = "custom"
             command = [usage, "codex", "run", accounts[name], "--cwd", str(project),
                        "--binary", codex, "--", "app-server", "--listen", "stdio://"]
             client = Client(command, env, project, root / f"{name}.stderr")
             try:
                 config = client.rpc("config/read", {"cwd": str(project)})["config"]
                 assert config["model_provider"] == provider, config
+                third_party = client.rpc('thread/list', picker_params('custom'))['data']
+                assert official_id not in {thread['id'] for thread in third_party}, third_party
+                all_threads = client.rpc('thread/list', {'cwd': str(project), 'modelProviders': []})['data']
+                assert official_id in {thread['id'] for thread in all_threads}, all_threads
+                assert legacy_id in {thread['id'] for thread in third_party}, third_party
                 assert config["mcp_servers"]["fixture"]["enabled"] is False, config
                 for field in ["sandbox_workspace_write", "js_repl_node_path", "js_repl_node_module_dirs"]:
                     assert config[field] == native_config[field], (field, config[field], native_config[field])
@@ -321,7 +347,7 @@ def main():
                                            "--binary", codex, "--", "app-server", "--listen", "stdio://"],
                                           env, project, root / "B-concurrent.stderr")
                     try:
-                        visible = concurrent_b.rpc("thread/list", picker_params("usage_byok"))["data"]
+                        visible = concurrent_b.rpc("thread/list", picker_params("custom"))["data"]
                         assert thread_id in {thread["id"] for thread in visible}, visible
                         assert client.process.poll() is None, "A must still be running for this visibility check"
                     finally:
@@ -334,7 +360,7 @@ def main():
                     # Match the real /resume picker's provider and cwd filters. An empty
                     # modelProviders array is a separate all-provider API, not the picker.
                     visible = client.rpc("thread/list", picker_params(provider))["data"]
-                    assert (thread_id in {thread["id"] for thread in visible}) == (name == "B"), visible
+                    assert thread_id in {thread["id"] for thread in visible}, visible
                     all_providers = client.rpc("thread/list", {"cwd": str(project), "modelProviders": []})["data"]
                     assert thread_id in {thread["id"] for thread in all_providers}, all_providers
                     thread = client.rpc("thread/read", {"threadId": thread_id})["thread"]
@@ -357,6 +383,7 @@ def main():
                     terminal.until(lambda: "gpt-5.4" in terminal.text(), "native B prompt")
                     terminal.submit("/resume")
                     terminal.until(lambda: "Shared A fixture" in terminal.text(), "A in B's native /resume picker")
+                    os.write(terminal.fd, b'Shared A fixture')
                     resume_start = len(terminal.data)
                     time.sleep(0.3)
                     os.write(terminal.fd, b"\r")
@@ -372,6 +399,25 @@ def main():
                     print("Native B /resume: A visible, history restored, B route and credential confirmed", flush=True)
                 finally:
                     terminal.close()
+        terminal = Terminal([usage, 'codex', 'run', accounts['A'], '--cwd', str(project), '--binary', codex], env, project)
+        try:
+            terminal.until(lambda: 'gpt-5.4' in terminal.text(), 'native A prompt for migrated history')
+            terminal.submit('/resume')
+            terminal.until(lambda: 'Legacy third-party fixture' in terminal.text(), 'migrated legacy thread in native /resume')
+            os.write(terminal.fd, b'Legacy third-party fixture')
+            time.sleep(0.3)
+            resume_start = len(terminal.data)
+            os.write(terminal.fd, b'\r')
+            terminal.until(lambda: 'Syntheticfixturereply' in terminal.compact_text(resume_start), 'legacy native history restored')
+            reply_start = len(terminal.data)
+            terminal.submit('Continue migrated legacy fixture')
+            terminal.until(lambda: any(path == '/a/v1/responses' and auth == 'Bearer synthetic-key-A'
+                                      and b'Legacy third-party fixture history' in body and b'Continue migrated legacy fixture' in body
+                                      for path, auth, body in stub.requests), 'legacy history continued with current A route and credential')
+            terminal.until(lambda: 'Syntheticfixturereply' in terminal.compact_text(reply_start), 'legacy migrated fixture turn completed')
+            print('Native /resume: migrated legacy third-party history visible and continued with current provider', flush=True)
+        finally:
+            terminal.close()
         nested_env = dict(env)
         nested_env.pop("USAGE_CODEX_BASE_HOME")
         nested_env["CODEX_HOME"] = str(root / "manager/homes" / accounts["A"] / "r1")
@@ -388,14 +434,18 @@ def main():
             with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
                 return connection.execute("SELECT model_provider, model, reasoning_effort FROM threads WHERE id=?",
                                           (thread_id,)).fetchone()
-        assert current_model_settings()[0] == "second-provider"
+        assert current_model_settings()[0] == "custom"
         home_config_before = (base / "config.toml").read_bytes()
         local_command = [usage, "codex", "resume-local", "--home", str(base), "--cwd", str(project),
                          "--session", thread_id, "--binary", str(native)]
         terminal = Terminal(local_command, env, project)
         try:
-            terminal.until(lambda: current_model_settings()[0] == "global-only", "ordinary Enter's default provider")
-            assert "Model provider `second-provider` not found" not in terminal.text()
+            terminal.until(lambda: 'gpt-5.4' in terminal.text(), "ordinary Enter's default provider")
+            terminal.submit('Verify native default fixture route')
+            terminal.until(lambda: any(path == '/default/v1/responses' and b'Verify native default fixture route' in body
+                                      for path, _, body in stub.requests), "ordinary Enter's default route")
+            terminal.until(lambda: 'Syntheticfixturereply' in terminal.compact_text(), "native default fixture completion")
+            assert "Model provider `custom` not found" not in terminal.text()
         finally:
             terminal.close()
         assert (base / "config.toml").read_bytes() == home_config_before, "".join(difflib.unified_diff(

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 mod migration;
 mod mutation;
+mod provider_history;
 pub(crate) use mutation::SessionMutation;
+pub(crate) use provider_history::ProviderHistoryReport;
 
 #[cfg(test)]
 mod tests;
@@ -100,21 +102,8 @@ impl SessionStore {
     }
 
     pub(crate) fn index(&self) -> io::Result<Option<(u32, PathBuf)>> {
-        if !self.index_dir.is_dir() {
-            return Ok(None);
-        }
-        Ok(fs::read_dir(&self.index_dir)?
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let version = name
-                    .to_str()?
-                    .strip_prefix("state_")?
-                    .strip_suffix(".sqlite")?
-                    .parse()
-                    .ok()?;
-                Some((version, entry.path()))
-            })
+        Ok(index_paths(&self.index_dir)?
+            .into_iter()
             .max_by_key(|(version, _)| *version))
     }
 
@@ -122,10 +111,58 @@ impl SessionStore {
         SessionMutation::acquire(&self.root)
     }
 
+    pub(crate) fn unify_third_party(
+        &self,
+        target: &str,
+        backups: &Path,
+        dry_run: bool,
+    ) -> Result<ProviderHistoryReport, String> {
+        provider_history::unify(self, target, backups, dry_run, provider_history::Scan::All)
+    }
+
+    pub(crate) fn prepare_third_party(
+        &self,
+        target: &str,
+        backups: &Path,
+    ) -> Result<ProviderHistoryReport, String> {
+        provider_history::unify(
+            self,
+            target,
+            backups,
+            false,
+            provider_history::Scan::Indexed,
+        )
+    }
+
     /// Mutating operation with an explicit source and destination; no account discovery.
     pub(crate) fn attach_legacy_home(&self, source: &Path) -> io::Result<()> {
         migration::attach(source, self)
     }
+}
+
+/// Shared native index discovery, ordered so mutations acquire database locks consistently.
+fn index_paths(directory: &Path) -> io::Result<Vec<(u32, PathBuf)>> {
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        if let Some(version) = name
+            .to_str()
+            .and_then(|s| s.strip_prefix("state_"))
+            .and_then(|s| s.strip_suffix(".sqlite"))
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            paths.push((version, entry.path()));
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn read_absolute_path(path: &Path) -> Option<PathBuf> {

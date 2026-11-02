@@ -516,7 +516,7 @@ fn unavailable_gateway_preparation_keeps_direct_endpoint_credentials_and_launch(
 }
 
 #[test]
-fn unaddressable_provider_id_fails_launch_instead_of_connecting_directly() {
+fn third_party_provider_alias_with_dots_uses_the_shared_id_and_observation_gateway() {
     let f = Fixture::new();
     let upstream = Upstream::new();
     let config = f.path.join("dotted.toml");
@@ -554,23 +554,21 @@ fn unaddressable_provider_id_fails_launch_instead_of_connecting_directly() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let status = f
-        .start_expect(
-            "dotted",
-            "123e4567-e89b-12d3-a456-426614174009",
-            "json",
-            true,
-        )
-        .wait()
-        .unwrap();
-    assert!(!status.success());
-    let stderr = fs::read_to_string(f.path.join("dotted.stderr")).unwrap();
-    assert!(stderr.contains("启动失败"), "{stderr}");
-    assert!(
-        !f.path.join("dotted.ready").exists(),
-        "Codex must not start directly"
+    let mut child = f.start_expect(
+        "dotted",
+        "123e4567-e89b-12d3-a456-426614174009",
+        "json",
+        false,
     );
-    assert!(upstream.calls.lock().unwrap().is_empty());
+    f.wait("dotted.ready");
+    fs::write(f.path.join("dotted.go"), "").unwrap();
+    f.wait("dotted.result");
+    assert!(child.wait().unwrap().success());
+    let calls = upstream.calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[("Bearer synthetic-key".into(), "requested-model".into())]
+    );
 }
 
 #[test]

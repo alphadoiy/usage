@@ -35,6 +35,44 @@ pub(super) fn native(url: &str, model: &str) -> String {
 }
 
 #[test]
+fn third_party_launch_projection_keeps_routes_and_saved_identity_and_leaves_oauth_native() {
+    for provider in ["usage_byok", "magpie", "vendor", "custom"] {
+        let text =
+            native("https://fixture.invalid/v1", "fixture-model").replace("usage_byok", provider);
+        let mut doc = config::parse(&text).unwrap();
+        doc["model_providers"][provider]["http_headers"]["X-Magpie-Account"] =
+            toml_edit::value("account-a");
+        doc["features"]["hooks"] = toml_edit::value(true);
+        let saved = doc.to_string();
+        let launched =
+            config::parse(&config::launch_config(&saved, AuthMode::Byok).unwrap()).unwrap();
+        assert_eq!(launched["model_provider"].as_str(), Some("custom"));
+        assert_eq!(launched["model"].as_str(), Some("fixture-model"));
+        assert_eq!(launched["model_reasoning_effort"].as_str(), Some("high"));
+        let original: toml::Value = toml::from_str(&saved).unwrap();
+        let effective: toml::Value = toml::from_str(&launched.to_string()).unwrap();
+        assert_eq!(
+            effective["model_providers"]["custom"],
+            original["model_providers"][provider]
+        );
+        assert_eq!(effective["features"], original["features"]);
+        assert_eq!(
+            config::parse(&saved).unwrap()["model_provider"].as_str(),
+            Some(provider)
+        );
+    }
+    let official = oauth::normalize_config("model='fixture-model'").unwrap();
+    assert_eq!(
+        config::launch_config(&official, AuthMode::Oauth).unwrap(),
+        official
+    );
+    assert_eq!(
+        config::parse(&official).unwrap()["model_provider"].as_str(),
+        Some("openai")
+    );
+}
+
+#[test]
 fn add_rejects_equivalent_provider_configs_but_keeps_distinct_keys_models_and_explicit_copies() {
     let f = Fixture::new();
     let mut manager = f.manager();

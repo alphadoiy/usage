@@ -146,6 +146,25 @@ impl Manager {
                 tracing::warn!(event = "session_share_deferred", reason = %error);
             }
         }
+        if profile.auth_mode == AuthMode::Byok {
+            match op.step("third_party_history_unify", || {
+                super::shared_sessions::prepare_third_party(&self.root)
+            }) {
+                Ok(report) => tracing::info!(
+                    event = "third_party_history_unified",
+                    files = report.files,
+                    index_rows = report.index_rows,
+                    deferred = report.deferred,
+                    reasons = ?report.deferred_reasons,
+                ),
+                // Explicit resume depends on migration succeeding. A fresh launch can
+                // still use its configured route and the already unified history.
+                Err(error) if resume.is_some() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(event = "third_party_history_deferred", reason = %error)
+                }
+            }
+        }
         let saved = op.step("revision_read", || self.revision(&profile.id, revision))?;
         let key = if profile.auth_mode == AuthMode::Byok {
             Some(op.step("credential_read", || {
@@ -307,6 +326,10 @@ impl Manager {
             AuthMode::Oauth => home.join(format!("usage-r{revision}.config.toml")),
         };
         let runtime_config = std::fs::read_to_string(runtime_path)?;
+        if !config::matches_runtime_config(&runtime_config, &selected.saved.config) {
+            return Err(Error::message("运行配置已改变，请重新启动"));
+        }
+        let runtime_config = config::launch_config(&runtime_config, profile.auth_mode)?;
         // A selected Usage instance owns startup routing/model defaults in every cwd,
         // including ~ where the ordinary user config can also be a project layer.
         launcher::pin_managed_config(&mut command, &runtime_config)?;
@@ -333,20 +356,16 @@ impl Manager {
     ) -> Result<crate::runs::CapturedContext> {
         let Selected {
             profile,
-            saved,
             key,
             magpie,
             ..
         } = selected;
         // Resolve the same snapshot already pinned into the command. A concurrent
         // preference edit must not change the identity captured for this launch.
-        let runtime_config = prepared.runtime_config.clone();
-        if !config::matches_runtime_config(&runtime_config, &saved.config) {
-            return Err(Error::message("运行配置已改变，请重新启动"));
-        }
+        let runtime_config = &prepared.runtime_config;
         let environment = |name: &str| std::env::var(name).ok();
         let effective = effective::resolve(
-            &runtime_config,
+            runtime_config,
             profile.auth_mode,
             &prepared.cwd,
             resume.is_some(),
@@ -361,7 +380,7 @@ impl Manager {
             // Resume resource identity still waits for Agent evidence. The requested
             // transport can be validated independently and is pinned by managed config.
             let transport = effective::resolve(
-                &runtime_config,
+                runtime_config,
                 profile.auth_mode,
                 &prepared.cwd,
                 false,
@@ -374,7 +393,7 @@ impl Manager {
             }) {
                 return Err(Error::message("Magpie 启动配置被覆盖，无法确认模型连接"));
             }
-            let saved_model = config::summary(&runtime_config)?.1;
+            let saved_model = config::summary(runtime_config)?.1;
             let model = transport
                 .identity
                 .model

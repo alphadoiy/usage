@@ -389,12 +389,12 @@ fn mutation_guard(
 }
 
 fn codex_metadata(path: &Path, compressed: bool) -> Result<Option<serde_json::Value>> {
-    let file = File::open(path).map_err(err)?;
-    let input: Box<dyn Read> = if compressed {
-        Box::new(ruzstd::decoding::StreamingDecoder::new(file).map_err(err)?)
+    let input = if compressed {
+        crate::logfiles::open_archive(path)
     } else {
-        Box::new(file)
-    };
+        crate::logfiles::open(path)
+    }
+    .map_err(err)?;
     Ok(BufReader::new(input.take(1024 * 1024))
         .lines()
         .take(8)

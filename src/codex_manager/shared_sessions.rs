@@ -18,3 +18,29 @@ pub(super) fn prepare(source: &Path, destination: &Path) -> Result<()> {
         .attach_legacy_home(source)
         .map_err(Into::into)
 }
+
+pub(crate) fn unify_third_party(
+    root: &Path,
+    dry_run: bool,
+) -> Result<crate::codex_native::ProviderHistoryReport> {
+    SessionStore::for_default_home(&target_home(root))
+        .unify_third_party(
+            super::config::THIRD_PARTY_PROVIDER,
+            &root.join("backups/third-party-history-v1"),
+            dry_run,
+        )
+        .map_err(super::Error::message)
+}
+
+/// Launch maintenance uses indexed legacy providers; a newly attached legacy Home
+/// also needs a full scan because its transcripts may not have native index rows yet.
+pub(super) fn prepare_third_party(
+    root: &Path,
+) -> Result<crate::codex_native::ProviderHistoryReport> {
+    SessionStore::for_default_home(&target_home(root))
+        .prepare_third_party(
+            super::config::THIRD_PARTY_PROVIDER,
+            &root.join("backups/third-party-history-v1"),
+        )
+        .map_err(super::Error::message)
+}

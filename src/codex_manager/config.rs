@@ -2,6 +2,34 @@ use super::{Error, Result};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub const KEY_ENV: &str = "USAGE_CODEX_API_KEY";
+/// Codex's native history bucket for every managed third-party connection.
+/// Saved profiles keep their original provider IDs for source identity and old revisions.
+pub const THIRD_PARTY_PROVIDER: &str = "custom";
+
+pub(super) fn launch_config(text: &str, mode: super::AuthMode) -> Result<String> {
+    if mode == super::AuthMode::Oauth {
+        return Ok(text.to_owned());
+    }
+    let mut doc = parse(text)?;
+    let selected = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .ok_or_else(|| Error::message("第三方配置缺少模型提供方"))?
+        .to_owned();
+    if selected == THIRD_PARTY_PROVIDER {
+        return Ok(text.to_owned());
+    }
+    let providers = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| Error::message("第三方模型提供方配置无效"))?;
+    let active = providers
+        .remove(&selected)
+        .ok_or_else(|| Error::message("找不到第三方模型提供方配置"))?;
+    providers.insert(THIRD_PARTY_PROVIDER, active);
+    doc["model_provider"] = value(THIRD_PARTY_PROVIDER);
+    Ok(doc.to_string())
+}
 /// Known `model_reasoning_effort` values, weakest first, matching magpie's effort rank.
 /// A model may accept only some, and others pass through.
 pub const REASONING_EFFORTS: [&str; 8] = [

@@ -22,7 +22,7 @@ usage magpie --address https://gateway.example --key-env MAGPIE_GATEWAY_KEY mode
 
 指定来源不代表固定账号，也不代表关闭 Magpie 的后备规则。`configure --account <账号标识>` 将 `X-Magpie-Account` 固定到实例配置；账号标识由 Magpie 提供，不是 Usage OAuth 账号 ID。未指定时由 Magpie 调度。
 
-启动配置使用显式的 `model_provider = "magpie"` 标识模型连接，通过现有 Manager 保存版本。已有多个旧 Magpie 预设时，界面收敛到一个内置入口，原配置及历史保留；后续配置修改沿用同一个 Profile。启动前验证 `/api/hello` 和实时目录，生成该实例的 Codex `model_catalog_json`，并拒绝已移除的模型。Agent 直接连接 Magpie，即使 `USAGE_GATEWAY=off` 也能运行。原生全局 Codex 配置不被改写；原生 Agent 子进程环境继续清除继承的认证覆盖。更改 Usage 配置从下一次启动生效，更改 Magpie 路由规则按 Magpie 的轮次语义生效。
+保存的启动配置使用显式的 `model_provider = "magpie"` 标识模型连接，通过现有 Manager 保存版本；启动时将选中的模型提供方表投影为 `custom`，与所有托管第三方共用 Codex 原生 `/resume` 分类，官方 OAuth 仍保留 `openai`。路由地址、凭据、固定账号请求头和模型目录保持原配置。已有多个旧 Magpie 预设时，界面收敛到一个内置入口，原配置及历史保留；后续配置修改沿用同一个 Profile。启动前验证 `/api/hello` 和实时目录，生成该实例的 Codex `model_catalog_json`，并拒绝已移除的模型。Agent 直接连接 Magpie，即使 `USAGE_GATEWAY=off` 也能运行。原生全局 Codex 配置不被改写；原生 Agent 子进程环境继续清除继承的认证覆盖。更改 Usage 配置从下一次启动生效，更改 Magpie 路由规则按 Magpie 的轮次语义生效。
 
 ## 看板与观测
 

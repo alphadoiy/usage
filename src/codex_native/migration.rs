@@ -162,6 +162,9 @@ pub(super) fn attach(account_home: &Path, store: &SessionStore) -> Result<()> {
             Err(error) => return Err(error),
         }
     }
+    if !moves.is_empty() || !base.join(SHARED_INDEX_MARKER).exists() {
+        super::provider_history::schedule_full_scan(store).map_err(std::io::Error::other)?;
+    }
     // Link then unlink preserves file identity without ever replacing a destination. A retry
     // also handles interruption between the two operations. Cross-device moves fail safely.
     for (from, to) in moves {

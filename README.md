@@ -193,7 +193,16 @@ BYOK 每次编辑或源配置更新生成新版本，账号凭据与连接配置
 
 Codex 可以正常保存模型、推理强度、通知、信任设置和其他偏好，不会再因普通偏好变化被判定为“配置被修改”。启动时将新增全局配置与实例中保存的偏好合并；已经在实例内改过或删除的设置保留，不回写全局 `config.toml`。只有供应商路由和认证配置变化需要通过 Usage 保存新版本，错误会指出发生变化的字段。
 
-所有账号与默认 Codex 共用 `sessions`、`archived_sessions`、SQLite 会话索引和原生线程写锁。同一会话在 Usage 中只显示和统计一次；首页项目列表或 F3 会话页按 `Shift+P` 选择本次使用的 Provider，也可运行 `usage codex run <目标账号> --resume <会话UUID>`，可选 `--revision N`。共享后的普通 `Enter` 使用默认 Codex 配置；显式选择 Provider 时使用目标账号的连接和凭据。普通 BYOK 账号使用相同的原生 `usage_byok` 标识，在同一项目的 Codex 恢复列表中可以互相看到会话。Codex 自带列表仍按原生 provider 标识筛选；自定义标识不同或 OAuth 与 BYOK 之间恢复时，使用上述 Usage 入口显式选择目标账号。
+所有账号与默认 Codex 共用 `sessions`、`archived_sessions`、SQLite 会话索引和原生线程写锁。同一会话在 Usage 中只显示和统计一次；首页项目列表或 F3 会话页按 `Shift+P` 选择本次使用的 Provider，也可运行 `usage codex run <目标账号> --resume <会话UUID>`，可选 `--revision N`。共享后的普通 `Enter` 使用默认 Codex 配置；显式选择 Provider 时使用目标账号的连接和凭据。
+
+官方 OAuth 保留原生 `openai` 身份，所有托管第三方（BYOK、Magpie、导入配置）启动时统一投影为 `custom`。第三方之间可以直接在 Codex 原生 `/resume` 列表中找到并继续同一会话；实际连接、密钥、模型和配置版本仍按实例隔离。保存的 Provider ID 和历史配置不被改写。官方和第三方历史保持两个分类；Codex 0.166 的 Provider 校验仍生效，统一标识不会赋予第三方官方工具或跨后端加密内容的兼容能力。
+
+第三方首次启动或接入旧会话目录时，会扫描旧第三方历史；后续启动只查询原生索引中的旧分类和待重试路径，索引缺少路径字段时回退全量扫描。迁移同步 JSONL 的 `session_meta.model_provider` 与原生索引，保留正文、压缩格式、会话 ID 和时间。官方分类不迁移，活动写锁对应的会话延后重试。迁移前将原文件、包含 WAL 数据的 SQLite 快照和逐会话映射记录保存到账号库的 `backups/third-party-history-v1/`。索引冲突会回滚事务，文件写入失败会尝试恢复；跨索引版本提交中断会明确报错，下次迁移可继续。后台迁移错误会记录到日志，新会话仍可启动，显式恢复则停止并报错。手动放入共享目录且没有索引的新历史，可独立全量预览或迁移：
+
+```sh
+usage codex unify-sessions --dry-run
+usage codex unify-sessions
+```
 
 原生恢复列表不显示尚无用户消息的空会话。普通恢复沿用 Codex 原生解析的有效配置，保留受信项目的模型和推理强度设置；项目文件中的 Provider 路由仍按原生规则忽略。
 
@@ -222,7 +231,7 @@ usage codex run personal --cwd ~/Coding/project
 
 登录和 refresh token 刷新交给官方 Codex CLI，不自行实现 OAuth 端点或在应用中硬编码 client ID。[官方认证文档](https://learn.chatgpt.com/docs/auth)说明 CLI 支持浏览器 / 设备码登录，以及文件凭据存储。设备码授权需要个人或工作区启用该功能。新增账号默认使用 CLI 的默认模型，也可选择账号可用的模型。
 
-OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `auth.json`；目录权限 `700`，凭据文件权限 `600`，明文存储，不接入 Keychain。SQLite 保存身份信息和配置，令牌不进入数据库、导出的 TOML、账号列表或启动命令。配置版本使用 `usage-rN.config.toml`，通过原生 `--profile` 选择；需要 **Codex CLI 0.134.0 或更新版本**（[原生 profile 文档](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)）。修改配置不会复制或还原旧 token，CLI 刷新后继续使用最新凭据。在共享会话列表中可选择该 OAuth 账号继续任意会话，默认使用该账号当前配置；可用 `run --revision N --resume UUID` 显式选择旧配置，仍使用最新登录。
+OAuth 每个账号使用一个固定 `CODEX_HOME`，登录保存在其中的 `auth.json`；目录权限 `700`，凭据文件权限 `600`，明文存储，不接入 Keychain。SQLite 保存身份信息和配置，令牌不进入数据库、导出的 TOML、账号列表或启动命令。配置版本使用 `usage-rN.config.toml`，通过原生 `--profile` 选择；需要 **Codex CLI 0.134.0 或更新版本**（[原生 profile 文档](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles)）。修改配置不会复制或还原旧 token，CLI 刷新后继续使用最新凭据。在共享会话列表中可选择该 OAuth 账号继续官方会话，默认使用该账号当前配置；可用 `run --revision N --resume UUID` 显式选择旧配置，仍使用最新登录。
 
 不同 OAuth 账号、同一 OAuth 账号都可以并行运行。同账号实例共用一个 `CODEX_HOME` 和 `auth.json`，通过原生 profile 选择各自配置版本，token 刷新及凭据重新加载由 Codex CLI 处理。macOS/Linux 的运行实例及其仍存活的子任务持有共享锁，不限制多开；即使 `usage` 启动器异常退出，也不会提前释放运行锁。重新登录和导入替换凭据需要独占锁，必须先关闭该账号的所有托管实例和子任务。运行中允许保存新的配置版本。OAuth 不能复制为另一个账号，以免复制 refresh token。重新登录失败、取消或身份不符时，原账号登录保留。登录暂存目录在流程结束后清理。
 

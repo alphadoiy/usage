@@ -59,6 +59,9 @@ fn rejected_split_does_not_initialize_account_store() {
     let output = f
         .command(&["run", "missing", "--split"])
         .env_remove("GHOSTTY_RESOURCES_DIR")
+        .env_remove("REX_SESSION")
+        .env_remove("REX_BIN_DIR")
+        .env_remove("REX_SERVER")
         .env("TERM_PROGRAM", "usage-test")
         .output()
         .unwrap();
@@ -829,7 +832,7 @@ fn same_account_opens_twice_and_resume_pins_original_revision() {
     assert_eq!(&lines[2..6], ["unset", "unset", "unset", "unset"]);
     assert_eq!(lines[6], "--no-daemon");
     assert_eq!(&lines[lines.len() - 2..], ["resume", &session]);
-    assert!(lines.contains(&"model_provider=\"usage_byok\""));
+    assert!(lines.contains(&"model_provider=\"custom\""));
     assert!(
         lines
             .iter()
