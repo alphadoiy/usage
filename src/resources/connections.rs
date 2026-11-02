@@ -296,83 +296,110 @@ pub fn render_text(reports: &[ResourceReport]) -> String {
             lines.push("  查询成功，当前范围暂无账单项目".into());
         }
         for metric in &snapshot.metrics {
-            lines.push(match metric {
-                ResourceMetric::RequestUsage {
-                    name, requests, failed_requests, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
-                } => format!(
-                    "  {name} · 请求 {requests} 次 · 失败 {failed_requests} 次 · 输入 {input_tokens} / 输出 {output_tokens} Token · 缓存读取 {cache_read_tokens} / 写入 {cache_write_tokens} Token · 推理 {reasoning_tokens} Token"
-                ),
-                ResourceMetric::ReportedBalance { name, display } => {
-                    format!("  {name} 余额：{display}")
-                }
-                ResourceMetric::Balance { remaining } => {
-                    format!(
-                        "  余额 {} {}{}",
-                        remaining.amount,
-                        remaining.currency,
-                        if snapshot.service == "new_api_token" {
-                            "（接口返回）"
-                        } else {
-                            ""
-                        }
-                    )
-                }
-                ResourceMetric::Cost {
-                    used,
-                    period_start,
-                    period_end,
-                } => format!(
-                    "  费用 {} {} · {} 至 {} (UTC)",
-                    used.amount,
-                    used.currency,
-                    period_start.format("%Y-%m-%d %H:%M"),
-                    period_end.format("%Y-%m-%d %H:%M")
-                ),
-                ResourceMetric::Allowance {
-                    remaining,
-                    used,
-                    unit,
-                    unlimited,
-                } => format!(
-                    "  {} · 已用 {} · {}",
-                    unit,
-                    used.as_deref().unwrap_or("未知"),
-                    if *unlimited {
-                        match remaining {
-                            Some(value) => format!("剩余 {value} · 令牌不限额"),
-                            None => "令牌额度不限量（不代表账号余额无限）".into(),
-                        }
-                    } else {
-                        format!("剩余 {}", remaining.as_deref().unwrap_or("未知"))
-                    }
-                ),
-                ResourceMetric::QuotaWindow {
-                    name, used_percent, ..
-                } => format!("  {name} · 已用 {used_percent:.0}%"),
-                ResourceMetric::AllowanceWindow {
-                    name,
-                    used,
-                    limit,
-                    remaining,
-                    unit,
-                    resets_at,
-                } => format!(
-                    "  {name} · 已用 {used} / {limit} {unit} · 剩余 {remaining}{}",
-                    resets_at
-                        .map(|t| format!(" · {} 重置", t.to_rfc3339()))
-                        .unwrap_or_default()
-                ),
-                ResourceMetric::ResetCredits { available } => {
-                    format!("  主动重置 {available} 次")
-                }
-                ResourceMetric::Spending { used, currency, .. } => format!(
-                    "  支出 {} {}",
-                    used.map(|v| v.to_string()).unwrap_or_else(|| "未知".into()),
-                    currency.as_deref().unwrap_or("")
-                ),
-            });
+            lines.push(render_metric(metric, &snapshot.service));
         }
     }
     lines.join("\n")
+}
+
+fn render_metric(metric: &ResourceMetric, service: &str) -> String {
+    match metric {
+        ResourceMetric::Account { account } => {
+            let status = match account.status {
+                crate::resources::AccountStatus::Ready => "",
+                crate::resources::AccountStatus::Pending => " · 待查询",
+                crate::resources::AccountStatus::Failed => " · 查询失败",
+                crate::resources::AccountStatus::Cached => " · 缓存",
+            };
+            let mut lines = vec![format!(
+                "  {} {}{status}",
+                account.name,
+                account.user.as_deref().unwrap_or("")
+            )];
+            lines.extend(account.metrics.iter().map(|m| render_metric(m, service)));
+            lines.join("\n")
+        }
+
+        ResourceMetric::RequestUsage {
+            name,
+            requests,
+            failed_requests,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+        } => format!(
+            "  {name} · 请求 {requests} 次 · 失败 {failed_requests} 次 · 输入 {input_tokens} / 输出 {output_tokens} Token · 缓存读取 {cache_read_tokens} / 写入 {cache_write_tokens} Token · 推理 {reasoning_tokens} Token"
+        ),
+        ResourceMetric::ReportedBalance { name, display } => {
+            format!("  {name} 余额：{display}")
+        }
+        ResourceMetric::Balance { remaining } => {
+            format!(
+                "  余额 {} {}{}",
+                remaining.amount,
+                remaining.currency,
+                if service == "new_api_token" {
+                    "（接口返回）"
+                } else {
+                    ""
+                }
+            )
+        }
+        ResourceMetric::Cost {
+            used,
+            period_start,
+            period_end,
+        } => format!(
+            "  费用 {} {} · {} 至 {} (UTC)",
+            used.amount,
+            used.currency,
+            period_start.format("%Y-%m-%d %H:%M"),
+            period_end.format("%Y-%m-%d %H:%M")
+        ),
+        ResourceMetric::Allowance {
+            remaining,
+            used,
+            unit,
+            unlimited,
+            ..
+        } => format!(
+            "  {} · 已用 {} · {}",
+            unit,
+            used.as_deref().unwrap_or("未知"),
+            if *unlimited {
+                match remaining {
+                    Some(value) => format!("剩余 {value} · 令牌不限额"),
+                    None => "令牌额度不限量（不代表账号余额无限）".into(),
+                }
+            } else {
+                format!("剩余 {}", remaining.as_deref().unwrap_or("未知"))
+            }
+        ),
+        ResourceMetric::QuotaWindow {
+            name, used_percent, ..
+        } => format!("  {name} · 已用 {used_percent:.0}%"),
+        ResourceMetric::AllowanceWindow {
+            name,
+            used,
+            limit,
+            remaining,
+            unit,
+            resets_at,
+        } => format!(
+            "  {name} · 已用 {used} / {limit} {unit} · 剩余 {remaining}{}",
+            resets_at
+                .map(|t| format!(" · {} 重置", t.to_rfc3339()))
+                .unwrap_or_default()
+        ),
+        ResourceMetric::ResetCredits { available } => {
+            format!("  主动重置 {available} 次")
+        }
+        ResourceMetric::Spending { used, currency, .. } => format!(
+            "  支出 {} {}",
+            used.map(|v| v.to_string()).unwrap_or_else(|| "未知".into()),
+            currency.as_deref().unwrap_or("")
+        ),
+    }
 }

@@ -91,94 +91,145 @@ impl ResourceReader for GatewayReader {
 }
 pub(super) fn quota_metrics(value: &Value) -> Result<(Vec<ResourceMetric>, Vec<String>)> {
     let rows = value["data"].as_array().ok_or("Magpie 额度目录格式无效")?;
-    let mut metrics = Vec::new();
-    let mut notes = Vec::new();
+    let mut accounts: Vec<ResourceAccount> = Vec::new();
     for row in rows {
-        let label = [
-            row["name"].as_str().unwrap_or("Magpie"),
-            row["user"].as_str().unwrap_or(""),
-        ]
-        .join(" ");
-        // A vendor's error or deferred read is not a zero quota.
-        if row["error"].as_str().is_some_and(|v| !v.is_empty()) {
-            notes.push(format!("{label}：额度读取失败，请在 Magpie 查看"));
-            continue;
-        }
-        if row["readDeferred"] == true && row["readAt"].is_null() && row["asOf"].is_null() {
-            notes.push(format!("{label}：额度尚未读取"));
-            continue;
-        }
-        if let Some(windows) = row["windows"].as_array() {
-            for w in windows {
-                let name = format!("{} · {}", label, w["name"].as_str().unwrap_or("额度"));
-                let resets_at = w["resetsAt"]
-                    .as_str()
-                    .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-                    .map(|v| v.with_timezone(&Utc));
-                let unit = w["unit"].as_str().unwrap_or("");
-                if w["unlimited"] == true {
-                    metrics.push(ResourceMetric::Allowance {
-                        remaining: None,
-                        used: None,
-                        unit: name,
-                        unlimited: true,
-                    });
-                } else if w["text"] == true {
-                    if let Some(text) = w["display"].as_str() {
-                        notes.push(format!("{name}：{text}"));
+        let name = row["name"].as_str().unwrap_or("Magpie").to_owned();
+        let provider = row["provider"].as_str().unwrap_or(&name).to_owned();
+        let user = row["user"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+        let id = serde_json::to_string(&(&provider, user.as_deref().unwrap_or(&name)))
+            .map_err(|_| "Magpie 账号身份无效")?;
+        let cached = !row["asOf"].is_null();
+        let status = if cached {
+            AccountStatus::Cached
+        } else if row["error"].as_str().is_some_and(|v| !v.is_empty()) {
+            AccountStatus::Failed
+        } else if row["readDeferred"] == true && row["readAt"].is_null() {
+            AccountStatus::Pending
+        } else {
+            AccountStatus::Ready
+        };
+        let mut account = ResourceAccount {
+            id,
+            provider,
+            name,
+            user,
+            status,
+            metrics: Vec::new(),
+        };
+        if matches!(status, AccountStatus::Ready | AccountStatus::Cached) {
+            if let Some(windows) = row["windows"].as_array() {
+                for window in windows {
+                    if let Some(metric) = quota_window(window) {
+                        account.metrics.push(metric);
                     }
-                } else if let Some(balance) = decimal(w.get("balance")) {
-                    metrics.push(ResourceMetric::Allowance {
-                        remaining: Some(balance),
-                        used: None,
-                        unit: format!("{name} {unit}"),
-                        unlimited: false,
-                    });
-                } else if !unit.is_empty()
-                    && let (Some(used), Some(limit)) = (
-                        decimal(w.get("amount")).or_else(|| {
-                            // Magpie omits its numeric amount field when it is zero, while
-                            // its used percentage is always present. Missing usage stays unknown.
-                            (w["used"].as_f64() == Some(0.0)).then(|| "0".into())
-                        }),
-                        decimal(w.get("limit")),
-                    )
-                {
-                    if let (Ok(u), Ok(l)) = (
-                        used.parse::<rust_decimal::Decimal>(),
-                        limit.parse::<rust_decimal::Decimal>(),
-                    ) {
-                        metrics.push(ResourceMetric::AllowanceWindow {
-                            name,
-                            used,
-                            limit,
-                            remaining: (l - u).to_string(),
-                            unit: unit.into(),
-                            resets_at,
-                        });
-                    }
-                } else if let Some(used) = w["used"].as_f64().filter(|v| v.is_finite() && *v >= 0.0)
-                {
-                    metrics.push(ResourceMetric::QuotaWindow {
-                        name,
-                        used_percent: used,
-                        resets_at,
-                    });
                 }
             }
+            // Keep vendor prose separate from structured amounts. The view can prefer
+            // a numeric window over a duplicate reported balance without summing either.
+            if let Some(balance) = row["balance"].as_str().filter(|v| !v.is_empty()) {
+                account.metrics.push(ResourceMetric::ReportedBalance {
+                    name: "余额".into(),
+                    display: balance.into(),
+                });
+            }
         }
-        // Balance strings may contain credits, currencies or vendor prose. Preserve their unit.
-        if let Some(balance) = row["balance"].as_str().filter(|v| !v.is_empty()) {
-            metrics.push(ResourceMetric::ReportedBalance {
-                name: label.trim().into(),
-                display: balance.into(),
+        if let Some(existing) = accounts.iter_mut().find(|a| a.id == account.id) {
+            // Each API row is a complete account reading. Prefer the freshest usable
+            // reading; mixing cached and current windows can duplicate old amounts.
+            let priority = |status| match status {
+                AccountStatus::Ready => 3,
+                AccountStatus::Cached => 2,
+                AccountStatus::Failed => 1,
+                AccountStatus::Pending => 0,
+            };
+            if priority(account.status) >= priority(existing.status) {
+                *existing = account;
+            }
+        } else {
+            accounts.push(account);
+        }
+    }
+    let notes = if accounts.is_empty() {
+        vec!["Magpie 尚无可查询额度的账号".into()]
+    } else {
+        Vec::new()
+    };
+    Ok((
+        accounts
+            .into_iter()
+            .map(|account| ResourceMetric::Account { account })
+            .collect(),
+        notes,
+    ))
+}
+
+fn quota_window(window: &Value) -> Option<ResourceMetric> {
+    let name = window["name"].as_str().unwrap_or("额度").to_owned();
+    let resets_at = window["resetsAt"]
+        .as_str()
+        .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
+        .map(|v| v.with_timezone(&Utc));
+    let unit = window["unit"].as_str().unwrap_or("");
+    if window["unlimited"] == true {
+        return Some(ResourceMetric::Allowance {
+            name: Some(name),
+            remaining: None,
+            used: None,
+            unit: unit.into(),
+            unlimited: true,
+        });
+    }
+    // Text-only windows (including check-in status) have no numeric usage, even
+    // when the gateway reports a placeholder used=0 alongside their display text.
+    if window["text"] == true {
+        return window["display"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(|text| ResourceMetric::ReportedBalance {
+                name,
+                display: text.into(),
             });
-        }
     }
-    if rows.is_empty() {
-        notes.push("Magpie 尚无可查询额度的账号".into());
+    if let Some(balance) = decimal(window.get("balance")) {
+        return Some(ResourceMetric::Allowance {
+            name: Some(name),
+            remaining: Some(balance),
+            used: None,
+            unit: unit.into(),
+            unlimited: false,
+        });
     }
-    Ok((metrics, notes))
+    if !unit.is_empty()
+        && let (Some(used), Some(limit)) = (
+            decimal(window.get("amount"))
+                .or_else(|| (window["used"].as_f64() == Some(0.0)).then(|| "0".into())),
+            decimal(window.get("limit")),
+        )
+        && let (Ok(u), Ok(l)) = (
+            used.parse::<rust_decimal::Decimal>(),
+            limit.parse::<rust_decimal::Decimal>(),
+        )
+    {
+        return Some(ResourceMetric::AllowanceWindow {
+            name,
+            used,
+            limit,
+            remaining: (l - u).to_string(),
+            unit: unit.into(),
+            resets_at,
+        });
+    }
+    window["used"]
+        .as_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|used_percent| ResourceMetric::QuotaWindow {
+            name,
+            used_percent,
+            resets_at,
+        })
 }
 
 pub(super) fn usage_metrics(value: &Value) -> Result<(Vec<ResourceMetric>, Vec<String>)> {

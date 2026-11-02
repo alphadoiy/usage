@@ -15,8 +15,9 @@ binary = str(Path(sys.argv[1]).resolve())
 seen = []
 delivered = []
 models = [{"id": "group/coding", "owned_by": "group", "context_window": 200000,
-           "reasoning_levels": ["low", "high"], "modalities": {"input": ["text", "image"], "output": ["text"]}},
-          {"id": "vendor/model", "owned_by": "vendor"}]
+           "reasoning_levels": ["low", "high"], "modalities": {"input": ["text", "image", "audio", "video", "future-modality"], "output": ["text"]}},
+          {"id": "vendor/model", "owned_by": "vendor"},
+          {"id": "vendor/video-only", "owned_by": "vendor", "modalities": {"input": ["video"], "output": ["text"]}}]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -114,9 +115,9 @@ provider=config['model_providers'][config['model_provider']]
 assert config['model_provider']=='custom'
 assert provider['base_url']==os.environ['EXPECTED_MAGPIE']+'/v1', provider
 catalog=json.loads(Path(config['model_catalog_json']).read_text())['models']
+assert catalog[0]['input_modalities']==['text','image','audio'],catalog[0]
 assert [m['slug'] for m in catalog]==['group/coding','vendor/model']
 assert catalog[0]['context_window']==200000
-assert catalog[0]['input_modalities']==['text','image']
 assert os.environ['USAGE_CODEX_API_KEY']=='synthetic-gateway-key'
 headers=dict(provider['http_headers'],Authorization='Bearer '+os.environ['USAGE_CODEX_API_KEY'],session_id=os.environ['FIXTURE_SESSION'])
 body=json.dumps({'model':config['model'],'input':'synthetic test task','stream':True}).encode()
@@ -156,15 +157,20 @@ with urllib.request.urlopen(request,timeout=5) as response:
         terminal = Terminal(binary, [], env, root)
         try:
             terminal.until("Magpie")
-            terminal.until("内置Provider·e配置模型与路由")
-            terminal.until("余额：12.30credits")
+            terminal.until("Magpie·内置")
+            terminal.until("12.30credits")
             terminal.until("请求3次")
-            terminal.until("剩余6,390.6credits")
+            terminal.until("6,390.6credits")
             terminal.until("150Token")
             displayed = plain(terminal.data)
-            assert any(dot in displayed for dot in "●◕◑◔○"), displayed
+            assert any(dot in displayed for dot in "━─"), displayed
             for removed in ("共享额度与余额", "读取于", "范围：", "估算费用", "缓存读取", "1709.39999966", "6390.60000034"):
                 assert removed not in displayed, displayed
+            terminal.send(b"M")
+            terminal.until("返回账号")
+            terminal.send(b"\r")
+            terminal.send(b"j")
+            terminal.until("Credits")
             terminal.send(b"v")
             terminal.until("Magpie请求与路由")
             terminal.until("尚无请求记录")
@@ -181,7 +187,7 @@ with urllib.request.urlopen(request,timeout=5) as response:
             # Ratatui reuses the unchanged "不能" prefix of the previous notice.
             terminal.until("复制或添加")
             terminal.send(b"\x1b")
-            terminal.until("内置Provider·e配置模型与路由")
+            terminal.until("Magpie·内置")
             terminal.send(b"e")
             terminal.until("连接Magpie")
             terminal.send(b"\r")
@@ -194,6 +200,12 @@ with urllib.request.urlopen(request,timeout=5) as response:
             terminal.until("已保存内置Magpie配置")
         finally:
             terminal.close()
+        # A model with no compatible input must fail before generating a catalog
+        # or allowing the Agent to send a request. Other models remain usable.
+        run([*prefix, 'configure', '--model', 'vendor/video-only'])
+        rejected = run(['codex', 'run', group['id'], '--cwd', str(root), '--binary', str(fake)], success=False)
+        assert '没有 Codex 支持的输入类型' in rejected.stderr, rejected.stderr
+        run([*prefix, 'configure', '--model', 'group/coding'])
         profiles = json.loads(run(['codex', 'list', '--json']).stdout)
         assert len(profiles) == 1
         assert all(p['model_provider'] == 'magpie' for p in profiles)

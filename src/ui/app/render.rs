@@ -432,6 +432,21 @@ pub(super) fn render_provider_contents(area: Rect, buf: &mut Buffer, app: &Dashb
     if area.is_empty() {
         return;
     }
+    if let Some((_, provider)) = crate::ui::overview::selected(
+        app.overview_state.catalog.as_ref(),
+        app.home_provider.as_deref(),
+    ) && provider.kind == crate::provider_catalog::ProviderKind::Magpie
+    {
+        crate::ui::magpie_accounts::render(
+            area,
+            buf,
+            provider,
+            &app.home_magpie,
+            app.home_models_expanded,
+            app.home_scroll,
+        );
+        return;
+    }
     let lines = home_lines(app, area.width);
     let max = lines
         .len()

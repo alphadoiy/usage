@@ -430,6 +430,7 @@ fn provider_budget_updates_are_scoped_by_generation_and_identity_and_render_abov
                 },
             },
             ResourceMetric::Allowance {
+                name: None,
                 remaining: Some("6172839".into()),
                 used: Some("1000000".into()),
                 unit: "new_api_quota".into(),

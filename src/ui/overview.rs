@@ -172,7 +172,6 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
         );
     }
     for source in &usage.sources {
-        let magpie = matches!(source.service.as_str(), "magpie_quotas" | "magpie_usage");
         let scope = match &source.state {
             QueryState::Result(snapshot) => match snapshot.scope {
                 ResourceScope::Account => "账号",
@@ -193,9 +192,7 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
         } else {
             format!("{} · {}", clean(&source.label), scope)
         };
-        if !magpie {
-            lines.push(Line::from(format!("  {title}")).dim());
-        }
+        lines.push(Line::from(format!("  {title}")).dim());
         if imported && expanded {
             lines.push(Line::from("  配置来源：CC Switch").dim());
         }
@@ -220,6 +217,10 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                 });
                 for metric in metrics {
                     let text = match metric {
+                        ResourceMetric::Account { account } => {
+                            lines.extend(super::magpie_accounts::details(account, 80));
+                            continue;
+                        }
                         ResourceMetric::RequestUsage {
                             name,
                             requests,
@@ -230,19 +231,6 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                             cache_write_tokens,
                             reasoning_tokens,
                         } => {
-                            if magpie {
-                                let tokens = u128::from(*input_tokens) + u128::from(*output_tokens);
-                                let failures = if *failed_requests > 0 {
-                                    format!(" · 失败 {failed_requests} 次")
-                                } else {
-                                    String::new()
-                                };
-                                lines.push(Line::from(format!(
-                                    "  {} · 请求 {requests} 次 · {tokens} Token{failures}",
-                                    clean(name)
-                                )));
-                                continue;
-                            }
                             for text in [
                                 format!("{name} · 请求 {requests} 次 · 失败 {failed_requests} 次"),
                                 format!(
@@ -276,25 +264,10 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                         }
                         ResourceMetric::Allowance {
                             remaining,
-                            unit,
-                            unlimited,
-                            ..
-                        } if magpie => {
-                            format!(
-                                "{} · {}",
-                                clean(unit),
-                                if *unlimited {
-                                    "不限量".into()
-                                } else {
-                                    format!("剩余 {}", allowance_amount(remaining.as_deref(), unit))
-                                }
-                            )
-                        }
-                        ResourceMetric::Allowance {
-                            remaining,
                             used,
                             unit,
                             unlimited,
+                            ..
                         } => format!(
                             "{} · 已用 {} · {}",
                             if matches!(unit.as_str(), "new_api_quota" | "sub2api_quota") {
@@ -321,46 +294,6 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                             limit,
                             remaining,
                             unit,
-                            ..
-                        } if magpie => {
-                            lines.push(Line::from(format!("  {}", clean(name))));
-                            let percent = used
-                                .parse::<f64>()
-                                .ok()
-                                .zip(limit.parse::<f64>().ok())
-                                .filter(|(_, limit)| *limit > 0.0)
-                                .map(|(used, limit)| used / limit * 100.0)
-                                .filter(|percent| percent.is_finite());
-                            let mut spans = vec![Span::raw("  ")];
-                            if let Some(percent) = percent {
-                                spans.extend(super::widgets::quota_dots("magpie", percent));
-                                spans.push(Span::raw(format!(
-                                    "{} · ",
-                                    crate::labels::fmt_percent(percent)
-                                )));
-                            } else {
-                                spans.push(Span::raw(format!(
-                                    "已用 {} · ",
-                                    allowance_amount(Some(used), unit)
-                                )));
-                            }
-                            spans.push(
-                                Span::raw(format!(
-                                    "剩余 {} {}",
-                                    allowance_amount(Some(remaining), unit),
-                                    clean(unit)
-                                ))
-                                .bold(),
-                            );
-                            lines.push(Line::from(spans));
-                            continue;
-                        }
-                        ResourceMetric::AllowanceWindow {
-                            name,
-                            used,
-                            limit,
-                            remaining,
-                            unit,
                             resets_at,
                         } => format!(
                             "{} · 已用 {} / {} {} · 剩余 {}{}",
@@ -376,22 +309,6 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                                 ))
                                 .unwrap_or_default()
                         ),
-                        ResourceMetric::QuotaWindow {
-                            name, used_percent, ..
-                        } if magpie => {
-                            lines.push(Line::from(format!("  {}", clean(name))));
-                            let mut spans = vec![Span::raw("  ")];
-                            spans.extend(super::widgets::quota_dots("magpie", *used_percent));
-                            spans.push(
-                                Span::raw(format!(
-                                    "已用 {}",
-                                    crate::labels::fmt_percent(*used_percent)
-                                ))
-                                .bold(),
-                            );
-                            lines.push(Line::from(spans));
-                            continue;
-                        }
                         ResourceMetric::QuotaWindow {
                             name,
                             used_percent,
@@ -452,18 +369,13 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
                     };
                     lines.push(Line::from(format!("  {}", clean(&text))));
                 }
-                if source.service != "magpie_usage"
-                    && let Some(message) = &snapshot.message
-                {
+                if let Some(message) = &snapshot.message {
                     lines.push(Line::from(format!("  {}", clean(message))).dim());
                 }
                 if snapshot.metrics.is_empty() && snapshot.message.is_none() {
                     lines.push(Line::from("  接口未返回额度或账单项目").dim());
                 }
-                if expanded
-                    && !magpie
-                    && let Some(time) = snapshot.queried_at
-                {
+                if expanded && let Some(time) = snapshot.queried_at {
                     lines.push(
                         Line::from(format!(
                             "  更新 {}",
@@ -479,7 +391,7 @@ fn usage_lines(usage: &ProviderUsage, expanded: bool) -> Vec<Line<'static>> {
 }
 
 /// Credits are counts, not currency. Match Magpie's presentation without changing stored values.
-fn allowance_amount(value: Option<&str>, unit: &str) -> String {
+pub(super) fn allowance_amount(value: Option<&str>, unit: &str) -> String {
     let Some(value) = value else {
         return "未知".into();
     };
@@ -733,6 +645,7 @@ mod tests {
                     state: ResourceState::Ready,
                     metrics: vec![
                         ResourceMetric::Allowance {
+                            name: None,
                             remaining: Some("9007199254740993".into()),
                             used: Some("1".into()),
                             unit: "new_api_quota".into(),

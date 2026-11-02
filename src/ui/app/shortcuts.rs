@@ -128,13 +128,31 @@ impl Dashboard {
         } else {
             match self.home_focus {
                 super::super::home::Focus::Providers => {
+                    let magpie = crate::ui::overview::selected(
+                        self.overview_state.catalog.as_ref(),
+                        self.home_provider.as_deref(),
+                    )
+                    .is_some_and(|(_, p)| p.kind == crate::provider_catalog::ProviderKind::Magpie);
                     let mut actions = vec![
-                        enter("展开 / 收起模型列表"),
+                        enter(if magpie {
+                            "展开 / 收起账号详情"
+                        } else {
+                            "展开 / 收起模型列表"
+                        }),
                         action('a', "a", "添加 Provider"),
                         action('v', "v", "查看性能"),
                         action('x', "x", "查询 / 主动重置额度"),
                         action('c', "c", "签到"),
                     ];
+                    if magpie {
+                        actions[2] = action('v', "v", "查看请求与实际路由");
+                        actions.push(action('M', "Shift+M", "查看 / 收起模型列表"));
+                        actions.push(Shortcut::new(
+                            KeyCode::PageDown,
+                            "PgUp/PgDn",
+                            "滚动账号详情",
+                        ));
+                    }
                     if crate::ui::overview::selected(
                         self.overview_state.catalog.as_ref(),
                         self.home_provider.as_deref(),
@@ -147,7 +165,11 @@ impl Dashboard {
                     actions.push(refresh);
                     (
                         "Provider",
-                        "Tab / Shift+Tab 切换看板 · ←/→ 切换 Provider · ↑/↓ 滚动",
+                        if magpie {
+                            "Tab 切换看板 · ←/→ 切换 Provider · ↑/↓ 选择账号"
+                        } else {
+                            "Tab / Shift+Tab 切换看板 · ←/→ 切换 Provider · ↑/↓ 滚动"
+                        },
                         actions,
                     )
                 }

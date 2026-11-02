@@ -688,6 +688,7 @@ struct Dashboard {
     service_state: state::ServiceState,
     home_scroll: u16,
     home_models_expanded: bool,
+    home_magpie: super::magpie_accounts::State,
     home_provider: Option<String>,
     menu: Option<menu::Menu>,
     history_state: state::HistoryState,
@@ -776,6 +777,7 @@ impl Dashboard {
             service_state: state::ServiceState::new(),
             home_scroll: 0,
             home_models_expanded: false,
+            home_magpie: super::magpie_accounts::State::default(),
             home_provider: None,
             menu: None,
             history_state: state::HistoryState::new(config.clone()),
@@ -1580,6 +1582,52 @@ impl Dashboard {
             self.home_sessions_state.browser.clear_search();
             return true;
         }
+        if self.home_focus == HomeFocus::Providers
+            && let Some((_, provider)) = super::overview::selected(
+                self.overview_state.catalog.as_ref(),
+                self.home_provider.as_deref(),
+            )
+            && provider.kind == crate::provider_catalog::ProviderKind::Magpie
+        {
+            if key == KeyCode::Char('M') {
+                self.home_models_expanded = !self.home_models_expanded;
+                self.home_scroll = 0;
+                return true;
+            }
+            let area = super::home::areas_with_details(
+                Rect::new(0, 1, width, height.saturating_sub(2)),
+                self.home_connections.is_details(),
+            )[0];
+            let size = (area.width.saturating_sub(2), area.height.saturating_sub(2));
+            if !self.home_models_expanded && self.home_magpie.key(key, provider, size) {
+                return true;
+            }
+            if self.home_models_expanded
+                && matches!(
+                    key,
+                    KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Char('j' | 'k')
+                        | KeyCode::PageUp
+                        | KeyCode::PageDown
+                )
+            {
+                let step = if matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+                    i32::from(size.1.saturating_sub(5).max(1))
+                } else {
+                    3
+                };
+                let delta = if matches!(key, KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp) {
+                    -step
+                } else {
+                    step
+                };
+                let max = super::magpie_accounts::model_scroll_max(provider, size.1);
+                self.home_scroll =
+                    (i32::from(self.home_scroll) + delta).clamp(0, i32::from(max)) as u16;
+                return true;
+            }
+        }
         match key {
             KeyCode::Char('e')
                 if self.home_focus == HomeFocus::Providers && self.home_subscription_details =>
@@ -1753,6 +1801,7 @@ impl Dashboard {
             (index + 1) % count
         };
         self.home_provider = Some(catalog.providers[next].id.clone());
+        self.home_magpie = super::magpie_accounts::State::default();
         self.home_scroll = 0;
         self.home_models_expanded = false;
         self.home_subscription_details = false;
@@ -2462,6 +2511,12 @@ impl Dashboard {
                             .is_some_and(|catalog| catalog.apply_resource(&target, snapshot))
                     {
                         self.overview_state.complete_one();
+                        if let Some((_, provider)) = super::overview::selected(
+                            self.overview_state.catalog.as_ref(),
+                            self.home_provider.as_deref(),
+                        ) {
+                            self.home_magpie.reconcile(provider);
+                        }
                         changed = true;
                     }
                     continue;

@@ -158,6 +158,7 @@ fn quota_metrics(
         return Err(invalid());
     }
     let mut metrics = vec![ResourceMetric::Allowance {
+        name: None,
         // Match CC Switch: the returned remainder and the token's quota cap are
         // independent. Relay implementations may return a wallet value here.
         remaining: Some(remaining.normalize().to_string()),

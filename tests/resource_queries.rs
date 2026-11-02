@@ -198,6 +198,7 @@ async fn unlimited_token_preserves_returned_balance_and_explicit_ccswitch_conver
             reports[0].snapshot.metrics,
             vec![
                 ResourceMetric::Allowance {
+                    name: None,
                     remaining: Some(available.into()),
                     used: Some("1000000".into()),
                     unit: "new_api_quota".into(),

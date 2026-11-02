@@ -775,6 +775,7 @@ mod tests {
         assert_eq!(snapshot.state, ResourceState::Ready);
         assert_eq!(snapshot.scope, ResourceScope::Token);
         assert!(snapshot.metrics.contains(&ResourceMetric::Allowance {
+            name: None,
             remaining: Some("2500000".into()),
             used: Some("1000000".into()),
             unit: "new_api_quota".into(),

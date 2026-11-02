@@ -116,13 +116,23 @@ fn quota_mapping_preserves_units_and_does_not_invent_zero_for_unknown_or_failed(
         {"name":"Balance","balance":"¥12.30","windows":[]}
     ]}))
     .unwrap();
-    assert_eq!(metrics.len(), 2);
+    assert_eq!(metrics.len(), 4);
     assert!(
-        matches!(&metrics[0],crate::resources::ResourceMetric::AllowanceWindow {remaining,unit,..} if remaining=="8.75" && unit=="credits")
+        matches!(&quota_account(&metrics[0]).metrics[0],crate::resources::ResourceMetric::AllowanceWindow {remaining,unit,..} if remaining=="8.75" && unit=="credits")
     );
     assert!(
-        matches!(&metrics[1], crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "¥12.30")
+        matches!(&quota_account(&metrics[3]).metrics[0], crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "¥12.30")
     );
+    assert_eq!(
+        quota_account(&metrics[1]).status,
+        crate::resources::AccountStatus::Pending
+    );
+    assert_eq!(
+        quota_account(&metrics[2]).status,
+        crate::resources::AccountStatus::Failed
+    );
+    assert!(quota_account(&metrics[1]).metrics.is_empty());
+    assert!(quota_account(&metrics[2]).metrics.is_empty());
     assert!(!notes.join(" ").contains("private-vendor-error"));
 }
 
@@ -193,7 +203,7 @@ async fn builtin_catalog_collapses_legacy_presets_and_attaches_usage_and_balance
     for profile in &plan.catalog.providers {
         assert!(matches!(&profile.usage.sources[0].state,
             crate::provider_catalog::QueryState::Result(s) if s.metrics.iter().any(|metric|
-                matches!(metric, crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "¥12.30"))));
+                quota_account(metric).metrics.iter().any(|metric| matches!(metric, crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "¥12.30")))));
         assert!(matches!(&profile.usage.sources[1].state,
             crate::provider_catalog::QueryState::Result(s) if matches!(s.metrics[0], crate::resources::ResourceMetric::RequestUsage { requests: 3, .. })));
     }
@@ -344,9 +354,10 @@ fn omitted_zero_amount_is_known_only_with_explicit_zero_usage() {
         {"name":"Trae","windows":[{"name":"Credits","used":0,"remaining":100,"limit":1100,"unit":"credits"}]},
         {"name":"Unknown","windows":[{"name":"Credits","limit":1100,"unit":"credits"}]}
     ]})).unwrap();
-    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics.len(), 2);
+    assert!(quota_account(&metrics[1]).metrics.is_empty());
     assert!(
-        matches!(&metrics[0], crate::resources::ResourceMetric::AllowanceWindow {
+        matches!(&quota_account(&metrics[0]).metrics[0], crate::resources::ResourceMetric::AllowanceWindow {
         used, remaining, unit, ..
     } if used=="0" && remaining=="1100" && unit=="credits")
     );
@@ -377,7 +388,7 @@ async fn summary_permission_failure_does_not_hide_available_balance() {
     let usage = GatewayReader::usage(connection, http).read().await;
     assert_eq!(quota.state, ResourceState::Ready);
     assert!(
-        matches!(&quota.metrics[0], crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "12.30 credits")
+        matches!(&quota_account(&quota.metrics[0]).metrics[0], crate::resources::ResourceMetric::ReportedBalance { display, .. } if display == "12.30 credits")
     );
     assert_eq!(usage.state, ResourceState::TransientFailure);
     assert!(usage.metrics.is_empty());
@@ -404,4 +415,80 @@ async fn offline_permission_and_invalid_identity_errors_never_become_empty_succe
     let error = connection.models(&http).await.unwrap_err();
     assert!(error.contains("权限"));
     assert!(!error.contains("synthetic-private-key"));
+}
+
+fn quota_account(metric: &crate::resources::ResourceMetric) -> &crate::resources::ResourceAccount {
+    match metric {
+        crate::resources::ResourceMetric::Account { account } => account,
+        _ => panic!("expected structured quota account"),
+    }
+}
+
+#[test]
+fn quota_accounts_keep_identity_separate_from_labels_and_prefer_fresh_readings() {
+    use crate::resources::{AccountStatus, ResourceMetric};
+    let (metrics, _) = resources::quota_metrics(&json!({"data":[
+        {"provider":"vendor","name":"Old label","user":"account-a","asOf":"2026-11-01T00:00:00Z","error":"private-error","windows":[{"name":"wallet","balance":"100","unit":"积分"}]},
+        {"provider":"vendor","name":"New label","user":"account-a","windows":[{"name":"wallet","balance":"80","unit":"积分"},{"name":"签到","text":true,"used":0,"display":"今日未签"}]},
+        {"provider":"vendor","name":"Another account","user":"account-b","asOf":"2026-11-01T00:00:00Z","error":"private-error","windows":[{"name":"wallet","balance":"12.30","unit":"USD"}]}
+    ]})).unwrap();
+    assert_eq!(metrics.len(), 2);
+    let a = quota_account(&metrics[0]);
+    let b = quota_account(&metrics[1]);
+    assert_eq!(a.name, "New label");
+    assert_eq!(a.provider, "vendor");
+    assert_eq!(a.user.as_deref(), Some("account-a"));
+    assert_ne!(a.id, b.id);
+    assert_eq!(a.status, AccountStatus::Ready);
+    assert_eq!(b.status, AccountStatus::Cached);
+    assert!(
+        matches!(&a.metrics[0],ResourceMetric::Allowance { name: Some(name),remaining:Some(value),unit,..} if name=="wallet" && value=="80" && unit=="积分")
+    );
+    assert!(
+        matches!(&a.metrics[1],ResourceMetric::ReportedBalance {name,display} if name=="签到" && display=="今日未签")
+    );
+    let (renamed, _) = resources::quota_metrics(
+        &json!({"data":[{"provider":"vendor","name":"Renamed again","user":"account-a"}]}),
+    )
+    .unwrap();
+    assert_eq!(a.id, quota_account(&renamed[0]).id);
+    assert!(
+        !serde_json::to_string(&metrics)
+            .unwrap()
+            .contains("private-error")
+    );
+}
+
+#[test]
+fn codex_catalog_projects_supported_inputs_without_changing_upstream_capabilities() {
+    let models: Vec<Model> = serde_json::from_value(json!([
+        {"id":"mixed","modalities":{"input":["text","image","audio","video","future",null,12,"text"]}},
+        {"id":"video-only","modalities":{"input":["video"]}},
+        {"id":"future-only","modalities":{"input":["future"]}},
+        {"id":"empty","modalities":{"input":[]}},
+        {"id":"malformed","modalities":{"input":"text"}},
+        {"id":"unspecified"},
+        {"id":"null","modalities":{"input":null}}
+    ])).unwrap();
+    let catalog = catalog::codex_models(&models).unwrap();
+    let entries = catalog["models"].as_array().unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["mixed", "unspecified", "null"]
+    );
+    assert_eq!(
+        entries[0]["input_modalities"],
+        json!(["text", "image", "audio"])
+    );
+    assert_eq!(entries[1]["input_modalities"], json!(["text"]));
+    assert_eq!(entries[2]["input_modalities"], json!(["text"]));
+    assert_eq!(
+        models[0].modalities["input"],
+        json!([
+            "text", "image", "audio", "video", "future", null, 12, "text"
+        ])
+    );
 }

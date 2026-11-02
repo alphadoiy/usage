@@ -75,6 +75,7 @@ impl ApiProtocol for Sub2Api {
                 .ok_or_else(invalid)?;
             let remaining = limit.checked_sub(used).ok_or_else(invalid)?;
             metrics.push(ResourceMetric::Allowance {
+                name: None,
                 remaining: Some(remaining.normalize().to_string()),
                 used: Some(used.normalize().to_string()),
                 unit: unit.into(),
@@ -91,6 +92,7 @@ impl ApiProtocol for Sub2Api {
                     .any(|m| matches!(m, ResourceMetric::Allowance { .. }))
                 {
                     metrics.push(ResourceMetric::Allowance {
+                        name: None,
                         remaining: Some(remaining.normalize().to_string()),
                         used: None,
                         unit: unit.into(),
@@ -103,6 +105,7 @@ impl ApiProtocol for Sub2Api {
                     .any(|m| matches!(m, ResourceMetric::Allowance { .. }))
                 {
                     metrics.push(ResourceMetric::Allowance {
+                        name: None,
                         remaining: None,
                         used: None,
                         unit: unit.into(),
@@ -308,6 +311,7 @@ fn openrouter(v: &Value) -> QueryResult<Vec<ResourceMetric>> {
     Ok(vec![
         balance(total.checked_sub(used).ok_or_else(invalid)?, "USD")?,
         ResourceMetric::Allowance {
+            name: None,
             remaining: Some(
                 total
                     .checked_sub(used)

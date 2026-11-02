@@ -344,9 +344,17 @@ impl Connection {
         if !models.iter().any(|m| m.id == model) {
             return Err(format!("Magpie 已不再提供 {model}，请重新选择模型或路由组"));
         }
+        let catalog = catalog::codex_models(&models)?;
+        if !catalog["models"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["slug"] == model))
+        {
+            return Err(format!(
+                "Magpie 模型 {model} 没有 Codex 支持的输入类型，请重新选择模型或路由组"
+            ));
+        }
         let path = home.join("magpie-models.json");
-        let bytes = serde_json::to_vec(&catalog::codex_models(&models)?)
-            .map_err(|_| "无法生成 Magpie 模型目录")?;
+        let bytes = serde_json::to_vec(&catalog).map_err(|_| "无法生成 Magpie 模型目录")?;
         crate::private_fs::write(&path, &bytes).map_err(|_| "无法保存实例模型目录")?;
         Ok(path)
     }
