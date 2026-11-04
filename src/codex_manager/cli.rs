@@ -176,7 +176,7 @@ pub enum CodexCommand {
         resume: Option<String>,
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
-        /// 在 Ghostty 右侧分屏运行，或在 Rex 新标签页运行
+        /// 在 Herdr / Rex 新标签页或 Ghostty 右侧分屏运行
         #[arg(long)]
         split: bool,
         #[arg(long)]

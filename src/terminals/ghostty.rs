@@ -22,7 +22,7 @@ impl TerminalBackend for Ghostty {
         &self,
         _context: &TerminalContext,
         request: &TerminalRequest<'_>,
-    ) -> Result<Command, String> {
+    ) -> Result<TerminalCommand, String> {
         let script = r#"on run argv
         tell application "Ghostty"
             set currentTerm to focused terminal of selected tab of front window
@@ -40,6 +40,6 @@ impl TerminalBackend for Ghostty {
             .args(["-e", script])
             .arg(request.cwd)
             .arg(request.shell_command);
-        Ok(command)
+        Ok(command.into())
     }
 }

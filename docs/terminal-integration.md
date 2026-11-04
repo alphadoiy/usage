@@ -6,11 +6,12 @@
 
 | 目标 | 检测上下文 | 执行方式 | 布局与焦点 |
 | --- | --- | --- | --- |
+| Herdr 原生 App | 非空 `HC_TERMINAL_ID`、`HC_TERMINAL_SOCKET` | `hc get` 读取所属 space；`hc run --bg --no-parent --no-notify --keep` 新建带 `herdr.space`、`herdr.tab` 标签的终端 | 同一 space 每次新建 tab，保留窗口焦点 |
 | Rex | 非空 `REX_SESSION`；读取 `REX_BIN_DIR`、`REX_SERVER` | 匹配服务器的 `rex run --session … --cwd … --focus=false --keep-open -- sh -lc COMMAND` | 每次新建 tab，保留 Usage 焦点 |
 | Ghostty | macOS，且有 `GHOSTTY_RESOURCES_DIR` 或 `TERM_PROGRAM=ghostty` | AppleScript 将 cwd 和命令作为独立 argv 传入 | 右侧分屏并聚焦 |
 | 当前终端 | 显式选择，或自动检测未命中 | 调用方退出 TUI，委托原 Agent Launcher，退出后返回 TUI | 复用当前终端 |
 
-自动检测按注册顺序执行，Rex 优先于 Ghostty，避免嵌套环境中残留的 Ghostty 标记抢占 Rex。仅安装某个终端不代表当前运行在其中。显式选择不可用终端时报错，不改为其它终端，也不在失败后再次启动 Agent。
+自动检测按注册顺序执行，Herdr 优先于 Rex，Rex 优先于 Ghostty。Herdr 先于 Ghostty 是因为原生 App 的 `TERM_PROGRAM` 可能就是 `ghostty`；Rex 先于 Ghostty 是为了避免残留的 Ghostty 标记抢占 Rex。Herdr 与 Rex 互相嵌套时，环境变量无法判断哪个是最内层，Herdr 先于 Rex 只是固定的启发式顺序；需要使用另一个终端时，请在配置里显式设置 `resume = "rex"`（或 `herdr`）。仅安装某个终端不代表当前运行在其中。显式选择不可用终端时报错，不改为其它终端，也不在失败后再次启动 Agent。
 
 ## 结构与设计模式
 
@@ -24,7 +25,7 @@ TerminalRegistry + Selection + TerminalContext
     │ 选择策略、校验 cwd、绑定环境快照
     ▼
 TerminalBackend（Adapter / Strategy）
-    │ 只构造 std::process::Command
+    │ 构造控制命令及可选的后续命令
     ▼
 TerminalLaunch（Command）
     │ 统一执行与失败处理
@@ -32,10 +33,10 @@ TerminalLaunch（Command）
 终端自己的 PTY → Agent → 原生终端协议
 ```
 
-- **Adapter / Strategy**：`TerminalBackend` 封装工具特有的检测和启动命令。Rex CLI 与 Ghostty AppleScript 在独立文件中，不进入业务层。
+- **Adapter / Strategy**：`TerminalBackend` 封装工具特有的检测和启动命令。Herdr、Rex CLI 与 Ghostty AppleScript 在独立文件中，不进入业务层。
 - **Registry**：`TerminalRegistry` 管理有序策略，拒绝重复、空或保留 ID。内置注册表初始化后只读；测试可注入独立注册表，无需修改进程全局环境。
 - **Command**：`prepare` 返回 `TerminalLaunch`，构造阶段不启动终端；`execute` 才运行控制程序。执行失败直接返回，避免重复启动。
-- **依赖倒置**：UI 只使用目标描述与 `is_current()` 判断是否需要交还当前终端，不根据 Rex、Ghostty 等具体名称分支。配置字符串到适配器 ID 的映射集中于 `ResumeMode::backend_id`。
+- **依赖倒置**：UI 只使用目标描述与 `is_current()` 判断是否需要交还当前终端，不根据 Herdr、Rex、Ghostty 等具体名称分支。配置字符串到适配器 ID 的映射集中于 `ResumeMode::backend_id`。
 
 这里使用轻量对象注册表，不引入动态插件加载、额外继承层次或重复的工厂体系。
 
@@ -45,8 +46,8 @@ TerminalLaunch（Command）
 | --- | --- |
 | `target()` | 返回稳定 ID、界面描述和布局类型 `Tab / RightSplit` |
 | `environment_keys()` | 声明检测及控制 CLI 需要的环境变量；注册表只采集这些变量 |
-| `available(context)` | 只读检查平台和活动上下文；不启动进程、不探测网络、不创建窗口 |
-| `command(context, request)` | 根据已校验请求构造控制命令；不执行命令，不再次读取全局环境 |
+| `available(context)` | 只读检查平台和活动上下文；不启动进程、不访问文件系统、不探测网络、不创建窗口 |
+| `command(context, request)` | 根据已校验请求构造 `TerminalCommand`（控制命令及可选响应解析回调）；不执行命令，不再次读取全局环境；允许对上下文中的 PATH 做只读文件探测以定位控制 CLI |
 | `registry.prepare(...)` | 选择策略，检查可用性、cwd 与空命令，将声明的环境变量绑定到计划 |
 | `launch.execute()` | 启动控制 CLI，检查退出码并报告失败；不更换后端重试 |
 
@@ -68,7 +69,7 @@ Codex 的 OSC 7501 由 Codex 直接写入自己的终端，不经过 Usage hook 
 2. 在 `builtin_registry()` 注册适配器，明确与其它终端嵌套时的自动检测优先级。
 3. 如需配置显式选择，在 `src/config.rs` 的 `ResumeMode` 添加枚举值、ID 映射、标签和轮换顺序；保持已有配置值兼容。
 4. 使用注入的 `TerminalContext` 检查自动检测、显式选择不可用、未知 ID 和平台差异，不用全局 `set_var` 驱动并行测试。
-5. 用实际子进程或模拟控制 CLI 验证包含空格/引号的 cwd、命令边界、非零退出码、多实例隔离和启动失败后无重复执行。现有 Rex 集成测试位于 `tests/support/terminal_launch.rs`。
+5. 用实际子进程或模拟控制 CLI 验证包含空格/引号的 cwd、命令边界、非零退出码、多实例隔离和启动失败后无重复执行。现有 Herdr / Rex 集成测试位于 `tests/support/terminal_launch.rs`。
 6. 在真实终端中验证新建与恢复、焦点、Agent 退出、Ctrl+C、独立 PTY，以及 Agent 原生状态。记录本机验证范围，不把模拟测试等同于界面验证。
 
 正常接入不应修改 Provider、账号存储、会话发现、会话恢复意图或各个 UI 页面的终端名称分支。如果新工具确实需要新布局能力，先扩充 `Placement` 与请求约定，再实现适配器。
@@ -86,3 +87,22 @@ codex mcp add superlogical --url https://www.superlogical.com/rex/community-mcp
 按提示通过 Discord OAuth 授权，需要加入 Rex Beta Discord。若添加后尚未完成授权，可运行 `codex mcp login superlogical`。服务名采用官方建议的 `superlogical`，避免与 `rex` CLI 混淆。
 
 这是开发者的可选工具，不属于 Usage 运行依赖。用户的 MCP 配置和 OAuth 凭据留在本机，不提交到仓库；终端启动和状态对接继续使用 Rex CLI、Server API 与程序原生协议。
+
+## Herdr 原生 App
+
+在 Herdr 原生 App 内运行 Usage，默认 `auto` 在当前终端所属的 space 新建标签页。会话恢复、Provider 启动及 `usage codex run <账号> --split` 共用此行为；会话页按 `Shift+R` 可选 Herdr，也可配置：
+
+```toml
+[sessions]
+resume = "herdr"
+```
+
+适配器使用 [herdr-core 官方 CLI](https://github.com/herdrdev/herdr-core) 及原生 App 的终端标签约定（本机 `~/.config/herdr-app/AGENTS.md`）。它把调用终端的 `HC_TERMINAL_SOCKET` 映射为控制 CLI 的 `HC_SOCKET`（优先于同时透传的 `HC_SESSION`），通过 `hc get --json <HC_TERMINAL_ID>` 读取 `labels["herdr.space"]`，再创建带同一 space 和独立 tab 标签的新终端。控制 CLI 从 PATH 查找 `hc` / `herdr-core`，其次查找用户目录下的 `.local/bin`。
+
+原生 App 的 `TERM_PROGRAM` 可以是 `ghostty`；检测时 Herdr 优先于 Rex、Ghostty，避免误唤起外部应用。新终端使用独立 PTY、`sh -lc` 执行导出的启动命令；不关联父终端的生命周期，也不向父终端注入退出通知。Herdr App 自动采用带标签的终端，窗口焦点保持不变。Agent 的原生 OSC 7501 是否被 Herdr App 识别尚未验证，本适配器只保证新终端拥有独立 PTY，不声明状态协议支持。
+
+`herdr.space` / `herdr.tab` 标签属于 Herdr 原生 App 的终端标签约定，而不是公开的稳定协议，只在 App 0.1.12 / herdr-core 0.1.17 上验证过，且全部集中在 `herdr.rs`。App 调整约定后，新终端可能不再被 App 采用；此时只需修改该文件。
+
+读取终端或创建终端失败时直接报错，不切换后端，不自动重复提交。当前终端缺少所属 space 时不会创建不可见的终端。
+
+自动测试覆盖嵌套检测、显式选择、socket 路由、space 归属、命令与路径边界、错误不重试，以及模拟 core 下的新建／恢复和独立 PTY。本机已使用 Herdr App 0.1.12 / herdr-core 0.1.17，从真实 Provider 页面启动 Codex：确认同一 space 新建标签页、原窗口焦点不变，Codex 进入 hooks 审核界面；未代用户信任 hooks。

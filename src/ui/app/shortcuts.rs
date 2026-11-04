@@ -88,7 +88,7 @@ impl Dashboard {
                     action('D', "Shift+D", "清理当前项目列表（需确认）"),
                     action('b', "b", "打开回收站"),
                     action('o', "o", "切换最近活动 / Token 排序"),
-                    action('R', "Shift+R", "切换自动 / Ghostty / Rex / 当前终端"),
+                    action('R', "Shift+R", crate::config::ResumeMode::CYCLE_HINT),
                     action('y', "y", "复制会话恢复命令"),
                     action('c', "c", "清除搜索"),
                     refresh,

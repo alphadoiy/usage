@@ -87,14 +87,19 @@ pub enum ResumeMode {
     Auto,
     Ghostty,
     Rex,
+    Herdr,
     Current,
 }
 impl ResumeMode {
+    /// Shift+R vocabulary, in `next()` order. Checked against `label()` by a test.
+    pub const CYCLE_HINT: &'static str = "切换自动 / Ghostty / Rex / Herdr / 当前终端";
+
     /// Persisted configuration vocabulary; runtime routing belongs to terminals.
     pub(crate) fn backend_id(self) -> Option<&'static str> {
         match self {
             Self::Ghostty => Some("ghostty"),
             Self::Rex => Some("rex"),
+            Self::Herdr => Some("herdr"),
             Self::Auto | Self::Current => None,
         }
     }
@@ -104,6 +109,7 @@ impl ResumeMode {
             Self::Auto => "自动",
             Self::Ghostty => "Ghostty 分屏",
             Self::Rex => "Rex 新标签页",
+            Self::Herdr => "Herdr 新标签页",
             Self::Current => "当前终端",
         }
     }
@@ -111,7 +117,8 @@ impl ResumeMode {
         match self {
             Self::Auto => Self::Ghostty,
             Self::Ghostty => Self::Rex,
-            Self::Rex => Self::Current,
+            Self::Rex => Self::Herdr,
+            Self::Herdr => Self::Current,
             Self::Current => Self::Auto,
         }
     }
@@ -236,7 +243,7 @@ bell = false
 desktop = false
 
 [sessions]
-# auto：Rex 中新建标签页，Ghostty 中分屏，其它终端在当前终端恢复；也可设 rex / ghostty / current
+# auto：Herdr / Rex 中新建标签页，Ghostty 中分屏，其它终端在当前终端恢复；也可设 herdr / rex / ghostty / current
 resume = "auto"
 
 # 额外实例示例（数据只读）
@@ -620,6 +627,27 @@ struct RawPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_mode_cycle_is_closed_and_described_by_the_shortcut_hint() {
+        let mut mode = ResumeMode::Auto;
+        let mut seen = Vec::new();
+        loop {
+            seen.push(mode);
+            mode = mode.next();
+            if mode == ResumeMode::Auto {
+                break;
+            }
+        }
+        let hints: Vec<_> = ResumeMode::CYCLE_HINT
+            .trim_start_matches("切换")
+            .split(" / ")
+            .collect();
+        assert_eq!(seen.len(), hints.len());
+        for (mode, hint) in seen.iter().zip(hints) {
+            assert!(mode.label().starts_with(hint), "{mode:?}: {hint}");
+        }
+    }
 
     #[test]
     fn quota_conversion_saves_preserve_other_settings_and_reject_stale_or_invalid_edits() {

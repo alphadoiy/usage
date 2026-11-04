@@ -1,5 +1,6 @@
 //! Terminal transport, independent of Agent identity, credentials and session storage.
 mod ghostty;
+mod herdr;
 mod rex;
 
 use std::collections::BTreeMap;
@@ -100,7 +101,35 @@ pub trait TerminalBackend: Send + Sync {
         &self,
         context: &TerminalContext,
         request: &TerminalRequest<'_>,
-    ) -> Result<Command, String>;
+    ) -> Result<TerminalCommand, String>;
+}
+
+type CommandContinuation = Box<dyn FnOnce(&[u8]) -> Result<Command, String> + Send>;
+
+/// Some transports create a terminal first, then address it using the response ID.
+/// Both stages are prepared without side effects and execute at most once.
+pub struct TerminalCommand {
+    command: Command,
+    next: Option<CommandContinuation>,
+}
+
+impl From<Command> for TerminalCommand {
+    fn from(command: Command) -> Self {
+        Self {
+            command,
+            next: None,
+        }
+    }
+}
+
+impl TerminalCommand {
+    pub fn then(
+        mut self,
+        next: impl FnOnce(&[u8]) -> Result<Command, String> + Send + 'static,
+    ) -> Self {
+        self.next = Some(Box::new(next));
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -191,7 +220,7 @@ impl TerminalRegistry {
         if request.shell_command.trim().is_empty() {
             return Err("终端启动命令为空".into());
         }
-        let mut command = backend.command(
+        let command = backend.command(
             context,
             &TerminalRequest {
                 cwd: &cwd,
@@ -200,17 +229,16 @@ impl TerminalRegistry {
         )?;
         // Bind the adapter's routing context to the prepared plan, rather than
         // re-reading a potentially changed parent environment when it executes.
-        for key in backend.environment_keys() {
-            match context.var(key) {
-                Some(value) => {
-                    command.env(key, value);
-                }
-                None => {
-                    command.env_remove(key);
-                }
-            }
-        }
-        Ok(TerminalLaunch { target, command })
+        let environment = backend
+            .environment_keys()
+            .iter()
+            .map(|key| ((*key).to_owned(), context.var(key).map(OsStr::to_os_string)))
+            .collect();
+        Ok(TerminalLaunch {
+            target,
+            command,
+            environment,
+        })
     }
 }
 
@@ -218,22 +246,43 @@ impl TerminalRegistry {
 /// No Debug implementation, so command arguments cannot enter ordinary diagnostics.
 pub struct TerminalLaunch {
     pub target: TerminalTarget,
-    command: Command,
+    command: TerminalCommand,
+    environment: Vec<(String, Option<OsString>)>,
 }
 
 impl TerminalLaunch {
     pub fn execute(mut self) -> Result<(), String> {
         tracing::debug!(event = "terminal_launch", backend = self.target.id, placement = ?self.target.placement);
-        let output = self
-            .command
+        let output =
+            Self::execute_command(self.target, &self.environment, &mut self.command.command)?;
+        if let Some(next) = self.command.next {
+            let mut command = next(&output.stdout)?;
+            Self::execute_command(self.target, &self.environment, &mut command)?;
+        }
+        Ok(())
+    }
+
+    fn execute_command(
+        target: TerminalTarget,
+        environment: &[(String, Option<OsString>)],
+        command: &mut Command,
+    ) -> Result<std::process::Output, String> {
+        for (key, value) in environment {
+            if let Some(value) = value {
+                command.env(key, value);
+            } else {
+                command.env_remove(key);
+            }
+        }
+        let output = command
             .output()
-            .map_err(|e| format!("无法启动{}：{e}", self.target.label))?;
+            .map_err(|e| format!("无法启动{}：{e}", target.label))?;
         if output.status.success() {
-            Ok(())
+            Ok(output)
         } else {
             Err(format!(
                 "{}启动失败：{}",
-                self.target.label,
+                target.label,
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
@@ -243,8 +292,12 @@ impl TerminalLaunch {
 pub fn builtin_registry() -> &'static TerminalRegistry {
     static REGISTRY: OnceLock<TerminalRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        TerminalRegistry::new(vec![Box::new(rex::Rex), Box::new(ghostty::Ghostty)])
-            .expect("unique terminal adapters")
+        TerminalRegistry::new(vec![
+            Box::new(herdr::Herdr),
+            Box::new(rex::Rex),
+            Box::new(ghostty::Ghostty),
+        ])
+        .expect("unique terminal adapters")
     })
 }
 

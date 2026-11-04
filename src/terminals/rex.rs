@@ -20,7 +20,7 @@ impl TerminalBackend for Rex {
         &self,
         context: &TerminalContext,
         request: &TerminalRequest<'_>,
-    ) -> Result<Command, String> {
+    ) -> Result<TerminalCommand, String> {
         let session = context
             .var("REX_SESSION")
             .ok_or("请在 Rex session 中打开新标签页")?;
@@ -37,6 +37,6 @@ impl TerminalBackend for Rex {
             .arg(request.cwd)
             .args(["--focus=false", "--keep-open", "--", "sh", "-lc"])
             .arg(request.shell_command);
-        Ok(cli)
+        Ok(cli.into())
     }
 }

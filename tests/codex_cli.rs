@@ -88,7 +88,9 @@ impl Fixture {
             .env("USAGE_CODEX_BASE_HOME", self.path.join("user-codex"))
             .env("USAGE_LOG_DIR", self.path.join("logs"))
             .env("USAGE_LOG", "debug")
-            .env("USAGE_GATEWAY", "off");
+            .env("USAGE_GATEWAY", "off")
+            .env_remove("HC_TERMINAL_ID")
+            .env_remove("HC_TERMINAL_SOCKET");
         command
     }
     fn command(&self, args: &[&str]) -> Command {

@@ -113,3 +113,77 @@ for state in ['idle','working','blocked:kind=permission','working','done','error
     }
     assert!(!f.path.join("manager/bark.json").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn herdr_tabs_launch_and_resume_managed_agents_in_distinct_ptys() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let account = f.add();
+    let project = f.path.join("project ' with spaces");
+    fs::create_dir_all(&project).unwrap();
+    let herdr = f.path.join("hc");
+    fs::write(&herdr, r#"#!/usr/bin/env python3
+import errno,json,os,pty,select,subprocess,sys,time,uuid
+args=sys.argv[1:]
+if args[0]=='get':
+    assert args==['get','--json','t-parent']
+    print(json.dumps({'labels':{'herdr.space':'sp-fixture'}}))
+    sys.exit(0)
+assert args[:7]==['run','--json','--bg','--no-parent','--no-notify','--keep','--cwd']
+assert args[8:11]==['--label','herdr.space=sp-fixture','--label']
+target={'pane':'t'+uuid.uuid4().hex,'cwd':args[7]}
+master,slave=pty.openpty()
+env=dict(os.environ,HC_TERMINAL_ID=target['pane'])
+proc=subprocess.Popen(args[args.index('--')+1:],cwd=target['cwd'],env=env,stdin=slave,stdout=slave,stderr=slave)
+os.close(slave)
+data=b''
+try:
+    until=time.monotonic()+20
+    while True:
+        if time.monotonic()>until: raise RuntimeError('pane timed out')
+        if not select.select([master],[],[],.1)[0]: continue
+        try: chunk=os.read(master,65536)
+        except OSError as e:
+            if e.errno==errno.EIO: break
+            raise
+        if not chunk: break
+        data+=chunk
+    code=proc.wait(timeout=2)
+    if code: print(data.decode(),file=sys.stderr)
+    sys.exit(code)
+finally:
+    if proc.poll() is None: proc.kill();proc.wait()
+    os.close(master)
+"#).unwrap();
+    fs::set_permissions(&herdr, fs::Permissions::from_mode(0o700)).unwrap();
+    let binary = f.path.join("mock codex tty");
+    fs::write(&binary, r#"#!/usr/bin/env python3
+import json,os,sys
+if '--help' in sys.argv: print('--no-daemon');sys.exit(0)
+assert all(os.isatty(fd) for fd in [0,1,2])
+assert os.environ['HC_TERMINAL_ID']!='t-parent'
+with open(os.environ['CAPTURE_FILE'],'a') as f:
+    f.write(json.dumps({'pane':os.environ['HC_TERMINAL_ID'],'cwd':os.getcwd(),'args':sys.argv[1:]})+'\n')
+"#).unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let capture = f.path.join("agents.jsonl");
+    let session = uuid::Uuid::new_v4().to_string();
+    for resume in [false, true] {
+        let mut command = f.command(&["run", &account, "--cwd", project.to_str().unwrap(), "--split", "--binary", binary.to_str().unwrap()]);
+        if resume { command.args(["--resume", &session]); }
+        success(command.env("HC_TERMINAL_ID", "t-parent")
+            .env("HC_TERMINAL_SOCKET", "/tmp/herdr named.sock")
+            .env("PATH", format!("{}:{}", f.path.display(), std::env::var("PATH").unwrap_or_default()))
+            .env("REX_SESSION", "outer-rex").env("TERM_PROGRAM", "ghostty")
+            .env("CAPTURE_FILE", &capture)
+            .output().unwrap());
+    }
+    let records: Vec<serde_json::Value> = fs::read_to_string(capture).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(records.len(), 2);
+    assert_ne!(records[0]["pane"], records[1]["pane"]);
+    for record in &records { assert_eq!(record["cwd"], project.to_str().unwrap()); }
+    let args: Vec<_> = records[1]["args"].as_array().unwrap().iter().map(|arg| arg.as_str().unwrap()).collect();
+    assert!(args.windows(2).any(|pair| pair == ["resume", session.as_str()]));
+}
