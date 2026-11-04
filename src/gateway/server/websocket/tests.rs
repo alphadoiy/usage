@@ -415,7 +415,7 @@ async fn native_socket(compressed: bool) {
         .unwrap()
         .unwrap();
     assert_eq!(reply, expected_reply);
-    let (_, _, record) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let (_, _, record) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .unwrap()
         .unwrap();

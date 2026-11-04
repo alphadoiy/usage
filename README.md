@@ -26,7 +26,7 @@
 
 ### Homebrew（GitHub Release）
 
-macOS 15 或更新版本，支持 Apple Silicon 和 Intel，无需安装 Rust：
+macOS 15 或更新版本，仅支持 Apple Silicon，无需安装 Rust：
 
 ```bash
 brew install alphadoiy/tap/usage

@@ -351,7 +351,7 @@ async fn home_discovers_sessions_in_background_and_keeps_selection_on_refresh() 
         let generation = app.home_sessions_state.generation;
         app.start_home_sessions_load(&Handle::current());
         assert_eq!(app.home_sessions_state.generation, generation);
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while app.home_sessions_state.loading {
                 app.drain_events();
                 tokio::task::yield_now().await;

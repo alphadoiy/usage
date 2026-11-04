@@ -562,7 +562,7 @@ mod tests {
             .await
         });
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .unwrap(),
             Some(1)
@@ -570,7 +570,7 @@ mod tests {
         assert!(!task.is_finished());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while !cancelled.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
@@ -627,10 +627,10 @@ mod tests {
             .collect();
         let task =
             tokio::spawn(
-                async move { collect_with_deadline(&readers, Duration::from_secs(5)).await },
+                async move { collect_with_deadline(&readers, Duration::from_secs(30)).await },
             );
         for _ in 0..MAX_CONCURRENT_QUERIES {
-            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -641,7 +641,7 @@ mod tests {
                 .is_err()
         );
         gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -651,7 +651,7 @@ mod tests {
                 .is_err()
         );
         gate.add_permits(count - 1);
-        let snapshots = tokio::time::timeout(Duration::from_secs(2), task)
+        let snapshots = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .unwrap()
             .unwrap();

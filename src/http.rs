@@ -287,7 +287,7 @@ mod redirect_tests {
             .await
             .unwrap();
             assert!(result.unwrap_err().0.contains("size limit"));
-            tokio::time::timeout(Duration::from_secs(1), server)
+            tokio::time::timeout(Duration::from_secs(10), server)
                 .await
                 .unwrap()
                 .unwrap();

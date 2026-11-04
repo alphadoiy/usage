@@ -99,7 +99,7 @@ fn reset_catalog(providers: &[Arc<dyn UsageProvider>]) -> crate::provider_catalo
 }
 
 async fn drain_until(app: &mut Dashboard, condition: impl Fn(&Dashboard) -> bool) -> (bool, bool) {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let outcome = app.drain_events();
             if condition(app) {

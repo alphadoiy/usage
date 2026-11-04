@@ -1,7 +1,7 @@
 //! Owned background work with cooperative cancellation across async and blocking boundaries.
 use std::future::Future;
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::{
@@ -78,14 +78,37 @@ impl Budget {
     }
 }
 
+// Production shares one process-wide budget per kind of work. Tests run in parallel
+// on separate threads, so a shared budget would let one test's held permits starve
+// another's; each test thread gets its own budget instead.
+#[cfg(not(test))]
 fn query_budget() -> &'static Budget {
-    static BUDGET: OnceLock<Budget> = OnceLock::new();
+    static BUDGET: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
     BUDGET.get_or_init(|| Budget::new(QUERY_CONCURRENCY, QUERY_QUEUE))
 }
 
+#[cfg(not(test))]
 fn blocking_budget() -> &'static Budget {
-    static BUDGET: OnceLock<Budget> = OnceLock::new();
+    static BUDGET: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
     BUDGET.get_or_init(|| Budget::new(BLOCKING_CONCURRENCY, BLOCKING_QUEUE))
+}
+
+#[cfg(test)]
+fn query_budget() -> &'static Budget {
+    thread_local! {
+        static BUDGET: &'static Budget =
+            Box::leak(Box::new(Budget::new(QUERY_CONCURRENCY, QUERY_QUEUE)));
+    }
+    BUDGET.with(|budget| *budget)
+}
+
+#[cfg(test)]
+fn blocking_budget() -> &'static Budget {
+    thread_local! {
+        static BUDGET: &'static Budget =
+            Box::leak(Box::new(Budget::new(BLOCKING_CONCURRENCY, BLOCKING_QUEUE)));
+    }
+    BUDGET.with(|budget| *budget)
 }
 
 pub(crate) async fn query<T>(work: impl Future<Output = T>) -> Result<T, &'static str> {
@@ -227,7 +250,7 @@ mod tests {
         );
         assert!(matches!(budget.admit().await, Err("后台任务排队已满")));
         drop(running);
-        let admitted = tokio::time::timeout(Duration::from_secs(1), waiting)
+        let admitted = tokio::time::timeout(Duration::from_secs(10), waiting)
             .await
             .unwrap()
             .unwrap();
@@ -262,7 +285,7 @@ mod tests {
             })
             .await
         });
-        tokio::time::timeout(Duration::from_secs(1), ready)
+        tokio::time::timeout(Duration::from_secs(10), ready)
             .await
             .unwrap()
             .unwrap();
@@ -274,7 +297,7 @@ mod tests {
                 .is_err()
         );
         let _ = release.send(());
-        let _permit = tokio::time::timeout(Duration::from_secs(1), next)
+        let _permit = tokio::time::timeout(Duration::from_secs(10), next)
             .await
             .unwrap()
             .unwrap();

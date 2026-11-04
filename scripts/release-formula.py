@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a Homebrew formula from both release archives (Python 3.11+)."""
+"""Generate a Homebrew formula from the Apple Silicon release archive (Python 3.11+)."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -17,23 +17,17 @@ def main():
     version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
         parser.error("stable releases require a MAJOR.MINOR.PATCH version")
-    blocks = []
-    for arch, target in (("arm", "aarch64-apple-darwin"), ("intel", "x86_64-apple-darwin")):
-        name = f"usage-v{version}-{target}.tar.gz"
-        digest = hashlib.sha256((args.dist / name).read_bytes()).hexdigest()
-        blocks.append(f'''  on_{arch} do
-    url "https://github.com/{args.repo}/releases/download/v{version}/{name}"
-    sha256 "{digest}"
-  end''')
+    name = f"usage-v{version}-aarch64-apple-darwin.tar.gz"
+    digest = hashlib.sha256((args.dist / name).read_bytes()).hexdigest()
     formula = f'''class Usage < Formula
   desc "Terminal dashboard for AI agent usage, providers, and sessions"
   homepage "https://github.com/{args.repo}"
-  version "{version}"
+  url "https://github.com/{args.repo}/releases/download/v{version}/{name}"
+  sha256 "{digest}"
 
+  depends_on arch: :arm64
   depends_on macos: :sequoia
   conflicts_with "usage-local", because: "both install the usage command"
-
-{chr(10).join(blocks)}
 
   def install
     bin.install "usage"

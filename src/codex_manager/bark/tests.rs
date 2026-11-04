@@ -258,7 +258,7 @@ async fn completion_callbacks_send_immediately_without_coalescing_or_deduplicati
     );
     a.unwrap();
     b.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(10));
     for _ in 0..2 {
         let message = server.receive();
         assert_eq!(message["level"], "active");

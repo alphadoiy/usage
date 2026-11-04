@@ -19,9 +19,9 @@ bash scripts/publish-github.sh
 
 脚本要求干净工作区。它创建缺少的公开仓库，将当前提交推送到源码仓库的 `main`，创建与 Cargo 版本一致的标签（如 `v0.1.0`），等待 Release 工作流成功，再把 Release 内的 `usage.rb` 提交到 tap 的 `Formula/usage.rb`。已有远程分支与标签不会被强制覆盖。脚本需要 GitHub CLI 的仓库创建、源码及工作流写入权限；使用 classic token 时需包含 `repo` 和 `workflow` 权限。可设置 `USAGE_GITHUB_REPO` 与 `USAGE_HOMEBREW_REPO` 覆盖仓库名，README 的安装命令需同步修改。
 
-Release 工作流在 [GitHub 的 macOS runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 分别测试并构建 Apple Silicon 与 Intel 二进制。部署目标是 macOS 15。两种架构都成功后生成 SHA-256 校验文件和 Formula，再发布 Release。运行时只安装预编译二进制，无需 Rust。tap 更新使用本机已有 GitHub 登录，不需要向 Actions 另存跨仓库 token。
+Release 工作流在 [GitHub 的 macOS runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 上构建 Apple Silicon（`aarch64-apple-darwin`）二进制，不再提供 Intel 构建。部署目标是 macOS 15。测试只在 `main` 的 CI 中对同一提交运行一次；`verify-ci` 与构建并行，等待该提交的 CI 成功，再由 `publish` 生成 SHA-256 校验文件和 Formula 并发布 Release。CI 并行运行 Rust 测试，进程级的后台任务预算在测试构建里按线程隔离，避免并行测试互相占用许可。没有成功的 CI 时发布失败，因此需要先推送到 `main`（发布脚本会这样做）。Formula 带 `depends_on arch: :arm64`，Intel Mac 会收到明确的安装错误。运行时只安装预编译二进制，无需 Rust。tap 更新使用本机已有 GitHub 登录，不需要向 Actions 另存跨仓库 token。
 
-`main` 的 CI 会并行为两种架构预热测试和 release 依赖缓存，标签构建使用相同的缓存键读取它们。GitHub 标签之间的缓存互相隔离，因此缓存写入默认分支，发布任务只读取；首次预热仍需完整编译。缓存按 Rust 工具链、目标架构、依赖及编译环境区分，业务源码会重新编译，完整测试仍在发布时运行。常规 CI 另外缓存自身的检查和测试依赖。
+`main` 的 CI 会预热 release 依赖缓存，标签构建使用相同的缓存键读取。GitHub 标签之间的缓存互相隔离，因此缓存写入默认分支，发布任务只读取；首次预热仍需完整编译。缓存按 Rust 工具链、目标架构、依赖及编译环境区分，业务源码会重新编译。
 
 ## 后续更新
 

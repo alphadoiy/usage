@@ -14,19 +14,10 @@ concurrency:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
-      USAGE_LOG: "off"
-      USAGE_CODEX_DIR: /tmp/usage-release-test
+      TARGET: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - name: Check version tag
@@ -39,13 +30,9 @@ jobs:
       - name: Restore Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-${{ matrix.target }}
+          shared-key: release-${{ env.TARGET }}
           save-if: false
-      - name: Test
-        run: cargo +stable test --locked -- --test-threads=1
       - name: Build and package
-        env:
-          TARGET: ${{ matrix.target }}
         shell: bash
         run: |
           cargo +stable build --release --locked --target "$TARGET"
@@ -54,11 +41,41 @@ jobs:
           tar -czf "dist/usage-${GITHUB_REF_NAME}-${TARGET}.tar.gz" -C "target/$TARGET/release" usage
       - uses: actions/upload-artifact@v4
         with:
-          name: usage-${{ matrix.target }}
+          name: usage-${{ env.TARGET }}
           path: dist/*.tar.gz
           if-no-files-found: error
+  # Tests run once, in CI, for this exact commit. Building in parallel with that
+  # run keeps the release as fast as the slower of the two.
+  verify-ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          deadline=$((SECONDS + 1500))
+          while true; do
+            runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" --json status,conclusion)"
+            if jq -e 'any(.[]; .status == "completed" and .conclusion == "success")' <<<"$runs" >/dev/null; then
+              exit 0
+            fi
+            if jq -e 'length > 0 and all(.[]; .status == "completed")' <<<"$runs" >/dev/null; then
+              echo "CI did not succeed for $GITHUB_SHA" >&2
+              exit 1
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "No successful CI run for $GITHUB_SHA; push the commit to main first." >&2
+              exit 1
+            fi
+            sleep 15
+          done
   publish:
-    needs: build
+    needs: [build, verify-ci]
     runs-on: ubuntu-latest
     permissions:
       contents: write

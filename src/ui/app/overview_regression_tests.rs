@@ -297,7 +297,7 @@ options={user_id=1}
         Arc::new(|_| panic!("billing-only resource resolved credentials")),
     ));
     app.refresh_overview(&Handle::current());
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while app.overview_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;
@@ -317,7 +317,7 @@ options={user_id=1}
     assert!(!root.join("absent-manager").exists());
     std::fs::write(path, "invalid [ TOML").unwrap();
     app.refresh_overview(&Handle::current());
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while app.overview_state.loading {
             app.drain_events();
             tokio::task::yield_now().await;

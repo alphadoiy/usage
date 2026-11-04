@@ -36,7 +36,7 @@ jobs:
       - name: Lint
         run: cargo +stable clippy --locked --all-targets -- -D warnings
       - name: Rust tests
-        run: cargo +stable test --locked -- --test-threads=1
+        run: cargo +stable test --locked
       - name: TUI workflow contracts
         run: python3 tests/support/ui_workflows.py target/debug/usage
       - name: Install pinned native Codex for contract tests
@@ -54,18 +54,10 @@ jobs:
           python3 scripts/ablate-current-changes.py --output /private/tmp/usage-ci-current-anchors --check-anchors
 
   release-cache:
-    # Tag caches are isolated from other tags. Warm both native targets on main
-    # so future releases can restore debug and release dependencies from it.
+    # Tag caches are isolated from other tags, so warm the release dependencies
+    # on main. Tests are cached by the check job and no longer run at release time.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     timeout-minutes: 20
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
@@ -76,8 +68,6 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: release-${{ matrix.target }}
-      - name: Compile test dependencies
-        run: cargo +stable test --locked --no-run
+          shared-key: release-aarch64-apple-darwin
       - name: Compile release dependencies
-        run: cargo +stable build --release --locked --target ${{ matrix.target }}
+        run: cargo +stable build --release --locked --target aarch64-apple-darwin

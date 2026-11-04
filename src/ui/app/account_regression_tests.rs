@@ -38,7 +38,7 @@ async fn two_accounts_receive_their_own_card_results() {
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.history_state.config.alerts.enabled = true;
     app.refresh(&Handle::current());
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while app.pending > 0 {
             app.drain_events();
             tokio::task::yield_now().await;

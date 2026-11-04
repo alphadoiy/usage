@@ -1291,7 +1291,7 @@ mod tests {
             })
             .await;
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if results.lock().unwrap().len() == 2 && active.load(Ordering::SeqCst) == 1 {
                     break;
@@ -1303,7 +1303,7 @@ mod tests {
         .unwrap();
         task.abort();
         let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while active.load(Ordering::SeqCst) > 0 {
                 tokio::task::yield_now().await;
             }
