@@ -19,13 +19,13 @@
 [sessions]
 resume = "auto"  # auto / ghostty / rex / herdr / current
 layout = "auto"  # auto / split / tab
-focus  = "keep"  # keep / new
+focus  = "new"   # new / keep
 ```
 
 - `layout = "auto"`：能分屏就分屏；自适应终端（目前是 Ghostty、Herdr 和 Rex）按下面的规则自动排布。
 - `layout = "split"`：始终在 Usage 所在标签页分屏，自适应终端忽略每页上限，必要时才低于最小尺寸。
 - `layout = "tab"`：始终新建标签页。
-- `focus = "keep"`（默认）：留在 Usage，可连续启动多个实例；`new`：切到新实例。Herdr 创建成功后若焦点操作失败，会明确提示“实例已创建”，避免误以为需要重新启动。
+- `focus = "new"`（默认）：切到新实例；显式 `keep` 留在 Usage，方便连续创建多个实例。Herdr 创建成功后若焦点操作失败，会明确提示“实例已创建”，避免误以为需要重新启动。
 
 两项都可省略，未知取值和显式配置文件读取失败会直接报错，不静默回退。`usage codex run --split` 的含义仍是“在新终端运行”，具体落点由上述配置决定。
 
@@ -133,7 +133,7 @@ Ghostty 的 AppleScript 不暴露 pane 尺寸，也不提供稳定的“当前 U
 
 1. `herdr-app ls` 找到 `HC_TERMINAL_ID` 所在 space、tab 与 pane。
 2. 布局引擎决定 `pane.split --direction right|down --pane <pane> --argv […]` 或 `tab.new --space <Usage 所在 space> --name <目录名> --folder <cwd> --argv […]`。argv 为 `sh -c AGENT_WRAPPER usage-agent <cwd> <launcher command>`，cwd 和命令都是独立参数。
-3. 启动成功后记录布局状态；`focus = "keep"` 先 `tab.select` Usage 所在 tab、再 `pane.focus` Usage pane，`focus = "new"` 直接聚焦新 pane。
+3. 启动成功后记录布局状态；`focus = "keep"` 先 `tab.select` Usage 所在 tab、再 `pane.focus` Usage pane，`focus = "new"` 先选中目标标签页，再聚焦新 pane。
 
 CLI 查找顺序是 `HERDR_APP_HOME/bin/herdr-app`、PATH、`~/.local/bin/herdr-app`。查询、启动或焦点命令失败时直接报错，不重试、不切换后端。自动测试用假 `herdr-app` 覆盖多阶段调用、失败不重放和 JSON 解析；`tests/support/terminal_launch.rs` 用假 App + PTY 验证两次启动拥有不同 PTY、项目目录和恢复参数。真实 App 0.1.12 / herdr-core 0.1.17 的旧标签页实现已被官方命令实现替换；本机 App 0.1.13 / herdr-core 0.1.18 曾因 core registry writer 故障无法做真实窗口验证。
 
@@ -151,3 +151,9 @@ CLI 优先使用 `REX_BIN_DIR/rex`，其次 PATH。查询或启动失败不重�
 - Rex：官方文档确认 `rex session inspect` / `rex run --split --ratio --block` 接口；在 Rex Beta 0.1.0 (1758) 真机使用隔离测试账号和模拟 Agent 验证了分屏、标签页、keep/new 焦点和新 pane 的布局缓存；尚未验证真实 Agent、恢复会话及 OSC 状态。
 - Herdr：本机 App 0.1.13 / herdr-core 0.1.18 的 `herdr-app ls/status/commands` 可用，但 core 报 `cannot save terminals: registry writer stopped`，因此无法创建真实 pane/tab 验证。
 - Ghostty：AppleScript 已按本机 Ghostty 字典编写并用假 `osascript` 验证调用链；真实窗口的创建和焦点行为尚未验证。
+
+## 重复恢复会话
+
+通过 Usage 在外部终端恢复的会话会记录匿名启动标识与 pane 的关联。再次恢复相同来源、目标账号和命令的会话时，先读取实时拓扑；pane 仍在当前 Herdr space、Rex session 或 Ghostty window 中时直接切换标签页并聚焦，不再启动第二个 Agent。pane 已关闭则重新创建。显式切换目标账号不会复用另一个账号的 pane。普通新实例启动始终创建新实例。
+
+关联只保存命令与项目路径的摘要以及 pane ID，不保存完整命令或凭据。更新前打开的实例、Usage 之外打开的实例和当前终端恢复没有此关联，不能仅凭会话标题猜测 pane。Rex 已退出但仍由 `--keep-open` 保留的 pane 也会被聚焦，关闭该 pane 后可重新恢复。

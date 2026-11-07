@@ -138,6 +138,15 @@ impl SessionBrowser {
             .sum()
     }
 
+    /// All currently visible projects, honoring search and history filters.
+    pub fn visible_sessions(&self) -> Vec<Session> {
+        self.projects
+            .iter()
+            .flat_map(|p| p.sessions.iter())
+            .map(|&i| self.sessions[i].clone())
+            .collect()
+    }
+
     pub fn project_count(&self) -> usize {
         self.projects.len()
     }
@@ -1137,6 +1146,13 @@ mod tests {
         let mut browser = SessionBrowser::new(vec![a, b, c]);
         browser.set_usage(map, Some("selected date".into()));
         assert_eq!(browser.visible_count(), 2);
+        assert_eq!(browser.visible_sessions().len(), 2);
+        assert!(
+            browser
+                .visible_sessions()
+                .iter()
+                .all(|s| s.title != "Outside day")
+        );
         assert_eq!(
             browser.selected_project().unwrap(),
             &PathBuf::from("/tmp/a")

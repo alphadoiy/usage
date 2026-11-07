@@ -35,8 +35,19 @@ fn log_path(session: &sessions::Session) -> PathBuf {
 fn dashboard(session: sessions::Session) -> Dashboard {
     let mut config = isolated_config();
     config.claude_dir = Some(session.home.clone());
-    let mut app = Dashboard::new(Vec::new(), config, "/nonexistent/cleanup-ui.toml".into());
+    let homes = sessions::SessionHomes::new().with("claude", &session.home);
+    let mut app = Dashboard::new_with_sessions(
+        Vec::new(),
+        config,
+        "/nonexistent/cleanup-ui.toml".into(),
+        sessions::builtin_registry(),
+        homes,
+    );
     app.cleanup_store = crate::session_cleanup::Store::at(session.cwd.join("trash"));
+    app.cleanup_opens = crate::session_cleanup::opens::Store::at(session.cwd.join("opens.sqlite3"));
+    app.home_sessions_state.project_store = std::sync::Arc::new(crate::projects::Store::at(
+        session.cwd.join("projects.sqlite3"),
+    ));
     app.home_activity.root = session.cwd.join("no-managed-runs");
     app.browser_state.panel = Some(SessionBrowser::new(vec![session]));
     app.browser_state.panel.as_mut().unwrap().focus_sessions();
@@ -126,6 +137,102 @@ async fn delete_cancel_restore_and_refresh_work_through_browser_keys() {
     .await
     .unwrap();
     assert_eq!(app.browser_state.panel.as_ref().unwrap().sessions.len(), 1);
+    drop(app);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn smart_cleanup_previews_and_deletes_only_stale_sessions() {
+    let (root, session) = fixture();
+    let mut stale = session.clone();
+    stale.id = uuid::Uuid::new_v4().to_string();
+    stale.title = "stale fixture".into();
+    stale.recency_at_ms = 1;
+    fs::write(
+        log_path(&stale),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"user","sessionId":stale.id,"cwd":root,"message":{"content":"old fixture"}})
+        ),
+    )
+    .unwrap();
+    fs::File::open(log_path(&stale))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(120)))
+        .unwrap();
+    let mut recent = session.clone();
+    recent.recency_at_ms = chrono::Utc::now().timestamp_millis();
+    let mut app = dashboard(recent.clone());
+    app.cleanup_opens.record(&stale.key(), 1).unwrap();
+    app.browser_state
+        .panel
+        .as_mut()
+        .unwrap()
+        .refresh(vec![recent, stale.clone()]);
+    let handle = Handle::current();
+    app.handle_browser_key(KeyCode::Char('C'), &handle);
+    assert!(matches!(app.cleanup.as_ref().unwrap().mode, Mode::Loading));
+    settle(&mut app).await;
+    let plan = match app.cleanup.as_ref().unwrap().mode {
+        Mode::Smart(SmartPlan::Ready(ref plan)) => plan.clone(),
+        ref other => panic!("unexpected cleanup mode: {other:?}"),
+    };
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].session.id, stale.id);
+    assert_eq!(
+        plan.candidates[0].reason,
+        crate::session_cleanup::policy::Reason::Stale
+    );
+    assert!(log_path(&stale).exists());
+    app.handle_cleanup_key(KeyCode::Char('y'), &handle);
+    settle(&mut app).await;
+    assert!(!log_path(&stale).exists());
+    assert!(
+        matches!(&app.cleanup.as_ref().unwrap().mode, Mode::Result(s) if s.contains("成功处理 1"))
+    );
+    drop(app);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn smart_cleanup_honors_search_and_rejects_cancelled_results() {
+    let (root, session) = fixture();
+    let mut other = session.clone();
+    other.id = uuid::Uuid::new_v4().to_string();
+    other.title = "excluded".into();
+    let mut app = dashboard(session.clone());
+    let browser = app.browser_state.panel.as_mut().unwrap();
+    browser.refresh(vec![session.clone(), other]);
+    for ch in "fixture".chars() {
+        browser.type_char(ch);
+    }
+    let handle = Handle::current();
+    app.open_smart_cleanup(&handle);
+    let generation = app.cleanup_generation;
+    let cancel = app
+        .cleanup
+        .as_ref()
+        .unwrap()
+        .task
+        .as_ref()
+        .unwrap()
+        .cancellation();
+    app.handle_cleanup_key(KeyCode::Esc, &handle);
+    assert!(cancel.is_cancelled());
+    app.open_smart_cleanup(&handle);
+    assert!(!app.accept_smart_cleanup(generation, SmartPlan::Failed("late result".into())));
+    settle(&mut app).await;
+    let Mode::Smart(SmartPlan::Ready(plan)) = &app.cleanup.as_ref().unwrap().mode else {
+        panic!("expected plan");
+    };
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].session.id, session.id);
+    assert!(plan.errors.is_empty());
+    for (width, height) in [(120, 30), (44, 14), (12, 4), (1, 1)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+    }
+    assert!(log_path(&session).exists());
     drop(app);
     fs::remove_dir_all(root).unwrap();
 }

@@ -51,15 +51,27 @@ impl TerminalBackend for Herdr {
         let size = context.size();
         let cwd = request.cwd.to_owned();
         let shell = request.shell_command.to_owned();
+        let endpoint = context
+            .var("HC_TERMINAL_SOCKET")
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let options = request.options;
+        let reuse_key = request.reuse_key.map(str::to_owned);
         let mut ls = Command::new(&app);
         ls.arg("ls");
         Ok(TerminalCommand::from(ls).then(move |stdout| {
             let (live, space) = parse_ls(&String::from_utf8_lossy(stdout), &terminal)?;
-            let scope = format!("herdr-{space}");
+            let scope = format!("herdr-{endpoint}-{space}");
             let store = Store::default_store();
             let group = group_key(&cwd);
-            let plan = adaptive::plan(&live, size, &store.load(&scope), options.layout, &group);
+            let model = store.load(&scope);
+            if let Some(existing) = model.existing(reuse_key.as_deref(), &live) {
+                let focus = do_command(&app, "pane.focus", json!({"pane": existing.pane}));
+                let select = do_command(&app, "tab.select", json!({"id": existing.tab}));
+                return Ok(TerminalCommand::from(select).then(move |_| Ok(focus)));
+            }
+            let plan = adaptive::plan(&live, size, &model, options.layout, &group);
             let launch = launch_command(
                 &app,
                 &space,
@@ -67,6 +79,7 @@ impl TerminalBackend for Herdr {
                 &TerminalRequest {
                     cwd: &cwd,
                     shell_command: &shell,
+                    reuse_key: None,
                     options,
                 },
             );
@@ -78,23 +91,43 @@ impl TerminalBackend for Herdr {
             let anchor = live.anchor.clone();
             let (hook_app, focus_new) = (app.clone(), options.focus == FocusMode::New);
             let layout = options.layout;
+            let destination_tab = match &plan.action {
+                Action::Split { tab, .. } => Some(live.tabs[*tab].id.clone()),
+                Action::NewTab => None,
+            };
             Ok(TerminalCommand::from(launch)
                 .marks_created()
                 .after(move |stdout| {
-                    plan.commit(&store, &scope, parse_created(stdout), layout, &group);
+                    plan.commit(
+                        &store,
+                        &scope,
+                        parse_created(stdout),
+                        layout,
+                        &group,
+                        reuse_key.as_deref(),
+                    );
                 })
                 .then(move |stdout| {
                     // Keep returns to Usage whatever the app did; New follows the new pane.
                     let created = parse_created(stdout);
-                    let target = match (&created, focus_new) {
-                        (Some(created), true) => created.pane.clone(),
-                        _ => anchor,
+                    let (target, tab) = if focus_new {
+                        let created =
+                            created.ok_or("实例已创建，但无法确认新 pane；请勿重复启动")?;
+                        (
+                            created.pane,
+                            created
+                                .tab
+                                .or(destination_tab)
+                                .ok_or("实例已创建，但无法确认新标签页；请勿重复启动")?,
+                        )
+                    } else {
+                        (anchor, home_tab)
                     };
                     let focus = do_command(&hook_app, "pane.focus", json!({ "pane": target }));
-                    if focus_new || home_tab.is_empty() {
+                    if tab.is_empty() {
                         return Ok(TerminalCommand::from(focus));
                     }
-                    let select = do_command(&hook_app, "tab.select", json!({ "id": home_tab }));
+                    let select = do_command(&hook_app, "tab.select", json!({ "id": tab }));
                     Ok(TerminalCommand::from(select).then(move |_| Ok(focus)))
                 }))
         }))
@@ -230,6 +263,7 @@ mod tests {
             &TerminalRequest {
                 cwd: Path::new("/tmp"),
                 shell_command: "opaque",
+                reuse_key: None,
                 options: LaunchOptions::default(),
             },
         );

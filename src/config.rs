@@ -51,7 +51,7 @@ impl Default for AppConfig {
             alerts: AlertConfig::default(),
             resume: ResumeMode::Auto,
             layout: LayoutMode::Auto,
-            focus: FocusMode::Keep,
+            focus: FocusMode::New,
         }
     }
 }
@@ -113,8 +113,8 @@ pub enum LayoutMode {
 #[serde(rename_all = "lowercase")]
 pub enum FocusMode {
     /// Stay in Usage, so several instances can be started in a row.
-    #[default]
     Keep,
+    #[default]
     New,
 }
 
@@ -653,7 +653,7 @@ impl Default for RawSessions {
         Self {
             resume: ResumeMode::Auto,
             layout: LayoutMode::Auto,
-            focus: FocusMode::Keep,
+            focus: FocusMode::New,
         }
     }
 }
@@ -695,7 +695,7 @@ mod tests {
         let config = parse_raw(toml::from_str("").unwrap()).unwrap();
         assert_eq!(
             (config.layout, config.focus),
-            (LayoutMode::Auto, FocusMode::Keep)
+            (LayoutMode::Auto, FocusMode::New)
         );
         let config = parse_raw(
             toml::from_str("[sessions]\nresume = \"rex\"\nlayout = \"tab\"\nfocus = \"new\"")

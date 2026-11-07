@@ -1,5 +1,6 @@
 use super::*;
 use crate::sessions::AgentKind;
+use std::collections::HashMap;
 
 struct Fixture {
     root: PathBuf,
@@ -631,4 +632,386 @@ fn native_codex_index_is_unchanged_and_registry_filters_deleted_rows() {
     );
     f.store.restore(&entry.key).unwrap();
     assert_eq!(registry.load_all(&homes).sessions.len(), 1);
+}
+
+#[test]
+fn cleanup_policy_finds_empty_and_stale_and_preserves_pinned_and_active() {
+    let root = std::env::temp_dir().join(format!("usage-policy-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(root.join("home/projects/project")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let mut empty = Fixture::new(AgentKind::CODEX).session.clone();
+    empty.cwd = root.clone();
+    empty.home = root.join("home");
+    empty.recency_at_ms = 1;
+    fs::create_dir_all(empty.home.join("sessions")).unwrap();
+    fs::write(
+        empty.home.join("sessions/empty.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":empty.id,"cwd":root}})
+        ),
+    )
+    .unwrap();
+
+    let mut used = empty.clone();
+    used.id = uuid::Uuid::new_v4().to_string();
+    used.recency_at_ms = 1;
+    fs::write(
+        used.home.join("sessions/used.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":used.id,"cwd":root}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hello"}})
+        ),
+    )
+    .unwrap();
+
+    let mut stale = empty.clone();
+    stale.id = uuid::Uuid::new_v4().to_string();
+    stale.recency_at_ms = 1;
+    fs::write(
+        stale.home.join("sessions/stale.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":stale.id,"cwd":root}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"old"}})
+        ),
+    )
+    .unwrap();
+
+    let mut pinned = stale.clone();
+    pinned.id = uuid::Uuid::new_v4().to_string();
+    pinned.cwd = root.join("pinned");
+    fs::create_dir_all(&pinned.cwd).unwrap();
+    fs::write(
+        pinned.home.join("sessions/pinned.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":pinned.id,"cwd":pinned.cwd}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"old"}})
+        ),
+    )
+    .unwrap();
+
+    let mut active = stale.clone();
+    active.id = uuid::Uuid::new_v4().to_string();
+    fs::write(
+        active.home.join("sessions/active.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":active.id,"cwd":root}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"old"}})
+        ),
+    )
+    .unwrap();
+
+    let mut unknown = stale.clone();
+    unknown.id = uuid::Uuid::new_v4().to_string();
+    fs::write(
+        unknown.home.join("sessions/unknown.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":unknown.id,"cwd":root}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"old"}})
+        ),
+    )
+    .unwrap();
+
+    let sessions = [
+        empty.clone(),
+        used.clone(),
+        stale.clone(),
+        pinned.clone(),
+        active.clone(),
+        unknown.clone(),
+    ];
+    let pinned_paths = HashSet::from([pinned.cwd.clone()]);
+    let active_keys = HashMap::from([(active.key(), ())]);
+    let opens = HashMap::from([
+        (used.key(), i64::MAX),
+        (stale.key(), 1),
+        (pinned.key(), 1),
+        (active.key(), 1),
+    ]);
+    let plan = policy::plan(
+        &sessions,
+        &pinned_paths,
+        &active_keys,
+        &opens,
+        policy::Policy {
+            now_ms: 31 * 24 * 60 * 60 * 1000,
+            stale_days: 30,
+        },
+    );
+    assert_eq!(plan.candidates.len(), 3);
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|c| c.session.id == empty.id && c.reason == policy::Reason::Empty)
+    );
+    assert!(
+        plan.candidates
+            .iter()
+            .any(|c| c.session.id == stale.id && c.reason == policy::Reason::Stale)
+    );
+    assert_eq!(plan.skipped_pinned, 1);
+    assert_eq!(plan.skipped_active, 1);
+    assert!(plan.errors.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn session_open_store_keeps_the_latest_timestamp() {
+    let root = std::env::temp_dir().join(format!("usage-opens-{}", uuid::Uuid::new_v4()));
+    let store = opens::Store::at(root.join("opens.sqlite3"));
+    let key = crate::sessions::SessionKey {
+        provider: "codex".into(),
+        instance: "codex".into(),
+        id: uuid::Uuid::new_v4().to_string(),
+    };
+    store.record(&key, 20).unwrap();
+    store.record(&key, 10).unwrap();
+    store.record(&key, 30).unwrap();
+    assert_eq!(store.list().unwrap()[&key], 30);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn codex_empty_detection_requires_a_user_message_in_any_segment() {
+    let mut f = Fixture::new(AgentKind::CODEX);
+    f.session.recency_at_ms = chrono::Utc::now().timestamp_millis();
+    let user = uuid::Uuid::new_v4().to_string();
+    let row = |kind: &str, payload: serde_json::Value| {
+        serde_json::json!({"type":kind,"payload":payload}).to_string()
+    };
+    f.put(
+        "sessions/day/first.jsonl",
+        &format!(
+            "{}\n{}\n",
+            row(
+                "session_meta",
+                serde_json::json!({"id":f.session.id,"cwd":f.root})
+            ),
+            row(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":""})
+            )
+        ),
+    );
+    f.put(
+        "sessions/day/second.jsonl",
+        &format!(
+            "{}\n{}\n",
+            row(
+                "session_meta",
+                serde_json::json!({"id":f.session.id,"cwd":f.root})
+            ),
+            row(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"real prompt"})
+            )
+        ),
+    );
+    f.put(
+        "sessions/day/other.jsonl",
+        &format!(
+            "{}\n{}\n",
+            row("session_meta", serde_json::json!({"id":user,"cwd":f.root})),
+            row(
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"other session"})
+            )
+        ),
+    );
+    assert!(
+        !policy::plan(
+            std::slice::from_ref(&f.session),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            policy::Policy {
+                now_ms: 31 * 24 * 60 * 60 * 1000,
+                stale_days: 30,
+            }
+        )
+        .candidates
+        .iter()
+        .any(|candidate| candidate.session.id == f.session.id)
+    );
+}
+
+#[test]
+fn grok_empty_detection_reads_summary_identity_not_directory_name() {
+    let mut f = Fixture::new(AgentKind::GROK);
+    f.session.recency_at_ms = chrono::Utc::now().timestamp_millis();
+    f.put(
+        "sessions/project/arbitrary-name/summary.json",
+        &serde_json::json!({"info":{"id":f.session.id,"cwd":f.root}}).to_string(),
+    );
+    f.put(
+        "sessions/project/arbitrary-name/updates.jsonl",
+        &serde_json::json!({
+            "params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hello"}}}
+        })
+        .to_string(),
+    );
+    assert!(
+        !policy::plan(
+            std::slice::from_ref(&f.session),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            policy::Policy::default()
+        )
+        .candidates
+        .iter()
+        .any(|candidate| candidate.session.id == f.session.id)
+    );
+}
+
+#[test]
+fn cleanup_preserves_html_multimodal_and_mixed_tool_content() {
+    let f = Fixture::new(AgentKind::CLAUDE);
+    for content in [
+        serde_json::json!("<div>Hello</div> explain this HTML"),
+        serde_json::json!([{"type":"image","source":{"type":"base64","data":"fixture"}}]),
+        serde_json::json!([{"type":"tool_result","content":"done"},{"type":"text","text":"continue"}]),
+    ] {
+        f.put(
+            format!("projects/p/{}.jsonl", f.session.id),
+            &serde_json::json!({"type":"user","message":{"content":content}}).to_string(),
+        );
+        let plan = policy::plan(
+            std::slice::from_ref(&f.session),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            policy::Policy {
+                now_ms: 2,
+                stale_days: 30,
+            },
+        );
+        assert!(plan.candidates.is_empty(), "{plan:?}");
+        assert!(plan.errors.is_empty());
+    }
+}
+
+#[test]
+fn cleanup_isolates_corrupt_codex_segments_and_preserves_missing_logs() {
+    let f = Fixture::new(AgentKind::CODEX);
+    let mut broken = f.session.clone();
+    broken.id = uuid::Uuid::new_v4().to_string();
+    let mut missing = f.session.clone();
+    missing.id = uuid::Uuid::new_v4().to_string();
+    let meta =
+        |id: &str| serde_json::json!({"type":"session_meta","payload":{"id":id}}).to_string();
+    f.put("sessions/empty.jsonl", &meta(&f.session.id));
+    f.put(
+        "sessions/broken.jsonl",
+        &format!("{}\n{{unfinished", meta(&broken.id)),
+    );
+    let plan = policy::plan(
+        &[f.session.clone(), broken, missing],
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        policy::Policy::default(),
+    );
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].session.id, f.session.id);
+    assert_eq!(plan.candidates[0].reason, policy::Reason::Empty);
+    assert_eq!(plan.errors.len(), 2);
+}
+
+#[test]
+fn cleanup_keeps_unknown_segments_and_honors_cancellation() {
+    let f = Fixture::new(AgentKind::CODEX);
+    f.put(
+        "sessions/empty.jsonl",
+        &serde_json::json!({"type":"session_meta","payload":{"id":f.session.id}}).to_string(),
+    );
+    f.put("sessions/unidentified.jsonl", "{broken");
+    let plan = policy::plan(
+        std::slice::from_ref(&f.session),
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        policy::Policy::default(),
+    );
+    assert!(plan.candidates.is_empty());
+    assert_eq!(plan.errors.len(), 1);
+    let cancel = crate::background::Cancellation::new();
+    cancel.cancel();
+    let plan = policy::plan_controlled(
+        std::slice::from_ref(&f.session),
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        policy::Policy::default(),
+        &cancel,
+    );
+    assert!(plan.candidates.is_empty());
+}
+
+#[test]
+fn cleanup_bounds_lines_and_uses_configured_staleness() {
+    let f = Fixture::new(AgentKind::CLAUDE);
+    f.put(
+        format!("projects/p/{}.jsonl", f.session.id),
+        &"x".repeat(1024 * 1024 + 1),
+    );
+    let policy = policy::Policy {
+        now_ms: 8 * 24 * 60 * 60 * 1000,
+        stale_days: 7,
+    };
+    let plan = policy::plan(
+        std::slice::from_ref(&f.session),
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        policy,
+    );
+    assert!(plan.candidates.is_empty());
+    assert_eq!(plan.errors.len(), 1);
+    f.put(
+        format!("projects/p/{}.jsonl", f.session.id),
+        &serde_json::json!({"type":"user","message":{"content":"hello"}}).to_string(),
+    );
+    let plan = policy::plan(
+        std::slice::from_ref(&f.session),
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        policy,
+    );
+    assert_eq!(plan.candidates[0].reason, policy::Reason::Stale);
+    assert_eq!(plan.stale_days, 7);
+    assert!(
+        plan.candidates[0]
+            .reason
+            .label(plan.stale_days)
+            .starts_with('7')
+    );
+}
+
+#[test]
+fn cleanup_never_treats_unknown_json_shapes_as_empty() {
+    let f = Fixture::new(AgentKind::CLAUDE);
+    for row in [
+        "{}",
+        "[]",
+        "42",
+        r#"{"type":"future_user_format","text":"important"}"#,
+    ] {
+        f.put(format!("projects/p/{}.jsonl", f.session.id), row);
+        let plan = policy::plan(
+            std::slice::from_ref(&f.session),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            policy::Policy::default(),
+        );
+        assert!(plan.candidates.is_empty(), "{row}");
+        assert_eq!(plan.errors.len(), 1);
+    }
 }

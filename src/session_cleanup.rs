@@ -13,6 +13,10 @@ use crate::sessions::Session;
 
 type Result<T> = std::result::Result<T, String>;
 
+mod evidence;
+pub mod opens;
+pub mod policy;
+pub(crate) mod service;
 #[cfg(test)]
 mod tests;
 

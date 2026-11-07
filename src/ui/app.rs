@@ -79,6 +79,10 @@ enum AppEvent {
         entries: Result<Vec<crate::session_cleanup::Entry>, String>,
         mutated: bool,
     },
+    SmartCleanupPlanned {
+        generation: u64,
+        plan: cleanup::SmartPlan,
+    },
     FingerprintLoaded {
         generation: u64,
         result: Result<Vec<crate::codex_manager::fingerprint::Snapshot>, String>,
@@ -674,7 +678,9 @@ struct Dashboard {
     shortcuts: Option<super::shortcuts::Menu>,
     cleanup: Option<cleanup::Panel>,
     cleanup_store: crate::session_cleanup::Store,
+    cleanup_opens: crate::session_cleanup::opens::Store,
     cleanup_refresh_due: bool,
+    cleanup_generation: u64,
     subscription_tests: super::subscription_tests::Tests,
     home_subscription_details: bool,
     fingerprint: state::FingerprintState,
@@ -762,7 +768,9 @@ impl Dashboard {
             shortcuts: None,
             cleanup: None,
             cleanup_store: crate::session_cleanup::Store::default(),
+            cleanup_opens: crate::session_cleanup::opens::Store::default(),
             cleanup_refresh_due: false,
+            cleanup_generation: 0,
             subscription_tests: super::subscription_tests::Tests::default(),
             home_subscription_details: false,
             fingerprint: state::FingerprintState::new(),
@@ -1212,6 +1220,7 @@ impl Dashboard {
             KeyCode::Char('b') => self.open_trash(handle),
             KeyCode::Char('d') | KeyCode::Delete => self.open_cleanup_delete(false),
             KeyCode::Char('D') => self.open_cleanup_delete(true),
+            KeyCode::Char('C') => self.open_smart_cleanup(handle),
             KeyCode::Char('s') => {
                 if let Some(browser) = &mut self.browser_state.panel {
                     if browser.focus() == Focus::Projects {
@@ -1532,6 +1541,14 @@ impl Dashboard {
         home: bool,
         handle: &Handle,
     ) {
+        let opens = self.cleanup_opens.clone();
+        let key = request.session().key();
+        let opened_at = chrono::Utc::now().timestamp_millis();
+        handle.spawn_blocking(move || {
+            if let Err(error) = opens.record(&key, opened_at) {
+                tracing::warn!(event = "session_open_record_failed", reason = %error);
+            }
+        });
         if home {
             self.home_sessions_state.browser.launching = true;
         } else if let Some(browser) = &mut self.browser_state.panel {
@@ -2304,6 +2321,10 @@ impl Dashboard {
                     result,
                 } => {
                     changed |= self.accept_session_preview(generation, request, result);
+                    continue;
+                }
+                AppEvent::SmartCleanupPlanned { generation, plan } => {
+                    changed |= self.accept_smart_cleanup(generation, plan);
                     continue;
                 }
                 AppEvent::CleanupFinished {

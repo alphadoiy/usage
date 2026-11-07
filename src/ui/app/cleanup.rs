@@ -3,7 +3,7 @@ use super::*;
 
 #[cfg(test)]
 mod tests;
-use crate::session_cleanup::Entry;
+use crate::session_cleanup::{Entry, policy};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
@@ -12,19 +12,27 @@ use ratatui::{
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) enum Action {
     Delete(Vec<sessions::Session>),
     Restore(String),
     Purge(Vec<String>),
 }
 
-enum Mode {
+#[derive(Clone, Debug)]
+pub(super) enum SmartPlan {
+    Ready(policy::Plan),
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub(super) enum Mode {
     Loading,
     List,
     Confirm(Action),
     Working,
     Result(String),
+    Smart(SmartPlan),
 }
 
 pub(super) struct Panel {
@@ -32,6 +40,7 @@ pub(super) struct Panel {
     selected: usize,
     mode: Mode,
     trash: bool,
+    task: Option<Task>,
 }
 
 impl Panel {
@@ -56,6 +65,7 @@ impl Panel {
             selected: 0,
             mode: Mode::Confirm(Action::Delete(sessions)),
             trash: false,
+            task: None,
         }
     }
 
@@ -122,7 +132,7 @@ impl Panel {
             return;
         }
         let lines = match &self.mode {
-            Mode::Loading => vec!["正在读取回收站…".into()],
+            Mode::Loading => vec!["正在分析会话…".into()],
             Mode::Working => vec!["正在处理会话，请等待…".into()],
             Mode::Result(message) => vec![message.clone()],
             Mode::Confirm(action) => match action {
@@ -180,16 +190,71 @@ impl Panel {
                     lines
                 }
             },
+            Mode::Smart(SmartPlan::Ready(plan)) => {
+                let empty = plan.count(policy::Reason::Empty);
+                let stale = plan.count(policy::Reason::Stale);
+                let mut lines = vec![
+                    "智能清理预览 · 当前搜索与时间筛选范围".to_string(),
+                    format!(
+                        "空会话：{empty} 个 · {}：{stale} 个",
+                        policy::Reason::Stale.label(plan.stale_days)
+                    ),
+                    format!(
+                        "跳过置顶：{} · 运行中：{} · 无法确认：{}",
+                        plan.skipped_pinned,
+                        plan.skipped_active,
+                        plan.errors.len()
+                    ),
+                    format!("将 {} 个会话移入回收站，可恢复。", plan.candidates.len()),
+                    "执行时仍会复核运行状态与最近写入。".into(),
+                    "".into(),
+                ];
+                lines.extend(plan.candidates.iter().map(|candidate| {
+                    format!(
+                        "• [{}] {} · {} · {}",
+                        candidate.reason.label(plan.stale_days),
+                        crate::ui::overview::clean(&candidate.session.title),
+                        crate::ui::overview::clean(&candidate.session.instance),
+                        crate::ui::overview::clean(&candidate.session.cwd.to_string_lossy())
+                    )
+                }));
+                lines.extend(
+                    plan.errors
+                        .iter()
+                        .map(|error| format!("跳过：{}", crate::ui::overview::clean(error))),
+                );
+                lines
+            }
+
+            Mode::Smart(SmartPlan::Failed(error)) => vec![format!("智能清理分析失败：{error}")],
             Mode::List => unreachable!(),
         };
         let [content, hint] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
-        Paragraph::new(lines.join("\n"))
-            .wrap(Wrap { trim: false })
-            .render(content, frame.buffer_mut());
+        if matches!(self.mode, Mode::Smart(SmartPlan::Ready(_))) {
+            let selected = self.selected.min(lines.len().saturating_sub(1));
+            let mut state = ListState::default().with_selected(Some(selected));
+            StatefulWidget::render(
+                List::new(lines)
+                    .highlight_symbol("› ")
+                    .highlight_style(Style::new().fg(Color::LightBlue)),
+                content,
+                frame.buffer_mut(),
+                &mut state,
+            );
+        } else {
+            Paragraph::new(lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .render(content, frame.buffer_mut());
+        }
         Paragraph::new(match self.mode {
             Mode::Confirm(_) => "y 确认 · n / Esc 取消",
-            Mode::Result(_) => "Enter / Esc 返回",
+            Mode::Smart(SmartPlan::Ready(ref plan)) if plan.candidates.is_empty() => {
+                "↑/↓ 查看详情 · Esc 返回"
+            }
+            Mode::Smart(SmartPlan::Ready(_)) => "↑/↓ 查看明细 · y 确认 · n / Esc 取消",
+            Mode::Loading if !self.trash => "Esc 取消分析",
+            Mode::Result(_) | Mode::Smart(SmartPlan::Failed(_)) => "Enter / Esc 返回",
             _ => "请等待处理完成…",
         })
         .dim()
@@ -221,12 +286,76 @@ impl Dashboard {
         self.cleanup = Some(Panel::delete(sessions));
     }
 
+    pub(super) fn open_smart_cleanup(&mut self, handle: &Handle) {
+        if self.browser_state.loading {
+            return;
+        }
+        let Some(browser) = &self.browser_state.panel else {
+            return;
+        };
+        let sessions = browser.visible_sessions();
+        if sessions.is_empty() {
+            self.notice = Some("没有可清理的会话".into());
+            return;
+        }
+        self.cleanup = Some(Panel {
+            entries: Vec::new(),
+            selected: 0,
+            mode: Mode::Loading,
+            trash: false,
+            task: None,
+        });
+        let opens_store = self.cleanup_opens.clone();
+        let project_store = self.home_sessions_state.project_store.clone();
+        let run_root = self.home_activity.root.clone();
+        let tx = self.tx.clone();
+        self.cleanup_generation = self.cleanup_generation.wrapping_add(1);
+        let generation = self.cleanup_generation;
+        let task = Task::blocking(
+            handle,
+            move |cancel| {
+                crate::session_cleanup::service::plan(
+                    &sessions,
+                    &opens_store,
+                    &project_store,
+                    &run_root,
+                    &cancel,
+                )
+            },
+            move |result| {
+                let plan = match result {
+                    Ok(plan) => SmartPlan::Ready(plan),
+                    Err(error) => SmartPlan::Failed(error),
+                };
+                let _ = tx.send(AppEvent::SmartCleanupPlanned { generation, plan });
+            },
+        );
+        self.cleanup.as_mut().unwrap().task = Some(task);
+    }
+
+    pub(super) fn accept_smart_cleanup(&mut self, generation: u64, plan: SmartPlan) -> bool {
+        if generation != self.cleanup_generation {
+            return false;
+        }
+        let Some(panel) = &mut self.cleanup else {
+            return false;
+        };
+        if panel.trash || !matches!(panel.mode, Mode::Loading) || panel.task.is_none() {
+            return false;
+        }
+        panel.task = None;
+        panel.selected = 0;
+        panel.mode = Mode::Smart(plan);
+        true
+    }
+
     pub(super) fn open_trash(&mut self, handle: &Handle) {
         self.cleanup = Some(Panel {
             entries: Vec::new(),
             selected: 0,
             mode: Mode::Loading,
             trash: true,
+            task: None,
         });
         let store = self.cleanup_store.clone();
         let tx = self.tx.clone();
@@ -247,7 +376,12 @@ impl Dashboard {
             return false;
         };
         match &panel.mode {
-            Mode::Working | Mode::Loading => {}
+            Mode::Working => {}
+            Mode::Loading => {
+                if !panel.trash && matches!(key, KeyCode::Esc | KeyCode::Char('n' | 'q')) {
+                    self.cleanup = None;
+                }
+            }
             Mode::Result(_) => {
                 if matches!(key, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                     if panel.trash {
@@ -255,6 +389,29 @@ impl Dashboard {
                     } else {
                         self.cleanup = None;
                     }
+                }
+            }
+            Mode::Smart(SmartPlan::Ready(plan)) => {
+                if matches!(key, KeyCode::Esc | KeyCode::Char('n' | 'q')) {
+                    self.cleanup = None;
+                } else if key == KeyCode::Up {
+                    panel.selected = panel.selected.saturating_sub(1);
+                } else if key == KeyCode::Down {
+                    panel.selected =
+                        (panel.selected + 1).min(plan.candidates.len() + plan.errors.len() + 6);
+                } else if key == KeyCode::Char('y') && !plan.candidates.is_empty() {
+                    let sessions = plan
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.session.clone())
+                        .collect::<Vec<_>>();
+                    panel.mode = Mode::Working;
+                    self.run_cleanup(Action::Delete(sessions), handle);
+                }
+            }
+            Mode::Smart(SmartPlan::Failed(_)) => {
+                if matches!(key, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+                    self.cleanup = None;
                 }
             }
             Mode::Confirm(action) => {
@@ -310,32 +467,17 @@ impl Dashboard {
                 let mut errors = Vec::new();
                 match action {
                     Action::Delete(sessions) => {
-                        let active = crate::codex_manager::Manager::open_read_only(run_root)
-                            .map_err(|e| e.to_string())
-                            .and_then(|m| {
-                                m.map_or_else(
-                                    || Ok(HashMap::new()),
-                                    |m| m.session_activity(&sessions).map_err(|e| e.to_string()),
-                                )
-                            });
+                        let active =
+                            crate::session_cleanup::service::active_sessions(&run_root, &sessions);
                         match active {
                             Err(error) => errors.push(format!("运行状态读取失败，未清理：{error}")),
                             Ok(active) => {
                                 for session in sessions {
-                                    let result =
-                                        if active.get(&session.key()).is_some_and(|runtime| {
-                                            runtime.runs.iter().any(|run| {
-                                                matches!(
-                                                    run.process,
-                                                    crate::runs::RunState::Running
-                                                        | crate::runs::RunState::Unknown
-                                                )
-                                            })
-                                        }) {
-                                            Err("会话仍在托管运行，已跳过".into())
-                                        } else {
-                                            store.delete(&session).map(|_| ())
-                                        };
+                                    let result = if active.contains_key(&session.key()) {
+                                        Err("会话仍在托管运行，已跳过".into())
+                                    } else {
+                                        store.delete(&session).map(|_| ())
+                                    };
                                     match result {
                                         Ok(()) => succeeded += 1,
                                         Err(error) => errors.push(format!(

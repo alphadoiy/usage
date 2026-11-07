@@ -7,6 +7,94 @@ fn context(vars: &[(&str, &str)]) -> TerminalContext {
     )
 }
 
+#[cfg(unix)]
+#[test]
+fn herdr_resumes_focus_existing_panes_and_recreate_closed_ones() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("usage-focus-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let binary = root.join("herdr-app");
+    let state = root.join("state.json");
+    let calls = root.join("calls.jsonl");
+    let scope = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        &binary,
+        format!(
+            r#"#!/usr/bin/env python3
+import json,sys,pathlib
+state=pathlib.Path({state:?})
+s=json.loads(state.read_text()) if state.exists() else {{'n':0,'panes':[]}}
+a=sys.argv[1:]
+with open({calls:?},'a') as f: f.write(json.dumps(a)+'\n')
+if a[0]=='ls':
+    tabs=[{{'id':'home','terminals':[{{'terminal':'usage','pane':'anchor'}}]}}]
+    tabs += [{{'id':'tab-'+p,'terminals':[{{'terminal':'t-'+p,'pane':p}}]}} for p in s['panes']]
+    print(json.dumps({{'spaces':[{{'id':{scope:?},'tabs':tabs}}]}}))
+elif a[1]=='tab.new':
+    s['n']+=1
+    pane='p'+str(s['n']);s['panes'].append(pane);state.write_text(json.dumps(s))
+    print(json.dumps({{'pane':pane,'tab':'tab-'+pane}}))
+else: print('{{"ok":true}}')
+"#,
+            state = state.to_str().unwrap(),
+            calls = calls.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ctx = context(&[
+        ("HC_TERMINAL_ID", "usage"),
+        ("HC_TERMINAL_SOCKET", "fixture"),
+        ("PATH", &format!("{}:/usr/bin:/bin", root.display())),
+    ]);
+    let launch = |key| {
+        builtin_registry()
+            .prepare(
+                Selection::Auto,
+                &ctx,
+                &TerminalRequest {
+                    cwd: &root,
+                    shell_command: "opaque resume command",
+                    reuse_key: key,
+                    options: LaunchOptions {
+                        layout: LayoutMode::Tab,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .execute()
+            .unwrap()
+    };
+    launch(Some("same-session-and-target"));
+    launch(Some("same-session-and-target"));
+    let recorded: Vec<serde_json::Value> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(recorded.iter().filter(|c| c[1] == "tab.new").count(), 1);
+    assert_eq!(recorded.iter().filter(|c| c[1] == "pane.focus").count(), 2);
+    for call in recorded.iter().filter(|c| c[1] == "tab.select") {
+        let args: serde_json::Value = serde_json::from_str(call[2].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["id"], "tab-p1",
+            "must switch to the target tab before focus"
+        );
+    }
+    launch(Some("different-target"));
+    launch(None);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(saved["n"], 3);
+    saved["panes"] = serde_json::json!([]);
+    std::fs::write(&state, serde_json::to_vec(&saved).unwrap()).unwrap();
+    launch(Some("same-session-and-target"));
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    assert_eq!(saved["n"], 4, "closed panes must be recreated");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn nested_context_and_explicit_selection_have_deterministic_priority() {
     let registry = builtin_registry();
@@ -45,7 +133,11 @@ fn nested_context_and_explicit_selection_have_deterministic_priority() {
     let request = TerminalRequest {
         cwd: Path::new("/"),
         shell_command: "usage codex run fixture",
-        options: LaunchOptions::default(),
+        reuse_key: None,
+        options: LaunchOptions {
+            focus: FocusMode::Keep,
+            ..Default::default()
+        },
     };
     // An explicit target cannot silently run in a different terminal.
     assert!(
@@ -113,7 +205,11 @@ fn an_injected_backend_launches_through_the_common_path_and_surfaces_failure() {
             &TerminalRequest {
                 cwd: &cwd,
                 shell_command: shell,
-                options: LaunchOptions::default(),
+                reuse_key: None,
+                options: LaunchOptions {
+                    focus: FocusMode::Keep,
+                    ..Default::default()
+                },
             },
         )
         .unwrap();
@@ -137,7 +233,11 @@ fn an_injected_backend_launches_through_the_common_path_and_surfaces_failure() {
                 &TerminalRequest {
                     cwd: &root.join("missing"),
                     shell_command: shell,
-                    options: LaunchOptions::default(),
+                    reuse_key: None,
+                    options: LaunchOptions {
+                        focus: FocusMode::Keep,
+                        ..Default::default()
+                    },
                 }
             )
             .is_err()
@@ -184,7 +284,11 @@ fn herdr_context_takes_priority_and_requires_complete_routing() {
                     &TerminalRequest {
                         cwd: Path::new("/"),
                         shell_command: "usage",
-                        options: LaunchOptions::default(),
+                        reuse_key: None,
+                        options: LaunchOptions {
+                            focus: FocusMode::Keep,
+                            ..Default::default()
+                        },
                     }
                 )
                 .is_err()
@@ -259,7 +363,11 @@ elif args[0]=='do':
                 &TerminalRequest {
                     cwd: &cwd,
                     shell_command: shell,
-                    options: LaunchOptions::default(),
+                    reuse_key: None,
+                    options: LaunchOptions {
+                        focus: FocusMode::Keep,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap()
@@ -413,7 +521,11 @@ elif args[0]=='run':
                 &TerminalRequest {
                     cwd: &cwd,
                     shell_command: "usage codex run $(literal)",
-                    options: LaunchOptions::default(),
+                    reuse_key: None,
+                    options: LaunchOptions {
+                        focus: FocusMode::Keep,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap()
@@ -510,7 +622,11 @@ fi
             &TerminalRequest {
                 cwd: &cwd,
                 shell_command: "usage codex run $(literal)",
-                options: LaunchOptions::default(),
+                reuse_key: None,
+                options: LaunchOptions {
+                    focus: FocusMode::Keep,
+                    ..Default::default()
+                },
             },
         )
         .unwrap()

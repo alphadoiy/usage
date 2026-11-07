@@ -166,6 +166,8 @@ pub struct TerminalRequest<'a> {
     pub cwd: &'a Path,
     pub shell_command: &'a str,
     pub options: LaunchOptions,
+    /// Only resume requests may reuse a live pane; new-instance launches always create one.
+    pub reuse_key: Option<&'a str>,
 }
 
 /// Adapter/strategy: detection is read-only; command construction must not spawn.
@@ -327,6 +329,7 @@ impl TerminalRegistry {
             &TerminalRequest {
                 cwd: &cwd,
                 shell_command: request.shell_command,
+                reuse_key: request.reuse_key,
                 options: LaunchOptions {
                     layout: match (target.capabilities.split, target.capabilities.tab) {
                         (true, false) => LayoutMode::Split,
@@ -362,6 +365,24 @@ pub struct TerminalLaunch {
 
 impl TerminalLaunch {
     pub fn execute(self) -> Result<(), String> {
+        // Serialize observation + creation + persistence across Usage processes, so
+        // simultaneous resumes cannot both observe an absent pane and create duplicates.
+        use fs2::FileExt;
+        use sha2::{Digest, Sha256};
+        let dir = crate::paths::data_dir().join("terminal-locks");
+        crate::private_fs::create_dir(&dir).map_err(|e| format!("无法锁定终端启动：{e}"))?;
+        let path = dir.join(format!(
+            "{:x}.lock",
+            Sha256::digest(self.target.id.as_bytes())
+        ));
+        crate::private_fs::create(&path, b"").map_err(|e| format!("无法锁定终端启动：{e}"))?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("无法锁定终端启动：{e}"))?;
+        lock.lock_exclusive()
+            .map_err(|e| format!("无法锁定终端启动：{e}"))?;
         tracing::debug!(event = "terminal_launch", backend = self.target.id);
         let mut stage = self.command;
         let mut created = false;
@@ -461,6 +482,7 @@ pub fn command_in_terminal(
             &TerminalRequest {
                 cwd,
                 shell_command: command,
+                reuse_key: None,
                 options,
             },
         )?
@@ -469,3 +491,33 @@ pub fn command_in_terminal(
 
 #[cfg(test)]
 mod tests;
+
+/// Resume requests carry an opaque identity including the chosen launcher/target.
+/// Selecting another account therefore never focuses a pane using different credentials.
+pub fn resume_in_terminal(
+    cwd: &Path,
+    command: &str,
+    mode: ResumeMode,
+    options: LaunchOptions,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}\0{}",
+        cwd.canonicalize().map_err(|e| e.to_string())?.display(),
+        command
+    );
+    let key = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let registry = builtin_registry();
+    registry
+        .prepare(
+            selection(mode),
+            &registry.capture(),
+            &TerminalRequest {
+                cwd,
+                shell_command: command,
+                options,
+                reuse_key: Some(&key),
+            },
+        )?
+        .execute()
+}

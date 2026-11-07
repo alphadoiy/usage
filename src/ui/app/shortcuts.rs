@@ -86,6 +86,7 @@ impl Dashboard {
                     action('a', "a", "全选 / 取消当前项目列表"),
                     action('d', "d / Delete", "将选中会话移入回收站"),
                     action('D', "Shift+D", "清理当前项目列表（需确认）"),
+                    action('C', "Shift+C", "智能清理当前筛选范围（需确认）"),
                     action('b', "b", "打开回收站"),
                     action('o', "o", "切换最近活动 / Token 排序"),
                     action('R', "Shift+R", crate::config::ResumeMode::CYCLE_HINT),

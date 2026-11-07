@@ -19,6 +19,18 @@ pub(super) struct LiveTab {
 pub(super) struct Model {
     tabs: Vec<Tab>,
     tab_size: Option<(u32, u32)>,
+    #[serde(default)]
+    sessions: std::collections::HashMap<String, String>,
+}
+impl Model {
+    pub fn existing(&self, key: Option<&str>, live: &Live) -> Option<Created> {
+        let pane = self.sessions.get(key?)?;
+        let tab = live.tabs.iter().find(|tab| tab.panes.contains(pane))?;
+        Some(Created {
+            pane: pane.clone(),
+            tab: Some(tab.id.clone()),
+        })
+    }
 }
 pub(super) struct Store {
     dir: PathBuf,
@@ -30,16 +42,8 @@ impl Store {
         }
     }
     fn path(&self, scope: &str) -> PathBuf {
-        let name: String = scope
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        use sha2::{Digest, Sha256};
+        let name = format!("{:x}", Sha256::digest(scope.as_bytes()));
         self.dir.join(format!("{name}.json"))
     }
     pub fn load(&self, scope: &str) -> Model {
@@ -64,6 +68,7 @@ pub(super) struct Plan {
     pub topology: Topology,
     pub action: Action,
     tab_size: (u32, u32),
+    sessions: std::collections::HashMap<String, String>,
 }
 pub(super) fn plan(
     live: &Live,
@@ -147,6 +152,12 @@ pub(super) fn plan(
         topology,
         action,
         tab_size,
+        sessions: model
+            .sessions
+            .iter()
+            .filter(|(_, pane)| live.tabs.iter().any(|tab| tab.panes.contains(pane)))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 pub(super) struct Created {
@@ -155,15 +166,19 @@ pub(super) struct Created {
 }
 impl Plan {
     pub fn commit(
-        self,
+        mut self,
         store: &Store,
         scope: &str,
         created: Option<Created>,
         layout: LayoutMode,
         group: &str,
+        reuse_key: Option<&str>,
     ) {
         let mut topology = self.topology;
         if let Some(created) = created {
+            if let Some(key) = reuse_key {
+                self.sessions.insert(key.into(), created.pane.clone());
+            }
             let tab = created
                 .tab
                 .unwrap_or_else(|| format!("tab-{}", topology.tabs.len()));
@@ -181,6 +196,7 @@ impl Plan {
             &Model {
                 tabs: topology.tabs,
                 tab_size: Some(self.tab_size),
+                sessions: self.sessions,
             },
         );
     }
@@ -188,6 +204,16 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn server_scopes_do_not_share_bindings_after_path_sanitization() {
+        let store = Store {
+            dir: "/tmp/unused-layout-test".into(),
+        };
+        assert_ne!(
+            store.path("rex-server/a-session"),
+            store.path("rex-server_a-session")
+        );
+    }
     fn live(panes: &[&[&str]], current: usize, anchor: &str) -> Live {
         Live {
             tabs: panes
@@ -243,6 +269,7 @@ mod tests {
                 }),
                 LayoutMode::Auto,
                 "g",
+                None,
             );
         }
         assert_eq!(tabs[0].len(), 4);
@@ -253,6 +280,7 @@ mod tests {
     }
     fn model() -> Model {
         Model {
+            sessions: Default::default(),
             tabs: vec![Tab {
                 id: "tab0".into(),
                 group: None,

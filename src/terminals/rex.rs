@@ -55,13 +55,25 @@ impl TerminalBackend for Rex {
         let size = context.size();
         let cwd = request.cwd.to_owned();
         let shell = request.shell_command.to_owned();
+        let endpoint = context
+            .var("REX_SERVER")
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let options = request.options;
+        let reuse_key = request.reuse_key.map(str::to_owned);
         Ok(TerminalCommand::from(inspect).then(move |stdout| {
             let live = parse_inspect(&String::from_utf8_lossy(stdout), &anchor)?;
-            let scope = format!("rex-{session}");
+            let scope = format!("rex-{endpoint}-{session}");
             let store = Store::default_store();
             let group = group_key(&cwd);
-            let plan = adaptive::plan(&live, size, &store.load(&scope), options.layout, &group);
+            let model = store.load(&scope);
+            if let Some(existing) = model.existing(reuse_key.as_deref(), &live) {
+                let mut focus = Command::new(&binary);
+                focus.args(["focus", &existing.pane, "--session", &session]);
+                return Ok(TerminalCommand::from(focus));
+            }
+            let plan = adaptive::plan(&live, size, &model, options.layout, &group);
             let mut cli = Command::new(&binary);
             cli.arg("run")
                 .arg("--session")
@@ -103,6 +115,7 @@ impl TerminalBackend for Rex {
                     parse_created(&String::from_utf8_lossy(stdout)),
                     options.layout,
                     &group,
+                    reuse_key.as_deref(),
                 );
             }))
         }))

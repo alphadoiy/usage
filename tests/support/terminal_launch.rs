@@ -69,9 +69,10 @@ if sys.argv[1]=='session':
     fs::write(&rex, format!("#!/usr/bin/env python3\n{inspect}\nopen(os.environ['CAPTURE_FILE'],'a').write(json.dumps(sys.argv[1:])+'\\n')\n")).unwrap();
     fs::set_permissions(&rex, fs::Permissions::from_mode(0o700)).unwrap();
     let capture = f.path.join("calls.jsonl");
-    for (layout, focus, split) in [("tab", "new", Some(false)), ("split", "keep", Some(true)), ("auto", "keep", None)] {
+    for (layout, focus, split) in [("tab", "new", Some(false)), ("split", "keep", Some(true)), ("auto", "keep", None), ("auto", "", None)] {
         let config = f.path.join(format!("{layout}-{focus}.toml"));
-        fs::write(&config, format!("[sessions]\nlayout = \"{layout}\"\nfocus = \"{focus}\"\n")).unwrap();
+        let focus_config = if focus.is_empty() { String::new() } else { format!("focus = \"{focus}\"\n") };
+        fs::write(&config, format!("[sessions]\nlayout = \"{layout}\"\n{focus_config}")).unwrap();
         fs::write(&capture, "").unwrap();
         success(f.root_command(&["--config", config.to_str().unwrap(), "codex", "run", &account, "--cwd", f.path.to_str().unwrap(), "--split", "--binary", "/tmp/codex"])
             .env("REX_SESSION", "session:fixture")
@@ -88,7 +89,7 @@ if sys.argv[1]=='session':
         if let Some(split) = split {
             assert_eq!(args.iter().any(|a| a == "--split"), split, "{layout}/{focus}: {args:?}");
         }
-        let expected = if focus == "new" { "--focus=true" } else { "--focus=false" };
+        let expected = if focus != "keep" { "--focus=true" } else { "--focus=false" };
         assert!(args.iter().any(|a| a == expected), "{layout}/{focus}: {args:?}");
     }
 }

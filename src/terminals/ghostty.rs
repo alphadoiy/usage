@@ -70,6 +70,15 @@ const ACT: &str = r#"on run argv
     end tell
 end run"#;
 
+const FOCUS: &str = r#"on run argv
+    tell application "Ghostty"
+        set w to first window whose id is (item 1 of argv)
+        select tab (first tab of w whose id is (item 2 of argv))
+        focus (first terminal of w whose id is (item 3 of argv))
+        activate
+    end tell
+end run"#;
+
 impl TerminalBackend for Ghostty {
     fn target(&self) -> TerminalTarget {
         TerminalTarget {
@@ -100,6 +109,7 @@ impl TerminalBackend for Ghostty {
         let cwd = request.cwd.to_owned();
         let shell = request.shell_command.to_owned();
         let options = request.options;
+        let reuse_key = request.reuse_key.map(str::to_owned);
         let mut observe = Command::new(&osascript);
         observe
             .args(["-e", OBSERVE])
@@ -109,7 +119,17 @@ impl TerminalBackend for Ghostty {
             let scope = format!("ghostty-{window}");
             let store = Store::default_store();
             let group = group_key(&cwd);
-            let plan = adaptive::plan(&live, size, &store.load(&scope), options.layout, &group);
+            let model = store.load(&scope);
+            if let Some(existing) = model.existing(reuse_key.as_deref(), &live) {
+                let mut focus = Command::new(&osascript);
+                focus
+                    .args(["-e", FOCUS])
+                    .arg(&window)
+                    .arg(existing.tab.unwrap())
+                    .arg(existing.pane);
+                return Ok(TerminalCommand::from(focus));
+            }
+            let plan = adaptive::plan(&live, size, &model, options.layout, &group);
             let act = action_command(
                 &osascript,
                 &window,
@@ -118,13 +138,21 @@ impl TerminalBackend for Ghostty {
                 &TerminalRequest {
                     cwd: &cwd,
                     shell_command: &shell,
+                    reuse_key: None,
                     options,
                 },
             );
             let layout = options.layout;
             Ok(TerminalCommand::from(act).after(move |stdout| {
                 let created = parse_created(&String::from_utf8_lossy(stdout));
-                plan.commit(&store, &scope, created, layout, &group);
+                plan.commit(
+                    &store,
+                    &scope,
+                    created,
+                    layout,
+                    &group,
+                    reuse_key.as_deref(),
+                );
             }))
         }))
     }
@@ -272,7 +300,11 @@ mod tests {
             &TerminalRequest {
                 cwd: Path::new("/tmp"),
                 shell_command: "opaque",
-                options: LaunchOptions::default(),
+                reuse_key: None,
+                options: LaunchOptions {
+                    focus: FocusMode::Keep,
+                    ..Default::default()
+                },
             },
         );
         let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();

@@ -383,7 +383,12 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                             .join(" "),
                     );
                 }
-                crate::terminals::command_in_terminal(
+                let launch = if resume.is_some() {
+                    crate::terminals::resume_in_terminal
+                } else {
+                    crate::terminals::command_in_terminal
+                };
+                launch(
                     &cwd,
                     &command,
                     crate::config::ResumeMode::Auto,
