@@ -89,6 +89,7 @@ impl Fixture {
             .env("USAGE_LOG_DIR", self.path.join("logs"))
             .env("USAGE_LOG", "debug")
             .env("USAGE_GATEWAY", "off")
+            .env("XDG_DATA_HOME", self.path.join("xdg-data"))
             .env_remove("HC_TERMINAL_ID")
             .env_remove("HC_TERMINAL_SOCKET");
         command

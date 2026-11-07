@@ -230,6 +230,8 @@ inference={base_url="https://relay.invalid/v1",credential_env="FAKE_KEY"}
     assert_eq!(http.models.load(Ordering::SeqCst), 1);
     assert_eq!(app.home_provider, selected);
     assert!(app.home_models_expanded);
+    // Model cache retention is independent of quota refresh: it remains active
+    // for ordinary background rounds and expires on its own interval.
     let generation = app.overview_state.generation;
     app.refresh_background(&handle);
     assert_eq!(app.overview_state.generation, generation);
@@ -828,5 +830,171 @@ async fn provider_changes_reload_inventory_while_old_queries_are_pending() {
     until(&mut app, |app| !app.overview_state.loading).await;
     drop(app);
     drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn model_ttl_is_independent_of_quota_schedule_and_can_be_disabled() {
+    use crate::http::{HttpClient, HttpResponse, TransportError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CatalogHttp {
+        models: AtomicUsize,
+        quotas: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl HttpClient for CatalogHttp {
+        async fn request(
+            &self,
+            _: &str,
+            url: &str,
+            _: &[(&str, String)],
+            _: Option<Vec<u8>>,
+        ) -> Result<HttpResponse, TransportError> {
+            let body = if !url.ends_with("/models") {
+                self.quotas.fetch_add(1, Ordering::SeqCst);
+                r#"{"success":true,"data":{"object":"token_usage","unlimited_quota":false,"total_used":10,"total_available":90}}"#
+            } else if self.models.fetch_add(1, Ordering::SeqCst) == 0 {
+                r#"{"data":[{"id":"old-model"}]}"#
+            } else {
+                r#"{"data":[{"id":"new-model"}]}"#
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("usage-model-refresh-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("usage.toml");
+    std::fs::write(
+        &path,
+        r#"[[resources]]
+id="relay"
+service="new_api_token"
+base_url="https://relay.invalid"
+credential_env="FAKE_KEY"
+inference={base_url="https://relay.invalid/v1",credential_env="FAKE_KEY"}
+"#,
+    )
+    .unwrap();
+    let http = Arc::new(CatalogHttp {
+        models: AtomicUsize::new(0),
+        quotas: AtomicUsize::new(0),
+    });
+    let mut app = dashboard();
+    app.config_path = path;
+    app.service_state.http = Arc::new(crate::http::FakeHttp::new());
+    app.overview_state.service = Arc::new(crate::provider_catalog::CatalogService::new(
+        root.join("absent-manager"),
+        http.clone(),
+        Arc::new(|_| Ok("synthetic-key".into())),
+    ));
+    app.overview_state.model_refresh_seconds = 300;
+    let handle = Handle::current();
+    app.refresh(&handle);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.overview_state.loading {
+            app.drain_events();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(http.models.load(Ordering::SeqCst), 1);
+    assert_eq!(http.quotas.load(Ordering::SeqCst), 1);
+    assert!(rendered(&app, 100, 30).contains("old-model"));
+
+    // Ordinary quota refreshes retain the model list.
+    app.refresh_seconds = 1;
+    app.last_refresh = std::time::Instant::now() - Duration::from_secs(2);
+    assert!(app.maybe_auto_refresh(&handle));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.overview_state.loading {
+            app.drain_events();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(http.models.load(Ordering::SeqCst), 1);
+    assert_eq!(http.quotas.load(Ordering::SeqCst), 2);
+    assert!(rendered(&app, 100, 30).contains("old-model"));
+
+    // Quota polling can be disabled (or busy) without disabling model polling.
+    app.refresh_seconds = 0;
+    app.pending = 1;
+    let quota_refresh = app.last_refresh;
+    for at in app
+        .overview_state
+        .catalog
+        .as_mut()
+        .unwrap()
+        .model_checked_at
+        .values_mut()
+    {
+        *at = std::time::Instant::now() - Duration::from_secs(301);
+    }
+    assert!(app.maybe_auto_refresh(&handle));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.overview_state.loading {
+            app.drain_events();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(http.models.load(Ordering::SeqCst), 2);
+    assert_eq!(http.quotas.load(Ordering::SeqCst), 2);
+    assert!(
+        matches!(&app.overview_state.catalog.as_ref().unwrap().providers[0].usage.sources[0].state,
+        crate::provider_catalog::QueryState::Result(snapshot) if snapshot.state == crate::resources::ResourceState::Ready)
+    );
+    assert_eq!(app.last_refresh, quota_refresh);
+    app.pending = 0;
+    assert!(
+        rendered(&app, 100, 30)
+            .split_whitespace()
+            .collect::<String>()
+            .contains("new-model")
+    );
+    assert!(
+        app.overview_state
+            .catalog
+            .as_ref()
+            .unwrap()
+            .model_checked_at
+            .values()
+            .all(|at| at.elapsed() < Duration::from_secs(1))
+    );
+    // Zero disables automatic revalidation, while manual r still forces it.
+    app.overview_state.model_refresh_seconds = 0;
+    for at in app
+        .overview_state
+        .catalog
+        .as_mut()
+        .unwrap()
+        .model_checked_at
+        .values_mut()
+    {
+        *at = std::time::Instant::now() - Duration::from_secs(301);
+    }
+    let generation = app.overview_state.generation;
+    app.maybe_auto_refresh(&handle);
+    assert_eq!(app.overview_state.generation, generation);
+    app.refresh(&handle);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while app.overview_state.loading {
+            app.drain_events();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(http.models.load(Ordering::SeqCst), 3);
+    assert_eq!(http.quotas.load(Ordering::SeqCst), 3);
     std::fs::remove_dir_all(root).unwrap();
 }

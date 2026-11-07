@@ -1,6 +1,6 @@
 //! Local session catalog and terminal launchers.
 // Compatibility exports; terminal integration is independent of session discovery.
-pub use crate::terminals::{TerminalTarget, command_in_terminal, terminal_target};
+pub use crate::terminals::{LaunchOptions, TerminalTarget, command_in_terminal, terminal_target};
 pub(crate) mod preview;
 
 use std::collections::{HashMap, HashSet};
@@ -1066,7 +1066,12 @@ pub fn resume_in_ghostty(session: &Session) -> Result<(), String> {
 
 /// Open a launcher command containing identifiers, never credentials, in a fresh Ghostty split.
 pub fn command_in_ghostty(cwd: &Path, command: &str) -> Result<(), String> {
-    command_in_terminal(cwd, command, crate::config::ResumeMode::Ghostty)
+    command_in_terminal(
+        cwd,
+        command,
+        crate::config::ResumeMode::Ghostty,
+        crate::terminals::LaunchOptions::default(),
+    )
 }
 
 #[cfg(test)]

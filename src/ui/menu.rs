@@ -143,7 +143,7 @@ impl Menu {
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_symbol("› ")
-                .highlight_style(Style::new().bg(Color::Rgb(35, 45, 65)).fg(Color::LightBlue)),
+                .highlight_style(super::widgets::selected_row()),
             list,
             &mut ListState::default().with_selected(Some(self.selected)),
         );

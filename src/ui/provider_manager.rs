@@ -22,15 +22,26 @@ enum Prompt {
 /// `launch` holds the account to start once a project is chosen; None only changes the default.
 struct ProjectPicker {
     query: TextInput,
+    path_cache: std::cell::RefCell<Option<(String, Vec<PathBuf>)>>,
     selected: usize,
     launch: Option<Profile>,
     /// Result of the last add / pin / remove, shown inside the picker.
     status: String,
 }
 impl ProjectPicker {
+    fn choices(&self, cwd: &Path, projects: &[crate::projects::Project]) -> Vec<PathBuf> {
+        let mut cache = self.path_cache.borrow_mut();
+        let query = self.query.as_str();
+        if cache.as_ref().is_none_or(|(previous, _)| previous != query) {
+            *cache = Some((query.to_owned(), path_choices(query)));
+        }
+        merge_project_choices(cwd, projects, query, cache.as_ref().unwrap().1.clone())
+    }
+
     fn prompt(launch: Option<Profile>) -> Prompt {
         Prompt::Project(Box::new(Self {
             query: TextInput::default(),
+            path_cache: Default::default(),
             selected: 0,
             launch,
             status: String::new(),
@@ -119,9 +130,104 @@ fn typed_path(query: &str) -> Option<PathBuf> {
         .flatten()
         .filter(|path| path.is_dir())
 }
+const COMPLETION_LIMIT: usize = 50;
+fn split_typed_path(query: &str) -> Option<(&str, &str)> {
+    let query = query.trim();
+    if query == "~" {
+        return Some(("~/", ""));
+    }
+    if !(query.starts_with('/') || query.starts_with("~/")) {
+        return None;
+    }
+    Some(query.split_at(query.rfind('/')? + 1))
+}
+fn path_completions(query: &str) -> Vec<(String, PathBuf)> {
+    let Some((dir, prefix)) = split_typed_path(query) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(expand_path(dir)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            ((!name.starts_with('.') || prefix.starts_with('.'))
+                && name.starts_with(prefix)
+                && entry.path().metadata().ok()?.is_dir())
+            .then(|| (name, entry.path()))
+        })
+        .collect();
+    found.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then(a.0.cmp(&b.0))
+    });
+    found
+}
+fn complete_path(query: &str) -> Option<String> {
+    let (dir, _) = split_typed_path(query)?;
+    let names = path_completions(query);
+    let mut common = names.first()?.0.clone();
+    for (name, _) in &names[1..] {
+        let len = common
+            .chars()
+            .zip(name.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum();
+        common.truncate(len);
+    }
+    let mut completed = format!("{dir}{common}");
+    if names.len() == 1 {
+        completed.push('/');
+    }
+    (completed != query.trim()).then_some(completed)
+}
+fn clean_pasted_path(text: &str) -> String {
+    let text = text.trim();
+    let text = text
+        .strip_prefix('\'')
+        .and_then(|t| t.strip_suffix('\''))
+        .or_else(|| text.strip_prefix('"').and_then(|t| t.strip_suffix('"')))
+        .unwrap_or(text);
+    if text.starts_with("file://") {
+        return reqwest::Url::parse(text)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .map_or_else(
+                || text.to_owned(),
+                |path| path.to_string_lossy().into_owned(),
+            );
+    }
+    if text.starts_with('/') || text.starts_with('~') {
+        text.replace("\\ ", " ")
+    } else {
+        text.to_owned()
+    }
+}
+fn path_choices(query: &str) -> Vec<PathBuf> {
+    let mut choices: Vec<_> = typed_path(query).into_iter().collect();
+    for (_, path) in path_completions(query).into_iter().take(COMPLETION_LIMIT) {
+        if let Ok(path) = path.canonicalize()
+            && !choices.contains(&path)
+        {
+            choices.push(path);
+        }
+    }
+    choices
+}
+#[cfg(test)]
 fn project_choices(cwd: &Path, projects: &[crate::projects::Project], query: &str) -> Vec<PathBuf> {
+    merge_project_choices(cwd, projects, query, path_choices(query))
+}
+fn merge_project_choices(
+    cwd: &Path,
+    projects: &[crate::projects::Project],
+    query: &str,
+    mut choices: Vec<PathBuf>,
+) -> Vec<PathBuf> {
     let needle = query.trim().to_lowercase();
-    let mut choices: Vec<PathBuf> = typed_path(query).into_iter().collect();
     for path in std::iter::once(cwd).chain(projects.iter().map(|p| p.path.as_path())) {
         if !choices.iter().any(|c| c == path)
             && (needle.is_empty() || path.to_string_lossy().to_lowercase().contains(&needle))
@@ -267,7 +373,7 @@ fn draw_accounts(
         frame.render_stateful_widget(
             List::new(items)
                 .block(Block::bordered())
-                .highlight_style(Style::new().bg(Color::Rgb(35, 45, 65)))
+                .highlight_style(super::widgets::selected_row())
                 .highlight_symbol("› "),
             body,
             &mut state,
@@ -370,7 +476,7 @@ pub(super) fn run_embedded(
                 if let Some(menu) = &mut shortcuts_menu {
                     menu.paste(text);
                 } else if let Some(Prompt::Project(picker)) = &mut prompt
-                    && picker.query.paste(text)
+                    && picker.query.paste(&clean_pasted_path(text))
                 {
                     picker.selected = 0;
                 }
@@ -430,7 +536,7 @@ pub(super) fn run_embedded(
             if let Some(current) = prompt.take() {
                 match current {
                     Prompt::Project(mut picker) => {
-                        let choices = project_choices(&cwd, &projects.list, &picker.query);
+                        let choices = picker.choices(&cwd, &projects.list);
                         let control = key.modifiers.contains(KeyModifiers::CONTROL);
                         let target = choices.get(picker.selected).cloned();
                         match key.code {
@@ -469,6 +575,23 @@ pub(super) fn run_embedded(
                             KeyCode::Down => {
                                 picker.selected =
                                     (picker.selected + 1).min(choices.len().saturating_sub(1));
+                                prompt = Some(Prompt::Project(picker));
+                            }
+                            KeyCode::Tab => {
+                                match complete_path(picker.query.as_str()) {
+                                    Some(completed) => {
+                                        picker.query = TextInput::from(completed);
+                                        picker.selected = 0;
+                                        picker.status.clear();
+                                    }
+                                    None if split_typed_path(picker.query.as_str()).is_some() => {
+                                        picker.status =
+                                            "没有可继续补全的公共前缀；可用方向键选择目录".into();
+                                    }
+                                    None => {
+                                        picker.status = "Tab 补全以 / 或 ~ 开头的路径".into();
+                                    }
+                                }
                                 prompt = Some(Prompt::Project(picker));
                             }
                             KeyCode::Char('a') if control => {
@@ -767,18 +890,26 @@ fn launch(
 ) -> io::Result<String> {
     let mode = crate::config::ResumeMode::Auto;
     let target = crate::terminals::terminal_target(mode);
+    let config = crate::config::load_config(
+        &usage_config
+            .map(Path::to_path_buf)
+            .unwrap_or_else(crate::config::default_config_path),
+        usage_config.is_some(),
+    )
+    .map_err(io::Error::other)?;
+    let options = crate::terminals::LaunchOptions::from_config(&config);
     if !target.is_current() {
         return Ok(
             codex_manager::launch_shell_command(&profile.id, cwd, None, None)
                 .and_then(|command| codex_manager::with_usage_config(command, usage_config))
                 .and_then(|command| {
-                    crate::terminals::command_in_terminal(cwd, &command, mode)
+                    crate::terminals::command_in_terminal(cwd, &command, mode, options)
                         .map_err(codex_manager::Error::message)
                 })
                 .map(|_| {
                     format!(
                         "已在{}打开 Codex（{}）；可继续选择其他账号",
-                        target.label(),
+                        target.describe(options),
                         display_path(cwd)
                     )
                 })
@@ -836,7 +967,7 @@ fn project_label(path: &Path, cwd: &Path, project: Option<&crate::projects::Proj
 fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects: &Projects) {
     let (title, text, height) = match prompt {
         Prompt::Project(picker) => {
-            let choices = project_choices(cwd, &projects.list, &picker.query);
+            let choices = picker.choices(cwd, &projects.list);
             let first = picker.selected.saturating_sub(PICKER_ROWS - 1);
             let mut lines = vec![Line::from(""), Line::from("")];
             for (index, path) in choices.iter().enumerate().skip(first).take(PICKER_ROWS) {
@@ -848,7 +979,7 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects
                 });
             }
             if choices.is_empty() {
-                lines.push(Line::from("没有匹配的项目；输入以 / 或 ~ 开头的完整路径").dim());
+                lines.push(Line::from("没有匹配的项目；输入以 / 或 ~ 开头的路径，Tab 补全").dim());
             }
             if projects.sessions.is_none() {
                 lines.push(Line::from("正在读取项目…").dim());
@@ -864,7 +995,7 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects
             };
             lines.push(
                 Line::from(format!(
-                    "↑↓ 选择 · 输入筛选或路径 · Enter {confirm} · Esc 取消"
+                    "↑↓ 选择 · 输入筛选，~/ 开头的路径按 Tab 补全 · Enter {confirm} · Esc 取消"
                 ))
                 .dim(),
             );
@@ -910,6 +1041,74 @@ fn draw_prompt(frame: &mut ratatui::Frame, prompt: &Prompt, cwd: &Path, projects
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tab_completes_directories_to_their_common_prefix() {
+        let root = std::env::temp_dir().join(format!("usage-complete-{}", uuid::Uuid::new_v4()));
+        for dir in ["alpha-one", "alpha-two", "beta", ".hidden"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("alpha-file"), "").unwrap();
+        let base = format!("{}/", root.display());
+        let names = |query: &str| -> Vec<String> {
+            path_completions(query).into_iter().map(|c| c.0).collect()
+        };
+        assert_eq!(names(&format!("{base}al")), ["alpha-one", "alpha-two"]);
+        assert_eq!(names(&base), ["alpha-one", "alpha-two", "beta"]);
+        assert_eq!(names(&format!("{base}.")), [".hidden"]);
+        assert_eq!(
+            complete_path(&format!("{base}al")),
+            Some(format!("{base}alpha-"))
+        );
+        assert_eq!(
+            complete_path(&format!("{base}be")),
+            Some(format!("{base}beta/"))
+        );
+        assert_eq!(complete_path(&format!("{base}alpha-")), None);
+        assert_eq!(complete_path(&format!("{base}zzz")), None);
+        assert_eq!(complete_path("beta"), None);
+        assert_eq!(
+            project_choices(Path::new("/synthetic"), &[], &format!("{base}al")).len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn pasted_paths_lose_quotes_urls_and_escapes() {
+        assert_eq!(clean_pasted_path("  '/a/b c'\n"), "/a/b c");
+        assert_eq!(clean_pasted_path("file:///a/b"), "/a/b");
+        assert_eq!(clean_pasted_path("file:///a/b%20c"), "/a/b c");
+        assert_eq!(
+            clean_pasted_path("file://localhost/a/%E4%B8%AD%E6%96%87"),
+            "/a/中文"
+        );
+        assert_eq!(clean_pasted_path("/a/b\\ c"), "/a/b c");
+        assert_eq!(clean_pasted_path("plain"), "plain");
+    }
+    #[test]
+    fn completion_prefix_includes_candidates_beyond_display_limit_and_caches_io() {
+        let root =
+            std::env::temp_dir().join(format!("usage-completion-limit-{}", uuid::Uuid::new_v4()));
+        for i in 0..COMPLETION_LIMIT {
+            std::fs::create_dir_all(root.join(format!("alpha{i:03}"))).unwrap();
+        }
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        let query = format!("{}/", root.display());
+        assert_eq!(complete_path(&query), None);
+        let Prompt::Project(mut picker) = ProjectPicker::prompt(None) else {
+            unreachable!()
+        };
+        picker.query = TextInput::from(query.clone());
+        let before = picker.choices(Path::new("/nonexistent"), &[]);
+        std::fs::create_dir_all(root.join("aardvark")).unwrap();
+        assert_eq!(picker.choices(Path::new("/nonexistent"), &[]), before);
+        picker.query = TextInput::from(format!("{query}aard"));
+        assert_eq!(
+            picker.choices(Path::new("/nonexistent"), &[]),
+            [root.join("aardvark").canonicalize().unwrap()]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     fn profile() -> Profile {
         Profile {

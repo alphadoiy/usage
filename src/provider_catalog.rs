@@ -8,7 +8,7 @@ pub use refresh::{RefreshRequest, RefreshUpdate};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 pub use usage::{ProviderUsage, QueryState, ResetHandle, UsageSource};
 
 use sha2::{Digest, Sha256};
@@ -65,10 +65,38 @@ pub struct Provider {
 pub struct Catalog {
     pub providers: Vec<Provider>,
     pub(crate) model_keys: HashMap<String, String>,
+    /// Completion time of an actual model query, copied only across identical query keys.
+    pub(crate) model_checked_at: HashMap<String, Instant>,
     pub(crate) refreshing_models: HashSet<String>,
     pub(crate) refreshing_resources: HashSet<String>,
 }
 impl Catalog {
+    pub(crate) fn models_due(&self, interval: Duration) -> bool {
+        !interval.is_zero()
+            && self
+                .model_keys
+                .keys()
+                .any(|id| self.model_due(id, interval))
+    }
+
+    fn model_due(&self, id: &str, interval: Duration) -> bool {
+        if interval.is_zero() {
+            return false;
+        }
+        let failed = self
+            .providers
+            .iter()
+            .any(|p| p.id == id && matches!(p.models, Models::Unavailable(_)));
+        let interval = if failed {
+            interval.min(Duration::from_secs(60))
+        } else {
+            interval
+        };
+        self.model_checked_at
+            .get(id)
+            .is_none_or(|at| at.elapsed() >= interval)
+    }
+
     pub fn apply_models(&mut self, id: &str, models: Models) -> bool {
         let Some(provider) = self.providers.iter_mut().find(|p| p.id == id) else {
             return false;
@@ -80,6 +108,7 @@ impl Catalog {
         if !matches!(provider.models, Models::Loading) && !refreshing {
             return false;
         }
+        self.model_checked_at.insert(id.to_owned(), Instant::now());
         provider.models = models;
         true
     }
@@ -94,7 +123,7 @@ pub struct Plan {
 impl Plan {
     /// Reuse only values whose query identity is unchanged. A new plan always
     /// rediscovers local configuration, but stable model lists need no network.
-    pub(crate) fn reuse(&mut self, previous: &Catalog, refresh_models: bool) {
+    pub(crate) fn reuse(&mut self, previous: &Catalog, refresh_models: bool, interval: Duration) {
         self.queries.retain(|query| {
             let cached = previous.providers.iter().find(|p| p.id == query.id);
             if self
@@ -111,9 +140,12 @@ impl Plan {
                     .find(|p| p.id == query.id)
                     .unwrap()
                     .models = cached.models.clone();
-                // Failed queries are retried on the next scheduled refresh; only successful
-                // catalogs may be reused indefinitely. Keep the last error visible meanwhile.
-                let retry = refresh_models || matches!(cached.models, Models::Unavailable(_));
+                if let Some(at) = previous.model_checked_at.get(&query.id) {
+                    self.catalog.model_checked_at.insert(query.id.clone(), *at);
+                }
+                // Retry failed queries on their own deadline too. A zero interval disables
+                // all periodic revalidation; manual refresh still forces a query.
+                let retry = refresh_models || previous.model_due(&query.id, interval);
                 if retry {
                     self.catalog.refreshing_models.insert(query.id.clone());
                 }
@@ -481,6 +513,69 @@ mod tests {
     }
 
     #[test]
+    fn model_ttl_follows_each_query_identity_and_throttles_failed_retries() {
+        let f = Fixture::new();
+        let service = CatalogService::new(
+            f.0.clone(),
+            Arc::new(FakeHttp::new()),
+            Arc::new(|_| Ok("key".into())),
+        );
+        let mut config = config();
+        let mut other = config.resources[0].clone();
+        other.id = "other".into();
+        config.resources.push(other);
+        let mut initial = service.load(&config).unwrap();
+        let first = initial.queries[0].id.clone();
+        let second = initial.queries[1].id.clone();
+        initial
+            .catalog
+            .apply_models(&first, Models::Ready(vec!["a".into()]));
+        initial
+            .catalog
+            .apply_models(&second, Models::Ready(vec!["b".into()]));
+        let old = Instant::now() - Duration::from_secs(301);
+        initial.catalog.model_checked_at.insert(first.clone(), old);
+        // A newly successful query cannot make another provider's old result fresh.
+        initial.catalog.refreshing_models.insert(second.clone());
+        initial
+            .catalog
+            .apply_models(&second, Models::Ready(vec!["new-b".into()]));
+        let mut due = service.load(&config).unwrap();
+        due.reuse(&initial.catalog, false, Duration::from_secs(300));
+        assert_eq!(
+            due.queries.iter().map(|q| &q.id).collect::<Vec<_>>(),
+            [&first]
+        );
+        assert_eq!(due.catalog.model_checked_at[&first], old);
+        assert!(due.catalog.models_due(Duration::from_secs(300)));
+        // Failed models retry after a bounded delay even with quota polling off.
+        due.catalog
+            .apply_models(&first, Models::Unavailable("temporary".into()));
+        assert!(!due.catalog.models_due(Duration::from_secs(300)));
+        let mut fresh_error = service.load(&config).unwrap();
+        fresh_error.reuse(&due.catalog, false, Duration::from_secs(300));
+        assert!(fresh_error.queries.is_empty());
+        due.catalog
+            .model_checked_at
+            .insert(first.clone(), Instant::now() - Duration::from_secs(61));
+        assert!(due.catalog.models_due(Duration::from_secs(300)));
+        assert!(!due.catalog.models_due(Duration::ZERO));
+        let mut errors_disabled = service.load(&config).unwrap();
+        errors_disabled.reuse(&due.catalog, false, Duration::ZERO);
+        assert!(errors_disabled.queries.is_empty());
+        // Disabling TTL keeps stable successful results; a changed endpoint never reuses them.
+        let mut disabled = service.load(&config).unwrap();
+        disabled.reuse(&initial.catalog, false, Duration::ZERO);
+        assert!(disabled.queries.is_empty());
+        config.resources[0].inference.as_mut().unwrap().base_url =
+            "https://changed.invalid/v1".into();
+        let mut changed = service.load(&config).unwrap();
+        changed.reuse(&initial.catalog, false, Duration::ZERO);
+        assert_eq!(changed.queries.len(), 1);
+        assert!(!changed.catalog.model_checked_at.contains_key(&first));
+    }
+
+    #[test]
     fn performance_only_uses_an_explicit_instance_and_factory_source_without_creating_home() {
         let f = Fixture::new();
         let service = CatalogService::new(
@@ -563,7 +658,7 @@ mod tests {
 
         config.resources[0].label = Some("Renamed provider".into());
         let mut automatic = service.load(&config).unwrap();
-        automatic.reuse(&initial.catalog, false);
+        automatic.reuse(&initial.catalog, false, Duration::ZERO);
         assert!(automatic.queries.is_empty());
         assert_eq!(automatic.resources.len(), 1);
         assert_eq!(automatic.catalog.providers[0].name, "Renamed provider");
@@ -599,7 +694,7 @@ mod tests {
         );
 
         let mut manual = service.load(&config).unwrap();
-        manual.reuse(&initial.catalog, true);
+        manual.reuse(&initial.catalog, true, Duration::ZERO);
         assert_eq!(manual.queries.len(), 1);
         assert_eq!(
             manual.catalog.providers[0].models,
@@ -617,7 +712,11 @@ mod tests {
                 .apply_models(&id, Models::Ready(vec!["duplicate".into()]))
         );
         let mut recovered = service.load(&config).unwrap();
-        recovered.reuse(&manual.catalog, false);
+        manual
+            .catalog
+            .model_checked_at
+            .insert(id.clone(), Instant::now() - Duration::from_secs(61));
+        recovered.reuse(&manual.catalog, false, Duration::from_secs(300));
         assert_eq!(recovered.queries.len(), 1);
         assert_eq!(
             recovered.catalog.providers[0].models,
@@ -632,7 +731,7 @@ mod tests {
             Models::Ready(vec!["cached-model".into()])
         );
         let mut stable = service.load(&config).unwrap();
-        stable.reuse(&recovered.catalog, false);
+        stable.reuse(&recovered.catalog, false, Duration::ZERO);
         assert!(stable.queries.is_empty());
         let mut failed = snapshot.clone();
         failed.state = crate::resources::ResourceState::TransientFailure;
@@ -645,15 +744,16 @@ mod tests {
 
         *key.lock().unwrap() = "rotated-inference".into();
         let mut rotated = service.load(&config).unwrap();
-        rotated.reuse(&initial.catalog, false);
+        rotated.reuse(&initial.catalog, false, Duration::ZERO);
         assert_eq!(rotated.queries.len(), 1);
         assert_eq!(rotated.catalog.providers[0].models, Models::Loading);
+        assert!(rotated.catalog.model_checked_at.is_empty());
         assert!(!format!("{:?}", rotated.catalog).contains("rotated-inference"));
         *key.lock().unwrap() = "synthetic-inference".into();
 
         config.resources[0].inference.as_mut().unwrap().base_url = "https://new.invalid/v1".into();
         let mut changed = service.load(&config).unwrap();
-        changed.reuse(&initial.catalog, false);
+        changed.reuse(&initial.catalog, false, Duration::ZERO);
         assert_eq!(changed.queries.len(), 1);
         assert_eq!(changed.catalog.providers[0].models, Models::Loading);
         assert!(matches!(
@@ -1192,7 +1292,7 @@ mod tests {
             );
         }
         let mut stable = service.load(&AppConfig::default()).unwrap();
-        stable.reuse(&plan.catalog, false);
+        stable.reuse(&plan.catalog, false, Duration::ZERO);
         assert!(stable.queries.is_empty());
         assert_eq!(http.calls.lock().unwrap().len(), 2);
 
@@ -1202,7 +1302,7 @@ mod tests {
         auth["tokens"]["access_token"] = json!("rotated-access-token");
         std::fs::write(auth_path, auth.to_string()).unwrap();
         let mut changed = service.load(&AppConfig::default()).unwrap();
-        changed.reuse(&plan.catalog, false);
+        changed.reuse(&plan.catalog, false, Duration::ZERO);
         assert_eq!(changed.queries.len(), 1);
         assert_eq!(changed.queries[0].id, a.id);
         collect_models(

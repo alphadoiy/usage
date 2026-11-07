@@ -1074,7 +1074,7 @@ mod tests {
         assert!(snapshot.metrics.iter().any(|m| matches!(m, crate::resources::ResourceMetric::Allowance { remaining: Some(value), .. } if value == "6172839")));
         assert_detected_result_applies(&mut plan, snapshot);
         let mut raw = service.load(&AppConfig::default()).unwrap();
-        raw.reuse(&plan.catalog, false);
+        raw.reuse(&plan.catalog, false, std::time::Duration::ZERO);
         assert!(matches!(
             raw.catalog.providers[0].usage.sources[0].state,
             QueryState::Loading

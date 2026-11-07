@@ -249,9 +249,13 @@ pub(super) struct HomeSessionsState {
 }
 
 impl HomeSessionsState {
-    pub fn new(resume: crate::config::ResumeMode) -> Self {
+    pub fn new(
+        resume: crate::config::ResumeMode,
+        options: crate::terminals::LaunchOptions,
+    ) -> Self {
         let mut browser = SessionBrowser::new(Vec::new());
         browser.resume_mode = resume;
+        browser.launch_options = options;
         Self {
             browser,
             loading: false,
@@ -271,6 +275,10 @@ pub(super) struct OverviewState {
     pub generation: u64,
     pub service: Arc<crate::provider_catalog::CatalogService>,
     pub task: Option<Task>,
+    /// Successful model lists may only be reused until this interval elapses.
+    pub model_refresh_seconds: u64,
+    /// Throttles retries when inventory discovery itself fails. Model TTLs live in Catalog.
+    pub last_model_attempt: Option<std::time::Instant>,
 }
 
 impl OverviewState {
@@ -283,6 +291,8 @@ impl OverviewState {
             generation: 0,
             service: Arc::new(crate::provider_catalog::CatalogService::from_environment()),
             task: None,
+            model_refresh_seconds: 300,
+            last_model_attempt: None,
         }
     }
 

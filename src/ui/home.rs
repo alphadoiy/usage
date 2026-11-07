@@ -397,7 +397,7 @@ impl Connections {
                     format!("{symbol} {name}")
                 };
                 let style = if active && index == self.selected {
-                    Style::new().fg(color).bg(Color::Rgb(35, 45, 65)).bold()
+                    super::widgets::selected_row().fg(color).bold()
                 } else {
                     Style::new().fg(color)
                 };

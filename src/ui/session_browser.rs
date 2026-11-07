@@ -49,6 +49,7 @@ pub struct SessionBrowser {
     pub filter_label: Option<String>,
     pub sort_tokens: bool,
     pub resume_mode: crate::config::ResumeMode,
+    pub launch_options: crate::terminals::LaunchOptions,
     /// Set on the home board: projects come from the project store merged with sessions.
     project_records: Option<Vec<crate::projects::Record>>,
 }
@@ -72,6 +73,7 @@ impl SessionBrowser {
             filter_label: None,
             sort_tokens: false,
             resume_mode: crate::config::ResumeMode::Auto,
+            launch_options: Default::default(),
             project_records: None,
         };
         browser.rebuild();
@@ -512,7 +514,7 @@ fn render_preview(area: Rect, buf: &mut Buffer, browser: &SessionBrowser) {
         .title(format!(
             " 恢复预览 · {} · {} ",
             session.provider.name(),
-            crate::terminals::terminal_target(browser.resume_mode).label()
+            crate::terminals::terminal_target(browser.resume_mode).describe(browser.launch_options)
         ))
         .border_style(DIM);
     let inner = block.inner(area);
@@ -788,7 +790,7 @@ fn render_session_list(
     StatefulWidget::render(
         List::new(items)
             .highlight_symbol("› ")
-            .highlight_style(Style::new().bg(Color::Rgb(35, 45, 65))),
+            .highlight_style(super::widgets::selected_row()),
         inner,
         buf,
         &mut state,
@@ -952,10 +954,35 @@ mod tests {
             assert!(text.contains("Grok"), "{text}");
             let compact = text.replace(' ', "");
             assert!(compact.contains("恢复预览"), "{text}");
-            assert!(compact.contains("Ghostty右侧分屏"), "{text}");
+            assert!(compact.contains("Ghostty"), "{text}");
             assert!(compact.contains("目录"), "{text}");
             assert!(compact.contains("运行"), "{text}");
         }
+    }
+
+    #[test]
+    fn selected_session_row_is_reversed_so_any_terminal_theme_stays_readable() {
+        let mut browser = SessionBrowser::new(vec![session(
+            AgentKind::CODEX,
+            "Review UI",
+            "/tmp/beta",
+            30,
+        )]);
+        browser.focus_sessions();
+        let area = Rect::new(0, 0, 100, 22);
+        let mut buffer = Buffer::empty(area);
+        render(area, &mut buffer, &browser);
+        assert!(buffer.content.iter().any(|cell| {
+            cell.symbol() == "R" && cell.modifier.contains(ratatui::style::Modifier::REVERSED)
+        }));
+        // No selection style pins a single color: that is what made text vanish.
+        assert!(
+            buffer
+                .content
+                .iter()
+                .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+                .all(|cell| cell.bg == Color::Reset)
+        );
     }
 
     #[test]
@@ -979,7 +1006,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             rows.iter()
-                .any(|row| row.replace(' ', "").contains("Codex·Ghostty右侧分屏"))
+                .any(|row| row.replace(' ', "").contains("Codex·Ghostty"))
         );
         assert!(
             rows.iter()

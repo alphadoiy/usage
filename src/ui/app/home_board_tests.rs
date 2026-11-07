@@ -98,12 +98,9 @@ async fn status_details_select_vendor_scroll_and_return_without_launching_sessio
     buffer = Buffer::empty(area);
     render_home(area, &mut buffer, &app);
     assert!(text(&buffer).contains("○Claude"));
-    assert!(
-        buffer
-            .content
-            .iter()
-            .any(|cell| cell.symbol() == "C" && cell.bg == Color::Rgb(35, 45, 65))
-    );
+    assert!(buffer.content.iter().any(|cell| {
+        cell.symbol() == "C" && cell.modifier.contains(ratatui::style::Modifier::REVERSED)
+    }));
     assert!(text(&buffer).contains("Codex"));
     assert!(!app.handle_home_key(KeyCode::Esc, &handle, (80, 24)));
 }

@@ -21,6 +21,7 @@ impl std::error::Error for ConfigError {}
 pub struct AppConfig {
     pub style: String,
     pub refresh_seconds: u64,
+    pub model_refresh_seconds: u64,
     pub providers: Vec<String>,
     pub claude_dir: Option<PathBuf>,
     pub codex_dir: Option<PathBuf>,
@@ -30,6 +31,8 @@ pub struct AppConfig {
     pub provider_usage: std::collections::BTreeMap<String, crate::resources::QuotaConversion>,
     pub alerts: AlertConfig,
     pub resume: ResumeMode,
+    pub layout: LayoutMode,
+    pub focus: FocusMode,
 }
 
 impl Default for AppConfig {
@@ -37,6 +40,7 @@ impl Default for AppConfig {
         Self {
             style: "bar".into(),
             refresh_seconds: 60,
+            model_refresh_seconds: 300,
             providers: vec!["claude".into(), "codex".into(), "grok".into()],
             claude_dir: None,
             codex_dir: None,
@@ -46,6 +50,8 @@ impl Default for AppConfig {
             provider_usage: Default::default(),
             alerts: AlertConfig::default(),
             resume: ResumeMode::Auto,
+            layout: LayoutMode::Auto,
+            focus: FocusMode::Keep,
         }
     }
 }
@@ -90,6 +96,28 @@ pub enum ResumeMode {
     Herdr,
     Current,
 }
+/// How a new Agent instance is arranged once a terminal is chosen. The terminal
+/// adapter decides what each intent means for its own panes/tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayoutMode {
+    /// Split when the terminal can, otherwise open a tab.
+    #[default]
+    Auto,
+    Split,
+    Tab,
+}
+
+/// Where keyboard focus ends up after a new instance is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FocusMode {
+    /// Stay in Usage, so several instances can be started in a row.
+    #[default]
+    Keep,
+    New,
+}
+
 impl ResumeMode {
     /// Shift+R vocabulary, in `next()` order. Checked against `label()` by a test.
     pub const CYCLE_HINT: &'static str = "切换自动 / Ghostty / Rex / Herdr / 当前终端";
@@ -107,9 +135,9 @@ impl ResumeMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "自动",
-            Self::Ghostty => "Ghostty 分屏",
-            Self::Rex => "Rex 新标签页",
-            Self::Herdr => "Herdr 新标签页",
+            Self::Ghostty => "Ghostty",
+            Self::Rex => "Rex",
+            Self::Herdr => "Herdr",
             Self::Current => "当前终端",
         }
     }
@@ -229,6 +257,9 @@ style = "{style}"
 
 # 自动刷新间隔（秒）。0 表示只在打开和按 r 时查询
 refresh_seconds = 60
+
+# 模型列表自动刷新间隔（秒）。0 表示只在打开、连接变化和按 r 时查询
+model_refresh_seconds = 300
 
 # 查询顺序。已内置 claude、codex、grok
 providers = ["claude", "codex", "grok"]
@@ -454,6 +485,9 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
     if let Some(refresh) = raw.refresh_seconds {
         config.refresh_seconds = refresh;
     }
+    if let Some(refresh) = raw.model_refresh_seconds {
+        config.model_refresh_seconds = refresh;
+    }
     if let Some(providers) = raw.providers {
         if providers.is_empty() || providers.iter().any(|item| item.trim().is_empty()) {
             return Err(ConfigError("providers 必须是非空的字符串列表".into()));
@@ -482,6 +516,8 @@ fn parse_raw(raw: RawConfig) -> Result<AppConfig, ConfigError> {
     }
     if let Some(sessions) = raw.sessions {
         config.resume = sessions.resume;
+        config.layout = sessions.layout;
+        config.focus = sessions.focus;
     }
     config.resources = raw.resources.unwrap_or_default();
     config.provider_usage = raw.provider_usage.unwrap_or_default();
@@ -595,6 +631,7 @@ pub fn home_dir() -> PathBuf {
 struct RawConfig {
     style: Option<String>,
     refresh_seconds: Option<u64>,
+    model_refresh_seconds: Option<u64>,
     providers: Option<Vec<String>>,
     paths: Option<RawPaths>,
     instances: Option<Vec<DataInstance>>,
@@ -608,11 +645,15 @@ struct RawConfig {
 #[serde(default, deny_unknown_fields)]
 struct RawSessions {
     resume: ResumeMode,
+    layout: LayoutMode,
+    focus: FocusMode,
 }
 impl Default for RawSessions {
     fn default() -> Self {
         Self {
             resume: ResumeMode::Auto,
+            layout: LayoutMode::Auto,
+            focus: FocusMode::Keep,
         }
     }
 }
@@ -646,6 +687,27 @@ mod tests {
         assert_eq!(seen.len(), hints.len());
         for (mode, hint) in seen.iter().zip(hints) {
             assert!(mode.label().starts_with(hint), "{mode:?}: {hint}");
+        }
+    }
+
+    #[test]
+    fn session_layout_and_focus_are_optional_and_reject_unknown_values() {
+        let config = parse_raw(toml::from_str("").unwrap()).unwrap();
+        assert_eq!(
+            (config.layout, config.focus),
+            (LayoutMode::Auto, FocusMode::Keep)
+        );
+        let config = parse_raw(
+            toml::from_str("[sessions]\nresume = \"rex\"\nlayout = \"tab\"\nfocus = \"new\"")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (config.resume, config.layout, config.focus),
+            (ResumeMode::Rex, LayoutMode::Tab, FocusMode::New)
+        );
+        for bad in ["layout = \"grid\"", "focus = \"both\""] {
+            assert!(toml::from_str::<RawConfig>(&format!("[sessions]\n{bad}")).is_err());
         }
     }
 

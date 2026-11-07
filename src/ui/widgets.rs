@@ -2,7 +2,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
@@ -20,6 +20,14 @@ const TEXT: Color = Color::Rgb(242, 242, 247);
 const DIM: Color = Color::Rgb(142, 142, 147);
 const WARNING: Color = Color::Rgb(255, 159, 10);
 const ERROR: Color = Color::Rgb(255, 69, 58);
+
+/// The one selected-row highlight. It swaps the cell's own foreground and background,
+/// so contrast comes from whatever theme the terminal uses (light, dark, 16 or
+/// truecolor). Never set only a background or only a foreground for a selection:
+/// the unset half comes from the terminal and can match it.
+pub(super) fn selected_row() -> Style {
+    Style::new().add_modifier(Modifier::REVERSED)
+}
 
 /// A wide glyph drawn underneath a popup can straddle its edge. Clear its outside
 /// half too, otherwise Terminal::diff skips the popup border as a continuation cell.
@@ -692,6 +700,60 @@ fn note_color(provider_id: &str, line: &str) -> Color {
 
 #[cfg(test)]
 mod tests {
+    /// A fixed background with text left on the terminal's default foreground is
+    /// invisible on some themes. Every visible glyph on a pinned background needs a pinned color.
+    #[test]
+    fn card_text_on_a_fixed_background_always_has_a_fixed_foreground() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 29, 12, 0, 0).unwrap();
+        let snapshot = snapshot_ok(
+            "claude",
+            "Claude Code",
+            vec![QuotaTier {
+                name: "five_hour".into(),
+                utilization: 42.0,
+                resets_at: Some(now + chrono::Duration::hours(2)),
+            }],
+            None,
+            now,
+        );
+        for style in ["ring", "bar"] {
+            let view = crate::view::builtin_styles()
+                .build(style, &snapshot, now, None)
+                .unwrap();
+            let area = ratatui::layout::Rect::new(0, 0, 90, 14);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            super::render_card(area, &mut buffer, "claude", "Claude Code", &view);
+            let mut inspected = 0;
+            for cell in &buffer.content {
+                if cell.symbol().trim().is_empty() || cell.bg == ratatui::style::Color::Reset {
+                    continue;
+                }
+                inspected += 1;
+                assert_ne!(
+                    cell.fg,
+                    ratatui::style::Color::Reset,
+                    "glyph {:?} has a fixed background but no fixed foreground",
+                    cell.symbol()
+                );
+            }
+            assert!(
+                inspected > 0,
+                "{style}: nothing rendered on the card background"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_rows_swap_theme_colors_instead_of_fixing_one_half() {
+        let style = super::selected_row();
+        assert!(
+            style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert_eq!((style.fg, style.bg), (None, None));
+    }
+
     use chrono::{TimeZone, Utc};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;

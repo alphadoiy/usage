@@ -581,7 +581,7 @@ pub(super) fn render(
         }
         let selected = start + offset == index;
         let style = if selected {
-            Style::new().bg(Color::Rgb(25, 35, 45))
+            super::widgets::selected_row()
         } else {
             Style::default()
         };

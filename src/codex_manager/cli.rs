@@ -176,7 +176,7 @@ pub enum CodexCommand {
         resume: Option<String>,
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
-        /// 在 Herdr / Rex 新标签页或 Ghostty 右侧分屏运行
+        /// 在新终端运行（Rex / Ghostty / Herdr），分屏或标签页由 [sessions] layout 决定
         #[arg(long)]
         split: bool,
         #[arg(long)]
@@ -387,6 +387,15 @@ pub async fn dispatch(command: CodexCommand, usage_config: Option<PathBuf>) -> R
                     &cwd,
                     &command,
                     crate::config::ResumeMode::Auto,
+                    crate::terminals::LaunchOptions::from_config(
+                        &crate::config::load_config(
+                            &usage_config
+                                .clone()
+                                .unwrap_or_else(crate::config::default_config_path),
+                            usage_config.is_some(),
+                        )
+                        .map_err(|error| Error::message(error.to_string()))?,
+                    ),
                 )
                 .map_err(Error::message)?;
             } else {

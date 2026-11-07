@@ -1,6 +1,8 @@
 //! Terminal transport, independent of Agent identity, credentials and session storage.
+mod adaptive;
 mod ghostty;
 mod herdr;
+mod layout;
 mod rex;
 
 use std::collections::BTreeMap;
@@ -9,20 +11,57 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::config::ResumeMode;
+use crate::config::{FocusMode, LayoutMode, ResumeMode};
 
+/// Capability-level preference for UI descriptions, before live layout planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     Current,
     Tab,
-    RightSplit,
+    Split,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    pub split: bool,
+    pub tab: bool,
+    /// Reads the existing panes and tiles by their size instead of using a fixed direction.
+    pub adaptive: bool,
+}
+
+/// User intent for one launch, independent of the terminal that carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LaunchOptions {
+    pub layout: LayoutMode,
+    pub focus: FocusMode,
+}
+
+impl LaunchOptions {
+    pub fn from_config(config: &crate::config::AppConfig) -> Self {
+        Self {
+            layout: config.layout,
+            focus: config.focus,
+        }
+    }
+}
+
+/// `Auto` and `Split` prefer a split and `Tab` prefers a tab; whatever the terminal
+/// cannot do degrades to the other, never to a different terminal.
+pub fn resolve(capabilities: Capabilities, layout: LayoutMode) -> Placement {
+    match (capabilities.split, capabilities.tab) {
+        (false, false) => Placement::Current,
+        (true, false) => Placement::Split,
+        (false, true) => Placement::Tab,
+        (true, true) if layout == LayoutMode::Tab => Placement::Tab,
+        (true, true) => Placement::Split,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalTarget {
     pub id: &'static str,
     pub label: &'static str,
-    pub placement: Placement,
+    pub capabilities: Capabilities,
 }
 
 impl TerminalTarget {
@@ -30,14 +69,40 @@ impl TerminalTarget {
         self.label
     }
     pub fn is_current(self) -> bool {
-        self.placement == Placement::Current
+        !self.capabilities.split && !self.capabilities.tab
+    }
+    pub fn placement(self, options: LaunchOptions) -> Placement {
+        resolve(self.capabilities, options.layout)
+    }
+    /// Truthful description of what this launch will do, including degradation.
+    pub fn describe(self, options: LaunchOptions) -> String {
+        let placement = self.placement(options);
+        let wanted_split = options.layout == LayoutMode::Split;
+        let wanted_tab = options.layout == LayoutMode::Tab;
+        match placement {
+            Placement::Current => self.label.to_owned(),
+            Placement::Split if wanted_tab => format!("{} 右侧分屏（不支持标签页）", self.label),
+            Placement::Split if self.capabilities.adaptive && !wanted_split => {
+                format!("{} 自动排布", self.label)
+            }
+            Placement::Split if self.capabilities.adaptive => {
+                format!("{} 分屏", self.label)
+            }
+            Placement::Split => format!("{} 右侧分屏", self.label),
+            Placement::Tab if wanted_split => format!("{} 新标签页（不支持分屏）", self.label),
+            Placement::Tab => format!("{} 新标签页", self.label),
+        }
     }
 }
 
 const CURRENT: TerminalTarget = TerminalTarget {
     id: "current",
     label: "当前终端",
-    placement: Placement::Current,
+    capabilities: Capabilities {
+        split: false,
+        tab: false,
+        adaptive: false,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +129,8 @@ impl Platform {
 pub struct TerminalContext {
     platform: Platform,
     vars: BTreeMap<String, OsString>,
+    /// Columns and rows of the pane that runs Usage, when it has a terminal.
+    size: Option<(u32, u32)>,
 }
 
 impl TerminalContext {
@@ -71,7 +138,16 @@ impl TerminalContext {
         Self {
             platform,
             vars: vars.into_iter().collect(),
+            size: None,
         }
+    }
+    pub fn with_size(mut self, cols: u32, rows: u32) -> Self {
+        self.size = Some((cols, rows));
+        self
+    }
+    /// Unknown dimensions cannot authorize an automatic split.
+    pub fn size(&self) -> (u32, u32) {
+        self.size.unwrap_or((0, 0))
     }
     pub fn platform(&self) -> Platform {
         self.platform
@@ -89,6 +165,7 @@ impl TerminalContext {
 pub struct TerminalRequest<'a> {
     pub cwd: &'a Path,
     pub shell_command: &'a str,
+    pub options: LaunchOptions,
 }
 
 /// Adapter/strategy: detection is read-only; command construction must not spawn.
@@ -104,13 +181,16 @@ pub trait TerminalBackend: Send + Sync {
     ) -> Result<TerminalCommand, String>;
 }
 
-type CommandContinuation = Box<dyn FnOnce(&[u8]) -> Result<Command, String> + Send>;
+type CommandContinuation = Box<dyn FnOnce(&[u8]) -> Result<TerminalCommand, String> + Send>;
+type CommandObserver = Box<dyn FnOnce(&[u8]) + Send>;
 
 /// Some transports create a terminal first, then address it using the response ID.
 /// Both stages are prepared without side effects and execute at most once.
 pub struct TerminalCommand {
     command: Command,
     next: Option<CommandContinuation>,
+    after: Option<CommandObserver>,
+    created: bool,
 }
 
 impl From<Command> for TerminalCommand {
@@ -118,16 +198,32 @@ impl From<Command> for TerminalCommand {
         Self {
             command,
             next: None,
+            after: None,
+            created: false,
         }
     }
 }
 
 impl TerminalCommand {
-    pub fn then(
+    /// Following stages only arrange focus; a failure must not imply creation failed.
+    pub fn marks_created(mut self) -> Self {
+        self.created = true;
+        self
+    }
+
+    /// Runs once this stage has succeeded, with its stdout. Bookkeeping only: it cannot fail
+    /// the launch, because the terminal has already done what was asked.
+    pub fn after(mut self, hook: impl FnOnce(&[u8]) + Send + 'static) -> Self {
+        self.after = Some(Box::new(hook));
+        self
+    }
+
+    /// The next stage receives the previous stage's stdout and may chain further stages.
+    pub fn then<C: Into<TerminalCommand>>(
         mut self,
-        next: impl FnOnce(&[u8]) -> Result<Command, String> + Send + 'static,
+        next: impl FnOnce(&[u8]) -> Result<C, String> + Send + 'static,
     ) -> Self {
-        self.next = Some(Box::new(next));
+        self.next = Some(Box::new(move |stdout| next(stdout).map(Into::into)));
         self
     }
 }
@@ -153,20 +249,26 @@ impl TerminalRegistry {
                 return Err("终端适配器 ID 为空、保留或重复".into());
             }
             if target.is_current() {
-                return Err("外部终端适配器必须声明新标签页或分屏".into());
+                return Err("外部终端适配器必须声明支持新标签页或分屏".into());
             }
         }
         Ok(Self { backends })
     }
 
     pub fn capture(&self) -> TerminalContext {
-        TerminalContext::new(
+        let context = TerminalContext::new(
             Platform::current(),
             self.backends
                 .iter()
                 .flat_map(|b| b.environment_keys().iter())
                 .filter_map(|key| std::env::var_os(key).map(|v| ((*key).to_string(), v))),
-        )
+        );
+        match ratatui::crossterm::terminal::size() {
+            Ok((cols, rows)) if cols > 0 && rows > 0 => {
+                context.with_size(u32::from(cols), u32::from(rows))
+            }
+            _ => context,
+        }
     }
 
     fn select(
@@ -225,6 +327,14 @@ impl TerminalRegistry {
             &TerminalRequest {
                 cwd: &cwd,
                 shell_command: request.shell_command,
+                options: LaunchOptions {
+                    layout: match (target.capabilities.split, target.capabilities.tab) {
+                        (true, false) => LayoutMode::Split,
+                        (false, true) => LayoutMode::Tab,
+                        _ => request.options.layout,
+                    },
+                    ..request.options
+                },
             },
         )?;
         // Bind the adapter's routing context to the prepared plan, rather than
@@ -251,15 +361,28 @@ pub struct TerminalLaunch {
 }
 
 impl TerminalLaunch {
-    pub fn execute(mut self) -> Result<(), String> {
-        tracing::debug!(event = "terminal_launch", backend = self.target.id, placement = ?self.target.placement);
-        let output =
-            Self::execute_command(self.target, &self.environment, &mut self.command.command)?;
-        if let Some(next) = self.command.next {
-            let mut command = next(&output.stdout)?;
-            Self::execute_command(self.target, &self.environment, &mut command)?;
+    pub fn execute(self) -> Result<(), String> {
+        tracing::debug!(event = "terminal_launch", backend = self.target.id);
+        let mut stage = self.command;
+        let mut created = false;
+        loop {
+            let output = Self::execute_command(self.target, &self.environment, &mut stage.command)
+                .map_err(|error| {
+                    if created {
+                        format!("实例已创建，但后续焦点操作失败；请勿重复启动：{error}")
+                    } else {
+                        error
+                    }
+                })?;
+            created |= stage.created;
+            if let Some(hook) = stage.after.take() {
+                hook(&output.stdout);
+            }
+            match stage.next {
+                Some(next) => stage = next(&output.stdout)?,
+                None => return Ok(()),
+            }
         }
-        Ok(())
     }
 
     fn execute_command(
@@ -280,11 +403,14 @@ impl TerminalLaunch {
         if output.status.success() {
             Ok(output)
         } else {
-            Err(format!(
-                "{}启动失败：{}",
-                target.label,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            // Some control CLIs report errors on stdout (Herdr prints `{ "error": … }`).
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let detail = if detail.is_empty() {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            } else {
+                detail
+            };
+            Err(format!("{}启动失败：{detail}", target.label))
         }
     }
 }
@@ -301,6 +427,11 @@ pub fn builtin_registry() -> &'static TerminalRegistry {
     })
 }
 
+/// Opaque launcher command for adapters that cannot set the directory or keep a failed
+/// pane open themselves: `sh -c WRAPPER usage-agent CWD COMMAND`. Only a launcher failure
+/// pauses the pane, so its error is not lost; normal exit and Ctrl+C close it.
+pub const AGENT_WRAPPER: &str = r#"cd -- "$1" || exit 1; sh -lc "$2"; status=$?; case $status in 0|130|143) ;; *) printf '\n[usage] 启动失败（退出码 %s），按回车关闭\n' "$status"; read -r _ ;; esac; exit "$status""#;
+
 fn selection(mode: ResumeMode) -> Selection<'static> {
     match mode.backend_id() {
         Some(id) => Selection::Backend(id),
@@ -316,7 +447,12 @@ pub fn terminal_target(mode: ResumeMode) -> TerminalTarget {
         .expect("configured terminal is registered")
 }
 
-pub fn command_in_terminal(cwd: &Path, command: &str, mode: ResumeMode) -> Result<(), String> {
+pub fn command_in_terminal(
+    cwd: &Path,
+    command: &str,
+    mode: ResumeMode,
+    options: LaunchOptions,
+) -> Result<(), String> {
     let registry = builtin_registry();
     registry
         .prepare(
@@ -325,6 +461,7 @@ pub fn command_in_terminal(cwd: &Path, command: &str, mode: ResumeMode) -> Resul
             &TerminalRequest {
                 cwd,
                 shell_command: command,
+                options,
             },
         )?
         .execute()

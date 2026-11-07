@@ -161,7 +161,7 @@ Codex 状态直接读取 [OpenAI 官方组件接口](https://status.openai.com/a
 
 Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板会显示剩余次数（包括 0）；未返回次数时提示按 `x` 查询，不把未知显示为 0。按 `x` 查询首页当前选中 Provider 的最新次数和最近到期时间，同时更新其已加载的看板次数。查询与确认都绑定该 Provider 的独立账号目录，不回退到默认登录或 Keychain。确认框显示 Provider 名称与账号，按 `y` 才会消耗一次，按 `n` 或 `Esc` 取消；打开确认后目标固定。提交前会再次确认有可用次数，成功后刷新额度。若提交请求中断或服务端暂时不可用，结果可能无法判定；先刷新额度和剩余次数，再决定是否重试。BYOK、Claude Code 和 Grok 没有主动重置入口。
 
-按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 Herdr 原生 App 中于当前 space 打开新标签页（保留 Usage 焦点），在 Rex 中打开新标签页，在 macOS Ghostty 中打开右侧 split，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty 分屏、Rex 新标签页、Herdr 新标签页、当前终端；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引，遵循用户配置的 `sqlite_home` 和 `CODEX_SQLITE_HOME`；托管账号共用该索引和会话目录。旧会话尚未进入索引时会补充扫描日志，从未运行过的目录视为没有会话。选中共享存储中的 Codex 会话后可按 `Shift+P` 选择已保存的 Provider 继续同一会话；独立来源目录会说明尚未共享，并保留默认恢复方式。恢复与复制命令沿用当前 Usage 配置文件。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
+按 `p` 或 `F3` 打开会话浏览器。第一级按最近活动时间列出项目，第二级显示该项目的会话，并按 Claude Code、Codex、Grok 分组。宽终端左右排列，窄终端上下排列。用方向键或 `j`/`k` 选择项目，按 `Enter` 进入会话列表；按 `Tab` 或左右方向键切换列表。选中会话后，底部会预览工具、项目目录和即将运行的恢复命令；再按 `Enter` 恢复会话。默认 `auto` 模式在 Herdr 原生 App、Rex 和 macOS Ghostty 中按当前窗口 / pane 自动选择右分屏、下分屏或项目标签页，在其它终端中暂时退出 TUI、使用当前终端运行 agent；agent 退出后返回原来的列表，`Ctrl+C` 中断 agent 后也能返回。按大写 `R` 轮换自动、Ghostty、Rex、Herdr、当前终端；用 `[sessions] layout = "auto|split|tab"` 统一选择分屏或标签页，用 `focus = "keep|new"` 选择启动后是否切到新实例（默认保持在 Usage），详见[终端适配规范](docs/terminal-integration.md)；按 `y` 复制包含项目目录、实例配置目录和会话 ID 的完整恢复命令。按 `/` 搜索项目路径、标题、工具或会话 ID，按 `c` 清除搜索，按 `r` 重新读取。`Esc` 从会话返回项目，再按一次返回用量面板。新 split 会沿用对应工具的配置目录。Ghostty 分屏要求 macOS Ghostty 1.3+；当前终端恢复可用于其它终端，两种方式都需要对应工具的 CLI。Codex 优先读取本机 SQLite 会话索引，遵循用户配置的 `sqlite_home` 和 `CODEX_SQLITE_HOME`；托管账号共用该索引和会话目录。旧会话尚未进入索引时会补充扫描日志，从未运行过的目录视为没有会话。选中共享存储中的 Codex 会话后可按 `Shift+P` 选择已保存的 Provider 继续同一会话；独立来源目录会说明尚未共享，并保留默认恢复方式。恢复与复制命令沿用当前 Usage 配置文件。首次使用 Ghostty 分屏时 macOS 可能要求允许终端控制 Ghostty。列表只收录 ID 合法且本机项目目录仍存在的会话；实际恢复结果由对应工具的 CLI 决定。
 
 会话扫描在后台运行，刷新时保留当前项目和会话选择。标题优先使用真实的首条用户提示，跳过工具结果和自动注入的上下文；Grok 子代理不会作为独立会话列出，分叉会话仍可选择。Codex 日志回退只扫描 `sessions/`，并排除在 `archived_sessions/` 中也能找到的会话；Codex 应用压缩后的 `.jsonl.zst` 日志同样可读，压缩过程中同目录存在明文副本时优先读取明文。新增会话来源可向 `SessionRegistry` 注册 `SessionSource`，用 `SessionHomes::with` 指定目录，再通过 `ui::run_with_sessions` 注入；来源的名称、颜色、排序、恢复命令和环境变量由 `AgentKind::new` 一起定义，浏览器无需增加工具分支。
 
@@ -170,7 +170,7 @@ Codex OAuth 的用量响应若提供主动重置次数，首页 Provider 看板�
 
 添加时会检测相同配置与凭据，重复项提示使用已有 Provider；不同模型或配置可以分别保存，显式“复制”仍可创建独立副本。第三方账号的授权、去重和刷新由 Magpie 管理。
 
-在 Herdr 或 Rex 中启动会为每次启动打开独立标签页，并保留 Usage 页面的焦点；在 Ghostty 中启动会打开右侧分屏，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。Rex 使用官方 [`rex run`](https://www.superlogical.com/rex/docs/automate/shell-scripting) 在当前 `REX_SESSION` 中新建 tab，优先使用 `REX_BIN_DIR` 中与服务器匹配的 CLI；`usage codex run ... --split` 同样支持 Rex 标签页。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
+启动位置由 `[sessions] layout` 统一决定：Rex、Herdr 与 Ghostty 都会自动排布；默认保留 Usage 页面的焦点，可继续选择其他账号，也可重复打开同一个 BYOK / OAuth 账号。在其它终端中使用当前终端运行 Codex；也可在多个终端分别执行 `run`。Rex 使用官方 [`rex run`](https://www.superlogical.com/rex/docs/automate/shell-scripting) 在当前 `REX_SESSION` 中新建 tab，优先使用 `REX_BIN_DIR` 中与服务器匹配的 CLI；`usage codex run ... --split` 同样支持 Rex 标签页。需要安装 Codex CLI，使用支持 `--no-daemon` 的版本时会自动启用该参数。要让并发任务使用各自的 Git 工作目录，可传 `--worktree`（需要 Codex CLI 支持）。
 
 ```bash
 usage codex
@@ -369,7 +369,9 @@ bell = false
 desktop = false
 
 [sessions]
-resume = "auto" # auto / ghostty / rex / current
+resume = "auto" # auto / ghostty / rex / herdr / current
+layout = "auto" # auto / split / tab
+focus = "keep"  # keep / new
 
 [[instances]]
 id = "work-codex"

@@ -772,8 +772,14 @@ impl Dashboard {
             home_activity: state::HomeActivityState::new(),
             home_focus: super::home::Focus::Providers,
             home_connections: super::home::Connections::default(),
-            home_sessions_state: state::HomeSessionsState::new(config.resume),
-            overview_state: state::OverviewState::new(),
+            home_sessions_state: state::HomeSessionsState::new(
+                config.resume,
+                crate::terminals::LaunchOptions::from_config(&config),
+            ),
+            overview_state: state::OverviewState {
+                model_refresh_seconds: config.model_refresh_seconds,
+                ..state::OverviewState::new()
+            },
             service_state: state::ServiceState::new(),
             home_scroll: 0,
             home_models_expanded: false,
@@ -1140,6 +1146,8 @@ impl Dashboard {
         self.browser_state.panel = Some(self.browser_state.saved.take().unwrap_or_else(|| {
             let mut browser = SessionBrowser::new(Vec::new());
             browser.resume_mode = self.history_state.config.resume;
+            browser.launch_options =
+                crate::terminals::LaunchOptions::from_config(&self.history_state.config);
             browser
         }));
         self.apply_browser_usage();
@@ -1529,14 +1537,23 @@ impl Dashboard {
         } else if let Some(browser) = &mut self.browser_state.panel {
             browser.launching = true;
         }
-        if crate::terminals::terminal_target(mode).is_current() {
+        let target = crate::terminals::terminal_target(mode);
+        if target.is_current() {
             self.browser_state.resume_plan = Some(request);
             return;
         }
-        self.notice = Some(format!(
-            "正在{}打开会话…",
-            crate::terminals::terminal_target(mode).label()
-        ));
+        let options = if home {
+            self.home_sessions_state.browser.launch_options
+        } else {
+            self.browser_state
+                .panel
+                .as_ref()
+                .map(|browser| browser.launch_options)
+                .unwrap_or_else(|| {
+                    crate::terminals::LaunchOptions::from_config(&self.history_state.config)
+                })
+        };
+        self.notice = Some(format!("正在{}打开会话…", target.describe(options)));
         let tx = self.tx.clone();
         let generation = if home {
             self.home_sessions_state.generation
@@ -1545,7 +1562,7 @@ impl Dashboard {
         };
         // Accepted launches must not be cancelled when their source view closes.
         handle.spawn_blocking(move || {
-            let result = request.run_in_terminal(mode);
+            let result = request.run_in_terminal(mode, options);
             let event = if home {
                 AppEvent::HomeSessionLaunched { generation, result }
             } else {
@@ -1921,13 +1938,34 @@ impl Dashboard {
         self.start_overview_refresh(handle, refresh_models);
     }
 
+    /// Model lists are more stable than quotas, but upstream catalog updates
+    /// must still become visible without requiring a manual refresh.
+    fn model_refresh_due(&self) -> bool {
+        let interval = Duration::from_secs(self.overview_state.model_refresh_seconds);
+        if interval.is_zero() {
+            return false;
+        }
+        match &self.overview_state.catalog {
+            Some(catalog) => catalog.models_due(interval),
+            None => self
+                .overview_state
+                .last_model_attempt
+                .is_none_or(|at| at.elapsed() >= interval.min(Duration::from_secs(60))),
+        }
+    }
+
     fn start_overview_refresh(&mut self, handle: &Handle, refresh_models: bool) {
+        self.start_catalog_refresh(handle, refresh_models, false);
+    }
+
+    fn start_catalog_refresh(&mut self, handle: &Handle, refresh_models: bool, models_only: bool) {
         if let Some(task) = self.overview_state.task.take() {
             task.abort();
         }
         self.overview_state.generation = self.overview_state.generation.wrapping_add(1);
         let generation = self.overview_state.generation;
         self.overview_state.loading = true;
+        self.overview_state.last_model_attempt = Some(std::time::Instant::now());
         self.overview_state.error = None;
         let previous = self.overview_state.catalog.clone();
         let service = self.overview_state.service.clone();
@@ -1935,6 +1973,7 @@ impl Dashboard {
             config_path: self.config_path.clone(),
             previous,
             refresh_models,
+            models_only,
         };
         let tx = self.tx.clone();
         self.overview_state.task = Some(Task::spawn(handle, move |_| async move {
@@ -2214,16 +2253,18 @@ impl Dashboard {
             return false;
         }
         let summary_started = self.refresh_home_performance(handle);
-        if self.refresh_seconds == 0
-            || self.pending > 0
-            || self.overview_state.loading
-            || self.reset.is_some()
-            || self.browser_state.panel.is_some()
-        {
+        if self.overview_state.loading || self.reset.is_some() {
             return summary_started;
         }
-        if self.last_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds) {
+        if self.refresh_seconds > 0
+            && self.pending == 0
+            && self.last_refresh.elapsed() >= Duration::from_secs(self.refresh_seconds)
+        {
             self.refresh_background(handle);
+            return true;
+        }
+        if self.model_refresh_due() {
+            self.start_catalog_refresh(handle, false, true);
             return true;
         }
         summary_started
@@ -2487,11 +2528,8 @@ impl Dashboard {
                     models,
                 } => {
                     if generation == self.overview_state.generation
-                        && self
-                            .overview_state
-                            .catalog
-                            .as_mut()
-                            .is_some_and(|catalog| catalog.apply_models(&target, models))
+                        && let Some(catalog) = self.overview_state.catalog.as_mut()
+                        && catalog.apply_models(&target, models)
                     {
                         self.overview_state.complete_one();
                         changed = true;

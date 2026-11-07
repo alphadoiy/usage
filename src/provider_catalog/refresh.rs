@@ -7,6 +7,8 @@ pub struct RefreshRequest {
     pub config_path: PathBuf,
     pub previous: Option<Catalog>,
     pub refresh_models: bool,
+    /// Refresh model metadata without polling quota and balance readers.
+    pub models_only: bool,
 }
 
 #[derive(Debug)]
@@ -38,7 +40,26 @@ impl CatalogService {
                 .map_err(|_| "首页配置读取失败，请检查配置文件".to_string())?;
             let mut plan = service.load(&config)?;
             if let Some(previous) = request.previous {
-                plan.reuse(&previous, request.refresh_models);
+                plan.reuse(
+                    &previous,
+                    request.refresh_models,
+                    std::time::Duration::from_secs(config.model_refresh_seconds),
+                );
+            }
+            if request.models_only {
+                plan.resources.clear();
+                plan.catalog.refreshing_resources.clear();
+                for source in plan
+                    .catalog
+                    .providers
+                    .iter_mut()
+                    .flat_map(|p| &mut p.usage.sources)
+                {
+                    if matches!(source.state, super::QueryState::Loading) {
+                        source.state =
+                            super::QueryState::Unavailable("尚未查询，按 r 刷新额度".into());
+                    }
+                }
             }
             Ok::<_, String>(plan)
         })
@@ -331,6 +352,7 @@ mod tests {
                     config_path: path,
                     previous: None,
                     refresh_models: false,
+                    models_only: false,
                 },
                 move |update| tx.send(update).is_ok(),
             )

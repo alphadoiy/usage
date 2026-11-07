@@ -339,8 +339,8 @@ pub(super) fn render_home(area: Rect, buf: &mut Buffer, app: &Dashboard) {
         app.service_state.pending > 0,
         app.home_focus == HomeFocus::Connections,
     );
-    let mode =
-        crate::terminals::terminal_target(app.home_sessions_state.browser.resume_mode).label();
+    let mode = crate::terminals::terminal_target(app.home_sessions_state.browser.resume_mode)
+        .describe(app.home_sessions_state.browser.launch_options);
     let title = if app.home_sessions_state.browser.query.is_empty() {
         format!(
             "项目与会话 · {} 项目 · {mode}{}",

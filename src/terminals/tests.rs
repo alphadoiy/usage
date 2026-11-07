@@ -45,6 +45,7 @@ fn nested_context_and_explicit_selection_have_deterministic_priority() {
     let request = TerminalRequest {
         cwd: Path::new("/"),
         shell_command: "usage codex run fixture",
+        options: LaunchOptions::default(),
     };
     // An explicit target cannot silently run in a different terminal.
     assert!(
@@ -65,7 +66,11 @@ impl TerminalBackend for TestBackend {
         TerminalTarget {
             id: "test",
             label: "测试终端",
-            placement: Placement::Tab,
+            capabilities: Capabilities {
+                split: false,
+                tab: true,
+                adaptive: false,
+            },
         }
     }
     fn environment_keys(&self) -> &'static [&'static str] {
@@ -108,6 +113,7 @@ fn an_injected_backend_launches_through_the_common_path_and_surfaces_failure() {
             &TerminalRequest {
                 cwd: &cwd,
                 shell_command: shell,
+                options: LaunchOptions::default(),
             },
         )
         .unwrap();
@@ -130,7 +136,8 @@ fn an_injected_backend_launches_through_the_common_path_and_surfaces_failure() {
                 &ctx,
                 &TerminalRequest {
                     cwd: &root.join("missing"),
-                    shell_command: shell
+                    shell_command: shell,
+                    options: LaunchOptions::default(),
                 }
             )
             .is_err()
@@ -176,7 +183,8 @@ fn herdr_context_takes_priority_and_requires_complete_routing() {
                     &ctx,
                     &TerminalRequest {
                         cwd: Path::new("/"),
-                        shell_command: "usage"
+                        shell_command: "usage",
+                        options: LaunchOptions::default(),
                     }
                 )
                 .is_err()
@@ -195,44 +203,55 @@ fn herdr_context_takes_priority_and_requires_complete_routing() {
 
 #[cfg(unix)]
 #[test]
-fn herdr_routes_both_stages_and_stops_on_failures_without_replay() {
+fn herdr_routes_all_stages_and_stops_on_failures_without_replay() {
     use std::os::unix::fs::PermissionsExt;
-    let root = std::env::temp_dir().join(format!("usage-herdr-{}", uuid::Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!("usage-herdr-app-{}", uuid::Uuid::new_v4()));
     let cwd = root.join("project ' with spaces");
     std::fs::create_dir_all(&cwd).unwrap();
-    let binary = root.join("hc");
+    let app = root.join("herdr-app");
     let capture = root.join("calls.jsonl");
     let shell = "usage codex run 'account with spaces' -- --model 'a;$(literal)'";
     for scenario in [
         "success",
-        "lookup-failure",
+        "ls-failure",
         "invalid-json",
-        "missing-space",
-        "run-failure",
+        "missing-terminal",
+        "launch-failure",
+        "bad-created",
+        "focus-failure",
     ] {
-        let script = format!(
-            r#"#!/usr/bin/env python3
+        std::fs::write(
+            &app,
+            format!(
+                r#"#!/usr/bin/env python3
 import json,os,sys
 args=sys.argv[1:]
-with open({capture:?},'a') as f:
-    f.write(json.dumps({{'args':args,'socket':os.environ['HC_SOCKET'],'terminal':os.environ['HC_TERMINAL_ID']}})+'\n')
-if args[0]=='get':
-    if {scenario:?}=='lookup-failure': print('lookup rejected',file=sys.stderr);sys.exit(3)
+with open({capture:?},'a') as f: f.write(json.dumps({{'args':args}})+'\n')
+if args[0]=='ls':
+    if {scenario:?}=='ls-failure': print('ls failed',file=sys.stderr);sys.exit(3)
     if {scenario:?}=='invalid-json': print('bad json');sys.exit(0)
-    print(json.dumps({{'labels':{{'herdr.space':'sp-fixture'}}}}) if {scenario:?}!='missing-space' else '{{}}')
-else:
-    if {scenario:?}=='run-failure': print('run rejected',file=sys.stderr);sys.exit(4)
+    print('{{"spaces":[{{"id":"sp1","tabs":[{{"id":"tb1","terminals":[{{"terminal":"t3","pane":"p1"}},{{"terminal":"t9","pane":"p2"}}]}}]}}]}}' if {scenario:?}!='missing-terminal' else '{{"spaces":[{{"id":"sp1","tabs":[{{"id":"tb1","terminals":[{{"terminal":"t9","pane":"p2"}}]}}]}}]}}')
+elif args[0]=='do':
+    if args[1]=='pane.split':
+        if {scenario:?}=='launch-failure': print(json.dumps({{"error":"split failed"}}));sys.exit(4)
+        if {scenario:?}=='bad-created': print(json.dumps({{"pane":"p-new"}}),flush=True);print('unexpected trailing output',file=sys.stderr);sys.exit(0)
+        print(json.dumps({{"pane":"p-new","terminal":"t-new"}}))
+    elif args[1]=='pane.focus' or args[1]=='tab.select':
+        if {scenario:?}=='focus-failure': print('focus failed',file=sys.stderr);sys.exit(5)
+        print(json.dumps({{"ok":True}}))
 "#,
-            capture = capture.to_str().unwrap()
-        );
-        std::fs::write(&binary, script).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+                capture = capture.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(&capture, "").unwrap();
         let ctx = context(&[
             ("HC_TERMINAL_ID", "t3"),
             ("HC_TERMINAL_SOCKET", "/tmp/herdr named.sock"),
             ("PATH", &format!("{}:/usr/bin:/bin", root.display())),
-        ]);
+        ])
+        .with_size(200, 50);
         let result = builtin_registry()
             .prepare(
                 Selection::Auto,
@@ -240,6 +259,161 @@ else:
                 &TerminalRequest {
                     cwd: &cwd,
                     shell_command: shell,
+                    options: LaunchOptions::default(),
+                },
+            )
+            .unwrap()
+            .execute();
+        assert_eq!(
+            result.is_ok(),
+            scenario == "success" || scenario == "bad-created",
+            "{scenario}: {result:?}"
+        );
+        let calls: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if scenario == "focus-failure" {
+            assert!(result.unwrap_err().contains("实例已创建"));
+        }
+        let stages = match scenario {
+            "success" | "bad-created" => 4,
+            "ls-failure" | "invalid-json" | "missing-terminal" => 1,
+            "launch-failure" => 2,
+            "focus-failure" => 3,
+            _ => unreachable!("unknown Herdr scenario"),
+        };
+        assert_eq!(calls.len(), stages, "no retry after {scenario}");
+        if stages == 4 {
+            assert_eq!(calls[0]["args"][0], "ls");
+            assert_eq!(calls[1]["args"][0], "do");
+            assert_eq!(calls[1]["args"][1], "pane.split");
+            assert_eq!(calls[2]["args"][1], "tab.select");
+            assert_eq!(calls[3]["args"][1], "pane.focus");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn options(layout: LayoutMode, focus: FocusMode) -> LaunchOptions {
+    LaunchOptions { layout, focus }
+}
+
+#[test]
+fn layout_intent_resolves_the_same_way_for_every_terminal_capability() {
+    use LayoutMode::{Auto, Split, Tab};
+    let both = Capabilities {
+        split: true,
+        tab: true,
+        adaptive: false,
+    };
+    let tab_only = Capabilities {
+        split: false,
+        tab: true,
+        adaptive: false,
+    };
+    let split_only = Capabilities {
+        split: true,
+        tab: false,
+        adaptive: false,
+    };
+    let none = Capabilities {
+        split: false,
+        tab: false,
+        adaptive: false,
+    };
+    for (caps, layout, expected) in [
+        (both, Auto, Placement::Split),
+        (both, Split, Placement::Split),
+        (both, Tab, Placement::Tab),
+        (tab_only, Auto, Placement::Tab),
+        (tab_only, Split, Placement::Tab),
+        (tab_only, Tab, Placement::Tab),
+        (split_only, Auto, Placement::Split),
+        (split_only, Split, Placement::Split),
+        (split_only, Tab, Placement::Split),
+        (none, Auto, Placement::Current),
+        (none, Tab, Placement::Current),
+    ] {
+        assert_eq!(resolve(caps, layout), expected, "{caps:?} {layout:?}");
+    }
+}
+
+#[test]
+fn descriptions_never_promise_a_layout_the_terminal_cannot_make() {
+    let registry = builtin_registry();
+    let ctx = context(&[
+        ("REX_SESSION", "s"),
+        ("HC_TERMINAL_ID", "t"),
+        ("HC_TERMINAL_SOCKET", "/tmp/s"),
+    ]);
+    let herdr = registry.target(Selection::Backend("herdr"), &ctx).unwrap();
+    let rex = registry.target(Selection::Backend("rex"), &ctx).unwrap();
+    let any = |layout| options(layout, FocusMode::Keep);
+    assert_eq!(herdr.describe(any(LayoutMode::Auto)), "Herdr 自动排布");
+    assert_eq!(herdr.describe(any(LayoutMode::Split)), "Herdr 分屏");
+    assert_eq!(rex.describe(any(LayoutMode::Auto)), "Rex 自动排布");
+    assert_eq!(rex.describe(any(LayoutMode::Tab)), "Rex 新标签页");
+    assert_eq!(
+        registry
+            .target(Selection::Current, &ctx)
+            .unwrap()
+            .describe(any(LayoutMode::Split)),
+        "当前终端"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rex_routes_inspect_then_adaptive_launch_and_keeps_failure_surfaces() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("usage-rex-adaptive-{}", uuid::Uuid::new_v4()));
+    let cwd = root.join("project ' with spaces");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let rex = root.join("rex");
+    let capture = root.join("calls.jsonl");
+    for scenario in [
+        "success",
+        "inspect-failure",
+        "invalid-json",
+        "launch-failure",
+    ] {
+        std::fs::write(
+            &rex,
+            format!(
+                r#"#!/usr/bin/env python3
+import json,os,sys
+args=sys.argv[1:]
+with open({capture:?},'a') as f: f.write(json.dumps(args)+'\n')
+if args[0]=='session':
+    if {scenario:?}=='inspect-failure': print('inspect failed',file=sys.stderr);sys.exit(3)
+    if {scenario:?}=='invalid-json': print('bad json');sys.exit(0)
+    print(json.dumps({{"windows":[{{"window_id":"w0","layers":[{{"blocks":[{{"block_id":"block:usage"}},{{"block_id":"block:agent"}}]}}]}}]}}))
+elif args[0]=='run':
+    if {scenario:?}=='launch-failure': print('run failed',file=sys.stderr);sys.exit(4)
+    print(json.dumps({{"block_ids":["block:new"],"window_id":"w1"}}))
+"#,
+                capture = capture.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&capture, "").unwrap();
+        let ctx = context(&[
+            ("REX_SESSION", "session:fixed"),
+            ("REX_BIN_DIR", root.to_str().unwrap()),
+            ("REX_BLOCK", "block:usage"),
+        ])
+        .with_size(200, 50);
+        let result = builtin_registry()
+            .prepare(
+                Selection::Auto,
+                &ctx,
+                &TerminalRequest {
+                    cwd: &cwd,
+                    shell_command: "usage codex run $(literal)",
+                    options: LaunchOptions::default(),
                 },
             )
             .unwrap()
@@ -254,44 +428,102 @@ else:
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let stages = if matches!(scenario, "success" | "run-failure") {
-            2
-        } else {
-            1
-        };
-        assert_eq!(calls.len(), stages, "no retry after {scenario}");
-        assert_eq!(calls[0]["args"], serde_json::json!(["get", "--json", "t3"]));
-        for call in &calls {
-            assert_eq!(call["socket"], "/tmp/herdr named.sock");
-            assert_eq!(call["terminal"], "t3");
-        }
-        if stages == 2 {
-            let args: Vec<_> = calls[1]["args"]
-                .as_array()
-                .unwrap()
+        assert_eq!(
+            calls.len(),
+            if scenario == "success" || scenario == "launch-failure" {
+                2
+            } else {
+                1
+            },
+            "{scenario}: {calls:?} {result:?}"
+        );
+        if scenario == "success" {
+            let launch: Vec<String> = calls
                 .iter()
-                .map(|v| v.as_str().unwrap())
-                .collect();
-            assert_eq!(
-                &args[..7],
-                [
-                    "run",
-                    "--json",
-                    "--bg",
-                    "--no-parent",
-                    "--no-notify",
-                    "--keep",
-                    "--cwd"
-                ]
+                .filter_map(|call| call.as_array())
+                .find(|args| args.first().and_then(serde_json::Value::as_str) == Some("run"))
+                .map(|args| {
+                    args.iter()
+                        .map(|arg| arg.as_str().unwrap_or_default().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                launch.windows(2).any(|p| {
+                    let pair: Vec<&str> = p.iter().map(String::as_str).collect();
+                    pair == ["--block", "block:usage"] || pair == ["--block", "block:agent"]
+                }),
+                "{launch:?}"
             );
-            assert_eq!(Path::new(args[7]), cwd.canonicalize().unwrap());
-            assert_eq!(
-                &args[8..11],
-                ["--label", "herdr.space=sp-fixture", "--label"]
+            assert!(
+                launch
+                    .windows(2)
+                    .any(|p| p.iter().map(String::as_str).collect::<Vec<_>>()
+                        == ["--split", "right"]),
+                "{launch:?}"
             );
-            assert!(args[11].starts_with("herdr.tab=tb"));
-            assert_eq!(&args[12..], ["--", "sh", "-lc", shell]);
+            assert!(launch.iter().any(|a| a == "--focus=false"), "{launch:?}");
+            assert_eq!(
+                launch[launch.len() - 3..],
+                ["sh", "-lc", "usage codex run $(literal)"]
+            );
         }
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ghostty_observes_the_anchor_tty_then_splits_the_chosen_pane() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("usage-ghostty-fake-{}", uuid::Uuid::new_v4()));
+    let cwd = root.join("project ' with spaces");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let capture = root.join("calls");
+    let osascript = root.join("osascript");
+    std::fs::write(
+        &osascript,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" >> {capture:?}
+if printf '%s' "$2" | grep -q 'ps -o tty='; then
+  printf 'w1|t1|term-usage|true\nw1|t1|term-editor|false\n'
+  exit 0
+else
+  printf 'term-new|t-new\n'
+fi
+"#,
+            capture = capture.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&osascript, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let ctx = context(&[
+        ("TERM_PROGRAM", "ghostty"),
+        ("PATH", &format!("{}:/usr/bin:/bin", root.display())),
+    ])
+    .with_size(200, 50);
+    let result = builtin_registry()
+        .prepare(
+            Selection::Auto,
+            &ctx,
+            &TerminalRequest {
+                cwd: &cwd,
+                shell_command: "usage codex run $(literal)",
+                options: LaunchOptions::default(),
+            },
+        )
+        .unwrap()
+        .execute();
+    assert!(result.is_ok(), "{result:?}");
+    let calls = std::fs::read_to_string(&capture).unwrap();
+    assert!(calls.contains("ps -o tty="), "{calls}");
+    assert!(
+        calls.contains("split targetTerm direction right"),
+        "{calls}"
+    );
+    assert!(calls.contains(&cwd.canonicalize().unwrap().display().to_string()));
+    assert!(calls.contains("usage codex run $(literal)"));
+    assert!(calls.contains("keep"));
     std::fs::remove_dir_all(root).unwrap();
 }

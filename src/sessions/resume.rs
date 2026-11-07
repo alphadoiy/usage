@@ -175,8 +175,12 @@ impl ResumePlan {
     pub fn run_in_ghostty(&self) -> Result<(), String> {
         super::command_in_ghostty(self.cwd(), &self.shell_command()?)
     }
-    pub fn run_in_terminal(&self, mode: crate::config::ResumeMode) -> Result<(), String> {
-        super::command_in_terminal(self.cwd(), &self.shell_command()?, mode)
+    pub fn run_in_terminal(
+        &self,
+        mode: crate::config::ResumeMode,
+        options: super::LaunchOptions,
+    ) -> Result<(), String> {
+        super::command_in_terminal(self.cwd(), &self.shell_command()?, mode, options)
     }
 }
 
