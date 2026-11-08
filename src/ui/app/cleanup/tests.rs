@@ -69,6 +69,102 @@ async fn settle(app: &mut Dashboard) {
     .unwrap();
 }
 
+#[test]
+fn cleanup_dialog_text_keeps_contrast_without_the_terminal_ansi_palette() {
+    fn luminance(rgb: (u8, u8, u8)) -> f64 {
+        let linear = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(rgb.0) + 0.7152 * linear(rgb.1) + 0.0722 * linear(rgb.2)
+    }
+
+    let (root, session) = fixture();
+    let store = crate::session_cleanup::Store::at(root.join("trash"));
+    store.delete(&session).unwrap();
+    let entries = store.list().unwrap();
+    let plan = policy::Plan {
+        stale_days: 30,
+        candidates: vec![policy::Candidate {
+            session: session.clone(),
+            reason: policy::Reason::Empty,
+        }],
+        errors: vec!["损坏日志，保留会话".into()],
+        ..Default::default()
+    };
+    for (mode, selected) in [
+        (Mode::Smart(SmartPlan::Ready(plan.clone())), 0),
+        (Mode::Smart(SmartPlan::Ready(plan.clone())), 1),
+        (Mode::Smart(SmartPlan::Ready(plan)), 6),
+        (Mode::Smart(SmartPlan::Ready(policy::Plan::default())), 0),
+        (Mode::Smart(SmartPlan::Failed("读取失败".into())), 0),
+        (Mode::Loading, 0),
+        (Mode::Working, 0),
+        (Mode::Result("处理完成".into()), 0),
+        (Mode::Confirm(Action::Delete(vec![session])), 0),
+        (Mode::Confirm(Action::Restore(entries[0].key.clone())), 0),
+        (
+            Mode::Confirm(Action::Purge(vec![entries[0].key.clone()])),
+            0,
+        ),
+        (Mode::List, 0),
+    ] {
+        let mut panel = Panel {
+            entries: entries.clone(),
+            selected,
+            mode,
+            trash: true,
+            task: None,
+        };
+        for empty_trash in [false, true] {
+            if empty_trash {
+                panel.entries.clear();
+            }
+            for (width, height) in [(120, 30), (44, 14)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| panel.render(frame, store.path()))
+                    .unwrap();
+                let mut inspected = 0;
+                for cell in &terminal.backend().buffer().content {
+                    if cell.symbol().trim().is_empty() {
+                        continue;
+                    }
+                    inspected += 1;
+                    // Herdr can remap ANSI White/LightBlue/Yellow for a light theme.
+                    // A fixed dark popup must use palette-independent colors throughout.
+                    let (Color::Rgb(r, g, b), Color::Rgb(br, bg, bb)) = (cell.fg, cell.bg) else {
+                        panic!(
+                            "{:?}: glyph {:?} depends on terminal colors: {:?}",
+                            panel.mode,
+                            cell.symbol(),
+                            cell.style()
+                        );
+                    };
+                    let fg = luminance((r, g, b));
+                    let bg = luminance((br, bg, bb));
+                    let contrast = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
+                    assert!(
+                        contrast >= 4.5,
+                        "{:?}: glyph {:?} has contrast {contrast:.2}",
+                        panel.mode,
+                        cell.symbol()
+                    );
+                    assert!(!cell.modifier.intersects(
+                        ratatui::style::Modifier::DIM | ratatui::style::Modifier::REVERSED
+                    ));
+                }
+                assert!(inspected > 10);
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn delete_cancel_restore_and_refresh_work_through_browser_keys() {
     let (root, session) = fixture();

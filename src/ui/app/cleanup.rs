@@ -7,10 +7,17 @@ use crate::session_cleanup::{Entry, policy};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout},
-    style::{Color, Style, Stylize},
+    style::{Color, Style},
     text::Line,
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Widget, Wrap},
 };
+
+// This popup pins a dark background. ANSI colors (including White) can be
+// remapped to dark shades by light terminal themes such as Herdr's.
+const TEXT: Color = Color::Rgb(242, 242, 247);
+const MUTED: Color = Color::Rgb(180, 180, 185);
+const HIGHLIGHT: Color = Color::Rgb(96, 165, 250);
+const BORDER: Color = Color::Rgb(255, 159, 10);
 
 #[derive(Clone, Debug)]
 pub(super) enum Action {
@@ -83,8 +90,8 @@ impl Panel {
         Clear.render(modal, frame.buffer_mut());
         let block = Block::bordered()
             .title(" 会话清理 · 回收站 ")
-            .style(Style::new().bg(Color::Rgb(22, 22, 24)).fg(Color::White))
-            .border_style(Color::Yellow);
+            .style(Style::new().bg(Color::Rgb(22, 22, 24)).fg(TEXT))
+            .border_style(BORDER);
         let inner = block.inner(modal);
         block.render(modal, frame.buffer_mut());
         if matches!(self.mode, Mode::List) {
@@ -106,7 +113,7 @@ impl Panel {
                             entry.bytes.div_ceil(1024),
                             crate::ui::overview::clean(&entry.cwd.to_string_lossy())
                         ))
-                        .dim(),
+                        .style(Style::new().fg(MUTED)),
                     ])
                 })
                 .collect();
@@ -117,7 +124,7 @@ impl Panel {
                 StatefulWidget::render(
                     List::new(items)
                         .highlight_symbol("› ")
-                        .highlight_style(Style::new().fg(Color::LightBlue)),
+                        .highlight_style(Style::new().fg(HIGHLIGHT)),
                     list,
                     frame.buffer_mut(),
                     &mut state,
@@ -127,7 +134,7 @@ impl Panel {
                 "↑/↓ 选择 · Enter 恢复 · d 删除 · ? 更多 · Esc 返回\n不会自动清空回收站\n{}",
                 trash_path.display()
             ))
-            .dim()
+            .style(Style::new().fg(MUTED))
             .render(hint, frame.buffer_mut());
             return;
         }
@@ -237,7 +244,7 @@ impl Panel {
             StatefulWidget::render(
                 List::new(lines)
                     .highlight_symbol("› ")
-                    .highlight_style(Style::new().fg(Color::LightBlue)),
+                    .highlight_style(Style::new().fg(HIGHLIGHT)),
                 content,
                 frame.buffer_mut(),
                 &mut state,
@@ -257,7 +264,7 @@ impl Panel {
             Mode::Result(_) | Mode::Smart(SmartPlan::Failed(_)) => "Enter / Esc 返回",
             _ => "请等待处理完成…",
         })
-        .dim()
+        .style(Style::new().fg(MUTED))
         .render(hint, frame.buffer_mut());
     }
 }
