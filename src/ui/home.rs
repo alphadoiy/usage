@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 
 use crate::service_status::{self, ServiceStatus, State};
 
@@ -62,12 +62,21 @@ pub(super) fn areas_with_details(area: Rect, details: bool) -> [Rect; 3] {
 }
 
 pub(super) fn board(area: Rect, buf: &mut Buffer, title: &str, active: bool) -> Rect {
+    let title = if active {
+        Span::styled(
+            format!(" › {title} "),
+            Style::new().fg(Color::White).bg(Color::Blue).bold(),
+        )
+    } else {
+        Span::styled(format!("   {title} "), Style::new().fg(Color::DarkGray))
+    };
     let block = Block::bordered()
-        .title(format!(" {title} "))
+        .border_type(BorderType::Rounded)
+        .title(title)
         .border_style(if active {
-            Color::LightBlue
+            Style::new().fg(Color::Blue).bold()
         } else {
-            Color::DarkGray
+            Style::new().fg(Color::DarkGray)
         });
     let inner = block.inner(area);
     block.render(area, buf);
@@ -396,14 +405,8 @@ impl Connections {
                 } else {
                     format!("{symbol} {name}")
                 };
-                let style = if active && index == self.selected {
-                    super::widgets::selected_row().fg(color).bold()
-                } else {
-                    Style::new().fg(color)
-                };
-                Paragraph::new(text)
-                    .style(style)
-                    .render(columns[index], buf);
+                let style = Style::new().fg(color);
+                Paragraph::new(Span::styled(text, style)).render(columns[index], buf);
             }
             return;
         }
