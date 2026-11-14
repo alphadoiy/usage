@@ -749,6 +749,24 @@ async fn loader_storage_errors_and_parser_panics_both_finish_loading() {
         assert!(!final_update.loading);
         assert!(final_update.result.is_err());
         assert!(rx.recv().await.is_none());
+        // Repair the cause and retry through the same service, without restarting
+        // the application or discarding persisted observations.
+        if panic {
+            f.binding.source = source("codex").unwrap();
+        } else {
+            fs::remove_file(f.root.join("index")).unwrap();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _retry = service.start_load(
+            &tokio::runtime::Handle::current(),
+            load_request(&f),
+            move |update| tx.send(update).is_ok(),
+        );
+        assert!(load_update(&mut rx).await.loading);
+        let recovered = load_update(&mut rx).await;
+        assert!(!recovered.loading);
+        assert_eq!(recovered.result.unwrap().models[0].calls, 1);
+        assert!(rx.recv().await.is_none());
     }
 }
 

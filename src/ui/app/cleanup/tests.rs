@@ -39,7 +39,7 @@ fn dashboard(session: sessions::Session) -> Dashboard {
     let mut app = Dashboard::new_with_sessions(
         Vec::new(),
         config,
-        "/nonexistent/cleanup-ui.toml".into(),
+        Some("/nonexistent/cleanup-ui.toml".into()),
         sessions::builtin_registry(),
         homes,
     );

@@ -304,7 +304,11 @@ grok = ""
 pub fn load_config(path: &Path, required: bool) -> Result<AppConfig, ConfigError> {
     if !path.exists() {
         if required {
-            return Err(ConfigError(format!("找不到配置文件: {}", path.display())));
+            return Err(ConfigError(format!(
+                "找不到配置文件: {}；请检查 --config 路径，或运行 usage init-config --path {} 创建默认配置",
+                path.display(),
+                crate::codex_manager::shell_quote(&path.to_string_lossy())
+            )));
         }
         return Ok(AppConfig::default());
     }
@@ -668,6 +672,24 @@ struct RawPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_config_is_optional_unless_explicit_and_reports_how_to_initialize_it() {
+        let root = std::env::temp_dir().join(format!("usage-config-{}", uuid::Uuid::new_v4()));
+        let path = root.join("custom config.toml");
+        let defaults = load_config(&path, false).unwrap();
+        assert_eq!(defaults.providers, AppConfig::default().providers);
+        assert!(!path.exists());
+        let error = load_config(&path, true).unwrap_err().to_string();
+        assert!(error.contains("找不到配置文件:"));
+        assert!(error.contains(&format!(
+            "usage init-config --path {}",
+            crate::codex_manager::shell_quote(&path.to_string_lossy())
+        )));
+        write_default_config(&path, false).unwrap();
+        assert!(load_config(&path, true).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resume_mode_cycle_is_closed_and_described_by_the_shortcut_hint() {

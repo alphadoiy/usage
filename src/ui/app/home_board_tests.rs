@@ -7,7 +7,7 @@ fn app() -> Dashboard {
     let mut app = Dashboard::new(
         Vec::new(),
         isolated_config(),
-        "/nonexistent/home-boards.toml".into(),
+        Some("/nonexistent/home-boards.toml".into()),
     );
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app

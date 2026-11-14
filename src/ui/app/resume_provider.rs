@@ -75,7 +75,7 @@ impl Dashboard {
                     });
                 let intent = sessions::ResumeIntent::new(
                     picker.session.clone(),
-                    Some(self.config_path.clone()),
+                    self.config_override.clone(),
                 )
                 .with_target(target);
                 let plan = match intent.prepare() {

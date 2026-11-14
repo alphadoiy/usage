@@ -265,15 +265,30 @@ pub(super) fn prepare_config(root: &Path, home: &Path, path: &Path, saved: &str)
         let parse = |text: &str| {
             toml::from_str::<toml::Value>(text).map_err(|_| Error::message("Codex 配置无法解析"))
         };
-        let mut next = parse(&desired)?;
-        rebase(&parse(&previous)?, &parse(&runtime)?, &mut next);
-        if next != parse(&runtime)? {
-            private_write(
-                path,
-                toml::to_string(&next)
-                    .map_err(|_| Error::message("无法保存用户配置"))?
-                    .as_bytes(),
-            )?;
+        match parse(&previous) {
+            Ok(previous) => {
+                let mut next = parse(&desired)?;
+                rebase(&previous, &parse(&runtime)?, &mut next);
+                if next != parse(&runtime)? {
+                    private_write(
+                        path,
+                        toml::to_string(&next)
+                            .map_err(|_| Error::message("无法保存用户配置"))?
+                            .as_bytes(),
+                    )?;
+                }
+            }
+            Err(_) if snapshot.exists() => {
+                // This generated baseline is not authoritative. Without it we cannot
+                // distinguish inherited preferences from local edits/deletions, so keep
+                // the valid runtime untouched and adopt today's defaults as the baseline.
+                // Back up before replacing it so a failed recovery can be retried safely.
+                let backup =
+                    snapshot.with_extension(format!("corrupt-{}.toml", uuid::Uuid::new_v4()));
+                private_write(&backup, previous.as_bytes())?;
+                tracing::warn!(event = "context_baseline_recovered", backup = %backup.display());
+            }
+            Err(error) => return Err(error),
         }
     } else {
         private_create(path, desired.as_bytes())?;

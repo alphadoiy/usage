@@ -5,7 +5,7 @@ async fn selection_changes_cancel_old_previews_and_reject_results_from_other_hom
     let mut app = Dashboard::new(
         Vec::new(),
         isolated_config(),
-        "/nonexistent/preview.toml".into(),
+        Some("/nonexistent/preview.toml".into()),
     );
     let first = sessions::Session {
         agent: None,

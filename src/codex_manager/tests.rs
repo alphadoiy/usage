@@ -1249,8 +1249,11 @@ fn managed_resume_command_keeps_the_instances_explicit_account_store() {
     let command = instance.resume_shell_command(&session).unwrap();
     let args = shlex::split(&command).unwrap();
     assert_eq!(args[0], "env");
-    assert_eq!(args[1], format!("USAGE_CODEX_DIR={}", root.display()));
-    assert_eq!(&args[3..6], &["codex", "run", profile.id.as_str()]);
+    assert!(args.contains(&format!("USAGE_CODEX_DIR={}", root.display())));
+    assert!(
+        args.windows(3)
+            .any(|args| args == ["codex", "run", profile.id.as_str()])
+    );
     assert!(
         args.windows(2)
             .any(|pair| pair == ["--resume", &session.id])

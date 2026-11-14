@@ -339,7 +339,16 @@ impl Service {
                     ..Default::default()
                 });
             }
-            Err(TryLockError::Poisoned(_)) => return Err("性能采集状态不可用，请重启 Usage".into()),
+            Err(TryLockError::Poisoned(error)) => {
+                // A panicked parser unwinds the SQLite transaction. Its directory
+                // iterator/decoder may already have advanced, so rebuild only this
+                // disposable state and resume from the committed database cursors.
+                let mut workers = error.into_inner();
+                *workers = Workers::default();
+                self.workers.clear_poison();
+                tracing::warn!(event = "performance_workers_recovered");
+                workers
+            }
         };
         let scope = binding.log_scope();
         let log_home = binding.log_home();

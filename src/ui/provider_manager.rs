@@ -890,13 +890,15 @@ fn launch(
 ) -> io::Result<String> {
     let mode = crate::config::ResumeMode::Auto;
     let target = crate::terminals::terminal_target(mode);
-    let config = crate::config::load_config(
+    let config = match crate::config::load_config(
         &usage_config
             .map(Path::to_path_buf)
             .unwrap_or_else(crate::config::default_config_path),
         usage_config.is_some(),
-    )
-    .map_err(io::Error::other)?;
+    ) {
+        Ok(config) => config,
+        Err(error) => return Ok(error.to_string()),
+    };
     let options = crate::terminals::LaunchOptions::from_config(&config);
     if !target.is_current() {
         return Ok(

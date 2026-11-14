@@ -21,8 +21,11 @@ with open(os.environ['CAPTURE_FILE'], 'a') as f:
     let capture = f.path.join("tabs.jsonl");
     let config = f.path.join("layout.toml");
     fs::write(&config, "[sessions]\nlayout = \"split\"\n").unwrap();
-    for _ in 0..2 {
-        success(f.root_command(&["--config", config.to_str().unwrap(), "codex", "run", &account, "--cwd", f.path.to_str().unwrap(), "--split", "--binary", "/tmp/codex with spaces", "--", "--model", "fixture-model"])
+    for explicit in [true, false] {
+        let mut args = if explicit { vec!["--config", config.to_str().unwrap()] } else { Vec::new() };
+        args.extend(["codex", "run", &account, "--cwd", f.path.to_str().unwrap(), "--split", "--binary", "/tmp/codex with spaces", "--", "--model", "fixture-model"]);
+        success(f.root_command(&args)
+            .env("USAGE_CONFIG", &config)
             .env("REX_SESSION", "session:fixture")
             .env("REX_BLOCK", "block:usage")
             .env("REX_BIN_DIR", &bin_dir)
@@ -48,6 +51,7 @@ with open(os.environ['CAPTURE_FILE'], 'a') as f:
         assert!(shell.windows(2).any(|pair| pair == ["--binary", "/tmp/codex with spaces"]));
         assert!(shell.windows(2).any(|pair| pair == ["--model", "fixture-model"]));
         assert!(shell.iter().any(|arg| arg.starts_with("USAGE_CODEX_DIR=")));
+        assert!(shell.contains(&format!("USAGE_CONFIG={}", config.display())));
     }
 }
 

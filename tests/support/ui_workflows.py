@@ -1,4 +1,4 @@
-"""Exercise saved edits, page navigation and resume identity in a real terminal.
+"""Exercise saved edits, navigation, resume identity and missing configs in a real terminal.
 
 python3 tests/support/ui_workflows.py target/debug/usage
 Uses synthetic accounts, isolated stores and a fake Codex; no model requests.
@@ -96,7 +96,7 @@ def main():
         for path in [native, independent, project, root / "bin", root / "claude", root / "grok"]:
             path.mkdir()
         env = dict(os.environ)
-        for key in ["CODEX_SQLITE_HOME", "USAGE_CONFIG", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_AUTH_TOKEN", "OPENAI_BASE_URL", "USAGE_CODEX_API_KEY", "USAGE_CODEX_RUN_CONTEXT", "USAGE_CODEX_BARK_CONTEXT", "OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID"]:
+        for key in ["CODEX_SQLITE_HOME", "USAGE_CONFIG", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_AUTH_TOKEN", "OPENAI_BASE_URL", "USAGE_CODEX_API_KEY", "USAGE_CODEX_RUN_CONTEXT", "USAGE_CODEX_BARK_CONTEXT", "OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "REX_SESSION", "REX_BIN_DIR", "REX_SERVER", "GHOSTTY_RESOURCES_DIR"]:
             env.pop(key, None)
         env.update(TERM="xterm-256color", TERM_PROGRAM="usage-test", LANG="en_US.UTF-8", USAGE_LOG="off", USAGE_GATEWAY="off",
                    USAGE_CODEX_DIR=str(root / "accounts"), USAGE_CODEX_BASE_HOME=str(native), CODEX_HOME=str(native),
@@ -109,8 +109,9 @@ def main():
 if sys.argv[1:] == ['--help']:
     print('--no-daemon'); sys.exit(0)
 home=pathlib.Path(os.environ['CODEX_HOME'])
-session=sys.argv[sys.argv.index('resume')+1]
-assert any(session in p.name for p in (home/'sessions').rglob('*.jsonl')), 'resumed Home cannot see conversation'
+session=sys.argv[sys.argv.index('resume')+1] if 'resume' in sys.argv else None
+if session:
+    assert any(session in p.name for p in (home/'sessions').rglob('*.jsonl')), 'resumed Home cannot see conversation'
 pathlib.Path(os.environ['UI_WORKFLOW_RESULT']).write_text(json.dumps({'session':session,'home':str(home)}))
 ''')
         fake.chmod(0o700)
@@ -207,6 +208,102 @@ profile_ids = [{json.dumps(account)}]
         finally:
             terminal.close()
         print("PASS: saved effort clear, F1–F4 navigation, unshared resume guard, shared resume and custom Usage config")
+
+        def launch_selected_account(terminal, expected="Codex已退出："):
+            terminal.send(b"\r")
+            terminal.until("在哪个项目启动Fixture")
+            terminal.send(b"\r")
+            terminal.until(expected)
+
+        def launch_from_home(terminal, expected="Codex已退出："):
+            terminal.send(b"\x1bOS")
+            terminal.until("[F4Provider]")
+            terminal.send(b"\x1b[B")
+            launch_selected_account(terminal, expected)
+
+        default_config = root / "config/usage/config.toml"
+        launched = root / "launched.json"
+        for args, page in [
+            (["--providers", "grok", "--refresh", "0"], "[F1首页]"),
+            (["--providers", "grok", "history"], "[F2历史]"),
+            (["codex"], "[F4Provider]"),
+        ]:
+            assert not default_config.exists()
+            launched.unlink(missing_ok=True)
+            terminal = Terminal(binary, args, env, project)
+            try:
+                terminal.until(page)
+                if page == "[F4Provider]":
+                    terminal.send(b"\x1bOP")
+                    terminal.until("[F1首页]")
+                launch_from_home(terminal)
+                assert json.loads(launched.read_text())["session"] is None
+                assert not default_config.exists(), "default config must remain optional across pages"
+                # A second launch reuses the same dashboard without initializing a config.
+                launched.unlink()
+                terminal.send(b"\x1bOP")
+                terminal.until("[F1首页]")
+                launch_from_home(terminal)
+                assert launched.exists()
+            finally:
+                terminal.close()
+        print("PASS: absent default config supports repeated launches from dashboard, history and Provider navigation")
+
+        # An explicit --config remains required even when it names the default path.
+        default_config.parent.mkdir(parents=True, exist_ok=True)
+        default_config.write_text(config.read_text())
+        launched.unlink()
+        terminal = Terminal(binary, ["--config", str(default_config)], env, project)
+        try:
+            terminal.until("[F1首页]")
+            default_config.unlink()
+            launch_from_home(terminal, "找不到配置文件:")
+            assert not launched.exists(), "missing explicit config must not silently launch with defaults"
+            cli("init-config", "--path", str(default_config))
+            launch_selected_account(terminal)
+            assert launched.exists()
+        finally:
+            terminal.close()
+        print("PASS: missing explicit config blocks launch and init-config repairs it without restarting Usage")
+
+        launched.unlink()
+        terminal = Terminal(binary, ["--providers", "grok", "--refresh", "0"], env, project)
+        try:
+            terminal.until("[F1首页]")
+            default_config.unlink()
+            launch_from_home(terminal)
+            assert launched.exists(), "implicit config stays optional when deleted after startup"
+        finally:
+            terminal.close()
+        print("PASS: default config removed after startup falls back to defaults on launch")
+
+        saved_config = config.read_text()
+        terminal = Terminal(binary, ["--config", str(config), "codex"], env, project)
+        try:
+            terminal.until("[F4Provider]")
+            terminal.send(b"\x1b[B")
+            for damage, expected in [
+                ("missing", "找不到配置文件:"),
+                ("syntax", "配置不是合法的TOML:"),
+                ("directory", "无法读取配置:"),
+            ]:
+                launched.unlink(missing_ok=True)
+                config.unlink()
+                if damage == "syntax":
+                    config.write_text("providers = [")
+                elif damage == "directory":
+                    config.mkdir()
+                launch_selected_account(terminal, expected)
+                assert not launched.exists(), f"{damage} config must block the child"
+                if damage == "directory":
+                    config.rmdir()
+                config.write_text(saved_config)
+                # Retry in the same Provider page, with the same selected account.
+                launch_selected_account(terminal)
+                assert launched.exists(), f"{damage} config must recover without reopening Usage"
+        finally:
+            terminal.close()
+        print("PASS: missing, malformed and unreadable configs keep Provider management open for repair and retry")
 
 
 if __name__ == "__main__":

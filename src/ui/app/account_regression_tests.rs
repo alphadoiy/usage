@@ -33,7 +33,7 @@ async fn two_accounts_receive_their_own_card_results() {
     let mut app = Dashboard::new(
         vec![Arc::new(Account("a")), Arc::new(Account("b"))],
         isolated_config(),
-        "/nonexistent/usage-ablation.toml".into(),
+        Some("/nonexistent/usage-ablation.toml".into()),
     );
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.history_state.config.alerts.enabled = true;

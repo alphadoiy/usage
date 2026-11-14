@@ -1083,16 +1083,16 @@ pub fn binding_for_home(home: &Path) -> Result<Option<(String, i64)>> {
 }
 
 pub fn with_usage_config(command: String, config: Option<&Path>) -> Result<String> {
-    match config {
-        Some(path) => {
-            let path = std::path::absolute(path)?;
-            Ok(format!(
-                "env USAGE_CONFIG={} {command}",
-                shell_quote(&path.to_string_lossy())
-            ))
-        }
-        None => Ok(command),
-    }
+    // New terminal shells may have different USAGE_CONFIG/XDG_CONFIG_HOME values.
+    // Pin the resolved path via the optional environment default, never --config.
+    let path = config
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::config::default_config_path);
+    let path = std::path::absolute(path)?;
+    Ok(format!(
+        "env USAGE_CONFIG={} {command}",
+        shell_quote(&path.to_string_lossy())
+    ))
 }
 
 pub fn launch_shell_command(
@@ -1165,11 +1165,11 @@ fn usage_shell_command_in(root: &Path, args: &[String]) -> String {
     }
 }
 #[cfg(not(target_os = "windows"))]
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 #[cfg(target_os = "windows")]
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 

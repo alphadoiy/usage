@@ -65,7 +65,7 @@ fn reset_dashboard(available: u32, consumed: Arc<AtomicUsize>) -> Dashboard {
             consumed,
         })],
         isolated_config(),
-        "/tmp/usage-reset-test.toml".into(),
+        Some("/tmp/usage-reset-test.toml".into()),
     );
     app.overview_state.catalog = Some(reset_catalog(&app.providers));
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
@@ -114,7 +114,11 @@ async fn drain_until(app: &mut Dashboard, condition: impl Fn(&Dashboard) -> bool
 
 fn dashboard() -> Dashboard {
     let now = Utc::now();
-    let mut app = Dashboard::new(Vec::new(), isolated_config(), "/tmp/usage-test.toml".into());
+    let mut app = Dashboard::new(
+        Vec::new(),
+        isolated_config(),
+        Some("/tmp/usage-test.toml".into()),
+    );
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     app.cards = vec![
         CardSlot {
@@ -279,7 +283,7 @@ async fn dashboard_uses_injected_session_registry() {
     let mut app = Dashboard::new_with_sessions(
         Vec::new(),
         isolated_config(),
-        root.join("config.toml"),
+        Some(root.join("config.toml")),
         registry,
         sessions::SessionHomes::new().with("custom", &root),
     );
@@ -399,7 +403,7 @@ async fn reset_consumes_the_confirmed_account_even_when_another_has_the_same_too
             }),
         ],
         isolated_config(),
-        "/tmp/usage-reset-accounts.toml".into(),
+        Some("/tmp/usage-reset-accounts.toml".into()),
     );
     app.overview_state.catalog = Some(reset_catalog(&app.providers));
     app.home_provider = Some("b".into());
@@ -733,7 +737,7 @@ async fn repeated_quota_refresh_joins_pending_work() {
     let mut app = Dashboard::new(
         vec![Arc::new(CountingQuota(calls.clone()))],
         isolated_config(),
-        "/tmp/test-config".into(),
+        Some("/tmp/test-config".into()),
     );
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     let handle = Handle::current();
@@ -761,7 +765,7 @@ async fn a_panicking_quota_query_answers_and_later_refreshes_still_run() {
     let mut app = Dashboard::new(
         vec![Arc::new(PanickingQuota)],
         isolated_config(),
-        "/tmp/test-config".into(),
+        Some("/tmp/test-config".into()),
     );
     app.service_state.http = Arc::new(crate::http::FakeHttp::new());
     let handle = Handle::current();
@@ -935,7 +939,7 @@ async fn history_auto_refresh_scans_locally_and_skips_quota_network() {
     let mut app = Dashboard::new(
         vec![Arc::new(CountingQuota(calls.clone()))],
         isolated_config(),
-        "/tmp/test-config".into(),
+        Some("/tmp/test-config".into()),
     );
     app.history_state.config.providers.clear();
     app.history_state.cache = Some(crate::history::HistoryCache::at(

@@ -94,6 +94,8 @@ usage styles          # 列出可视化样式
 usage init-config     # 写出 ~/.config/usage/config.toml
 ```
 
+默认配置文件可省略，缺失时使用内置配置，仍可从各页面启动多个实例。通过 `--config <路径>` 指定的文件必须存在；可用 `usage init-config --path <路径>` 补建默认配置。
+
 `usage resources` 使用独立的 `[[resources]]` 配置，支持 New API 令牌额度、账号余额和 OpenAI 官方费用。凭据通过环境变量引用，查询范围和货币单位分别表达。配置示例见[资源连接](docs/resource-connections.md)。首页的 Provider 看板展示名称、类型、用量／余额和接口模型列表，托管 Codex OAuth 账号使用自身登录查询订阅模型；查询服务通过 `profile_ids` 或独立推理连接关联，也可复用正在跟随的 CC Switch 账号中已启用的内置查询配置。运行诊断继续使用 CLI。模型查询与首页操作见[首页中枢](docs/home-overview.md)。
 
 托管运行可以保存启动侧解析的模型、端点与资源关联，通过 `usage codex runs --json` 查看。`resources --run` 会核对启动时的连接版本和凭据，配置方法与解析边界见[运行资源关联](docs/run-resource-binding.md)。

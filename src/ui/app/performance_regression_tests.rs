@@ -6,7 +6,7 @@ use crate::provider_catalog::{Catalog, Models, Provider, ProviderKind};
 async fn homepage_performance_is_cached_per_binding_and_expires_after_five_minutes() {
     let root =
         std::env::temp_dir().join(format!("usage-home-performance-{}", uuid::Uuid::new_v4()));
-    let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config"));
+    let mut app = Dashboard::new(Vec::new(), AppConfig::default(), Some(root.join("config")));
     app.performance.service = Arc::new(crate::performance::Service::at(root.join("index.sqlite3")));
     let a = panel().binding.clone();
     let mut b = a.clone();
@@ -158,7 +158,11 @@ async fn performance_dialog_loads_local_index_refreshes_without_body_reads_and_c
         serde_json::json!({"timestamp":end,"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","duration_ms":10000,"time_to_first_token_ms":2000}}),
     ].into_iter().map(|v| v.to_string()+"\n").collect::<String>();
     std::fs::write(home.join("sessions/fixture.jsonl"), &text).unwrap();
-    let mut app = Dashboard::new(Vec::new(), AppConfig::default(), root.join("config.toml"));
+    let mut app = Dashboard::new(
+        Vec::new(),
+        AppConfig::default(),
+        Some(root.join("config.toml")),
+    );
     app.performance.service = Arc::new(crate::performance::Service::at(
         root.join("index/performance.sqlite3"),
     ));
@@ -257,7 +261,7 @@ fn performance_modal_shows_provenance_samples_and_intercepts_parent_actions() {
     let mut app = Dashboard::new(
         Vec::new(),
         AppConfig::default(),
-        "/nonexistent/perf-config".into(),
+        Some("/nonexistent/perf-config".into()),
     );
     app.performance.panel = Some(panel());
     // x, Enter and navigation belong to the modal, never to resets or parent sessions.
@@ -316,7 +320,7 @@ fn performance_results_cannot_cross_dialog_generations_or_provider_selection() {
     let mut app = Dashboard::new(
         Vec::new(),
         AppConfig::default(),
-        "/nonexistent/perf-config".into(),
+        Some("/nonexistent/perf-config".into()),
     );
     app.performance.panel = Some(panel());
     app.home_provider = Some("provider-b".into());
@@ -369,7 +373,7 @@ fn an_unbound_provider_never_scans_default_agent_logs() {
     let mut app = Dashboard::new(
         Vec::new(),
         AppConfig::default(),
-        "/nonexistent/perf-config".into(),
+        Some("/nonexistent/perf-config".into()),
     );
     app.overview_state.catalog = Some(Catalog {
         providers: vec![Provider {

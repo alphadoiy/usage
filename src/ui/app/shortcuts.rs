@@ -248,7 +248,7 @@ mod tests {
         let mut app = Dashboard::new(
             Vec::new(),
             isolated_config(),
-            "/nonexistent/shortcuts.toml".into(),
+            Some("/nonexistent/shortcuts.toml".into()),
         );
         app.browser_state.panel = Some(SessionBrowser::new(vec![sessions::Session {
             agent: None,

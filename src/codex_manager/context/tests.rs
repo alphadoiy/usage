@@ -317,3 +317,76 @@ fn existing_instance_context_is_kept_and_new_global_entries_are_added() {
     assert!(home.join("skills/local/SKILL.md").exists());
     assert!(home.join("skills/global/SKILL.md").exists());
 }
+
+#[test]
+fn corrupt_generated_baseline_recovers_without_resetting_runtime_preferences_or_credentials() {
+    for oauth in [false, true] {
+        let fixture = Fixture::new();
+        let mut manager = fixture.manager();
+        let base = base_home(manager.root());
+        write(
+            &base.join("config.toml"),
+            "personality='friendly'\n[tui]\nnotifications=false\n",
+        );
+        let account = if oauth {
+            let source = oauth_source(&fixture, "workspace", "refresh-fixture");
+            manager
+                .import_oauth(Some("OAuth"), None, &source, None)
+                .unwrap()
+        } else {
+            manager
+                .add("A", &native("https://a.invalid/v1", "model"), "key-a")
+                .unwrap()
+        };
+        let home = manager.materialize(&account.id, 1).unwrap();
+        let path = home.join(if oauth {
+            "usage-r1.config.toml"
+        } else {
+            "config.toml"
+        });
+        let auth_before = fs::read(home.join("auth.json")).ok();
+        let mut runtime = read(&path);
+        runtime
+            .as_table_mut()
+            .unwrap()
+            .insert("model".into(), "local-model".into());
+        runtime["tui"]["notifications"] = true.into();
+        runtime.as_table_mut().unwrap().remove("personality");
+        let runtime = toml::to_string(&runtime).unwrap();
+        write(&path, &runtime);
+        let snapshot = path.with_extension("usage-defaults.toml");
+        write(&snapshot, "[broken baseline\n");
+
+        manager.materialize(&account.id, 1).unwrap();
+        manager.materialize(&account.id, 1).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), runtime);
+        assert_eq!(fs::read(home.join("auth.json")).ok(), auth_before);
+        assert_eq!(
+            read(&snapshot)["tui"]["notifications"].as_bool(),
+            Some(false)
+        );
+        let backups: Vec<_> = fs::read_dir(&home)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&backups[0]).unwrap(),
+            "[broken baseline\n"
+        );
+
+        // Authoritative account settings still fail closed and are never reset.
+        write(&path, "model_provider='unexpected'\n");
+        assert!(manager.materialize(&account.id, 1).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "model_provider='unexpected'\n"
+        );
+    }
+}

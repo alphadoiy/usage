@@ -6,7 +6,7 @@ async fn old_refresh_completion_cannot_clear_current_work() {
     let mut app = Dashboard::new(
         Vec::new(),
         isolated_config(),
-        "/nonexistent/refresh.toml".into(),
+        Some("/nonexistent/refresh.toml".into()),
     );
     app.overview_state.generation = 4;
     app.overview_state.pending = 2;
@@ -51,7 +51,7 @@ fn dashboard() -> Dashboard {
     Dashboard::new(
         Vec::new(),
         isolated_config(),
-        "/nonexistent/usage-overview.toml".into(),
+        Some("/nonexistent/usage-overview.toml".into()),
     )
 }
 fn rendered(app: &Dashboard, width: u16, height: u16) -> String {

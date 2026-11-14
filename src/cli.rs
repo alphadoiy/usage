@@ -545,7 +545,7 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(|| {
                         crate::ui::run_history_with_query(
-                            handle, config, path, year, monthly, query,
+                            handle, config, cli.config, year, monthly, query,
                         )
                     })
                 })
@@ -666,7 +666,7 @@ async fn query(cli: Cli) -> Result<i32, CliError> {
         return Ok(print_once(&providers, &config, cli.json).await);
     }
     let handle = Handle::current();
-    let path = config_path;
+    let path = cli.config;
     let style_config = config;
     {
         let span = tracing::Span::current();

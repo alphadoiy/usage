@@ -28,7 +28,7 @@ async fn fingerprint_events_and_provider_switches_keep_account_identity() {
     let mut app = Dashboard::new(
         Vec::new(),
         isolated_config(),
-        PathBuf::from("/tmp/config.toml"),
+        Some(PathBuf::from("/tmp/config.toml")),
     );
     app.overview_state.catalog = Some(Catalog {
         providers: vec![
@@ -128,7 +128,7 @@ async fn tui_schedule_switch_persists_only_the_selected_account_and_survives_nav
     assert_eq!(snapshots.len(), 2);
     assert!(snapshots.iter().all(|s| s.engine_available && !s.enabled));
     assert!(!manager.root().join("fingerprint/accounts").exists());
-    let mut app = Dashboard::new(Vec::new(), isolated_config(), root.join("usage.toml"));
+    let mut app = Dashboard::new(Vec::new(), isolated_config(), Some(root.join("usage.toml")));
     app.fingerprint.service = service.clone();
     app.overview_state.catalog = Some(Catalog {
         providers,

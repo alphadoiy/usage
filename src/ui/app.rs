@@ -219,7 +219,7 @@ pub fn run(
     handle: Handle,
     providers: Vec<Arc<dyn UsageProvider>>,
     config: AppConfig,
-    config_path: std::path::PathBuf,
+    config_path: Option<PathBuf>,
 ) -> io::Result<()> {
     let app = Dashboard::new(providers, config, config_path);
     run_dashboard(handle, app)
@@ -241,7 +241,7 @@ pub(super) fn run_from_page(
         .into_iter()
         .map(Arc::from)
         .collect();
-    let mut app = Dashboard::new(providers, config, path);
+    let mut app = Dashboard::new(providers, config, config_path);
     app.navigate_page(action, &handle);
     run_dashboard(handle, app)
 }
@@ -251,7 +251,7 @@ pub fn run_with_sessions(
     handle: Handle,
     providers: Vec<Arc<dyn UsageProvider>>,
     config: AppConfig,
-    config_path: std::path::PathBuf,
+    config_path: Option<PathBuf>,
     registry: sessions::SessionRegistry,
     homes: sessions::SessionHomes,
 ) -> io::Result<()> {
@@ -262,7 +262,7 @@ pub fn run_with_sessions(
 pub fn run_history(
     handle: Handle,
     config: AppConfig,
-    config_path: std::path::PathBuf,
+    config_path: Option<PathBuf>,
     year: i32,
     monthly: bool,
 ) -> io::Result<()> {
@@ -279,7 +279,7 @@ pub fn run_history(
 pub fn run_history_with_query(
     handle: Handle,
     config: AppConfig,
-    config_path: std::path::PathBuf,
+    config_path: Option<PathBuf>,
     year: i32,
     monthly: bool,
     query: crate::history::HistoryQuery,
@@ -431,7 +431,7 @@ fn run_dashboard(handle: Handle, mut app: Dashboard) -> io::Result<()> {
                                 crate::ui::terminal::leave();
                                 let result = super::provider_manager::run_embedded(
                                     handle.clone(),
-                                    Some(app.config_path.clone()),
+                                    app.config_override.clone(),
                                     // Reuse the home board's sessions once loaded rather than scanning again.
                                     if app.home_sessions_state.generation > 0
                                         && !app.home_sessions_state.loading
@@ -707,6 +707,8 @@ struct Dashboard {
     cards: Vec<CardSlot>,
     refresh_seconds: u64,
     config_path: std::path::PathBuf,
+    /// Only an explicit --config makes a missing file an error on later launches.
+    config_override: Option<PathBuf>,
     status: String,
     generation: u64,
     pending: usize,
@@ -733,7 +735,7 @@ impl Dashboard {
     fn new(
         providers: Vec<Arc<dyn UsageProvider>>,
         config: AppConfig,
-        config_path: std::path::PathBuf,
+        config_path: Option<PathBuf>,
     ) -> Self {
         let session_homes = sessions::SessionHomes::from_config(&config);
         Self::new_with_sessions(
@@ -748,7 +750,7 @@ impl Dashboard {
     fn new_with_sessions(
         providers: Vec<Arc<dyn UsageProvider>>,
         config: AppConfig,
-        config_path: std::path::PathBuf,
+        config_override: Option<PathBuf>,
         session_registry: sessions::SessionRegistry,
         session_homes: sessions::SessionHomes,
     ) -> Self {
@@ -804,7 +806,10 @@ impl Dashboard {
             cards,
             status: "Provider · 厂商状态 · 项目会话".into(),
             refresh_seconds: config.refresh_seconds,
-            config_path,
+            config_path: config_override
+                .clone()
+                .unwrap_or_else(crate::config::default_config_path),
+            config_override,
             generation: 0,
             pending: 0,
             last_refresh: std::time::Instant::now(),
@@ -1290,7 +1295,7 @@ impl Dashboard {
                 {
                     let tx = self.tx.clone();
                     let request =
-                        sessions::ResumeRequest::new(session, Some(self.config_path.clone()));
+                        sessions::ResumeRequest::new(session, self.config_override.clone());
                     // An accepted clipboard write completes independently of the view.
                     handle.spawn_blocking(move || {
                         let result = request
@@ -1527,7 +1532,7 @@ impl Dashboard {
         home: bool,
         handle: &Handle,
     ) {
-        let intent = sessions::ResumeIntent::new(session, Some(self.config_path.clone()));
+        let intent = sessions::ResumeIntent::new(session, self.config_override.clone());
         match intent.prepare() {
             Ok(plan) => self.launch_resume_plan(plan, mode, home, handle),
             Err(error) => self.notice = Some(error),
